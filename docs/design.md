@@ -24,11 +24,12 @@ Orca's `worker-list` is not used as a role signal. Without `--run` it is scoped 
 
 ## Entries and effects
 
-An entry (`entrada`) is something that demands a decision from the coordinator. There are three sources:
+An entry (`entrada`) is something that demands a decision from the coordinator. There are four sources:
 
 - a prompt typed by the user (`origem: usuario`)
 - an action item from an automation report (`origem: relatorio`)
 - a `worker_done` message that carries a `reportPath` (`origem: relatorio_worker`)
+- a linked pull request that was merged or closed (`origem: pr`, see "Pull requests linked to a task")
 
 Each entry gets a sequential id (`e1`, `e2`, ...). It stays open until an `intake` event with the same id records its effect:
 
@@ -54,6 +55,7 @@ The model does the classifying. The code only checks that a classification was r
 | `heartbeat_absorvido`, `heartbeat_visto` | prompt hook, manager loop, waiter |
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
 | `fim_dispatch` | `orq liberar`: `dispatch`, `motivo` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
+| `pr` (`op: ligar/desligar/entrou/fechou/avisado`) | `orq pr`, the poll, the manager loop |
 | `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
 
@@ -310,6 +312,30 @@ Every `orq liberar` writes a `fim_dispatch` event with the dispatch's final stat
 `orq resumo --noite` prints the card for the latest `noite_ligar`, in at most 40 lines and pt-BR: one line per dispatch with its reason (`rodando` while it has no `fim_dispatch`), why dispatching stopped (`noite_parou`), dirty worktrees, branches with commits not pushed, parked decisions (`pend add` during the night, still open), whether the manager was alive, the longest gap in the log, and the commands to paste (`git -C <worktree> status --short` and `git -C <worktree> log --oneline origin/main..HEAD`, only for the worktrees that need them). `cartao_noite` is a pure function of the log, `cursor.json` and the pending file; for dispatches without `fim_dispatch` the command adds the worktree seen now through `worker-show` (best effort, at most 10). Lists cap at 8 dispatches and 3 per section, with `+N` for the rest.
 
 The manager panel stamps `gerente_volta` in `cursor.json` at every `orq gerente absorver` round. The card calls the manager alive when the last round was at most 5 minutes before the end of the night, and prints when it stopped otherwise. A gap is 10 minutes with no event in the log between two consecutive events (or the start and end of the night); the card prints the longest as "a máquina pode ter dormido às HH:MM". A quiet log is not proof of sleep, so the wording stays a maybe. The SessionStart hook adds the first line of the card (how many dispatches, how many per reason) while the night ended less than 12 hours ago, whether by `orq noite desligar` or by reaching its end time.
+
+## Pull requests linked to a task
+
+A feature moves through environments by the same branch: a pull request into `development`, then `staging`, then `main`, plus a `merge/<feature>-<environment>` request when a conflict shows up. Orca's task holds only a spec, so orq keeps the link in `prs.json` (`{itens, ultimo_poll}`), written under `pr.lock` with a temporary file and a rename like the other state files.
+
+`orq pr ligar <task> <url> [--issue N]` registers a request, `orq pr lista [--task]` lists them and `orq pr desligar <task> <url>` drops one. An item holds the task, URL, number, base branch, `estado` (`aberto`, `mergeado` or `fechado`), the optional GitHub issue and `avisado`. Linking asks `gh pr view` once for the state and base, but does not need the answer: without it the request enters `aberto` with no base and the poll fills it in. A request that is already merged or closed enters resolved and already announced, because whoever links it knows. One URL belongs to one task. The task id is not checked against Orca, since linking makes no Orca call.
+
+```mermaid
+flowchart LR
+    G["orq gerente absorver<br/>every lap"] --> P["pr_poll()<br/>at most every 120 s"]
+    M["orq pr poll"] --> P
+    P -->|"gh pr view, open items only"| S{"merged or closed?"}
+    S -->|no| N["stays aberto"]
+    S -->|yes| E["events: pr entrou/fechou<br/>entry origem pr, once"]
+    E --> A["pr_avisar()<br/>types one line into the coordinator"]
+```
+
+The poll runs outside every hook (`orq hook prompt`, `stop`, `session` never call `gh`). The manager loop calls it on each lap and `orq pr poll` calls it by hand. It spaces `gh` calls by `PR_POLL_S` (120 s, `ORQ_PR_POLL_S`; `--forcar` skips the wait), does nothing when no request is open, holds a non-blocking `pr-poll.lock` so only one poll runs, and queries the open requests four at a time. A `gh` that fails or is missing leaves the request open for the next round.
+
+A merge or close moves the item to its new state and appends an event `entrou` or `fechou` and an entry (`origem: pr`, `ref` = the URL) in one locked step. Because the entry's `ref` is the URL, running the step again never adds a second entry. The entry text reads `PR #1216 entrou em development (task_abc, issue #1210): pronto para staging`. It stays open until the coordinator records an effect with `orq intake`, and the prompt summary lists it in the extra line as `PR: ... [eN]`. Then `pr_avisar()` types `orq: <text>. Entrada eN.` into the coordinator through `digita`, the guarded typing the manager already uses, and only after that marks `avisado` and appends `avisado`. A busy coordinator or a draft in its box types nothing and the next lap tries again. A prompt that starts with `orq: PR ` has origin `aviso_orq`: the hook records no entry for it, since the poll already did. Without a manager, the entry still exists and shows in the next prompt summary; nobody types the line.
+
+`orq status` adds one line per feature: `PR task_abc: #1216 development ✓ · #1220 staging aberto`, plus the next step. The suggestion (`pr_proximo`) comes from the furthest merged base along development, staging, main: `pronto para staging`, `pronto para main`, or `em main` at the end. It is empty while a request of that feature is still open, or when only closed requests exist. orq never opens the next request; the line is a hint for the coordinator. A feature whose requests were all resolved more than 7 days ago leaves the status line. The per-prompt context never carries this list, only the open entry.
+
+Limits: a `merge/` request counts as entering its base environment, so its merge can hide that the feature's own request has not gone in. The panel's lap waits for its slowest `gh` call (15 s at most). `gh` is asked by URL, so a private repository needs the user's own `gh` login. The order development, staging, main is fixed in `AMBIENTES`.
 
 ## Design decisions
 

@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
+GH = os.environ.get("ORQ_GH") or "gh"
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado")
@@ -91,13 +92,18 @@ _STRING_JSON = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 # o detector do próprio Orca (findOrcaDispatchPreambleStart): linha de abertura opcional, <pasted_content> opcional, e o preâmbulo;
 # hosts sem a linha de abertura mandam o preâmbulo puro
 DESPACHO_SEM_ABERTURA = re.compile(r"(?:<pasted_content\b[^>]*>\s*)?You are working inside Orca, a multi-agent IDE\.")
+PRS = "prs.json"  # {itens: [{task, url, numero, base, estado, ligado_em, avisado, ...}], ultimo_poll}: os PRs de cada feature, ligados por `orq pr ligar`
+PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # intervalo mínimo entre dois polls do gh (fora dos hooks); `orq pr poll --forcar` ignora
+PR_GH_S = 15  # tempo de cada `gh pr view`
+PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
+AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
 
 
 # ---------- puras ----------
 
 def origem(prompt):
-    """usuario | notificacao | orca | comando | resumo | despacho."""
+    """usuario | notificacao | orca | comando | resumo | despacho | aviso_orq (a linha que o painel digita quando um PR ligado é resolvido)."""
     p = (prompt or "").lstrip()
     if p.startswith("<task-notification"):
         return "notificacao"
@@ -107,6 +113,8 @@ def origem(prompt):
         return "comando"
     if p.startswith("This session is being continued"):
         return "resumo"
+    if p.startswith("orq: PR "):
+        return "aviso_orq"
     if p.startswith("Please carry out this task from my Orca coordinator") or DESPACHO_SEM_ABERTURA.match(p):
         return "despacho"
     return "usuario"
@@ -564,6 +572,9 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
         partes.append(f"Alerta: scout {_cita(titulo)!r} concluído sem reportPath ({(a.get('task') or '')[:14]}).")
     if len(alertas) > 2:
         partes.append(f"+{len(alertas) - 2} alertas.")
+    prs = [e for e in todas if e.get("origem") == "pr"]
+    if prs:
+        partes.append("PR: " + "; ".join(f"{e['texto']} [{e['id']}]" for e in prs[:2]) + (f" +{len(prs) - 2}" if len(prs) > 2 else "") + ".")
     grupos = _relatorios(todas)
     if grupos:
         def grupo(fonte, es):
@@ -1367,7 +1378,7 @@ def confere_entrega(texto, repos, pr_commits=None):
 def _pr_commits(url):
     """Os oids dos commits do PR pelo gh, ou None se o gh não existe, falha ou não há rede."""
     try:
-        r = subprocess.run(["gh", "pr", "view", url, "--json", "commits", "-q", ".commits[].oid"], capture_output=True, text=True, timeout=20)
+        r = subprocess.run([GH, "pr", "view", url, "--json", "commits", "-q", ".commits[].oid"], capture_output=True, text=True, timeout=20)
     except (subprocess.TimeoutExpired, OSError):
         return None
     return r.stdout.split() if r.returncode == 0 else None
@@ -1682,6 +1693,188 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
                 return {**item, "aviso": aviso_gate(item["gate"], run)}
             _resolve_gate(item["gate"], resposta or "fechada sem resposta", run)
     return item
+
+
+# ---------- PR ligado à tarefa ----------
+
+_ESTADO_PR = {"aberto": "aberto", "mergeado": "✓", "fechado": "fechado"}
+
+
+def _pr_estado(url):
+    """{state, mergedAt, baseRefName} do PR pelo gh, ou None se o gh não existe, falha, demora ou não há rede."""
+    try:
+        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName"], capture_output=True, text=True, timeout=PR_GH_S)
+        d = json.loads(r.stdout) if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _estado_do_gh(s):
+    """`mergeado`, `fechado` ou None (aberto, ou sem resposta) para o que o gh devolveu."""
+    return "mergeado" if s.get("state") == "MERGED" or s.get("mergedAt") else "fechado" if s.get("state") == "CLOSED" else None
+
+
+def _prs_ro():
+    d = _dict(_read_json(_path(PRS)))
+    return {**d, "itens": [i for i in d.get("itens") or [] if isinstance(i, dict) and i.get("task") and i.get("url")]}
+
+
+def _mutar_prs(fn):
+    """Lê o prs.json, aplica fn(dados) e grava com tmp + rename, sob o pr.lock. Só comandos e o painel escrevem: os hooks nunca."""
+    with _trava("pr.lock"):
+        d = _prs_ro()
+        out = fn(d)
+        _write_json(_path(PRS), d, indent=2)
+    return out
+
+
+def pr_proximo(itens):
+    """O próximo ambiente da feature, só como sugestão (`pronto para staging`, ou `em main` no fim), ou None.
+
+    Vem do PR mergeado mais adiante em development, staging e main. Com um PR da feature ainda aberto o próximo já está a caminho: None.
+    Nunca abre o PR. O PR `merge/<feature>-<ambiente>` tem o ambiente como base e conta como entrada nele."""
+    if any(i["estado"] == "aberto" for i in itens):
+        return None
+    indices = [AMBIENTES.index(i["base"]) for i in itens if i["estado"] == "mergeado" and i.get("base") in AMBIENTES]
+    if not indices:
+        return None
+    return "em main" if max(indices) == len(AMBIENTES) - 1 else f"pronto para {AMBIENTES[max(indices) + 1]}"
+
+
+def _seg_pr(i):
+    return f"#{i.get('numero')} {i.get('base') or '?'} {_ESTADO_PR.get(i.get('estado'), i.get('estado'))}"
+
+
+def pr_ligar(task, url, issue=None):
+    """Liga um PR à task (a mesma feature tem um por ambiente). Consulta o gh uma vez, sem obrigar: sem resposta o PR entra `aberto` e sem base,
+    e o poll completa. PR já mergeado ou fechado entra resolvido e avisado: quem o liga já sabe. Não confere a task no Orca (sem rede aqui)."""
+    if not re.fullmatch(r"task_\w+", task or ""):
+        raise ValueError(f"task inválida: {task!r} (use o id, task_…)")
+    if not PR_RE.fullmatch(url or ""):
+        raise ValueError(f"URL de PR inválida: {url!r} (https://github.com/<org>/<repo>/pull/<n>)")
+    visto = _pr_estado(url) or {}
+
+    def add(d):
+        ja = next((i for i in d["itens"] if i["url"] == url), None)
+        if ja:
+            raise ValueError(f"PR #{ja.get('numero')} já está ligado à task {ja['task']}")
+        estado = _estado_do_gh(visto) or "aberto"
+        item = {"task": task, "url": url, "numero": int(url.rsplit("/", 1)[1]), "base": visto.get("baseRefName"), "estado": estado,
+                "ligado_em": now(), "avisado": estado != "aberto", **({"resolvido_em": now()} if estado != "aberto" else {}),
+                **({"issue": int(issue)} if issue else {})}
+        d["itens"].append(item)
+        append_event({"tipo": "pr", "op": "ligar", "task": task, "url": url, "numero": item["numero"], "base": item["base"], "estado": estado,
+                      **({"issue": item["issue"]} if issue else {})})
+        return item
+
+    return _mutar_prs(add)
+
+
+def pr_desligar(task, url):
+    def rm(d):
+        for n, i in enumerate(d["itens"]):
+            if i["task"] == task and i["url"] == url:
+                append_event({"tipo": "pr", "op": "desligar", "task": task, "url": url, "numero": i.get("numero")})
+                return d["itens"].pop(n)
+        raise ValueError(f"o PR {url} não está ligado à task {task}")
+
+    return _mutar_prs(rm)
+
+
+def pr_lista(task=None):
+    """Linhas de `orq pr lista`: task, PR com base e estado, issue e URL."""
+    return [f"{i['task']}  {_seg_pr(i)}" + (f"  (issue #{i['issue']})" if i.get("issue") else "") + f"  {i['url']}"
+            for i in _prs_ro()["itens"] if not task or i["task"] == task]
+
+
+def linhas_pr(agora=None):
+    """Uma linha por feature para o `orq status`: os PRs com o ambiente de cada um e a sugestão do próximo. Feature com tudo resolvido há
+    mais de PR_VISIVEL_D dias sai. Só lê o prs.json."""
+    agora = agora or datetime.now(timezone.utc)
+    por_task = {}
+    for i in _prs_ro()["itens"]:
+        por_task.setdefault(i["task"], []).append(i)
+    linhas = []
+    for task, itens in por_task.items():
+        if all(i["estado"] != "aberto" and i.get("resolvido_em") and (agora - _dt(i["resolvido_em"])).days > PR_VISIVEL_D for i in itens):
+            continue
+        prox = pr_proximo(itens)
+        linhas.append(f"PR {task}: " + " · ".join(_seg_pr(i) for i in itens) + (f" → {prox}" if prox else ""))
+    return linhas
+
+
+def _aplica_prs(d, vistos, agora):
+    """Passa ao estado novo cada PR aberto que o gh viu mergeado ou fechado: um evento `pr` e uma entrada `pr` por PR, uma vez só (o `ref` da
+    entrada é a URL, então repetir a passagem não a duplica). Devolve as linhas do que mudou."""
+    d["ultimo_poll"] = agora
+    ja = {e.get("ref") for e in read_events() if e.get("origem") == "pr"}
+    linhas = []
+    for i in d["itens"]:
+        visto = _dict(vistos.get(i["url"]))
+        novo = _estado_do_gh(visto)
+        if i["estado"] != "aberto" or not novo:
+            i["base"] = visto.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
+            continue
+        i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now())
+        prox = pr_proximo([x for x in d["itens"] if x["task"] == i["task"]])
+        onde = f"{i['task']}" + (f", issue #{i['issue']}" if i.get("issue") else "")
+        texto = f"PR #{i['numero']} entrou em {i['base']} ({onde})" + (f": {prox}" if prox else "") if novo == "mergeado" \
+            else f"PR #{i['numero']} fechado sem merge (base {i['base']}, {onde})"
+        append_event({"tipo": "pr", "op": "entrou" if novo == "mergeado" else "fechou", "task": i["task"], "url": i["url"], "numero": i["numero"],
+                      "base": i["base"], **({"proximo": prox} if prox else {})})
+        if i["url"] in ja:
+            i["avisado"] = True
+            continue
+        ent = append_event({"tipo": "entrada", "origem": "pr", "texto": texto, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"]}, novo_id=True)
+        i.update(entrada=ent["id"], texto=texto, avisado=False)
+        linhas.append(f"{i['task']}: {texto}")
+    return linhas
+
+
+def pr_poll(agora=None, forcar=False):
+    """Pergunta ao gh pelos PRs abertos e grava os que entraram ou foram fechados (_aplica_prs). Devolve as linhas do que mudou.
+
+    Roda fora dos hooks (o painel do gerente e `orq pr poll`), no máximo a cada PR_POLL_S (`forcar` ignora), sem PR aberto nem chama o gh, e
+    um poll por vez (lock não bloqueante). Os `gh pr view` saem em paralelo (4) para o painel não parar por PR lento. gh sem resposta deixa o
+    PR aberto para a próxima rodada. Limite: a volta do painel espera o gh mais lento, PR_GH_S no pior caso."""
+    agora = time.time() if agora is None else agora
+    os.makedirs(HOME, exist_ok=True)
+    with open(_path("pr-poll.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []
+        d = _prs_ro()
+        urls = [i["url"] for i in d["itens"] if i["estado"] == "aberto"]
+        if not urls or (not forcar and agora - (d.get("ultimo_poll") or 0) < PR_POLL_S):
+            return []
+        with ThreadPoolExecutor(4) as ex:
+            vistos = dict(zip(urls, ex.map(_pr_estado, urls)))
+        return _mutar_prs(lambda d: _aplica_prs(d, vistos, agora))
+
+
+def pr_avisar():
+    """Digita no coordenador uma linha `orq: PR #N entrou em <base> …` por PR resolvido ainda não avisado, uma vez (o painel do gerente chama a
+    cada volta). Coordenador ocupado ou com rascunho: nada é digitado e a próxima volta tenta. Sem gerente ligado não há quem digite: a
+    entrada já está no log e aparece no prompt seguinte. Devolve as linhas do painel."""
+    g = _gerente_cfg()
+    if not g or not g.get("coordenador"):
+        return []
+    linhas = []
+    for i in [x for x in _prs_ro()["itens"] if x["estado"] != "aberto" and not x.get("avisado") and x.get("entrada")]:
+        if digita(g["coordenador"], f"orq: {i['texto']}. Entrada {i['entrada']}.") != "enviado":
+            break
+
+        def marca(d, url=i["url"]):
+            for x in d["itens"]:
+                if x["url"] == url:
+                    x["avisado"] = True
+            append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": url, "numero": i["numero"]})
+
+        _mutar_prs(marca)
+        linhas.append(f"{i['task']}: aviso do PR #{i['numero']} digitado no coordenador")
+    return linhas
 
 
 def estado(entrada=None):
@@ -3805,6 +3998,10 @@ def gerente_absorver():
         linhas += reentrega_steers()
     except Exception as e:  # noqa: BLE001 - o painel não cai por causa do acompanhamento dos steers; a próxima volta tenta
         log(f"steers: {type(e).__name__}: {e}")
+    try:
+        linhas += [*pr_poll(), *pr_avisar()]
+    except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
+        log(f"prs: {type(e).__name__}: {e}")
     return "\n".join(linhas)
 
 
@@ -3836,6 +4033,16 @@ def main(argv=None):
     st.add_argument("texto")
     st.add_argument("--run")
     st.add_argument("--entrada")
+    pr = sub.add_parser("pr", help="PRs de cada feature ligados à task: ligar, lista, desligar, poll (o poll roda fora dos hooks)").add_subparsers(dest="op", required=True)
+    pl2 = pr.add_parser("ligar", help="orq pr ligar <task> <url> [--issue N]: registra o PR da feature (development, staging, main ou merge/)")
+    pl2.add_argument("task")
+    pl2.add_argument("url")
+    pl2.add_argument("--issue", type=int, help="número da issue do GitHub, quando houver")
+    pr.add_parser("lista").add_argument("--task")
+    pd2 = pr.add_parser("desligar")
+    pd2.add_argument("task")
+    pd2.add_argument("url")
+    pr.add_parser("poll", help="pergunta ao gh pelos PRs abertos; merge ou fechamento vira uma entrada, uma vez").add_argument("--forcar", action="store_true", help="ignora o intervalo mínimo")
     sub.add_parser("steers", help="reentrega o aviso dos ajustes que o worker parado não leu e grava o alerta na terceira falha (o painel do gerente já faz)")
     rp = sub.add_parser("responder", help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
     rp.add_argument("msg_id")
@@ -3924,6 +4131,16 @@ def main(argv=None):
                 print(json.dumps(feito, ensure_ascii=False))
                 if feito.get("aviso"):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
+        elif a.cmd == "pr":
+            if a.op == "ligar":
+                print(json.dumps(pr_ligar(a.task, a.url, a.issue), ensure_ascii=False))
+            elif a.op == "desligar":
+                pr_desligar(a.task, a.url)
+                print(f"PR desligado de {a.task}")
+            elif a.op == "lista":
+                print("\n".join(pr_lista(a.task)) or "nenhum PR ligado")
+            else:
+                print("\n".join(pr_poll(forcar=a.forcar)) or "nenhuma mudança nos PRs")
         elif a.cmd == "steer":
             print(json.dumps(steer(a.task, a.texto, a.run, a.entrada), ensure_ascii=False))
         elif a.cmd == "steers":
@@ -3933,7 +4150,7 @@ def main(argv=None):
         elif a.cmd == "alerta":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
         elif a.cmd == "status":
-            print(estado())
+            print("\n".join([estado(), *linhas_pr()]))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":
