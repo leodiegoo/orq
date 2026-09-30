@@ -5166,6 +5166,64 @@ def test_ticket24_constantes_com_nome():
     assert (orq_mod.NAO_COMECOU_S, orq_mod.PARADO_S) == (120, 60)
 
 
+def _espera_25(fase, hb_min, **k):
+    """Agente do cache com a fase e o último heartbeat de `hb_min` minutos atrás, reavaliado agora."""
+    from datetime import datetime, timezone
+    agora = datetime.now(timezone.utc)
+    ab = _aberto_ag("rodando", fase=fase, ultimo_heartbeat=now_iso(-hb_min * 60), desde=now_iso(-7200), **k)
+    return orq_mod.reavalia(ab["agentes"], [], agora)[0], ab, agora
+
+
+def _hhmm_25(min_):
+    return time.strftime("%H:%M", time.localtime(time.time() + min_ * 60))
+
+
+def test_ticket25_esperando_ha_30_min_nao_e_travado():
+    ag, _, _ = _espera_25("esperando: fila de E2E", 30)
+    assert ag["estado"] == "rodando" and ag["espera"] == "fila de E2E", ag
+
+
+def test_ticket25_espera_sem_prazo_vira_travada_depois_do_teto_com_o_motivo():
+    ag, _, _ = _espera_25("esperando: fila de E2E", 61)
+    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+
+
+def test_ticket25_fase_comum_continua_com_os_15_min():
+    assert _espera_25("fase-3", 16)[0]["estado"] == "travado"
+    assert _espera_25("fase-3", 14)[0]["estado"] == "rodando"
+    assert "motivo" not in _espera_25("fase-3", 16)[0]
+
+
+def test_ticket25_prazo_declarado_vale_ate_o_horario_e_depois_vence():
+    assert _espera_25(f"esperando: CI até {_hhmm_25(40)}", 30)[0]["estado"] == "rodando"
+    ag = _espera_25(f"esperando: CI até {_hhmm_25(-5)}", 30)[0]
+    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+
+
+def test_ticket25_monta_agentes_usa_a_mesma_regra():
+    from datetime import datetime, timezone
+    agora = datetime.now(timezone.utc)
+    msgs = [{"id": "m1", "type": "heartbeat", "payload": json.dumps({"taskId": "t", "dispatchId": "ctx_1", "phase": "esperando: deploy"}), "created_at": _iso(-1800)}]
+    ws = [{"dispatchId": "ctx_1", "taskId": "t", "dispatchStatus": "dispatched"}]
+    assert orq_mod.monta_agentes(ws, msgs, [], agora)[0]["estado"] == "rodando"
+    msgs[0]["created_at"] = _iso(-3700)
+    ag = orq_mod.monta_agentes(ws, msgs, [], agora)[0]
+    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida"
+
+
+def test_ticket25_resumo_mostra_a_espera_numa_linha_so_uma_vez():
+    ag, ab, agora = _espera_25("esperando: fila de E2E", 30)
+    txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
+    assert txt.count("esperando: fila de E2E") == 1 and "Travado" not in txt, txt
+    ab["agentes"][0]["ultimo_heartbeat"] = now_iso(-3700)
+    venc = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
+    assert "espera vencida" in venc and "Travado: task_aaaaaaaaaa" in venc, venc
+
+
+def test_ticket25_teto_com_nome():
+    assert orq_mod.ESPERA_TETO_S == 60 * 60
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

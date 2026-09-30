@@ -44,6 +44,8 @@ ASK_GUARD_TTL = 10  # segundos que a lista de despachos ativos vale para o hook 
 PAGINAS_ATIVOS = 3  # o worker-list vem dos mais novos para os mais velhos: 300 despachos bastam para achar um ativo
 SEM_LIGACAO = "term_00000000-0000-0000-0000-000000000000"  # handle que o Orca não conhece: sem Run ligado, o worker-list dá o escopo all
 TRAVADO_S = 15 * 60  # dispatch rodando sem heartbeat há mais que isto está travado: aparece no resumo e no painel com o orq steer sugerido
+ESPERA_TETO_S = 60 * 60  # heartbeat `esperando: <motivo>` sem `até HH:MM` vale por tanto tempo; depois disso o dispatch é travado por "espera vencida"
+ESPERA_FASE = re.compile(r"^\s*esperando:\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
 NAO_COMECOU_S = 120  # dispatch aberto sem nenhum turno registrado tanto tempo depois do despacho não começou (o worker-start que ficou sem Enter)
 PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker parou no prompt (o limiar evita chamar de parado a folga entre dois turnos)
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
@@ -160,6 +162,32 @@ def sinal_de_vida(m):
     return {"msg": m.get("id"), "task": p.get("taskId"), "dispatch": p.get("dispatchId"), "fase": p.get("phase"), "ts": m.get("created_at")}
 
 
+def espera_declarada(fase, ts):
+    """(motivo, prazo) de um heartbeat `esperando: <motivo> [até HH:MM]`, ou None para fase comum.
+
+    `HH:MM` é hora local, a próxima depois do heartbeat; sem ele o prazo é o heartbeat mais ESPERA_TETO_S.
+    """
+    m = ESPERA_FASE.match(fase or "")
+    ts = _ts(ts) if isinstance(ts, str) else ts
+    if not m or not ts:
+        return None
+    if m.group(2) is None:
+        return m.group(1), ts + timedelta(seconds=ESPERA_TETO_S)
+    local = ts.astimezone()
+    prazo = local.replace(hour=int(m.group(2)) % 24, minute=int(m.group(3)) % 60, second=0, microsecond=0)
+    return m.group(1), (prazo if prazo >= local else prazo + timedelta(days=1)).astimezone(timezone.utc)
+
+
+def _vivo_ou_travado(fase, ts, idade, agora):
+    """(estado, espera, motivo) de um dispatch aberto pelo último heartbeat: esperando declarado dentro do prazo não é travado; vencido, é "espera vencida"."""
+    esp = espera_declarada(fase, ts)
+    if esp and agora <= esp[1]:
+        return "rodando", esp[0], None
+    if esp:
+        return "travado", None, "espera vencida"
+    return ("travado" if idade is not None and idade > TRAVADO_S else "rodando"), None, None
+
+
 def sinais_de_vida(events):
     """{dispatch: último heartbeat (msg, task, fase, ts, run)} a partir dos eventos heartbeat_absorvido (Run ligado) e heartbeat_visto (outro Run)."""
     out = {}
@@ -274,16 +302,22 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
                 turno, quando = turno_do_dispatch(t, det.get("agente"), _ts(det.get("desde")), _ts(sinal.get("ts")), agora)
                 if quando:
                     idade = int((agora - quando).total_seconds())
-            estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") else "travado" if idade is not None and idade > TRAVADO_S else "rodando"
+            estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade, agora)
+            estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") else estado
         else:
+            espera = motivo = None
             estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue"), None
         ag = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": det.get("titulo"), "modelo": det.get("modelo"),
               "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
               "desde": _z(det.get("desde")), "idade_s": idade, "agente": det.get("agente"), "turno": turno,
               "turno_inicio": _z(t.get("inicio")), "turno_fim": _z(t.get("fim"))}
-        motivo = _retencao(w, humanos)
-        if estado == "entregue" and motivo:
-            ag["retido"] = motivo
+        if espera:
+            ag["espera"] = espera
+        if motivo and estado == "travado":
+            ag["motivo"] = motivo
+        retido = _retencao(w, humanos)
+        if estado == "entregue" and retido:
+            ag["retido"] = retido
         out.append(ag)
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
 
@@ -303,7 +337,12 @@ def reavalia(agentes_, events, agora, turnos=None):
                 ag["fase"], ag["ultimo_heartbeat"] = h.get("fase"), _z(h["ts"])
             ref = _ts(ag.get("ultimo_heartbeat")) or _ts(ag.get("desde"))
             ag["idade_s"] = int((agora - ref).total_seconds()) if ref else None
-            ag["estado"] = "travado" if ag["idade_s"] is not None and ag["idade_s"] > TRAVADO_S else "rodando"
+            ag["estado"], espera, motivo = _vivo_ou_travado(ag.get("fase"), ag.get("ultimo_heartbeat"), ag["idade_s"], agora)
+            ag.pop("espera", None), ag.pop("motivo", None)
+            if espera:
+                ag["espera"] = espera
+            if motivo:
+                ag["motivo"] = motivo
             t = _dict(turnos.get(ag.get("dispatch"))) if turnos is not None else {"inicio": ag.get("turno_inicio"), "fim": ag.get("turno_fim")}
             ag["turno"], quando = turno_do_dispatch(t, ag.get("agente"), _ts(ag.get("desde")), _ts(ag.get("ultimo_heartbeat")), agora)
             if ag["turno"] in ("nao_comecou", "parado"):
@@ -325,7 +364,7 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
         itens = []
         for a in vivos[:3]:
             nome = f"{(a.get('task') or '?')[:9]}… "
-            itens.append(nome + (f"TRAVADO há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "travado"
+            itens.append(nome + (f"TRAVADO há {(a.get('idade_s') or 0) // 60} min" + (f" ({a['motivo']})" if a.get("motivo") else "") if a["estado"] == "travado"
                                  else f"NÃO COMEÇOU há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "nao_comecou"
                                  else f"parado no prompt há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "parado" else "pergunta" if a["estado"] == "perguntando"
                                  else f"{a.get('fase') or '?'} {_hora_local(a['ultimo_heartbeat'])}" if a.get("ultimo_heartbeat") else "sem heartbeat"))
@@ -449,7 +488,7 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
         parados = [a for a in ags if a["estado"] == estado]
         for a in parados[:2]:
             min_ = (a.get("idade_s") or 0) // 60
-            detalhe = (f"{a.get('fase') or 'sem fase'}, sem heartbeat há {min_} min" if estado == "travado" else f"sem turno {min_} min depois do despacho"
+            detalhe = (f"{a.get('fase') or 'sem fase'}, sem heartbeat há {min_} min" + (f", {a['motivo']}" if a.get("motivo") else "") if estado == "travado" else f"sem turno {min_} min depois do despacho"
                        if estado == "nao_comecou" else f"há {min_} min")
             partes.append(f"{rotulo}: {a.get('task')} ({detalhe}): " + f'orq steer {a.get("task")} "<ajuste>" --run {a.get("run")}.')
         if len(parados) > 2:
