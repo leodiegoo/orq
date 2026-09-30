@@ -1683,7 +1683,116 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
 
 
 def estado(entrada=None):
-    return resumo(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=_cursor_ro(), turnos=_turnos_ro(), painel=aviso_painel())
+    events, cur = read_events(), _cursor_ro()
+    txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
+    return "\n".join([txt, *linhas_noite(cur, events)])
+
+
+# ---------- modo noite: orçamento e disjuntor ----------
+
+NOITE_FALHAS = 3  # falhas seguidas que fecham o despacho
+
+
+def noite_ativa(cur):
+    """O estado do modo noite no cursor.json ({ate, ligada_em, max_despachos, max_falhas}) ou None se desligado."""
+    n = _dict(cur).get("noite")
+    return n if isinstance(n, dict) and n.get("ate") else None
+
+
+def _desde_noite(events, noite, tipo):
+    return [e for e in events if e.get("tipo") == tipo and (e.get("ts") or "") >= noite["ligada_em"]]
+
+
+def falhas_seguidas(events, msgs, noite):
+    """Falhas seguidas no fim dos despachos desde `noite.ligada_em`, pelos worker_done da inbox e pelos `liberar` do log.
+
+    Conta: worker_done `failed` sem reportPath, ou dispatch liberado sem worker_done (o worker morreu). Reinicia: `succeeded`, ou `failed`
+    com reportPath (o worker explicou que não dá: decisão dele, não do ambiente). Dispatch ainda rodando não conta nem reinicia.
+    """
+    done = {}
+    for m in msgs:
+        p = _payload(m)
+        if m.get("type") == "worker_done" and p.get("dispatchId"):
+            done[p["dispatchId"]] = p
+    liberados = {e.get("dispatch") for e in events if e.get("tipo") == "liberar"}
+    n = 0
+    for e in _desde_noite(events, noite, "despacho"):
+        p = done.get(e.get("dispatch"))
+        if p is None:
+            n += e.get("dispatch") in liberados
+        elif p.get("outcome") == "failed" and not p.get("reportPath"):
+            n += 1
+        else:
+            n = 0
+    return n
+
+
+def noite_motivo(noite, events, msgs, agora):
+    """Por que o `orq despachar` deve recusar (horário, teto de despachos ou falhas seguidas), ou None."""
+    if agora >= _dt(noite["ate"]):
+        return f"passou do horário da noite ({_hora_local(noite['ate'])})"
+    teto = noite.get("max_despachos")
+    if teto is not None and len(_desde_noite(events, noite, "despacho")) >= teto:
+        return f"teto de {teto} despachos da noite"
+    falhas = noite.get("max_falhas") or NOITE_FALHAS
+    if msgs is not None and falhas_seguidas(events, msgs, noite) >= falhas:
+        return f"{falhas} falhas seguidas de worker"
+    return None
+
+
+def noite_checar(agora=None):
+    """Recusa o despacho com ValueError e grava `noite_parou` se o modo noite estourou o orçamento. Desligado: não faz nada."""
+    noite = noite_ativa(_cursor_ro())
+    if not noite:
+        return
+    events = read_events()
+    try:
+        msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # sem a inbox só as falhas seguidas ficam de fora: horário e teto valem
+        log(f"noite: inbox falhou ({type(e).__name__}: {e}); falhas seguidas não conferidas")
+        msgs = None
+    motivo = noite_motivo(noite, events, msgs, agora or datetime.now(timezone.utc))
+    if motivo:
+        append_event({"tipo": "noite_parou", "motivo": motivo})
+        raise ValueError(f"modo noite: {motivo}; nada foi despachado. Deixe a decisão em orq pend add ou rode orq noite desligar")
+
+
+def linhas_noite(cur, events):
+    """As duas linhas que o coordenador lê com o modo noite ligado (regras; orçamento ou motivo da parada). Vazio com o modo desligado."""
+    noite = noite_ativa(cur)
+    if not noite:
+        return []
+    parou = next((e for e in reversed(_desde_noite(events, noite, "noite_parou"))), None)
+    teto = noite.get("max_despachos")
+    gasto = f"{len(_desde_noite(events, noite, 'despacho'))}/{teto if teto is not None else '∞'} despachos, até {_hora_local(noite['ate'])}"
+    return ["[orq noite] Regras: sem AskUserQuestion (estacione a decisão com orq pend add e siga no que é independente), sem push nem merge, "
+            "pare de despachar ao estourar o orçamento.",
+            f"[orq noite] {'Parou de despachar: ' + parou['motivo'] + f' ({gasto}); orq noite desligar libera.' if parou else 'Orçamento: ' + gasto + f', {noite.get('max_falhas') or NOITE_FALHAS} falhas seguidas fecham.'}"]
+
+
+def noite_ligar(ate, max_despachos=None, max_falhas=NOITE_FALHAS, agora=None):
+    """Liga o modo noite até o próximo HH:MM local. Devolve o estado gravado."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", ate or "")
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError(f"--ate espera HH:MM (recebi {ate!r})")
+    if (max_despachos is not None and max_despachos < 1) or max_falhas < 1:
+        raise ValueError("--max-despachos e --max-falhas pedem um número maior que 0")
+    agora = (agora or datetime.now(timezone.utc)).astimezone()
+    fim = agora.replace(hour=int(m[1]), minute=int(m[2]), second=0, microsecond=0)
+    fim += timedelta(days=1) if fim <= agora else timedelta(0)
+    noite = {"ate": fim.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ligada_em": now(), "max_despachos": max_despachos, "max_falhas": max_falhas}
+    _cursor_mut(lambda c: c.__setitem__("noite", noite))
+    append_event({"tipo": "noite_ligar", **{k: v for k, v in noite.items() if k != "ligada_em"}})
+    return noite
+
+
+def noite_desligar():
+    """Desliga o modo noite; devolve se estava ligado."""
+    ligado = bool(noite_ativa(_cursor_ro()))
+    _cursor_mut(lambda c: c.pop("noite", None))
+    if ligado:
+        append_event({"tipo": "noite_desligar"})
+    return ligado
 
 
 # ---------- coordenador x worker ----------
@@ -1862,7 +1971,8 @@ def hook_prompt(ev, run):
     if org == "orca":
         refresh_bg(refresh=False)  # o aviso do Orca é o sinal de mensagem nova: ingere o inbox já, sem refazer o aberto.json (um heartbeat por 100 s)
     if org != "usuario":
-        return None
+        ln = linhas_noite(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # a noite acorda o coordenador por aviso, não por usuário
+        return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             **({"com_aviso": True} if com_aviso else {})}, novo_id=True)
     ctx = estado(entrada)
@@ -3120,8 +3230,9 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
 
     Com `ticket` (o número de um `orq ticket novo`) o worker sobe na task que o ticket já criou (`worker-start --task`), sem título nem spec: o
-    ticket é o conteúdo.
+    ticket é o conteúdo. Com o modo noite ligado, recusa depois do horário, do teto de despachos ou das falhas seguidas (noite_checar).
     """
+    noite_checar()
     if (name or base_branch) and worktree != "new-top-level":
         raise ValueError("--name e --base-branch só valem com --worktree new-top-level (o Orca recusa criar worktree em current)")
     tk = None
@@ -3521,6 +3632,11 @@ def main(argv=None):
     rl.add_argument("--modelo", help="troca o modelo (vai junto com --effort); sem ele, o do worker antigo")
     rl.add_argument("--effort")
     rl.add_argument("--run")
+    nt = sub.add_parser("noite", help="modo noite: orq noite ligar --ate HH:MM [--max-despachos N] [--max-falhas 3] | desligar | (sem op: estado)")
+    nt.add_argument("op", nargs="?", choices=["ligar", "desligar"])
+    nt.add_argument("--ate")
+    nt.add_argument("--max-despachos", type=int)
+    nt.add_argument("--max-falhas", type=int, default=NOITE_FALHAS)
     de = sub.add_parser("despachar", help="worker-start com modelo e effort, evento e intake")
     de.add_argument("--run", required=True)
     de.add_argument("--titulo")
@@ -3589,7 +3705,8 @@ def main(argv=None):
             print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
-            print(json.dumps(ags, ensure_ascii=False) if a.json else texto_agentes(ags))
+            parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]
+            print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([texto_agentes(ags), *parada]))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))
@@ -3604,6 +3721,13 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd == "noite":
+            if a.op == "ligar":
+                noite_ligar(a.ate, a.max_despachos, a.max_falhas)
+            elif a.op == "desligar":
+                print("modo noite desligado" if noite_desligar() else "modo noite já estava desligado")
+                return 0
+            print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
         elif a.cmd == "despachar":
             r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket)
             print(json.dumps(r, ensure_ascii=False))

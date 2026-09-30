@@ -6357,6 +6357,120 @@ def test_review9_resumo_nao_conta_backlog_nem_bloqueado_de_run_de_teste():
     assert sorted(b["id"] for b in ab["backlog"]) == ["a", "g"] and [b["id"] for b in ab["bloqueado"]] == ["b"], ab
 
 
+# ---- orq noite ----
+
+def _noite(a, ate_h=2, **extra):
+    """Liga o modo noite no cursor.json do ambiente; ate_h = horas a partir de agora (negativo: já passou)."""
+    ate = (datetime.now(timezone.utc) + __import__("datetime").timedelta(hours=ate_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"noite": {"ate": ate, "ligada_em": "2026-01-01T00:00:00Z", "max_despachos": None, "max_falhas": 3, **extra}}, open(os.path.join(a.home, "cursor.json"), "w"))
+
+
+def _desp_ev(a, dispatch):
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T01:00:00Z", "tipo": "despacho", "run": "run_a", "task": "t_" + dispatch, "dispatch": dispatch}) + "\n")
+
+
+def _wd(a, *itens):
+    """Põe worker_done no inbox falso: (dispatch, outcome, com_relatorio)."""
+    ms = [{"id": f"m{i}", "run_id": "run_a", "sequence": i, "type": "worker_done", "subject": "s", "created_at": "2026-09-30T02:00:00Z",
+           "payload": json.dumps({"dispatchId": d, "taskId": "t_" + d, "outcome": o, **({"reportPath": "/r.md"} if r else {})})} for i, (d, o, r) in enumerate(itens, 1)]
+    a.set("inbox.json", {"ok": True, "result": {"messages": ms}})
+
+
+def test_noite_despachar_recusado_depois_do_horario():
+    a = Amb(run="run_a")
+    _noite(a, ate_h=-1)
+    r = _despachar(a)
+    assert r.returncode != 0 and "horário" in r.stderr, r.stderr
+    assert not _log(a, "started.log"), "não pode ter subido worker"
+    assert [e["motivo"] for e in a.events() if e["tipo"] == "noite_parou"][0].startswith("passou do horário")
+
+
+def test_noite_despachar_recusado_no_teto_de_despachos():
+    a = Amb(run="run_a")
+    _noite(a, max_despachos=2)
+    _desp_ev(a, "d1"), _desp_ev(a, "d2")
+    r = _despachar(a)
+    assert r.returncode != 0 and "teto de 2 despachos" in r.stderr, r.stderr
+    _noite(a, max_despachos=3)
+    assert _despachar(a).returncode == 0, "abaixo do teto despacha"
+
+
+def test_noite_despachar_recusado_na_terceira_falha_seguida():
+    a = Amb(run="run_a")
+    _noite(a)
+    for d in ("d1", "d2", "d3"):
+        _desp_ev(a, d)
+    _wd(a, ("d1", "failed", False), ("d2", "failed", False))
+    assert _despachar(a).returncode == 0, "duas falhas ainda despacham"
+    _wd(a, ("d1", "failed", False), ("d2", "failed", False), ("d3", "failed", False))
+    r = _despachar(a)
+    assert r.returncode != 0 and "3 falhas seguidas" in r.stderr, r.stderr
+
+
+def test_noite_falha_reportada_reinicia_a_contagem():
+    f = orq_mod.falhas_seguidas
+    noite = {"ligada_em": "2026-01-01T00:00:00Z"}
+    evs = [{"ts": "2026-09-30T01:00:00Z", "tipo": "despacho", "dispatch": d} for d in ("d1", "d2", "d3", "d4")]
+    wd = lambda d, o, rp=False: {"type": "worker_done", "payload": {"dispatchId": d, "outcome": o, **({"reportPath": "/r"} if rp else {})}}
+    assert f(evs, [wd("d1", "failed"), wd("d2", "failed"), wd("d3", "failed"), wd("d4", "failed")], noite) == 4
+    assert f(evs, [wd("d1", "failed"), wd("d2", "failed"), wd("d3", "failed", True), wd("d4", "failed")], noite) == 1, "failed com relatório é decisão do worker"
+    assert f(evs, [wd("d1", "failed"), wd("d2", "succeeded"), wd("d3", "failed"), wd("d4", "failed")], noite) == 2, "succeeded reinicia"
+    lib = evs + [{"ts": "2026-09-30T03:00:00Z", "tipo": "liberar", "dispatch": "d1"}]
+    assert f(lib[:1] + lib[-1:], [], noite) == 1, "liberado sem worker_done conta"
+    assert f(evs[:2], [], noite) == 0, "ainda rodando não conta"
+
+
+def test_noite_desligar_libera():
+    a = Amb(run="run_a")
+    _noite(a, ate_h=-1)
+    assert _despachar(a).returncode != 0
+    r = a.orq("noite", "desligar")
+    assert r.returncode == 0 and "desligado" in r.stdout, r.stderr
+    assert _despachar(a).returncode == 0
+    assert "modo noite desligado" in a.orq("noite").stdout
+
+
+def test_noite_ligar_grava_evento_e_estado():
+    a = Amb(run="run_a")
+    r = a.orq("noite", "ligar", "--ate", "06:30", "--max-despachos", "5")
+    assert r.returncode == 0, r.stderr
+    n = json.load(open(os.path.join(a.home, "cursor.json")))["noite"]
+    assert n["max_despachos"] == 5 and n["max_falhas"] == 3 and _hora_de(n["ate"]) == "06:30", n
+    assert [e for e in a.events() if e["tipo"] == "noite_ligar"][0]["max_despachos"] == 5
+    assert "Regras" in r.stdout and "0/5 despachos" in r.stdout, r.stdout
+    assert a.orq("noite", "ligar", "--ate", "25:00").returncode != 0
+    assert a.orq("noite", "ligar").returncode != 0
+
+
+def _hora_de(ts):
+    return orq_mod._dt(ts).astimezone().strftime("%H:%M")
+
+
+def test_noite_motivo_aparece_uma_vez_em_status_e_em_agentes():
+    a = Amb(run="run_a")
+    _noite(a, ate_h=-1)
+    _despachar(a)
+    st = a.orq("status").stdout
+    assert st.count("Parou de despachar") == 1 and "horário" in st, st
+    ag = a.orq("agentes").stdout
+    assert ag.count("Parou de despachar") == 1, ag
+
+
+def test_noite_hooks_injetam_as_regras_e_desligado_nada_muda():
+    a = Amb(run="run_a")
+    assert "orq noite" not in a.prompt("oi").stdout and "orq noite" not in a.orq("status").stdout
+    _noite(a)
+    ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "[orq noite] Regras" in ctx and "AskUserQuestion" in ctx and "push" in ctx, ctx
+    aviso = a.orq("hook", "prompt", stdin=json.dumps({"prompt": "You have 1 orchestration messages. Run `orca orchestration check`", "session_id": "abcdef123456"}))
+    assert "[orq noite]" in aviso.stdout, "o aviso do Orca também leva as regras"
+    t0 = time.time()
+    orq_mod.linhas_noite(orq_mod._cursor_ro(), [])
+    assert time.time() - t0 < 0.1
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

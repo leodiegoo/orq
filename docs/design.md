@@ -278,6 +278,20 @@ Without active workers the widget is allowed, and `orq hook ask` still checks ea
 
 `hooks/worker-routing-guard.py` (PreToolUse on Bash and Agent) refuses `orca orchestration worker-start` without `--model` and `--effort`, `orq despachar` without `--modelo` and `--effort`, an Agent call without `model` (forks excepted), and `orca worktree rm` without `--run-hooks`. It only matches `orq despachar` in command position, so text inside quotes such as a commit message does not trigger it. The refusal points to the `worker-routing` skill, which picks the model from how ambiguous the task is and the effort from how much reasoning this run needs.
 
+## Night mode
+
+`orq noite ligar --ate HH:MM [--max-despachos N] [--max-falhas 3]` stores `noite` in `cursor.json` (end time as the next HH:MM, dispatch ceiling, failure limit, start time) and logs `noite_ligar`. `orq noite desligar` clears it and logs `noite_desligar`; `orq noite` prints the state. Off, nothing changes.
+
+While on, `orq status`, `orq hook prompt` (user prompts and Orca notices) and `orq hook session` give the coordinator two lines: the rules (no AskUserQuestion, park decisions with `orq pend add` and keep going on what is independent, no push or merge, stop dispatching when the budget runs out) and the budget or, after a refusal, the stop reason. `orq agentes` prints the stop reason once. The hooks only read `cursor.json` and the log, never Orca.
+
+`orq despachar` checks before doing anything and refuses, logging `noite_parou` with the reason, in three cases: past the end time, at the dispatch ceiling (`despacho` events since `noite_ligar`), or at the failure limit in a row. A failure is counted from the dispatches since `noite_ligar`, in order, using the `worker_done` messages of the last 200 inbox messages and the `liberar` events:
+
+- counts: `worker_done` with `outcome: failed` and no `reportPath`, or a dispatch released with no `worker_done` (the worker died);
+- resets to zero: `outcome: succeeded`, or `failed` with a `reportPath` (the worker wrote up why it cannot be done, which is its decision and not a broken environment);
+- a dispatch still running neither counts nor resets.
+
+If the inbox call fails, the time and ceiling checks still apply and the failure count is skipped (logged). The refusal exits non-zero with a message that points to `orq pend add` and `orq noite desligar`. Limit: the hooks do not stop the coordinator from other Orca commands, only `orq despachar` refuses; the external-action guard is a separate ticket.
+
 ## Design decisions
 
 Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.
