@@ -61,7 +61,8 @@ TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hook
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 AGENTE_COM_HOOK = "claude"  # só o Claude Code roda os hooks do orq: de outro agente o orq não sabe se parou
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "liberado": 6}
+ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "encerrado": 6, "liberado": 7}
+INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
 HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorvido encontra a caixa vazia: também é bloqueado
@@ -329,7 +330,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando.
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
-    liberados, pausas, telas = _liberados(events), interrompidos(events), telas or {}
+    liberados, pausas, telas, nao_iniciou = _liberados(events), interrompidos(events), telas or {}, _nao_iniciou(events)
     avisos_entrega = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
     controles = {}
     for e in events:
@@ -353,9 +354,12 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             pausa = _pausado(pausas.get(d), sinal.get("ts"), t)
             estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade_hb, agora, telas.get(d), pausa)
             estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
+            if d in nao_iniciou and not (t.get("inicio") or sinal):  # o despachar viu o prompt não entrar: não espera NAO_COMECOU_S
+                estado = "nao_comecou"
         else:
             espera = motivo = None
-            estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue"), None
+            feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
+            estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue" if feito else "encerrado"), None
         ag = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": det.get("titulo"), "modelo": det.get("modelo"),
               "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
               "desde": _z(det.get("desde")), "idade_s": idade, "agente": det.get("agente"), "turno": turno,
@@ -375,6 +379,11 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             ag["retido"] = retido
         out.append(ag)
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
+
+
+def _nao_iniciou(events):
+    """Os dispatches que o `orq despachar` marcou com `nao_iniciou` (o prompt do spec não entrou, nem depois do Enter)."""
+    return {e.get("dispatch") for e in events if e.get("tipo") == "nao_iniciou"}
 
 
 def reavalia(agentes_, events, agora, turnos=None):
@@ -405,6 +414,8 @@ def reavalia(agentes_, events, agora, turnos=None):
             ag["turno"], quando = turno_do_dispatch(t, ag.get("agente"), _ts(ag.get("desde")), _ts(ag.get("ultimo_heartbeat")), agora)
             if ag["turno"] in ("nao_comecou", "parado") and not (espera or motivo):  # quem espera de propósito (fila de E2E, CI) encerra o turno e não está parado; vencida, é travado (M16)
                 ag["estado"], ag["idade_s"] = ag["turno"], int((agora - quando).total_seconds())
+            elif ag.get("dispatch") in _nao_iniciou(events) and not (ag.get("turno_inicio") or h):
+                ag["estado"] = "nao_comecou"
         out.append(ag)
     return out
 
@@ -3699,6 +3710,41 @@ def relancar(dispatch, nota, modelo=None, effort=None, run=None):
                      erro=erro if subiu != pedido else None, worktree_intacta=_intacta(cp), aviso="; ".join(avisos), **base)
 
 
+def _prompt_entrou(dispatch, terminal, titulo):
+    """O turno do dispatch começou (hook prompt do worker em turnos.json) ou a tela do terminal já mostra o título do spec fora da caixa de digitação."""
+    if _dict(_turnos_ro().get(dispatch)).get("inicio"):
+        return True
+    if not terminal:
+        return False
+    try:
+        t = orca("read", "--terminal", terminal, "--limit", "40", area="terminal").get("terminal") or {}
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return False
+    return not (t.get("draft") or "").strip() and titulo in json.dumps(t.get("tail") or [], ensure_ascii=False)
+
+
+def _esperar_prompt(dispatch, terminal, titulo):
+    fim = time.monotonic() + INICIO_ESPERA_S
+    while True:
+        if _prompt_entrou(dispatch, terminal, titulo):
+            return True
+        if time.monotonic() >= fim:
+            return False
+        time.sleep(min(0.5, max(fim - time.monotonic(), 0)))
+
+
+def _conferir_inicio(dispatch, terminal, titulo, out):
+    """O spec entrou no worker? Espera o prompt; se não entrou, manda um Enter (numa caixa vazia não faz nada) e espera de novo. `out["enter"]` marca o Enter."""
+    if _esperar_prompt(dispatch, terminal, titulo):
+        return True
+    if not terminal:
+        return False
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+        orca("send", "--terminal", terminal, "--enter", area="terminal", timeout=3 + TIMEOUT_ORCA)
+        out["enter"] = True
+    return _esperar_prompt(dispatch, terminal, titulo)
+
+
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
@@ -3779,6 +3825,10 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             intake(entrada, "tarefa", task, run=run)
         except Exception as e:  # noqa: BLE001 - o worker já subiu: o intake vira aviso com o comando para repetir
             out["aviso"] = f"intake não gravado ({e}): rode orq intake {entrada} tarefa {task} --run {run}"
+    if not _conferir_inicio(dispatch, terminal, titulo, out):
+        append_event({"tipo": "nao_iniciou", "run": run, "task": task, "dispatch": dispatch, "terminal": terminal})
+        out["estado"] = "nao_iniciou"
+        out["aviso"] = "; ".join(filter(None, [out.get("aviso"), f"o spec não entrou no worker (nem depois do Enter): abra o terminal {terminal}, cole o spec ou relance com orq relancar {dispatch}"]))
     return out
 
 
