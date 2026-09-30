@@ -308,9 +308,23 @@ Orca's notice is typed into the coordinator's terminal. When an AskUserQuestion 
 
 Two defenses follow.
 
-`orq hook guard` (PreToolUse on AskUserQuestion) refuses the widget while any worker is dispatched in any Run, apart from Runs another live terminal coordinates. The refusal tells the coordinator to put the decision on a review page instead, a browser page whose answer cannot be typed by a terminal notice. In the author's setup that page is built with `lavish-axi`, and `orq lavish-resposta` records its answers under the same rules as the widget: only an explicit choice closes a decision. The list of active dispatches is cached for 10 s. `touch ~/.claude/orq/ask-guard.off` disables the guard if a dispatch is stuck.
+`orq hook guard` (PreToolUse on AskUserQuestion) refuses the widget in a worker session always (see below) and, in the coordinator, while any worker is dispatched in any Run, apart from Runs another live terminal coordinates. The refusal tells the coordinator to put the decision on a review page instead, a browser page whose answer cannot be typed by a terminal notice. In the author's setup that page is built with `lavish-axi`, and `orq lavish-resposta` records its answers under the same rules as the widget: only an explicit choice closes a decision. The list of active dispatches is cached for 10 s. `touch ~/.claude/orq/ask-guard.off` disables the guard if a dispatch is stuck.
 
 Without active workers the widget is allowed, and `orq hook ask` still checks each answer. It is marked suspicious (recorded, but closing nothing) if the prompt hook saw an Orca notice in the previous 3 s, if the answer text is itself a notice, or if Orca delivered a message within 5 s and the answer is just the recommended option. `orq auditar-respostas` scans a past transcript for answers that picked only the recommended option within 2 s of an Orca delivery and lists them for the user to check.
+
+## Prompts stuck on a worker's screen
+
+Claude Code asks for a human in three ways that never reach the coordinator: a permission prompt ("Dangerous rm operation on possibly-empty variable path… Do you want to proceed?", shown even with permissions bypassed), an open `AskUserQuestion`, and "trust this folder". Only someone looking at the terminal sees them, so the worker sits there.
+
+**Detection.** `tela_pergunta` reads the last `TELA_LINHAS` (30) lines of a worker's screen, the same read that finds `N shell still running`. A menu counts as open when it ends the screen with consecutive numbered options starting at 1, one carrying the `❯` cursor, and at most `TELA_RODAPE_MAX` (4) footer lines after it; the question text decides the kind (`trust`, `permissao`, `pergunta`). A `❯ 1. …` left in the history, a numbered list in the assistant's answer, or a menu the screen has scrolled past do not match (`fixtures/tela-*.txt`). `orq agentes` and the refresh show such a worker as `perguntando` with `PERGUNTA NA TELA (<kind>): <text> [1) … | 2) …]`.
+
+**One notice.** On each loop the manager (`telas_avisar`) reads the screens of the Claude workers that have a turn record, types one line into the coordinator (the question, the options and `orq responder-tela <task> <opção>`) and logs `pergunta_tela`. The same menu is not announced again; when it leaves the screen the manager logs `pergunta_tela_fim`, so a repeat later is announced anew. A busy coordinator or one with a draft is left alone and the next loop tries again, as for every other notice.
+
+**Answering.** `orq responder-tela <task> <opção>` reads the screen again, refuses if no menu is open or the option does not exist (a number typed into an ordinary prompt would become a message to the worker), types the option number with Enter into the worker's terminal and logs a `controle` event `responder-tela` with `por` (the terminal that answered), the option and the question. `<opção>` is the number or the start of the label. Limit: the number is sent with Enter, so a menu that takes the digit alone also receives an empty Enter, harmless on the next empty prompt.
+
+**Avoiding it.** The `AskUserQuestion` PreToolUse hook (`orq hook guard`) now also runs in worker sessions, decided by the role recorded from the dispatch preamble: it denies the box and tells the worker to escalate with `orca orchestration ask` or `send --type escalation`. It reads `cursor.json` only, no Orca call. The coordinator's branch is unchanged. The `worker-routing` skill asks specs for commands that do not trip Claude Code's guard (`rm -rf "${S:?}"/*.exit` instead of `$S/*.exit`).
+
+**Resumed sessions.** `orq retomar` adds to the continuation message the coordinator's handle and the escalation command (`orca orchestration send --from "$ORCA_TERMINAL_HANDLE" --to run:<run> --type escalation … --task-id … --dispatch-id …`), because a `claude --resume` session has lost the dispatch preamble that carried them.
 
 ## Worker-routing guard
 
