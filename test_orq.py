@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -5586,6 +5587,70 @@ def test_audiencia_check_acha_termo_proibido_e_pula_sem_lista():
     assert os.access(hook, os.X_OK) and "audiencia-check.py" in open(hook).read()
     # o repositório atual passa (sem a lista privada a checagem pula, e passa também)
     assert subprocess.run([sys.executable, check], capture_output=True, text=True).returncode == 0
+
+
+def _repo_git(tmp, sujo=False):
+    """Repositório git com um commit; devolve (caminho, sha curto)."""
+    repo = os.path.join(tmp, "r" + str(len(os.listdir(tmp))))
+    os.makedirs(repo)
+    g = lambda *x: subprocess.run(["git", "-C", repo, *x], capture_output=True, text=True, check=True).stdout.strip()  # noqa: E731
+    g("init", "-q")
+    open(os.path.join(repo, "f"), "w").write("x")
+    g("add", "f")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    if sujo:
+        open(os.path.join(repo, "novo"), "w").write("y")
+    return repo, g("rev-parse", "--short=7", "HEAD")
+
+
+def test_it_should_be_silent_when_the_cited_commit_exists_and_the_tree_is_clean():
+    with tempfile.TemporaryDirectory() as t:
+        repo, sha = _repo_git(t)
+        assert orq_mod.confere_entrega(f"pronto, commit {sha} sem push", [repo]) == []
+        assert orq_mod.confere_entrega("sem commit citado", [repo]) == []
+
+
+def test_it_should_warn_when_the_cited_commit_does_not_exist():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        av = orq_mod.confere_entrega("commit abc1234 publicado", [repo])
+        assert len(av) == 1 and "entrega sem commit" in av[0] and "abc1234" in av[0], av
+
+
+def test_it_should_warn_when_the_tree_is_dirty():
+    with tempfile.TemporaryDirectory() as t:
+        repo, sha = _repo_git(t, sujo=True)
+        av = orq_mod.confere_entrega(f"commit {sha}", [repo])
+        assert len(av) == 1 and "árvore suja" in av[0], av
+
+
+def test_it_should_check_the_pr_commits_with_gh_and_ignore_a_missing_gh():
+    with tempfile.TemporaryDirectory() as t:
+        repo, sha = _repo_git(t)
+        txt = f"commit {sha} no PR https://github.com/o/r/pull/7"
+        assert orq_mod.confere_entrega(txt, [repo], lambda u: [sha + "0" * 33]) == []
+        av = orq_mod.confere_entrega(txt, [repo], lambda u: ["deadbeef" * 5])
+        assert len(av) == 1 and "PR" in av[0], av
+        assert orq_mod.confere_entrega(txt, [repo], lambda u: None) == [], "sem gh ou sem rede não avisa"
+
+
+def test_it_should_show_the_delivery_warning_in_the_resumo_and_in_orq_agentes():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(ORQ_REPOS=repo)
+        a.set("automations_runs.json", {"result": {"runs": []}})
+        a.set("inbox.json", {"result": {"messages": [{"id": "msg_e1", "run_id": "run_a", "type": "worker_done", "subject": "pronto", "sequence": 5,
+                                         "body": "commit abc1234 sem push", "created_at": "2099-01-01T00:00:00Z",
+                                         "payload": json.dumps({"taskId": "task_e", "dispatchId": "ctx_e", "outcome": "succeeded"})}]}})
+        os.makedirs(a.home, exist_ok=True)
+        json.dump({"ingest": {"desde": DESDE_CEDO, "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
+        a.orq("ingest")
+        ev = [e for e in a.events() if e.get("tipo") == "entrega"]
+        assert len(ev) == 1 and ev[0]["dispatch"] == "ctx_e", a.events()
+        assert "Entrega sem prova" in a.orq("resumo").stdout and "abc1234" in a.orq("resumo").stdout
+        ags = orq_mod.monta_agentes([{"dispatchId": "ctx_e", "taskId": "task_e", "dispatchStatus": "completed", "agentTerminalHandle": "term_e"}],
+                                    [], a.events(), datetime.now(timezone.utc), vivos=["term_e"])
+        assert ags[0]["entrega"] and "AVISO: entrega sem commit" in orq_mod.texto_agentes(ags)
 
 
 if __name__ == "__main__":

@@ -294,6 +294,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados = _liberados(events)
+    avisos_entrega = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
     out = []
     for w in workers:
         d = w.get("dispatchId")
@@ -320,6 +321,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             ag["espera"] = espera
         if motivo and estado == "travado":
             ag["motivo"] = motivo
+        if avisos_entrega.get(d):
+            ag["entrega"] = avisos_entrega[d]
         retido = _retencao(w, humanos)
         if estado == "entregue" and retido:
             ag["retido"] = retido
@@ -621,11 +624,13 @@ def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None):
     def parte(nome, lst, vazio, fmt, n=5):
         return [f"{nome} ({len(lst)}):", *("  " + x for x in _lim(lst, n, fmt))] if lst else [f"{nome}: {vazio}"]
 
+    entregas = [f"{_cita(e.get('task'), 14)}: {a}" for e in na_janela if e.get("tipo") == "entrega" for a in e.get("avisos") or []]
     vem = [f"pronto: {t['num']} {_cita(t['titulo'], 40)}" for t in prontos[:5]] + [f"bloqueado: {bloq(t)}" for t in travados[:5]]
     return "\n".join([
         f"[orq resumo] desde {_hora_local(desde) if desde else 'o início'}",
         *parte("Com você", itens, "nada", lambda i: f"{i['id']}  {i.get('tipo')}  {_cita(i.get('titulo'), 50)}"),
         *parte("Entrou", entrou, "nada", efeito_de, 6),
+        *(parte("Entrega sem prova", entregas, "", lambda x: x, 4) if entregas else []),
         *parte("Anda", rodando, "ninguém rodando", lambda a: f"{_cita(a.get('titulo') or a.get('task'), 40)} [{a.get('fase') or 'sem fase'}]"),
         *(["Vem:", *("  " + x for x in vem)] if vem else ["Vem: nenhum ticket aberto"]),
         *parte("Decisões", dec, "nenhuma", lambda d: d, 6),
@@ -1251,6 +1256,74 @@ class _Transitorio(Exception):
     """O Orca não respondeu (timeout, recusa, saída ilegível): a mensagem não tem nada de errado e volta na próxima rodada."""
 
 
+SHA_RE = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+PR_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+
+def _git(repo, *args):
+    """Saída do git em `repo`, ou None se ele falhar, não existir ou demorar (sem rede: só git local)."""
+    try:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def confere_entrega(texto, repos, pr_commits=None):
+    """Avisos da prova de entrega de um worker_done: commits citados que não existem em nenhum de `repos` e árvore suja onde o commit está.
+
+    Sem sha no texto não há o que provar (lista vazia). `pr_commits(url)` devolve os oids do PR (None: sem gh ou sem resposta, e então não avisa).
+    O aviso não bloqueia o worker; só marca a entrega.
+    """
+    shas = list(dict.fromkeys(SHA_RE.findall(texto or "")))
+    avisos, sujos = [], []
+    for sha in shas:
+        onde = next((r for r in repos if _git(r, "cat-file", "-e", sha + "^{commit}") is not None), None)
+        if not onde:
+            avisos.append(f"entrega sem commit: {sha} não existe no repositório do worker")
+        elif onde not in sujos and _git(onde, "status", "--porcelain").strip():
+            sujos.append(onde)
+            avisos.append(f"entrega sem commit: árvore suja em {onde}")
+    for url in dict.fromkeys(PR_RE.findall(texto or "")):
+        oids = pr_commits(url) if pr_commits else None
+        faltam = [s for s in shas if oids is not None and not any(o.startswith(s) for o in oids)]
+        if faltam:
+            avisos.append(f"entrega sem commit: o PR {url} não tem {', '.join(faltam)}")
+    return avisos
+
+
+def _pr_commits(url):
+    """Os oids dos commits do PR pelo gh, ou None se o gh não existe, falha ou não há rede."""
+    try:
+        r = subprocess.run(["gh", "pr", "view", url, "--json", "commits", "-q", ".commits[].oid"], capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout.split() if r.returncode == 0 else None
+
+
+def _repos_do_worker(m, p):
+    """O worktree do dispatch (worker-list) e depois os repositórios de ORQ_REPOS (padrão ~/.claude/orq)."""
+    repos = []
+    try:
+        for w in _workers_todos(m["run_id"]):
+            if w.get("dispatchId") == p.get("dispatchId"):
+                wt = ((w.get("resource") or {}).get("worktreeId") or "").split("::", 1)[-1]
+                repos += [wt] if wt.startswith("/") else []
+    except Exception as e:  # noqa: BLE001
+        log(f"entrega: worker-list falhou ({type(e).__name__}: {e}); só ORQ_REPOS")
+    return repos + [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+
+
+def _prova_de_entrega(m, p):
+    """worker_done com sha no texto -> evento `entrega` com os avisos, se houver."""
+    texto = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
+    if not SHA_RE.search(texto):
+        return
+    avisos = confere_entrega(texto, _repos_do_worker(m, p), _pr_commits)
+    if avisos:
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": avisos})
+
+
 def _ingest_msg(m, desde, ja, titulos):
     """Uma mensagem da inbox -> 1 se virou entrada. Levanta o que a mensagem tiver de errado; quem chama isola.
 
@@ -1259,6 +1332,7 @@ def _ingest_msg(m, desde, ja, titulos):
     if m.get("type") != "worker_done" or _dt(m["created_at"]) <= desde or m["id"] in ja:
         return 0
     p = _payload(m)
+    _prova_de_entrega(m, p)
     if p.get("reportPath"):
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": m.get("subject") or "", "fonte": f"worker {m.get('subject') or ''}",
                       "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId")}, novo_id=True)
@@ -2602,6 +2676,8 @@ def texto_agentes(ags):
         elif a["estado"] == "parado":
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
         linhas.append(f"{a['estado']:<11} {a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
+        for av in a.get("entrega") or []:
+            linhas.append(f"            AVISO: {av}")
         if a.get("alerta"):
             linhas.append(f"            ALERTA: {a['alerta']} (o worker não leu o ajuste depois de {STEER_TENTATIVAS} avisos; um check sem --ack esconde as mensagens novas)")
         if a["estado"] in ("travado", "nao_comecou", "parado"):
