@@ -2492,6 +2492,26 @@ def linhas_ausente(cur):
             *([] if _gerente_cfg() else ["aviso: sem agent manager ligado ninguém roda o poll dos PRs; rode `orq pr poll` (o Stop não chama o gh)"])]
 
 
+PAINEL_URL = "http://localhost:8765/"
+
+
+def away(op=None):
+    """`orq away` / `/away`: liga, desliga ou mostra o modo ausente; sem op alterna. Devolve as linhas para imprimir.
+    Ao desligar só mostra o link do painel da 8765 e a contagem; não abre aba."""
+    cur = _dict(_cursor_ro().get("ausente"))
+    op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
+    if op == "status":
+        return linhas_ausente(_cursor_ro())[:1]
+    if op == "on":
+        if not cur:
+            ausente_ligar()
+        desde = _hora_local(_dict(_cursor_ro().get("ausente")).get("ligada_em"))
+        return [f"away mode ligado desde {desde}; o digest registra cada resposta"]
+    n = len(digest_gerar()[0]["linha"]) if cur else 0
+    ausente_desligar()
+    return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}"]
+
+
 def _ultima_resposta(ev):
     """O texto da última resposta do coordenador: `last_assistant_message` do Stop, senão o fim do transcrito (`transcript_path`); "" sem nenhum."""
     texto = ev.get("last_assistant_message")
@@ -5308,6 +5328,8 @@ def main(argv=None):
     fi.add_parser("lista")
     au = sub.add_parser("ausente", help="modo ausente: orq ausente ligar | desligar | (sem op: estado); o Stop de cada resposta atualiza o digest")
     au.add_argument("op", nargs="?", choices=["ligar", "desligar"])
+    aw = sub.add_parser("away", help="alias em inglês do modo ausente: orq away [on|off|status]; sem op alterna; ao desligar mostra o link do painel")
+    aw.add_argument("op", nargs="?", choices=["on", "off", "status", "ligar", "desligar"])
     sub.add_parser("steers", help="reentrega o aviso dos ajustes que o worker parado não leu e grava o alerta na terceira falha (o painel do gerente já faz)")
     rp = sub.add_parser("responder", help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
     rp.add_argument("msg_id")
@@ -5493,6 +5515,8 @@ def main(argv=None):
             elif a.op == "desligar":
                 ausente_desligar()
             print("\n".join(linhas_ausente(_cursor_ro())))
+        elif a.cmd == "away":
+            print("\n".join(away(a.op)))
         elif a.cmd == "noite":
             if a.op == "ligar":
                 noite_ligar(a.ate, a.max_despachos, a.max_falhas)
