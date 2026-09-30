@@ -46,6 +46,10 @@ SEM_LIGACAO = "term_00000000-0000-0000-0000-000000000000"  # handle que o Orca n
 TRAVADO_S = 15 * 60  # dispatch rodando sem heartbeat há mais que isto está travado: aparece no resumo e no painel com o orq steer sugerido
 ESPERA_TETO_S = 60 * 60  # heartbeat `esperando: <motivo>` sem `até HH:MM` vale por tanto tempo; depois disso o dispatch é travado por "espera vencida"
 ESPERA_FASE = re.compile(r"^\s*esperando:\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
+STEER_LEITURA_S = 90  # ajuste que o dispatch não leu (`read` no inbox do Orca ou o id no transcrito do worker) tanto tempo depois do envio, ou da última redigitação, é reentregue
+STEER_TENTATIVAS = 3  # redigitações do aviso ao worker parado; sem leitura STEER_LEITURA_S depois da terceira, vira o alerta "steer não lido"
+STEER_TRANSCRITO_BYTES = 4_000_000  # o fim do transcrito do worker onde se procura o id da mensagem do steer
+STEER_JANELA_S = 30 * 60  # steer mais velho que isto sai do acompanhamento: o inbox de 200 mensagens já não o alcança
 NAO_COMECOU_S = 120  # dispatch aberto sem nenhum turno registrado tanto tempo depois do despacho não começou (o worker-start que ficou sem Enter)
 PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker parou no prompt (o limiar evita chamar de parado a folga entre dois turnos)
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
@@ -62,7 +66,7 @@ RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem ta
 RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
 RUN_TESTE = re.compile(r"teste|descart[aá]vel", re.I)  # objetivo de Run de teste: nunca aparece por padrão
 GERENTE_PRESO_S = float(os.environ.get("ORQ_GERENTE_PRESO_S") or 120)  # o painel fica no Run do aviso até o coordenador confirmar, ou por este prazo
-MUTA_RUN = {"worker-start", "send", "check", "task-create", "task-update"}  # o Orca só aceita estes do terminal ligado ao Run do --run
+MUTA_RUN = {"worker-start", "send", "check", "reply", "task-create", "task-update"}  # o Orca só aceita estes do terminal ligado ao Run do --run
 AVISO_FINAL = re.compile(r"You have \d+ orchestration messages?\. Run `orca orchestration check --run run_\w+(?: --terminal [\w-]+)?`\.?\s*$")  # o aviso do Orca no fim do prompt (B26)  # o aviso do Orca cita o Run: "Run `orca orchestration check --run <r>`."
 ESPERA_RELATORIO_S = 3600  # o Orca marca a automation de terminal como completed antes de o agente gravar o relatório: espera até 1 h pelo arquivo
 ESCOLHA_LAVISH = ("escolha", "escolhida", "decidido", "manter", "trocar")  # disposicao de um item do Lavish que fecha a decisão (com resposta); o resto é resposta livre
@@ -387,23 +391,49 @@ def _cita(texto, n=40):
 
 
 def alertas_recentes(events, agora, agentes_=None):
-    """Alertas de scout sem relatório das últimas ALERTA_H horas, um por task.
+    """Alertas das últimas ALERTA_H horas, um por (task, tipo): scout sem relatório e steer não lido.
 
     Some quando algo posterior o trata: `orq alerta visto <task>` (alerta_visto), o `orq liberar` do dispatch da task ou um intake que cita a task (B30).
-    `agentes_` (já reavaliados): a task cujo agente está `liberado` também some, mesmo liberada fora do `orq liberar` (B39).
+    `agentes_` (já reavaliados): a task cujo agente está `liberado` também some, mesmo liberada fora do `orq liberar` (B39); o steer não lido some
+    também com o worker `entregue` (o ajuste ficou sem sentido).
+    """
+    out = {}
+
+    def trata(task, so=None):
+        for k in [k for k in out if k[0] == task and so in (None, k[1])]:
+            del out[k]
+
+    for e in events:
+        if e.get("tipo") == "alerta" and (not e.get("ts") or (agora - _dt(e["ts"])).total_seconds() < ALERTA_H * 3600):
+            out[(e.get("task"), e.get("alerta"))] = e
+        elif e.get("tipo") in ("alerta_visto", "liberar"):
+            trata(e.get("task"))
+        elif e.get("tipo") == "intake":
+            trata(e.get("ref"))
+    for a in agentes_ or []:
+        if a.get("estado") == "liberado":
+            trata(a.get("task"))
+        elif a.get("estado") == "entregue":
+            trata(a.get("task"), "steer_nao_lido")
+    return list(out.values())
+
+
+def steers_abertos(events, agora):
+    """{msg_id: {steer, tentativas, ultima}} dos steers ainda sem fim (lido, encerrado ou alerta) e dentro de STEER_JANELA_S.
+
+    `tentativas` são as redigitações do aviso (steer_reentrega); `ultima` é o instante do steer ou da última redigitação, de onde correm os STEER_LEITURA_S.
     """
     out = {}
     for e in events:
-        if e.get("tipo") == "alerta" and (not e.get("ts") or (agora - _dt(e["ts"])).total_seconds() < ALERTA_H * 3600):
-            out[e.get("task")] = e
-        elif e.get("tipo") in ("alerta_visto", "liberar"):
-            out.pop(e.get("task"), None)
-        elif e.get("tipo") == "intake":
-            out.pop(e.get("ref"), None)
-    for a in agentes_ or []:
-        if a.get("estado") == "liberado":
-            out.pop(a.get("task"), None)
-    return list(out.values())
+        m = e.get("msg_id")
+        if e.get("tipo") == "steer" and m and _ts(e.get("ts")):
+            out[m] = {"steer": e, "tentativas": 0, "ultima": _ts(e["ts"])}
+        elif e.get("tipo") == "steer_reentrega" and m in out and _ts(e.get("ts")):
+            out[m]["tentativas"] += 1
+            out[m]["ultima"] = _ts(e["ts"])
+        elif e.get("tipo") == "steer_fim" or (e.get("tipo") == "alerta" and e.get("alerta") == "steer_nao_lido"):
+            out.pop(m, None)
+    return {m: s for m, s in out.items() if (agora - _ts(s["steer"]["ts"])).total_seconds() < STEER_JANELA_S}
 
 
 def _relatorios(abertas_):
@@ -495,6 +525,9 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
             partes.append(f"+{len(parados) - 2} {rotulo.lower()}.")
     alertas = alertas_recentes(events, agora, ags)
     for a in alertas[:2]:
+        if a.get("alerta") == "steer_nao_lido":
+            partes.append(f"Alerta: steer não lido em {a.get('task')} depois de {STEER_TENTATIVAS} avisos ao terminal parado: olhe o worker (orq agentes).")
+            continue
         titulo = re.sub(r"^\s*\[scout\]\s*", "", a.get("titulo") or "", flags=re.I)
         partes.append(f"Alerta: scout {_cita(titulo)!r} concluído sem reportPath ({(a.get('task') or '')[:14]}).")
     if len(alertas) > 2:
@@ -2036,6 +2069,94 @@ def _terminal_do_dispatch(run, dispatch):
         return None
 
 
+def _aviso_worker(handle):
+    """O aviso no formato do Orca, digitado no terminal de um worker que ele não avisou."""
+    return f"You have 1 orchestration message. Run `orca orchestration check --terminal {handle}`."
+
+
+def lido_no_transcrito(dispatch, msg_id):
+    """True se o transcrito da sessão do worker cita a mensagem (o `check` dele a trouxe), False se não, None sem transcrito.
+
+    O `read` do inbox só vira 1 com o `check --ack`, e o worker que lê por `check --terminal` sem ack o deixa em 0 (conferido no Orca real em 29/09:
+    o worker leu, respondeu "recebi" e a linha seguiu com read 0). O Orca não expõe a entrega em aberto (tabela `deliveries`), então a leitura
+    se prova pelo id no fim do transcrito, achado pela sessão que o hook prompt gravou em turnos.json."""
+    sid = _dict(_turnos_ro().get(dispatch)).get("sessao")
+    for arq in glob.glob(os.path.join(PROJETOS, "*", f"{glob.escape(sid)}.jsonl")) if sid else []:
+        try:
+            with open(arq, "rb") as f:
+                f.seek(max(0, f.seek(0, 2) - STEER_TRANSCRITO_BYTES))
+                return msg_id.encode() in f.read()
+        except OSError as e:
+            log(f"transcrito {arq}: {type(e).__name__}: {e}")
+    return None
+
+
+def _orca_avisou(msg_id):
+    """A mensagem tem `delivered_at` no inbox: o Orca digitou o aviso dele no terminal do worker (conferido em 29/09: a resposta do gerente a um
+    worker preso no `ask` e o steer que o Orca não avisou ficam sem ele)."""
+    try:
+        return bool(msg_id) and any(m.get("id") == msg_id and m.get("delivered_at") for m in orca("inbox", "--limit", "20")["messages"] if isinstance(m, dict))
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
+def reentrega_steers(agora=None):
+    """Uma volta do gerente sobre os steers abertos: as linhas do painel.
+
+    Só toca o Orca com um steer vencido (STEER_LEITURA_S depois do envio ou da última redigitação). Mensagem com `read` no inbox ou citada no
+    transcrito do worker (lido_no_transcrito): `steer_fim` (lido).
+    Dispatch que já entregou: `steer_fim` (encerrado). Worker `parado` (turno encerrado, pelos hooks): redigita o aviso com `digita`, que não digita
+    por cima de um turno em andamento nem de rascunho e por isso não gasta a tentativa. Depois de STEER_TENTATIVAS redigitações sem leitura grava o
+    alerta `steer_nao_lido` (resumo e `orq agentes`) e o steer sai do acompanhamento. Worker ocupado não recebe nada, como no steer."""
+    agora = agora or datetime.now(timezone.utc)
+    vencidos = {m: s for m, s in steers_abertos(read_events(), agora).items() if (agora - s["ultima"]).total_seconds() >= STEER_LEITURA_S}
+    if not vencidos:
+        return []
+    msgs = {m.get("id"): m for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m, dict)}
+    linhas, ags = [], None
+    for m, s in vencidos.items():
+        st, linha = s["steer"], msgs.get(m)
+        base = {"msg_id": m, "task": st.get("task"), "dispatch": st.get("dispatch"), "run": st.get("run")}
+        if linha is None:
+            continue  # o inbox já não mostra a mensagem: sem prova de leitura nem de falta dela
+        fonte = "orca" if linha.get("read") else "transcrito" if lido_no_transcrito(st.get("dispatch"), m) else None
+        if fonte:
+            append_event({"tipo": "steer_fim", **base, "motivo": "lido", "fonte": fonte})
+            continue
+        ags = ags if ags is not None else {a["dispatch"]: a for a in agentes()}
+        ag = ags.get(st.get("dispatch"))
+        if not ag or ag["estado"] in ("entregue", "liberado"):
+            append_event({"tipo": "steer_fim", **base, "motivo": "encerrado"})
+        elif s["tentativas"] >= STEER_TENTATIVAS:
+            append_event({"tipo": "alerta", "alerta": "steer_nao_lido", **base})
+            linhas.append(f"{st.get('task')}: steer não lido depois de {s['tentativas']} avisos (alerta gravado)")
+        elif ag["estado"] == "parado" and digita(ag["terminal"], _aviso_worker(ag["terminal"])) == "enviado":
+            append_event({"tipo": "steer_reentrega", **base, "tentativa": s["tentativas"] + 1})
+            linhas.append(f"{st.get('task')}: steer não lido, aviso redigitado ({s['tentativas'] + 1}/{STEER_TENTATIVAS})")
+    return linhas
+
+
+def responder(msg_id, texto):
+    """Responde a mensagem de um worker (`orca orchestration reply`) pelo handle do gerente, ligando antes o Run da mensagem.
+
+    O Orca só deixa responder o terminal ligado ao Run da mensagem (consumer_fenced com o gerente em outro Run, visto em 29/09): o run vem da linha
+    do inbox e o `orca()` liga o gerente a ele. Run que nem o gerente nem o coordenador seguram é recusado com o `run-use` que falta."""
+    linha = next((x for x in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(x, dict) and x.get("id") == msg_id), None)
+    if not linha:
+        raise ValueError(f"mensagem {msg_id} não está entre as 200 mais novas do inbox")
+    alvo = linha.get("run_id")
+    atual = (orca("run-current")["run"] or {}).get("id")
+    fenced = f"o coordenador precisa estar ligado ao Run da mensagem: rode run-use --id {alvo}"
+    if atual != alvo and not _do_gerente(alvo):
+        raise ValueError(f"Run ligado é {atual or 'nenhum'}, a mensagem é do {alvo}; {fenced}")
+    try:
+        res = orca("reply", "--id", msg_id, "--body", texto, "--run", alvo, timeout=10)
+    except RuntimeError as e:
+        raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
+    return append_event({"tipo": "resposta_worker", "msg_id": msg_id, "run": alvo, "dispatch": _dispatch_da_msg(linha), "texto": texto,
+                         "resposta_id": (res.get("message") or res).get("id")})
+
+
 def steer(task, texto, run=None, entrada=None):
     """Manda `texto` ao dispatch da task (send --to dispatch:<id>) e registra.
 
@@ -2061,10 +2182,11 @@ def steer(task, texto, run=None, entrada=None):
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
     msg = res.get("message") or res
-    # O Orca digita o aviso no worker ocupado, mas não no que encerrou o turno parado no prompt (visto em 29/09): esse recebe o aviso daqui.
+    # O Orca digita o próprio aviso (a linha ganha `delivered_at`) no worker que ele alcança, e no que encerrou o turno parado no prompt às vezes não
+    # (visto em 29/09): só esse recebe o aviso daqui, e um aviso que o Orca acabou de digitar não se repete.
     time.sleep(STEER_ESPERA_S)
     handle = _terminal_do_dispatch(alvo, t["dispatch_id"])
-    entrega = digita(handle, f"You have 1 orchestration message. Run `orca orchestration check --terminal {handle}`.") if handle else "sem_terminal"
+    entrega = "orca" if _orca_avisou(msg.get("id")) else digita(handle, _aviso_worker(handle)) if handle else "sem_terminal"
     ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": alvo, "texto": texto, "msg_id": msg.get("id"),
                        **({"aviso_terminal": entrega} if entrega != "ocupado" else {})})
     if entrada:
@@ -2368,7 +2490,12 @@ def agentes(run=None, todos=False, agora=None):
         humanos = _interacao_registrada(events)
         ws = [w for w in ws if _ativo(w) and (w.get("dispatchStatus") == "dispatched" or not _retencao(w, humanos))]
     msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
-    ags = monta_agentes(ws, msgs, events, agora or datetime.now(timezone.utc), _detalhes(ws), vivos, _turnos_ro())
+    agora = agora or datetime.now(timezone.utc)
+    ags = monta_agentes(ws, msgs, events, agora, _detalhes(ws), vivos, _turnos_ro())
+    nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
+    for a in ags:
+        if a["dispatch"] in nao_lidos:
+            a["alerta"] = "steer não lido"
     return ags if todos else [a for a in ags if not (a.get("titulo") or "").startswith(PREFIXO_PROVA)]
 
 
@@ -2386,6 +2513,8 @@ def texto_agentes(ags):
         elif a["estado"] == "parado":
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
         linhas.append(f"{a['estado']:<11} {a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
+        if a.get("alerta"):
+            linhas.append(f"            ALERTA: {a['alerta']} (o worker não leu o ajuste depois de {STEER_TENTATIVAS} avisos; um check sem --ack esconde as mensagens novas)")
         if a["estado"] in ("travado", "nao_comecou", "parado"):
             linhas.append(f'            -> orq steer {a["task"]} "<ajuste>" --run {a["run"]}')
         elif a["estado"] == "entregue":
@@ -2892,6 +3021,10 @@ def gerente_absorver():
                 parados[r] = motivo
         gerente_soltar(parados)
         linhas += [f"{r}: solto do gerente ({m})" for r, m in parados.items()]
+    try:
+        linhas += reentrega_steers()
+    except Exception as e:  # noqa: BLE001 - o painel não cai por causa do acompanhamento dos steers; a próxima volta tenta
+        log(f"steers: {type(e).__name__}: {e}")
     return "\n".join(linhas)
 
 
@@ -2920,6 +3053,10 @@ def main(argv=None):
     st.add_argument("texto")
     st.add_argument("--run")
     st.add_argument("--entrada")
+    sub.add_parser("steers", help="reentrega o aviso dos ajustes que o worker parado não leu e grava o alerta na terceira falha (o painel do gerente já faz)")
+    rp = sub.add_parser("responder", help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
+    rp.add_argument("msg_id")
+    rp.add_argument("texto")
     sub.add_parser("status")
     al = sub.add_parser("alerta", help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
     al.add_parser("visto").add_argument("task")
@@ -2982,6 +3119,10 @@ def main(argv=None):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
         elif a.cmd == "steer":
             print(json.dumps(steer(a.task, a.texto, a.run, a.entrada), ensure_ascii=False))
+        elif a.cmd == "steers":
+            print("\n".join(reentrega_steers()) or "nenhum ajuste a reentregar")
+        elif a.cmd == "responder":
+            print(json.dumps(responder(a.msg_id, a.texto), ensure_ascii=False))
         elif a.cmd == "alerta":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
         elif a.cmd == "status":

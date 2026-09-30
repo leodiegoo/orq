@@ -303,6 +303,12 @@ elif cmd in ("task-create", "task-update"):
         t["result"] = opt("--result")
     json.dump(ts, open(os.path.join(d, "tasks_%s.json" % alvo), "w"))
     res = {"task": t}
+elif cmd == "reply":
+    # como o Orca real (visto em 29/09): só o terminal ligado ao Run da mensagem responde; o gerente em outro Run recebe consumer_fenced
+    if bound is None or (run and run != bound):
+        print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
+    open(os.path.join(d, "replied.log"), "a").write(json.dumps(a) + "\\n")
+    res = {"message": {"id": "msg_r1"}}
 elif cmd == "send":
     if os.environ.get("FAKE_FAIL") == "send" or bound is None or (run and run != bound):  # consumer_fenced: só o Run ligado recebe send
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
@@ -5222,6 +5228,227 @@ def test_ticket25_resumo_mostra_a_espera_numa_linha_so_uma_vez():
 
 def test_ticket25_teto_com_nome():
     assert orq_mod.ESPERA_TETO_S == 60 * 60
+
+
+# ---------- ticket 26: steer com reentrega e alerta; orq responder ----------
+
+def _steer_26(a, lido=0, **linha):
+    """Um steer a worker que o Orca já avisou (ocupado: o orq não digitou nada), o worker parado no prompt e a linha do inbox com `read`."""
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched",
+                            "desde": _iso(-3000), "agente": "claude"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    a.set("busy.json", ["term_w1"])
+    _steer_env(a)
+    r = a.orq("steer", "task_rodando", "use o índice novo")
+    assert r.returncode == 0, r.stderr
+    assert _log(a, "send.log") == [], "o steer a worker ocupado não digita nada"
+    a.set("busy.json", [])
+    _parado_26(a)
+    _linha_26(a, lido, **linha)
+
+
+def _parado_26(a, parado=True):
+    os.makedirs(a.home, exist_ok=True)
+    fim = now_iso(-300) if parado else None
+    json.dump({"ctx_1": {"task": "task_rodando", "inicio": now_iso(-600), "fim": fim}}, open(os.path.join(a.home, "turnos.json"), "w"))
+
+
+def _linha_26(a, lido=0, **campos):
+    """A mensagem do steer no inbox do Orca (msg_9 é o id que o Orca falso devolve ao send)."""
+    _inbox(a, {"id": "msg_9", "run_id": "run_a", "type": "status", "priority": "high", "subject": "Ajuste", "body": "use o índice novo", "payload": None,
+               "from_handle": "term_coord", "to_handle": "dispatch:ctx_1", "read": lido, "sequence": 900, "created_at": _iso(-5), "delivered_at": None, **campos})
+
+
+def _envelhece_26(a, seg):
+    """Recua `seg` segundos o carimbo dos steers e das reentregas: o tempo que o gerente espera antes de agir."""
+    import calendar
+    p = os.path.join(a.home, "events.jsonl")
+    linhas = []
+    for x in open(p).read().splitlines():
+        e = json.loads(x)
+        if e["tipo"] in ("steer", "steer_reentrega"):
+            e["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(calendar.timegm(time.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ")) - seg))
+        linhas.append(json.dumps(e))
+    open(p, "w").write("\n".join(linhas) + "\n")
+
+
+def _digitados_26(a):
+    return [e[e.index("--text") + 1] for e in _avisos_enviados(a, "term_w1")]
+
+
+def test_ticket26_sem_leitura_depois_de_90_s_com_o_worker_parado_redigita_o_aviso():
+    a = Amb()
+    _steer_26(a)
+    assert a.orq("steers").returncode == 0 and _digitados_26(a) == [], "menos de 90 s: ainda dá tempo de ler"
+    _envelhece_26(a, 100)
+    r = a.orq("steers")
+    assert r.returncode == 0, r.stderr
+    (texto,) = _digitados_26(a)
+    assert texto.startswith("You have 1 orchestration message.") and "check --terminal term_w1" in texto, texto
+    (ev,) = [e for e in a.events() if e["tipo"] == "steer_reentrega"]
+    assert (ev["msg_id"], ev["dispatch"], ev["tentativa"]) == ("msg_9", "ctx_1", 1), ev
+    assert _digitados_26(a) == [texto] and a.orq("steers").returncode == 0 and len(_digitados_26(a)) == 1, "a tentativa recomeça a contagem dos 90 s"
+
+
+def test_ticket26_worker_ocupado_nao_recebe_nada():
+    a = Amb()
+    _steer_26(a)
+    _parado_26(a, parado=False)  # o turno está aberto: o Orca avisa sozinho quando ele terminar
+    _envelhece_26(a, 500)
+    assert a.orq("steers").returncode == 0
+    assert _digitados_26(a) == [] and not [e for e in a.events() if e["tipo"] in ("steer_reentrega", "alerta")]
+    b = Amb()
+    _steer_26(b)
+    _envelhece_26(b, 500)
+    r = b.orq("steers", FAKE_PROMPT_BLOCKED="1")  # o hook diz parado, mas o Orca sabe que o agente está no meio do turno
+    assert r.returncode == 0 and not [e for e in b.events() if e["tipo"] == "steer_reentrega"], "o Orca recusou o texto: nenhuma tentativa gasta"
+    assert not [e for e in b.events() if e["tipo"] == "alerta"]
+
+
+def test_ticket26_terceira_falha_grava_o_alerta_e_para_de_digitar():
+    a = Amb()
+    _steer_26(a)
+    for _ in range(3):
+        _envelhece_26(a, 100)
+        assert a.orq("steers").returncode == 0
+    assert len(_digitados_26(a)) == 3 and not [e for e in a.events() if e["tipo"] == "alerta"], "três tentativas, ainda sem alerta"
+    _envelhece_26(a, 100)
+    r = a.orq("steers")
+    assert "steer não lido" in r.stdout, r.stdout
+    (al,) = [e for e in a.events() if e["tipo"] == "alerta"]
+    assert (al["alerta"], al["task"], al["dispatch"], al["run"], al["msg_id"]) == ("steer_nao_lido", "task_rodando", "ctx_1", "run_a", "msg_9"), al
+    _envelhece_26(a, 100)
+    a.orq("steers")
+    assert len(_digitados_26(a)) == 3 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
+    assert "steer não lido" in a.orq("status").stdout, "o resumo carrega o alerta"
+    ag = _agentes(a)["ctx_1"]
+    assert ag["alerta"] == "steer não lido", ag
+    assert "steer não lido" in a.orq("agentes").stdout
+    a.orq("alerta", "visto", "task_rodando")
+    assert "steer não lido" not in a.orq("status").stdout and "alerta" not in _agentes(a)["ctx_1"], "orq alerta visto trata o alerta"
+
+
+def test_ticket26_nenhuma_reentrega_depois_da_leitura():
+    a = Amb()
+    _steer_26(a)
+    _envelhece_26(a, 100)
+    a.orq("steers")
+    assert len(_digitados_26(a)) == 1
+    _linha_26(a, lido=1)  # o worker rodou o check
+    for _ in range(4):
+        _envelhece_26(a, 100)
+        assert a.orq("steers").returncode == 0
+    assert len(_digitados_26(a)) == 1 and not [e for e in a.events() if e["tipo"] == "alerta"], "lido: sem nova tentativa e sem alerta"
+    assert [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "orca")]
+    b = Amb()
+    _steer_26(b, lido=1)
+    _envelhece_26(b, 500)
+    b.orq("steers")
+    assert _digitados_26(b) == []
+
+
+def _transcrito_26(a, texto, sessao="sess26"):
+    """Transcrito da sessão do worker em ORQ_PROJETOS, com `texto` no fim, e o turnos.json apontando para ela."""
+    pasta = os.path.join(a.tmp.name, "projetos", "p")
+    os.makedirs(pasta, exist_ok=True)
+    open(os.path.join(pasta, sessao + ".jsonl"), "w").write(json.dumps({"type": "user", "message": {"content": "oi"}}) + "\n" + json.dumps({"type": "user", "message": {"content": texto}}) + "\n")
+    json.dump({"ctx_1": {"task": "task_rodando", "sessao": sessao, "inicio": now_iso(-600), "fim": now_iso(-300)}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    return {"ORQ_PROJETOS": os.path.join(a.tmp.name, "projetos")}
+
+
+def test_ticket26_worker_que_leu_por_check_sem_ack_conta_como_lido_pelo_transcrito():
+    a = Amb()
+    _steer_26(a)  # read segue 0: o check do worker não confirmou a entrega (visto no Orca real)
+    env = _transcrito_26(a, 'tool_result {"messages": [{"id": "msg_9", "subject": "Ajuste"}]}')
+    _envelhece_26(a, 100)
+    assert a.orq("steers", **env).returncode == 0
+    assert _digitados_26(a) == [] and [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "transcrito")]
+    b = Amb()
+    _steer_26(b)
+    env = _transcrito_26(b, "o worker rodou outra coisa e não viu o ajuste")
+    _envelhece_26(b, 100)
+    assert b.orq("steers", **env).returncode == 0 and len(_digitados_26(b)) == 1, "transcrito sem o id: não leu"
+
+
+def test_ticket26_nenhum_aviso_duplicado_quando_o_proprio_orca_ja_avisou_o_worker():
+    a = Amb()
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    _steer_env(a)
+    _linha_26(a, delivered_at=_iso(-1))  # o Orca digitou o aviso dele e o turno do worker ainda não começou (o terminal segue ocioso)
+    assert a.orq("steer", "task_rodando", "use o índice novo").returncode == 0
+    assert _log(a, "send.log") == [], "o orq não digita um segundo aviso"
+    assert [e["aviso_terminal"] for e in a.events() if e["tipo"] == "steer"] == ["orca"]
+    b = Amb()
+    b.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    b.set("terminals.json", ["term_w1", "term_coord"])
+    _steer_env(b)
+    _linha_26(b)  # sem delivered_at: o Orca não avisou este worker parado no prompt, o orq avisa
+    assert b.orq("steer", "task_rodando", "use o índice novo").returncode == 0 and len(_digitados_26(b)) == 1
+
+
+def test_ticket26_dispatch_encerrado_fecha_o_acompanhamento_sem_alerta():
+    a = Amb()
+    _steer_26(a)
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "completed", "desde": _iso(-3000), "agente": "claude"}])
+    _envelhece_26(a, 500)
+    assert a.orq("steers").returncode == 0
+    assert _digitados_26(a) == [] and [e["motivo"] for e in a.events() if e["tipo"] == "steer_fim"] == ["encerrado"]
+
+
+def test_ticket26_sem_steer_aberto_nao_chama_o_orca():
+    a = Amb()
+    assert a.orq("steers").returncode == 0 and not os.path.exists(os.path.join(a.fake, "calls.log"))
+
+
+def test_ticket26_painel_do_gerente_reentrega_a_cada_volta():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    a.set("terminals.json", ["term_w1", "term_ger", "term_coord"])
+    a.set("busy.json", ["term_w1"])
+    _steer_env(a)
+    assert a.orq("steer", "task_rodando", "use o índice novo", ORCA_TERMINAL_HANDLE="term_coord").returncode == 0
+    a.set("busy.json", [])
+    _parado_26(a)
+    _linha_26(a)
+    _envelhece_26(a, 100)
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0 and len(_digitados_26(a)) == 1 and "task_rodando" in r.stdout and "redigitado" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_ticket26_constantes_com_nome():
+    assert (orq_mod.STEER_LEITURA_S, orq_mod.STEER_TENTATIVAS) == (90, 3)
+
+
+def test_ticket26_responder_liga_o_run_da_pergunta_e_responde_pelo_gerente():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_coord")
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    _inbox(a, _pergunta_ask(50, "ctx_q", run="run_b"))
+    r = a.orq("responder", "msg_q50", "use o índice")
+    assert r.returncode == 0, r.stderr
+    (chamada,) = _log(a, "replied.log")
+    assert chamada[:5] == ["reply", "--id", "msg_q50", "--body", "use o índice"] and chamada[chamada.index("--run") + 1] == "run_b", chamada
+    assert _binds(a)["run_b"] == "term_ger", "o gerente foi ligado ao Run da pergunta antes de responder"
+    (ev,) = [e for e in a.events() if e["tipo"] == "resposta_worker"]
+    assert (ev["msg_id"], ev["run"], ev["dispatch"]) == ("msg_q50", "run_b", "ctx_q"), ev
+
+
+def test_ticket26_responder_no_run_ligado_do_coordenador_sem_gerente():
+    a = Amb(run="run_a")
+    _inbox(a, _pergunta_ask(50, "ctx_q", run="run_a"))
+    r = a.orq("responder", "msg_q50", "sim")
+    assert r.returncode == 0, r.stderr
+    assert len(_log(a, "replied.log")) == 1
+
+
+def test_ticket26_responder_recusa_run_que_o_coordenador_nao_segura_e_mensagem_inexistente():
+    a = Amb(run="run_a")
+    _inbox(a, _pergunta_ask(50, "ctx_q", run="run_b"))
+    r = a.orq("responder", "msg_q50", "sim")
+    assert r.returncode == 1 and "run-use --id run_b" in r.stderr and not _log(a, "replied.log"), r.stderr
+    r = a.orq("responder", "msg_fantasma", "sim")
+    assert r.returncode == 1 and "msg_fantasma" in r.stderr and not _log(a, "replied.log")
 
 
 if __name__ == "__main__":

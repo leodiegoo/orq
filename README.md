@@ -70,7 +70,8 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - `orq despachar` starts a worker with an explicit model and effort, renames its tab, records the dispatch and links the entry.
 - `orq agentes` shows every dispatch across all Runs as running, stuck (no heartbeat for 15 min), asking, delivered or released.
 - `orq liberar` acknowledges a finished worker's messages, releases it and closes its terminal when that is safe.
-- `orq steer` sends a correction to a running worker and, if the worker sits idle at its prompt, types the notice into its terminal.
+- `orq steer` sends a correction to a running worker and, if Orca did not notify it and it sits idle at its prompt, types the notice into its terminal. The manager loop (or `orq steers`) then checks that the worker read it: with no read after 90 s and the worker idle it types the notice again, up to 3 times, and then records a "steer não lido" alert in the summary and in `orq agentes`. A read is the message's `read` flag in Orca's inbox or its id in the worker's transcript, because Orca only sets `read` on `check --ack`.
+- `orq responder <msg_id> "<text>"` answers a worker's question through the manager's handle, binding the manager to the message's Run first (a bare `orca orchestration reply` fails with `consumer_fenced` from another Run).
 - Tickets as markdown files (`orq ticket novo|fechar|lista`), each backed by an Orca task with dependencies.
 - A pending list for the user (`orq pend add|done`), stored as JSON for a dashboard to read. A decision can hold an Orca gate on a task until it is answered.
 - AskUserQuestion guard. While any worker is running, the question widget is refused and the decision goes through a separate page (see [design](docs/design.md#askuserquestion-guard)).
