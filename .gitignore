@@ -1,0 +1,29 @@
+# runtime state (ORQ_HOME defaults to this directory)
+events.jsonl
+aberto.json
+ativos.json
+cursor.json
+gerente.json
+gerente-aviso.json
+pendencias.json
+ask-guard.off
+*.lock
+handoff/
+
+# decision pages and answers
+.lavish/
+
+# private planning notes: tickets, specs, reviews and the design map live in ~/.claude/orquestrador-plan
+docs/issues/
+docs/specs/
+docs/desenho.md
+docs/review-*.md
+docs/correcoes-review.md
+
+# backups, caches, editor and OS files
+*.bak*
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
