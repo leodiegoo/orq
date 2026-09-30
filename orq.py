@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
@@ -49,6 +49,9 @@ HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorv
 HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack devolve o próximo lote)
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
 GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
+RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
+RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
+RUN_TESTE = re.compile(r"teste|descart[aá]vel", re.I)  # objetivo de Run de teste: nunca aparece por padrão
 GERENTE_PRESO_S = float(os.environ.get("ORQ_GERENTE_PRESO_S") or 120)  # o painel fica no Run do aviso até o coordenador confirmar, ou por este prazo
 MUTA_RUN = {"worker-start", "send", "check", "task-create", "task-update"}  # o Orca só aceita estes do terminal ligado ao Run do --run
 AVISO_FINAL = re.compile(r"You have \d+ orchestration messages?\. Run `orca orchestration check --run run_\w+(?: --terminal [\w-]+)?`\.?\s*$")  # o aviso do Orca no fim do prompt (B26)  # o aviso do Orca cita o Run: "Run `orca orchestration check --run <r>`."
@@ -428,6 +431,12 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None):
     return linha if len(linha) <= 560 else linha[:559] + "…"
 
 
+def _linha_runs(aberto):
+    """" Runs: <objetivo> (N abertas), ..." dos Runs visíveis do aberto.json; vazio no cache antigo, sem a chave."""
+    rs = aberto.get("runs") or []
+    return " Runs: " + ", ".join(f"{_cita(x['objetivo'], 30)} ({x['abertas']} abertas)" for x in rs[:3]) + (f" +{len(rs) - 3}" if len(rs) > 3 else "") + "." if rs else ""
+
+
 def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None):
     """No máximo 5 linhas: entrada e o que está sem efeito, uma linha extra (suspeita, alerta, relatórios), aberto no Orca, pendências, como dar efeito."""
     todas = abertas(events)
@@ -443,7 +452,8 @@ def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None):
         falhas = aberto.get("falhas") or []
         sem_leitura = f" {len(falhas)} Run{'s' if len(falhas) > 1 else ''} sem leitura." if falhas else ""
         l2 = (f"Aberto (cache de {_hora_local(aberto.get('ts'))}): backlog {len(bl)}{velho}, rodando {aberto['rodando']}, "
-              f"bloqueado {len(aberto['bloqueado'])}, gates {len(aberto['gates'])}.{sem_leitura}{linha_vivos(events, aberto, agora)}")
+              f"bloqueado {len(aberto['bloqueado'])}, gates {len(aberto['gates'])}.{sem_leitura}{linha_vivos(events, aberto, agora)}"
+              f"{_linha_runs(aberto)}")
     else:
         l2 = "Aberto: cache ainda não existe (refresh em andamento)."
     itens = (pendencias or {}).get("itens", [])
@@ -740,13 +750,33 @@ def append_event(ev, novo_id=False):
 
 # ---------- aberto.json ----------
 
+ABERTA = ("ready", "pending", "dispatched", "blocked")
+
+
+def resumo_run(r, tasks, gerente=()):
+    """Um Run como o `orq runs` e o aberto.json o mostram. `ultima` é a atividade mais recente das tasks (criação ou conclusão), ou a criação do
+    Run: o updated_at do Orca não serve, o próprio painel o mexe a cada run-use."""
+    datas = [d for d in (_ts(r.get("created_at")), *(_ts(t.get(k)) for t in tasks for k in ("created_at", "completed_at"))) if d]
+    return {"id": r["id"], "objetivo": r.get("objective") or "", "abertas": sum(t.get("status") in ABERTA for t in tasks),
+            "concluidas": sum(t.get("status") == "completed" for t in tasks), "gerente": r["id"] in gerente,
+            "ultima": max(datas).strftime("%Y-%m-%dT%H:%M:%SZ") if datas else None}
+
+
+def runs_visiveis(runs, agora, todos=False):
+    """Runs com trabalho aberto ou com atividade nas últimas RUN_RECENTE_H h; os de teste só com `todos`."""
+    def vale(x):
+        ultima = _ts(x.get("ultima"))
+        return x["abertas"] or (ultima and agora - ultima < timedelta(hours=RUN_RECENTE_H))
+    return [x for x in runs if todos or (vale(x) and not RUN_TESTE.search(x["objetivo"]))]
+
+
 def monta_aberto(dados, agora):
     """Pura: [(run, tasks, gates_pendentes)] de todos os Runs -> o aberto (backlog, rodando, bloqueado, gates, falhas).
 
     Cancelada (completed com result.cancelado) é completed e não entra em nada. deps_faltando são as deps ainda não completed.
     Um Run com dado quebrado vai para `falhas` e para o log; os outros seguem.
     """
-    ab = {"ts": now(), "backlog": [], "rodando": 0, "andamento": [], "bloqueado": [], "gates": [], "falhas": []}
+    ab = {"ts": now(), "backlog": [], "rodando": 0, "andamento": [], "bloqueado": [], "gates": [], "falhas": [], "runs": []}
     for r, tasks, gates in dados:
         try:
             backlog, rodando, andamento, bloqueado = [], 0, [], []
@@ -770,12 +800,14 @@ def monta_aberto(dados, agora):
             log(f"refresh: Run {r.get('id')}: {type(e).__name__}: {e}")
             ab["falhas"].append(r.get("id"))
             continue
+        ab["runs"].append(resumo_run(r, tasks, runs_do_gerente()))
         ab["backlog"] += backlog
         ab["rodando"] += rodando
         ab["andamento"] += andamento
         ab["bloqueado"] += bloqueado
         ab["gates"] += gates_
     ab["backlog"].sort(key=lambda i: -i["dias"])
+    ab["runs"] = runs_visiveis(ab["runs"], agora)  # o resto fica no arquivo: orq runs --todos
     return ab
 
 
@@ -789,6 +821,21 @@ def _todos_os_runs():
         if not cursor:
             break
     return runs
+
+
+def runs_lista(todos=False):
+    """O `orq runs`: todos os Runs do Orca (run-list + task-list), com o filtro de fim de vida, mais recentes primeiro."""
+    def por_run(r):
+        return resumo_run(r, orca("task-list", "--run", r["id"], timeout=20)["tasks"], runs_do_gerente())
+    with ThreadPoolExecutor(8) as ex:
+        rs = list(ex.map(por_run, _todos_os_runs()))
+    return sorted(runs_visiveis(rs, datetime.now(timezone.utc), todos), key=lambda x: x["ultima"] or "", reverse=True)
+
+
+def texto_runs(rs):
+    """Uma linha por Run: id, objetivo, abertas/concluídas, gerente e última atividade."""
+    return "\n".join(f"{x['id']}  {_cita(x['objetivo'], 50)}  {x['abertas']} abertas/{x['concluidas']} concluídas  "
+                     f"{'no gerente' if x['gerente'] else 'fora do gerente'}  última {_hora_local(x['ultima'])}" for x in rs) or "nenhum Run com trabalho aberto"
 
 
 def refresh_aberto():
@@ -2631,6 +2678,29 @@ def _absorver_run(run, liga):
     return linha, (None if not msgs or so_heartbeats(msgs) else msgs)
 
 
+def _run_parado(run, sobrou):
+    """Motivo para soltar o Run do gerente, ou None: sem task aberta, sem mensagem (`sobrou`) e sem atividade há RUN_PARADO_MIN minutos."""
+    if sobrou:
+        return None
+    r = resumo_run((orca("run-show", "--id", run)["run"] or {"id": run}) | {"id": run}, orca("task-list", "--run", run)["tasks"])
+    ultima = _ts(r["ultima"])
+    if r["abertas"] or not ultima or datetime.now(timezone.utc) - ultima < timedelta(minutes=RUN_PARADO_MIN):
+        return None
+    return f"sem task aberta nem mensagem há mais de {RUN_PARADO_MIN:g} min (última atividade {r['ultima']})"
+
+
+def gerente_soltar(parados):
+    """Tira do gerente.json os Runs {run: motivo}, um evento `soltar` por Run. O último Run fica (sem Run o gerente vira o formato do ticket 17).
+    `orq despachar` num Run solto o religa (_adotar)."""
+    with trava_gerente():
+        g = _gerente_cfg()
+        for r, motivo in parados.items():
+            if r in g["runs"] and len(g["runs"]) > 1:
+                g["runs"].remove(r)
+                _write_json(_path(GERENTE), {k: v for k, v in g.items() if k != "run"})
+                append_event({"tipo": "gerente", "op": "soltar", "terminal": g["gerente"], "run": r, "motivo": motivo})
+
+
 def gerente_absorver():
     """Uma volta do painel do agent manager, no terminal dele: percorre os Runs ligados (um `run-use` por Run, o Orca liga um por terminal),
     absorve heartbeat e, quando sobra um lote com outra coisa, digita no coordenador um aviso no formato do Orca, uma vez por lote de
@@ -2676,6 +2746,17 @@ def gerente_absorver():
         linhas = [x.replace("esperando o coordenador ficar livre", "avisado ao coordenador") if x.startswith(f"{r}:") else x for x in linhas]
     if avisos != _avisos_gerente():
         _write_json(_path("gerente-aviso.json"), avisos)
+    if liga:
+        parados = {}
+        for r in runs:
+            try:
+                motivo = _run_parado(r, r in pendentes or r in avisos and avisos[r].get("ts"))
+            except RuntimeError:  # Orca fora do ar: não solta nada
+                continue
+            if motivo:
+                parados[r] = motivo
+        gerente_soltar(parados)
+        linhas += [f"{r}: solto do gerente ({m})" for r, m in parados.items()]
     return "\n".join(linhas)
 
 
@@ -2746,6 +2827,9 @@ def main(argv=None):
     gd = ge.add_parser("desligar", help="no coordenador: devolve um Run (--run) ou todos a este terminal")
     gd.add_argument("--run")
     ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
+    ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
+    ru.add_argument("--todos", action="store_true")
+    ru.add_argument("--json", action="store_true")
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
     a = ap.parse_args(argv)
     if a.cmd == "hook":
@@ -2770,6 +2854,9 @@ def main(argv=None):
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             print(json.dumps(ags, ensure_ascii=False) if a.json else texto_agentes(ags))
+        elif a.cmd == "runs":
+            rs = runs_lista(a.todos)
+            print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))
         elif a.cmd == "liberar":
             r = liberar(a.dispatch, a.run)
             print(json.dumps(r, ensure_ascii=False))

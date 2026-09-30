@@ -188,6 +188,8 @@ Repeated notices. `gerente-aviso.json` stores, per Run, the ids of messages alre
 
 While a notice waits to be read, the loop stays on that Run for up to 120 s (`ORQ_GERENTE_PRESO_S`), because the coordinator's raw `check` only works while the manager is bound to it.
 
+End of life of Runs. Orca has no command to close a Run and Runs have no status, so orq decides. Each `absorver` round, a Run with no task in `ready`/`pending`/`dispatched`/`blocked`, no unread message, and no task activity for `RUN_PARADO_MIN` minutes (30, `ORQ_RUN_PARADO_MIN`) leaves `gerente.json` (`gerente` event, `op: soltar`, with the reason). The last Run always stays, and `orq despachar` into a released Run adopts it again. Activity is the newest task creation or completion, not the Run's `updated_at`, which the manager itself moves with every `run-use`. The summary and `aberto.json` list only Runs with open work or activity in the last 24 h (`RUN_RECENT_H`), and never a Run whose objective says "teste" or "descartável"; `orq runs` prints Run, objective, open/completed tasks, manager membership and last activity, and `orq runs --todos` includes the archive.
+
 ## Heartbeat handling
 
 There are three paths, all built on the same rule: only a batch made entirely of heartbeats is ever acknowledged. Any other type, including an unknown or missing one, lets the notice through untouched.

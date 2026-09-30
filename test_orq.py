@@ -199,7 +199,7 @@ elif cmd == "run-list":
     itens, prox = pagina(ler("runs.json", []))
     res = {"runs": itens, "nextCursor": prox}
 elif cmd == "run-show" and os.path.exists(multi):
-    res = {"run": {"id": opt("--id"), "coordinator_handle": _b.get(opt("--id"), {}).get("handle")}}
+    res = {"run": {**next((r for r in ler("runs.json", []) if r["id"] == opt("--id")), {}), "id": opt("--id"), "coordinator_handle": _b.get(opt("--id"), {}).get("handle")}}
 elif cmd == "run-show":
     res = {"run": next((r for r in ler("runs.json", []) if r["id"] == opt("--id")), {"id": opt("--id")})}
 elif cmd == "worker-list":
@@ -4931,6 +4931,92 @@ def test_ticket20_agent_prompt_blocked_do_orca_conta_como_ocupado_no_painel_e_no
     b = Amb()
     assert _steer_com_worker(b, FAKE_PROMPT_BLOCKED="1").returncode == 0
     assert "aviso_terminal" not in [e for e in b.events() if e["tipo"] == "steer"][0], "worker ocupado: o Orca avisa sozinho"
+
+
+# ---------- fim de vida dos Runs (ticket 23) ----------
+
+VELHO = "2026-09-01 10:00:00"
+
+
+def _run_parado(a, run="run_b", **extra):
+    """Run sem task aberta, criado e concluído em setembro: parado há muito mais que RUN_PARADO_MIN."""
+    a.set("tasks_%s.json" % run, [{"id": "task_x", "status": "completed", "created_at": VELHO, "completed_at": "2026-09-01T10:05:00Z"}])
+    return {"id": run, "objective": "Frente antiga", "created_at": VELHO, **extra}
+
+
+def _run_ativo(a, run="run_a"):
+    a.set("tasks_%s.json" % run, [{"id": "task_y", "status": "dispatched", "created_at": VELHO}])
+    return {"id": run, "objective": "Frente viva", "created_at": VELHO}
+
+
+def test_gerente_absorver_solta_run_parado_sem_task_aberta_e_sem_mensagem():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.set("runs.json", [_run_ativo(a), _run_parado(a)])
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert _gerente_runs(a) == ["run_a"], "run_b não tem task aberta nem mensagem há mais de RUN_PARADO_MIN"
+    (ev,) = [e for e in a.events() if e["tipo"] == "gerente" and e["op"] == "soltar"]
+    assert ev["run"] == "run_b" and "sem task aberta" in ev["motivo"], ev
+
+
+def test_gerente_absorver_nao_solta_run_recente_com_mensagem_ou_o_ultimo():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger", "run_b": None, "run_c": None}, ["run_a", "run_b", "run_c"])
+    agora = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    a.set("runs.json", [_run_ativo(a), {**_run_parado(a), "created_at": agora}, _run_parado(a, "run_c")])
+    a.set("tasks_run_b.json", [])  # criado agora, sem task: ainda dentro do prazo
+    a.caixa(("worker_done", {"taskId": "task_1", "dispatchId": "ctx_1"}), run="run_c")  # parado, mas com mensagem esperando
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert _gerente_runs(a) == ["run_a", "run_b", "run_c"]
+    b = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(b, {"run_b": "term_ger"}, ["run_b"])
+    b.set("runs.json", [_run_parado(b)])
+    assert b.orq("gerente", "absorver").returncode == 0 and _gerente_runs(b) == ["run_b"], "o gerente nunca fica sem Run"
+
+
+def test_despachar_religa_run_que_o_gerente_soltou():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger", "run_b": "term_ger"}, ["run_a", "run_b"])
+    a.set("runs.json", [_run_ativo(a), _run_parado(a)])
+    a.orq("gerente", "absorver")
+    assert _gerente_runs(a) == ["run_a"]
+    a.env["ORCA_TERMINAL_HANDLE"] = "term_coord"
+    assert _despachar_em(a, "run_b").returncode == 0
+    assert _gerente_runs(a) == ["run_a", "run_b"]
+
+
+def _runs_fixture(a):
+    a.set("runs.json", [{**_run_ativo(a), "objective": "Frente viva"}, _run_parado(a, "run_b"),
+                        {**_run_parado(a, "run_t"), "objective": "teste ticket 20 (apagar)"},
+                        {**_run_parado(a, "run_n"), "objective": "Frente nova", "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}])
+    a.set("tasks_run_n.json", [{"id": "task_n", "status": "completed", "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}])
+
+
+def test_orq_runs_lista_abertas_concluidas_gerente_e_esconde_arquivo_e_teste():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    _runs_fixture(a)
+    r = a.orq("runs", "--json")
+    assert r.returncode == 0, r.stderr
+    por = {x["id"]: x for x in json.loads(r.stdout)}
+    assert sorted(por) == ["run_a", "run_n"], "run_b (concluído em setembro) vai para o arquivo e o Run de teste nunca aparece"
+    assert por["run_a"]["abertas"] == 1 and por["run_a"]["concluidas"] == 0 and por["run_a"]["gerente"] is True
+    assert por["run_n"]["abertas"] == 0 and por["run_n"]["concluidas"] == 1 and por["run_n"]["gerente"] is False and por["run_n"]["ultima"]
+    todos = {x["id"] for x in json.loads(a.orq("runs", "--todos", "--json").stdout)}
+    assert todos == {"run_a", "run_b", "run_t", "run_n"}
+    txt = a.orq("runs").stdout
+    assert "Frente viva" in txt and "Frente antiga" not in txt
+
+
+def test_resumo_e_aberto_mostram_so_runs_com_trabalho_aberto_ou_recentes():
+    a = Amb()
+    _runs_fixture(a)
+    assert a.orq("ingest", "--refresh").returncode == 0
+    ab = json.load(open(os.path.join(a.home, "aberto.json")))
+    assert sorted(x["id"] for x in ab["runs"]) == ["run_a", "run_n"]
+    st = a.orq("status").stdout
+    assert "Frente viva" in st and "Frente nova" in st and "Frente antiga" not in st and "teste ticket" not in st, st
 
 
 if __name__ == "__main__":
