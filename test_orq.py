@@ -5560,6 +5560,34 @@ def test_ticket29_resumo_e_curto_e_sem_dados_nao_cai():
     assert b.orq("resumo", "--desde", "ontem").returncode == 1
 
 
+def test_audiencia_check_acha_termo_proibido_e_pula_sem_lista():
+    """scripts/audiencia-check.py: falha com arquivo:linha, passa limpo, pula sem a lista; o pre-commit do repositório o chama"""
+    check = os.path.join(AQUI, "scripts", "audiencia-check.py")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q", d], check=True)
+        with open(os.path.join(d, "doc.md"), "w") as f:
+            f.write("limpo\nfala da Empresa Secreta aqui\n")
+        subprocess.run(["git", "-C", d, "add", "doc.md"], check=True)
+        lista = os.path.join(d, "termos.txt")
+        with open(lista, "w") as f:
+            f.write("# comentário\nempresa secreta\nre:host-\\d+\n")
+
+        def rodar(termos):
+            return subprocess.run([sys.executable, check, d], capture_output=True, text=True, env={**os.environ, "ORQ_TERMOS": termos})
+
+        r = rodar(lista)
+        assert r.returncode == 1 and "doc.md:2:" in r.stdout and "doc.md:1:" not in r.stdout, r.stdout + r.stderr
+        with open(os.path.join(d, "doc.md"), "w") as f:
+            f.write("limpo\n")
+        assert rodar(lista).returncode == 0
+        r = rodar(os.path.join(d, "nao-existe.txt"))
+        assert r.returncode == 0 and "pulada" in r.stderr, r.stderr
+    hook = os.path.join(AQUI, "githooks", "pre-commit")
+    assert os.access(hook, os.X_OK) and "audiencia-check.py" in open(hook).read()
+    # o repositório atual passa (sem a lista privada a checagem pula, e passa também)
+    assert subprocess.run([sys.executable, check], capture_output=True, text=True).returncode == 0
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

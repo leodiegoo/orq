@@ -206,6 +206,8 @@ python3 test_precompact.py
 python3 scripts/limpar-mergeados.py --self-test
 ```
 
+Audience check: `git config core.hooksPath githooks` runs `scripts/audiencia-check.py` before each commit. It scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, default `~/.claude/orquestrador-plan/termos-proibidos.txt`: one term per line, `re:` prefix for a regex) and prints `file:line`. Without the list it skips with a warning.
+
 ## Portability and lock-in
 
 orq is a personal tool tuned for Claude Code plus Orca. It works, it has a large test suite, and it is shaped by one person's workflow.
