@@ -6206,6 +6206,157 @@ def test_review8_m19_o_spec_de_worker_do_orq_manda_worktree_propria():
     assert "git worktree add" in skill and "git pull" in skill and "~/.claude/orq" in skill
 
 
+# ---------- review-9 (B49 a B53 e o filtro de Runs de teste) ----------
+
+def _sob_trava_falsa(vistos):
+    """Troca a trava_gerente por uma que só conta a profundidade; devolve o que restaurar."""
+    import contextlib
+    orig = orq_mod.trava_gerente
+    prof = [0]
+
+    @contextlib.contextmanager
+    def trava():
+        prof[0] += 1
+        try:
+            yield
+        finally:
+            prof[0] -= 1
+    orq_mod.trava_gerente = trava
+    return orig, prof
+
+
+def test_review9_b49_reconciliar_gates_confere_e_resolve_sob_a_trava_do_gerente():
+    vistos = []
+    orig, prof = _sob_trava_falsa(vistos)
+    velhos = (orq_mod.read_events, orq_mod.run_do_coordenador, orq_mod._resolve_gate)
+    try:
+        orq_mod.read_events = lambda: [{"tipo": "pend", "op": "done", "gate": "g1", "gate_run": "run_b", "resposta": "x"}]
+        orq_mod.run_do_coordenador = lambda run, proprio=None: vistos.append(("conferiu", prof[0])) or True
+        orq_mod._resolve_gate = lambda g, r, run=None: vistos.append(("resolveu", prof[0])) or True
+        orq_mod.reconciliar_gates()
+    finally:
+        orq_mod.trava_gerente = orig
+        orq_mod.read_events, orq_mod.run_do_coordenador, orq_mod._resolve_gate = velhos
+    assert vistos == [("conferiu", 1), ("resolveu", 1)], vistos
+
+
+def test_review9_b49_pend_done_confere_e_resolve_o_gate_sob_a_trava_do_gerente():
+    vistos = []
+    orig, prof = _sob_trava_falsa(vistos)
+    velhos = (orq_mod.read_events, orq_mod._mutar_pend, orq_mod.run_do_coordenador, orq_mod._resolve_gate)
+    try:
+        orq_mod.read_events = lambda: []
+        orq_mod._mutar_pend = lambda rm, ev: {"id": "d", "gate": "g1", "gate_run": "run_b"}
+        orq_mod.run_do_coordenador = lambda run, proprio=None: vistos.append(("conferiu", prof[0])) or True
+        orq_mod._resolve_gate = lambda g, r, run=None: vistos.append(("resolveu", prof[0])) or True
+        orq_mod.pend_done("d", "sim")
+    finally:
+        orq_mod.trava_gerente = orig
+        orq_mod.read_events, orq_mod._mutar_pend, orq_mod.run_do_coordenador, orq_mod._resolve_gate = velhos
+    assert vistos == [("conferiu", 1), ("resolveu", 1)], vistos
+
+
+def test_review9_b49_anda_mostra_travado_parado_e_nao_comecou():
+    agora = datetime.now(timezone.utc)
+
+    def z(s):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(agora.timestamp() - s))
+    base = {"agente": orq_mod.AGENTE_COM_HOOK, "estado": "rodando", "titulo": "W"}
+    ags = [{**base, "dispatch": "ctx_t", "task": "t1", "desde": z(3600), "ultimo_heartbeat": z(3000)},
+           {**base, "dispatch": "ctx_p", "task": "t2", "desde": z(3600), "ultimo_heartbeat": z(1200), "turno_inicio": z(1100), "turno_fim": z(900)},
+           {**base, "dispatch": "ctx_n", "task": "t3", "desde": z(900)}]
+    assert sorted(a["estado"] for a in orq_mod.reavalia(ags, [], agora)) == ["nao_comecou", "parado", "travado"]
+    out = orq_mod.resumo_quatro([], {"agentes": ags}, {"itens": []}, [], agora=agora)
+    assert "Anda (3)" in out, out
+
+
+def test_review9_b49_lavish_resposta_fecha_o_gate_de_um_run_que_o_coordenador_segura_fora_do_gerente():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    r = a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_b1", "--run", "run_b")
+    assert r.returncode == 0, r.stderr
+    r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}]))
+    assert r.returncode == 0 and "run-use" not in r.stderr and "gerente ligar" not in r.stderr, r.stderr
+    assert _resolucoes(a) == ["Sim"], "o Run próprio é conferido pelo handle do coordenador, não pelo run-current do painel"
+
+
+def test_review9_b50_sem_run_com_o_gerente_num_run_e_o_coordenador_noutro_pede_o_run():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": "term_coord"}, ["run_a"])
+    a.prompt("oi")
+    r = _novo(a)
+    assert r.returncode == 1 and "passe --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr and not _log(a, "created.log"), r.stderr
+    assert _novo(a, "Ticket de teste", "--run", "run_b").returncode == 0
+
+
+def test_review9_b50_o_run_proprio_igual_ao_do_gerente_nao_e_ambiguo():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a"])
+    a.prompt("oi")
+    assert _novo(a).returncode == 0, "o coordenador não segura Run fora do gerente: o do gerente é o alvo"
+
+
+def test_review9_b51_pend_add_task_num_run_que_o_coordenador_nao_comanda_recusa():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": None, "run_c": "term_outro"}, ["run_a"])
+    a.prompt("oi")
+    r = a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_c1", "--run", "run_c")
+    assert r.returncode == 1 and "run_c" in r.stderr and not _gates_log(a), r.stderr
+    assert "gate-dec" not in _ids_pend(a)
+
+
+def test_review9_b52_heartbeat_de_um_run_do_coordenador_fora_do_gerente_e_absorvido_e_confirmado():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    a.caixa(_hb("lendo"), run="run_b")
+    _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900))
+    r = a.prompt(AVISO_B)
+    assert _bloqueado(r) and "absorvidos" in json.loads(r.stdout)["reason"], r.stdout
+    assert a.estados() == {"msg_1": "acked"}, "o check confirmou a entrega: o aviso de Run próprio não cai no bloqueio sem confirmar"
+
+
+def test_review9_b52_hook_ask_resolve_o_gate_de_um_run_do_coordenador_fora_do_gerente():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_b1", "--run", "run_b")
+    q = [_pergunta("gate-dec", [("Sim", "x"), ("Não", "y")])]
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}))
+    assert r.returncode == 0 and "run-use" not in r.stdout and "gerente ligar" not in r.stdout, r
+    assert _resolucoes(a) == ["Sim"], "a resposta resolve o gate na hora, sem esperar o próximo ingest"
+
+
+def test_review9_b52_waiter_vigia_o_run_do_coordenador_fora_do_gerente():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    a.caixa(("question", {"taskId": "t2", "dispatchId": "ctx_1"}), run="run_b")
+    out = json.loads(_waiter(a, "run_b").stdout)
+    assert out.get("run") == "run_b" and [m["type"] for m in out["messages"]] == ["question"], out
+    assert a.estados() == {"msg_1": "out"}, "veio pelo check do Run (entrega aberta), não por leitura do inbox"
+
+
+def test_review9_b53_lugar_reconhece_rtk_proxy_git():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, _ = _repo(a.tmp.name, ramo="feat/outra")
+    for cmd in ("rtk proxy git commit -m x", "rtk proxy git push"):
+        assert "lugar errado" in _aviso(_lugar(a, p, cmd=cmd)), cmd
+    assert _aviso(_lugar(a, p, cmd="rtk proxy git status")) == ""
+
+
+def test_review9_resumo_nao_conta_backlog_nem_bloqueado_de_run_de_teste():
+    agora = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+
+    def t(id, status, titulo=None):
+        return {"id": id, "status": status, "created_at": "2026-09-29 11:00:00", "deps": "[]", "task_title": titulo or id}
+    real = {"id": "run_1", "objective": "Frente A"}
+    prova = {"id": "run_2", "objective": "Prova r6"}  # Run real com task de teste dentro
+    de_teste = {"id": "run_3", "objective": "[teste] review-8 gate 1"}
+    ab = orq_mod.monta_aberto([(real, [t("a", "ready"), t("b", "blocked")], []),
+                               (prova, [t("c", "ready", "[teste] review-8 gate 1"), t("d", "blocked", "[teste] review-8 gate 2"), t("g", "ready", "Ticket 9")], []),
+                               (de_teste, [t("e", "pending"), t("f", "blocked")], [])], agora)
+    assert sorted(b["id"] for b in ab["backlog"]) == ["a", "g"] and [b["id"] for b in ab["bloqueado"]] == ["b"], ab
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

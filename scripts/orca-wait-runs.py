@@ -30,6 +30,8 @@ ORCA = os.environ.get("ORQ_ORCA") or "orca"  # os testes do orq apontam para o O
 
 def orca(*args):
     h = orq.handle_orca() if orq else None  # com o agent manager ligado, o Run é lido pelo terminal dele
+    if orq and "--run" in args and not orq._do_gerente(args[args.index("--run") + 1]):
+        h = os.environ.get("ORCA_TERMINAL_HANDLE") or h  # Run que o coordenador segura fora do gerente (B52)
     env = {**os.environ, "ORCA_TERMINAL_HANDLE": h} if h else None
     if orq and args[0] in orq.MUTA_RUN and "--run" in args and orq._do_gerente(args[args.index("--run") + 1]):
         orq.orca("run-use", "--id", args[args.index("--run") + 1])  # o gerente liga um Run por vez; quem chama segura a trava
@@ -47,6 +49,7 @@ runs = sys.argv[1:]
 before = {run: open_tasks(run) for run in runs}
 bound = (orca("run-current").get("result") or {}).get("run", {}).get("id")
 vigiados = (orq.runs_do_gerente() if orq else []) or ([bound] if bound else [])  # com o gerente ligado, a caixa de cada Run dele
+vigiados += [r for r in runs if r not in vigiados and orq and orq.run_do_coordenador(r)]
 start = time.time()
 while time.time() - start < MAX_S:
     time.sleep(POLL_S)

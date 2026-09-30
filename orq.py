@@ -802,7 +802,10 @@ def run_padrao(run=None):
     g = runs_do_gerente()
     if len(g) > 1:
         raise ValueError(f"o agent manager segura {len(g)} Runs ({', '.join(g)}): passe --run")
-    return _run_proprio() or (g[0] if g else None)
+    proprio = _run_proprio()
+    if proprio and g and proprio not in g:  # o coordenador comanda dois Runs: sem --run não há alvo óbvio (B50)
+        raise ValueError(f"o coordenador comanda {len(g) + 1} Runs ({', '.join([*g, proprio])}): passe --run")
+    return proprio or (g[0] if g else None)
 
 
 def dica_ligar(run):
@@ -1040,6 +1043,9 @@ def monta_aberto(dados, agora):
             ab["falhas"].append(r.get("id"))
             continue
         ab["runs"].append(resumo_run(r, tasks, runs_do_gerente()))
+        teste = RUN_TESTE.search(r.get("objective") or "")  # Run de teste, ou task "[teste] ..." num Run real: fora do backlog e do bloqueado (B54)
+        backlog = [i for i in backlog if not teste and not RUN_TESTE.search(i["titulo"])]
+        bloqueado = [i for i in bloqueado if not teste and not RUN_TESTE.search(i["titulo"])]
         ab["backlog"] += backlog
         ab["rodando"] += rodando
         ab["andamento"] += andamento
@@ -1613,6 +1619,8 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
     gate = gate_run = None
     if task:
         run = run_padrao(run)
+        if not run_do_coordenador(run):  # o gate-create não leva --run: fora do que o coordenador comanda nasceria no Run errado (B51)
+            raise ValueError(f"o coordenador não comanda o Run {run}: {dica_ligar(run)}")
         try:
             res = orca("gate-create", "--task", task, "--question", titulo, run=run)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -1819,7 +1827,7 @@ def bloqueio_de_heartbeat(ev, run):
     if not m:
         return None
     alvo = m.group(1)
-    if alvo != run["id"] and not _do_gerente(alvo):
+    if alvo != run["id"] and not run_do_coordenador(alvo):
         return bloqueio_de_outro_run(alvo)
     pendentes = orca("check", "--run", alvo, "--peek")["messages"]  # Run do agent manager: o orca() liga o gerente a ele, e o check cru do coordenador vale
     if not pendentes:
@@ -1971,7 +1979,7 @@ def hook_ask(ev, run):
                       **({"fechou": fechou} if fechou else {})})
         for i in fechou:
             try:
-                feito = pend_done(i, resposta if header != "ja-fez" else None, None if runs_do_gerente() else run["id"])
+                feito = pend_done(i, resposta if header != "ja-fez" else None, _DESCONHECIDO if runs_do_gerente() else run["id"])
             except ValueError as e:  # outro orq fechou no meio: as próximas perguntas seguem
                 log(f"ask: {e}")
             else:
@@ -2049,7 +2057,7 @@ def hook_guard(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
 
 
-LUGAR_ESCRITA = re.compile(r"(^|[;&|(]\s*)((\w+=\S*|rtk|env|command|time|sudo)\s+)*git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # M18: prefixos antes do git
+LUGAR_ESCRITA = re.compile(r"(^|[;&|(]\s*)((\w+=\S*|rtk(?:\s+proxy)?|env|command|time|sudo)\s+)*git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # M18: prefixos antes do git
 LUGAR_GIT_C = re.compile(r"\s-C\s+(\S+)")
 
 
