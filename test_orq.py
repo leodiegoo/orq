@@ -391,7 +391,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
 
@@ -7861,6 +7861,239 @@ def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_gu
     assert b.orq("gerente", "ligar", "--terminal", "term_ger").returncode == 0
     assert json.load(open(os.path.join(b.home, "gerente.json")))["runs"] == ["run_c"]
 
+
+
+# ---------- ticket 51: orçamento de uso do plano e pausa por prioridade ----------
+
+FIXTURE_HUD = os.path.join(AQUI, "fixtures", "hud-stdin.json")
+
+
+def _uso51(a, semana=None, cinco_h=None, idade_s=0, sem_reset=3 * 86400, cinco_reset=3600):
+    """Grava um quadro do HUD (stdin.<sessão>.json) a partir da fixture, com os percentuais dados e `idade_s` de idade."""
+    d = json.load(open(FIXTURE_HUD))
+    agora = time.time()
+    if semana is not None:
+        d["rate_limits"]["seven_day"] = {"used_percentage": semana, "resets_at": int(agora + sem_reset)}
+    if cinco_h is not None:
+        d["rate_limits"]["five_hour"] = {"used_percentage": cinco_h, "resets_at": int(agora + cinco_reset)}
+    os.makedirs(a.env["ORQ_HUD_CACHE"], exist_ok=True)
+    f = os.path.join(a.env["ORQ_HUD_CACHE"], "stdin.sessao-1.json")
+    json.dump(d, open(f, "w"))
+    os.utime(f, (agora - idade_s, agora - idade_s))
+
+
+def test_ticket51_uso_le_o_rate_limits_do_quadro_do_hud_sem_chamar_o_orca():
+    a = Amb()
+    _uso51(a, semana=93, cinco_h=86)
+    u = json.loads(a.orq("uso", "--json").stdout)
+    assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 86, "pausa"), u
+    assert "semana em 93% (limiar 92%), vira em 2d" in u["motivo"], u
+    assert not _log(a, "calls.log"), "ler o uso não fala com o Orca"
+    _uso51(a, semana=80, cinco_h=50)
+    assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "ok"
+    _uso51(a, semana=86, cinco_h=50)
+    assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "avisa"
+
+
+def test_ticket51_janela_que_ja_virou_vale_zero_e_quadro_velho_nao_vale():
+    a = Amb()
+    _uso51(a, semana=95, sem_reset=-60, cinco_h=10)
+    assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "ok", "a semana virou depois do quadro"
+    _uso51(a, semana=95, idade_s=3600)
+    u = json.loads(a.orq("uso", "--json").stdout)
+    assert u["uso"] is None and u["nivel"] == "desconhecido", u
+
+
+def test_ticket51_limiares_vem_do_uso_json():
+    a = Amb()
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"semana_pausa": 97}, open(os.path.join(a.home, "uso.json"), "w"))
+    _uso51(a, semana=95, cinco_h=10)
+    assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "avisa"
+
+
+def test_ticket51_despachar_recusa_acima_do_limiar_da_semana_e_da_janela_de_5h():
+    a = Amb(run="run_a")
+    _uso51(a, semana=93, cinco_h=10)
+    r = _despachar(a)
+    assert r.returncode == 1 and "uso do plano" in r.stderr and "semana em 93%" in r.stderr and "orq pausar" in r.stderr, r
+    assert not _log(a, "started.log"), "nada foi despachado"
+    _uso51(a, semana=50, cinco_h=91)
+    r = _despachar(a)
+    assert r.returncode == 1 and "janela de 5 h em 91%" in r.stderr and "janela virar" in r.stderr, r
+    assert not _log(a, "started.log")
+    _uso51(a, semana=90, cinco_h=89)
+    assert _despachar(a).returncode == 0, "abaixo dos limiares de pausa e de segurar o despacho sai"
+    assert not [c for c in _log(a, "calls.log") if c[0] == "worker-start"][:0] and len(_log(a, "started.log")) == 1
+
+
+def test_ticket51_gerente_avisa_o_coordenador_uma_vez_por_nivel_e_janela():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _gerente(a)
+    _uso51(a, semana=93)
+    assert a.orq("gerente", "absorver").returncode == 0
+    a.orq("gerente", "absorver")
+    (env,) = _log(a, "send.log")
+    assert env[env.index("--terminal") + 1] == "term_coord"
+    assert "uso do plano, semana em 93%" in env[env.index("--text") + 1] and "orq pausar" in env[env.index("--text") + 1]
+    assert [e["nivel"] for e in a.events() if e["tipo"] == "uso_aviso"] == ["pausa"]
+    _uso51(a, semana=50)  # voltou ao normal: o aviso reabre
+    a.orq("gerente", "absorver")
+    _uso51(a, semana=94)
+    a.orq("gerente", "absorver")
+    assert len(_log(a, "send.log")) == 2, "cruzou de novo: avisa de novo"
+
+
+def test_ticket51_prioridade_no_despacho_e_padrao_pela_frente():
+    a = Amb(run="run_a")
+    assert _despachar(a, "--prioridade", "1").returncode == 0
+    assert [e.get("prioridade") for e in a.events() if e["tipo"] == "despacho"] == [1]
+    r = _despachar(a, "--prioridade", "4")
+    assert r.returncode == 2 and "invalid choice" in r.stderr, r
+    p = orq_mod.prioridade_padrao
+    assert (p("Segurança: rotacionar segredos"), p("Deploy em produção"), p("Failover 31"), p("Painel do orq"), p("Diagnóstico de cache"), p("Ticket 07")) == (1, 1, 3, 3, 3, 2)
+
+
+def _pausa51(a):
+    """Quatro workers vivos no run_a: segurança (P1, implementando), failover (P3, implementando), ticket 07 (P2, investigando) e painel (P3, em review)."""
+    os.makedirs(a.home, exist_ok=True)
+    a.wt = os.path.join(a.tmp.name, "wt")
+    nomes = {"s": "Segurança: rotacionar segredos", "f": "Failover 31", "i": "Ticket 07", "p": "Painel do orq"}
+    for n in nomes:
+        os.makedirs(os.path.join(a.wt, n))
+    a.set("workers.json", [_w48("term_" + n, modelo="claude-opus-5-5") for n in nomes])
+    a.set("tasks_run_a.json", [{"id": "task_term_" + n, "task_title": t, "status": "dispatched", "dispatch_id": "ctx_term_" + n, "created_at": _iso(-900)} for n, t in nomes.items()])
+    a.set("terminals.json", ["term_coord", *("term_" + n for n in nomes)])
+    _turno48(a, **{"ctx_term_" + n: ("sess-" + n, a.wt + "/" + n) for n in nomes})
+    _inbox(a, _hbi(1, "ctx_term_s", "implementing", -30), _hbi(2, "ctx_term_f", "implementing", -30), _hbi(3, "ctx_term_i", "investigating", -30),
+           _hbi(4, "ctx_term_p", "reviewing", -30))
+
+
+def _escreve_pausa51(a, *nomes, depois=1.0):
+    """O worker obedece: depois de `depois` s escreve o PAUSA.md novo na worktree dele."""
+    def escreve():
+        time.sleep(depois)
+        for n in nomes:
+            f = os.path.join(a.wt, n, "PAUSA.md")
+            open(f, "w").write("parei em X; próximo passo Y\n")
+            os.utime(f, (time.time() + 5, time.time() + 5))
+    t = ThreadPoolExecutor(1)
+    return t.submit(escreve)
+
+
+def test_ticket51_pausar_sem_argumento_pausa_baixa_e_investigando_e_poupa_review_e_alta():
+    a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2")
+    _pausa51(a)
+    seco = json.loads(a.orq("pausar", "--dry-run", "--json").stdout)
+    assert sorted((w["task"], w["estado"]) for w in seco["pausados"]) == [("task_term_f", "a_pausar"), ("task_term_i", "a_pausar")], seco
+    assert [(w["task"], w["fase"]) for w in seco["preservados"]] == [("task_term_p", "reviewing")], "P3 em verificação final fica"
+    assert not _enviados(a) and not _log(a, "close.log")
+    f = _escreve_pausa51(a, "f", "i")
+    r = a.orq("pausar", "--json")
+    f.result()
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert sorted((w["task"], w["estado"], w["prioridade"]) for w in res["pausados"]) == [("task_term_f", "pausado", 3), ("task_term_i", "pausado", 2)], res
+    assert {x[x.index("--to") + 1] for x in _enviados(a)} == {"dispatch:ctx_term_f", "dispatch:ctx_term_i"}
+    assert all("PAUSA.md" in x[x.index("--body") + 1] for x in _enviados(a))
+    assert sorted(c[c.index("--terminal") + 1] for c in _log(a, "close.log")) == ["term_f", "term_i"], "só os pausados perdem o terminal"
+    p = _cursor(a)["pausados"]
+    assert set(p) == {"ctx_term_f", "ctx_term_i"} and (p["ctx_term_f"]["sessao"], p["ctx_term_f"]["cwd"], p["ctx_term_f"]["modelo"]) == ("sess-f", a.wt + "/f", "claude-opus-5-5"), p
+    assert {e["dispatch"] for e in a.events() if e["tipo"] == "pausa_plano"} == {"ctx_term_f", "ctx_term_i"}
+
+
+def test_ticket51_pausar_ate_prioridade_e_por_task_e_sem_pausa_md_mantem_o_terminal():
+    a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="1.5", ORQ_PAUSA_POLL_S="0.2")
+    _pausa51(a)
+    r = json.loads(a.orq("pausar", "--ate-prioridade", "2", "--dry-run", "--json").stdout)
+    assert sorted(w["task"] for w in r["pausados"]) == ["task_term_f", "task_term_i"], "P2 e P3; a review P3 continua poupada"
+    r = json.loads(a.orq("pausar", "--ate-prioridade", "1", "--dry-run", "--json").stdout)
+    assert sorted(w["task"] for w in r["pausados"]) == ["task_term_f", "task_term_i", "task_term_s"]
+    r = json.loads(a.orq("pausar", "task_term_p", "--dry-run", "--json").stdout)
+    assert [w["task"] for w in r["pausados"]] == ["task_term_p"] and r["preservados"] == [], "a task nomeada vale sozinha, até em review"
+    assert a.orq("pausar", "task_inexistente").returncode == 1
+    velho = os.path.join(a.wt, "f", "PAUSA.md")
+    open(velho, "w").write("de ontem\n")
+    os.utime(velho, (1, 1))
+    res = json.loads(a.orq("pausar", "task_term_f", "--json").stdout)
+    assert [(w["estado"]) for w in res["pausados"]] == ["sem_pausa_md"], "PAUSA.md antigo não vale"
+    assert not _log(a, "close.log") and not os.path.exists(os.path.join(a.home, "cursor.json")), "sem arquivo novo o worker segue com o terminal"
+
+
+def test_ticket51_pausar_nao_pausa_worker_sem_sessao_gravada():
+    a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="1")
+    _pausa51(a)
+    json.dump({}, open(os.path.join(a.home, "turnos.json"), "w"))
+    a.set("tasks_run_a.json", [{"id": "task_term_f", "task_title": "Failover 31", "status": "dispatched", "dispatch_id": "ctx_term_f", "created_at": _iso(-900)}])
+    res = json.loads(a.orq("pausar", "task_term_f", "--json").stdout)
+    assert [w["estado"] for w in res["pausados"]] == ["sem_sessao"] and not _enviados(a) and not _log(a, "close.log"), res
+
+
+def test_ticket51_retomar_pausados_sobe_com_resume_e_so_os_pausados_e_o_retomar_comum_os_ignora():
+    a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2", ORQ_RETOMAR_ESPERA_S="2")
+    _pausa51(a)
+    f = _escreve_pausa51(a, "f", "i")
+    assert a.orq("pausar").returncode == 0
+    f.result()
+    a.set("terminals.json", ["term_coord", "term_s", "term_p"])  # f e i fecharam
+    assert a.orq("retomar", "--dry-run").stdout.strip() == "nada a retomar", "o crash-recovery não revive o que o orçamento pausou"
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"], "term_ret2": ["esc to interrupt"]})
+    _uso51(a, semana=95)
+    r = a.orq("retomar", "--pausados")
+    assert r.returncode == 1 and "uso do plano ainda alto" in r.stderr and not _log(a, "create.log"), r
+    _uso51(a, semana=70, cinco_h=20)
+    r = a.orq("retomar", "--pausados", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)["workers"]
+    assert [(w["task"], w["estado"]) for w in res] == [("task_term_i", "retomado"), ("task_term_f", "retomado")], "a de prioridade mais alta (P2) sobe primeiro"
+    c = _log(a, "create.log")
+    assert c[0][c[0].index("--worktree") + 1] == "path:" + a.wt + "/i"
+    comando = c[0][c[0].index("--command") + 1]
+    assert comando.startswith("claude --resume sess-i --model claude-opus-5-5 --dangerously-skip-permissions 'O uso do plano voltou"), comando
+    assert not _cursor(a).get("pausados") and {e["dispatch"] for e in a.events() if e["tipo"] == "pausa_fim"} == {"ctx_term_f", "ctx_term_i"}
+    assert [e["terminal"] for e in a.events() if e["tipo"] == "retomada"] == ["term_ret1", "term_ret2"]
+    assert a.orq("retomar", "--pausados").stdout.strip() == "nada a retomar"
+
+
+def test_ticket51_orq_prioridade_troca_a_prioridade_e_aparece_em_agentes_status_e_digest():
+    a = Amb(run="run_a")
+    _pausa51(a)
+    ags = _agentes(a)
+    assert {d: x["prioridade"] for d, x in ags.items()} == {"ctx_term_s": 1, "ctx_term_f": 3, "ctx_term_i": 2, "ctx_term_p": 3}, "padrão pela frente"
+    assert "P1 task_term_s" in a.orq("agentes").stdout
+    r = a.orq("prioridade", "task_term_f", "1")
+    assert r.returncode == 0, r.stderr
+    assert _agentes(a)["ctx_term_f"]["prioridade"] == 1, "a troca vale sobre o padrão"
+    assert a.orq("prioridade", "task_term_f", "3").returncode == 0 and _agentes(a)["ctx_term_f"]["prioridade"] == 3, "a última troca vale"
+    r = a.orq("prioridade", "xyz", "2")
+    assert r.returncode == 1 and "não é um id de task" in r.stderr, r
+    assert a.orq("prioridade", "task_term_f", "5").returncode == 2
+    a.orq("prioridade", "task_term_p", "1")
+    # digest: 'rodando' sai da prioridade mais alta para a mais baixa
+    a.orq("ingest", "--refresh")
+    a.orq("digest")
+    rod = json.load(open(os.path.join(a.home, "digest", "atual.json")))["rodando"]
+    assert [r.get("prioridade") for r in rod] == sorted(r.get("prioridade") for r in rod) and rod[0]["prioridade"] == 1 and len(rod) == 4, rod
+    assert "P1 " in a.orq("status").stdout
+
+
+def test_ticket51_orq_pausar_respeita_a_prioridade_trocada():
+    a = Amb(run="run_a")
+    _pausa51(a)
+    a.orq("prioridade", "task_term_f", "1")  # o failover virou urgente
+    a.orq("prioridade", "task_term_s", "3")  # e a segurança deixou de ser
+    r = json.loads(a.orq("pausar", "--dry-run", "--json").stdout)
+    assert sorted(w["task"] for w in r["pausados"]) == ["task_term_i", "task_term_s"], r
+
+
+def test_ticket51_prioridade_1_passa_pela_janela_de_5h_mas_nao_pela_pausa_da_semana():
+    a = Amb(run="run_a")
+    _uso51(a, semana=50, cinco_h=95)
+    assert _despachar(a).returncode == 1
+    assert _despachar(a, "--prioridade", "1").returncode == 0, "urgente passa pela janela de 5 h"
+    _uso51(a, semana=95, cinco_h=10)
+    r = _despachar(a, "--prioridade", "1")
+    assert r.returncode == 1 and "semana" in r.stderr, "a pausa da semana vale para todas"
 
 
 if __name__ == "__main__":
