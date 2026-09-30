@@ -284,6 +284,7 @@ elif cmd == "worker-start":
     if bound is None or (run and run != bound):
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
     open(os.path.join(d, "started.log"), "a").write(json.dumps(a) + "\\n")
+    open(os.path.join(d, "started-env.log"), "a").write(json.dumps({k: os.environ.get(k) for k in ("GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1")}) + "\\n")
     if os.environ.get("FAKE_FAIL_START_MODEL") and os.environ["FAKE_FAIL_START_MODEL"] == opt("--model"):
         falha("model not available: " + str(opt("--model")))
     ws = ler("workers.json", [])
@@ -6471,6 +6472,103 @@ def test_noite_hooks_injetam_as_regras_e_desligado_nada_muda():
     assert time.time() - t0 < 0.1
 
 
+# ---- orq hook externas (modo noite) ----
+
+EXTERNAS = ["git push", "git push --force origin x", "rtk git push -u origin feat/x", "git -C /tmp/r push", "cd x && git push", "gh pr merge 12 --squash",
+            "gh workflow run deploy.yaml", "git commit --no-verify -m x", "git commit -n -m x", "git commit -anm x", "orca worktree rm --worktree x --force --run-hooks"]
+
+
+def _externas(a, cmd, cwd=None, tool="Bash"):
+    r = a.orq("hook", "externas", stdin=json.dumps({"tool_name": tool, "tool_input": {"command": cmd}, "session_id": "s1", "cwd": cwd or a.tmp.name}))
+    return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+
+def test_noite_externas_nega_cada_comando_com_o_modo_ligado():
+    a = Amb(run="run_a")
+    _noite(a)
+    for cmd in EXTERNAS:
+        out = _externas(a, cmd)
+        assert out and out["permissionDecision"] == "deny", cmd
+        assert "orq pend add" in out["permissionDecisionReason"] and "orq noite desligar" in out["permissionDecisionReason"], cmd
+
+
+def test_noite_externas_libera_com_o_modo_desligado():
+    a = Amb(run="run_a")
+    for cmd in EXTERNAS:
+        assert _externas(a, cmd) is None, cmd
+    _noite(a)
+    a.orq("noite", "desligar")
+    assert _externas(a, "git push") is None
+
+
+def test_noite_externas_texto_entre_aspas_e_leitura_nao_disparam():
+    a = Amb(run="run_a")
+    _noite(a)
+    for cmd in ['git commit -m "fix: never git push --force or gh pr merge"', "echo 'git push'", 'orq pend add "rodar gh workflow run depois"', "git status", "git log --oneline",
+                "git pull", "git commit -m x", "git commit -am x", "gh pr view 12", "gh pr list", "gh workflow list", "orca worktree rm --worktree x --run-hooks",
+                "git commit -F - <<'EOF'\nfeat: x\ngit push\nEOF", "git push-helper"]:
+        assert _externas(a, cmd) is None, cmd
+    assert _externas(a, "git push", tool="Edit") is None, "só Bash"
+
+
+def test_noite_externas_reset_hard_so_fora_de_worktree_ligada():
+    a = Amb(run="run_a")
+    _noite(a)
+    t = a.tmp.name
+    main, wt = os.path.join(t, "main"), os.path.join(t, "wt")
+    g = lambda *x: subprocess.run(["git", *x], cwd=main, check=True, capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    os.makedirs(main)
+    g("init", "-q"), g("commit", "-q", "--allow-empty", "-m", "i"), g("worktree", "add", "-q", wt, "-b", "w")
+    out = _externas(a, "git reset --hard HEAD~1", cwd=main)
+    assert out and out["permissionDecision"] == "deny", "checkout principal"
+    assert _externas(a, "git reset --hard HEAD~1", cwd=wt) is None, "worktree ligada (de worker)"
+    out = _externas(a, f"git -C {main} reset --hard", cwd=wt)
+    assert out and out["permissionDecision"] == "deny", "-C aponta para o checkout principal"
+    assert _externas(a, "git reset --soft HEAD~1", cwd=main) is None
+
+
+def test_noite_externas_hook_fica_abaixo_de_100_ms():
+    a = Amb(run="run_a")
+    _noite(a)
+    ev = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "session_id": "s1", "cwd": a.tmp.name}
+    t0 = time.time()
+    orq_mod._externas_negada(ev, orq_mod._cursor_ro())
+    assert time.time() - t0 < 0.1
+
+
+def _sem_git_env(a, **env):
+    """Tira do ambiente do teste as variáveis de git que a sessão do desenvolvedor pode ter (GIT_CONFIG_*, GIT_TERMINAL_PROMPT)."""
+    for k in [k for k in a.env if k.startswith("GIT_CONFIG_") or k == "GIT_TERMINAL_PROMPT"]:
+        del a.env[k]
+    a.env.update(env)
+
+
+def test_noite_despachar_soma_ao_git_config_que_o_ambiente_ja_tem():
+    a = Amb(run="run_a")
+    _sem_git_env(a, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.editor", GIT_CONFIG_VALUE_0="true")
+    _noite(a)
+    assert _despachar(a).returncode == 0
+    env = _log(a, "started-env.log")[0]
+    assert env["GIT_CONFIG_COUNT"] == "2" and env["GIT_CONFIG_KEY_0"] == "core.editor" and env["GIT_CONFIG_KEY_1"] == "commit.gpgsign" and env["GIT_CONFIG_VALUE_1"] == "false", env
+
+
+def test_noite_despachar_passa_o_ambiente_sem_prompt_e_grava_no_evento():
+    a = Amb(run="run_a")
+    _sem_git_env(a)
+    _noite(a)
+    assert _despachar(a).returncode == 0
+    env = _log(a, "started-env.log")[0]
+    assert {k: v for k, v in env.items() if v} == {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"}, env
+    assert [e for e in a.events() if e["tipo"] == "despacho"][0]["ambiente"] == ["GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]
+
+
+def test_despachar_fora_da_noite_nao_mexe_no_ambiente():
+    a = Amb(run="run_a")
+    _sem_git_env(a)
+    assert _despachar(a).returncode == 0
+    assert _log(a, "started-env.log")[0]["GIT_CONFIG_COUNT"] is None
+    assert "ambiente" not in [e for e in a.events() if e["tipo"] == "despacho"][0]
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
@@ -6484,3 +6582,4 @@ if __name__ == "__main__":
             print(f"FALHOU  {nome}: {type(e).__name__}: {str(e)[-400:]!r}")
     print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
     sys.exit(1 if falhas else 0)
+

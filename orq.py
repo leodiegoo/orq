@@ -744,7 +744,7 @@ def now():
 TIMEOUT_ORCA = float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)  # os testes sobem um processo Python por chamada e usam mais (B31)
 
 
-def orca(*args, timeout=TIMEOUT_ORCA, area="orchestration", sem_terminal=False, como=None, run=None):
+def orca(*args, timeout=TIMEOUT_ORCA, area="orchestration", sem_terminal=False, como=None, run=None, env_extra=None):
     """Único ponto que toca o Orca (`orca <area> ...`). Devolve `result` ou levanta RuntimeError.
 
     Com sem_terminal o Orca chama-o de um terminal sem ligação (SEM_LIGACAO): `worker-list` deixa de ser escopado a um Run e lista todos.
@@ -760,8 +760,8 @@ def orca(*args, timeout=TIMEOUT_ORCA, area="orchestration", sem_terminal=False, 
     if liga:
         with trava_gerente():
             _orca("run-use", "--id", liga, timeout=timeout, h=handle_orca())
-            return _orca(*args, timeout=timeout, area=area, h=handle_orca())
-    return _orca(*args, timeout=timeout, area=area, h=SEM_LIGACAO if sem_terminal else como or handle_orca())
+            return _orca(*args, timeout=timeout, area=area, h=handle_orca(), env_extra=env_extra)
+    return _orca(*args, timeout=timeout, area=area, h=SEM_LIGACAO if sem_terminal else como or handle_orca(), env_extra=env_extra)
 
 
 def _run_do_comando(area, args):
@@ -843,9 +843,11 @@ def trava_gerente():
             _TRAVA_GERENTE[0] = 0
 
 
-def _orca(*args, timeout, h, area="orchestration"):
+def _orca(*args, timeout, h, area="orchestration", env_extra=None):
     """Uma chamada ao binário do Orca com o handle `h` na variável ORCA_TERMINAL_HANDLE."""
     env = {**os.environ, "ORCA_TERMINAL_HANDLE": h} if h and h != os.environ.get("ORCA_TERMINAL_HANDLE") else None
+    if env_extra:
+        env = {**(env or os.environ), **env_extra}
     p = subprocess.run([ORCA, area, *args, "--json"], capture_output=True, text=True, timeout=timeout, env=env)
     out = json.loads(p.stdout)
     if not out.get("ok"):
@@ -1795,6 +1797,72 @@ def noite_desligar():
     return ligado
 
 
+# ---- modo noite: ações externas e ambiente do worker ----
+
+NOITE_GIT_CONFIG = ("commit.gpgsign", "false")  # sem assinatura: o pinentry não tem quem responda de madrugada
+
+
+def noite_ambiente(base=None):
+    """O ambiente extra do worker na noite: git sem prompt de credencial e sem assinatura. Soma ao GIT_CONFIG_COUNT que já existe, não o
+    sobrescreve. Devolve {variável: valor}."""
+    base = os.environ if base is None else base
+    n = int(base.get("GIT_CONFIG_COUNT") or 0) if str(base.get("GIT_CONFIG_COUNT") or "0").isdigit() else 0
+    return {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": NOITE_GIT_CONFIG[0], f"GIT_CONFIG_VALUE_{n}": NOITE_GIT_CONFIG[1]}
+
+
+_EXT_PRE = r"(?:^|[;&|(\n]\s*)(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env|command|time|sudo)\s+)*"  # só em posição de comando, como o worker-routing-guard
+_EXT_GIT = _EXT_PRE + r"git((?:\s+-\S+(?:\s+\S+)?)*)\s+"
+_EXT_GH = _EXT_PRE + r"gh(?:\s+-\S+(?:\s+\S+)?)*\s+"
+EXTERNAS_NOITE = [  # (o que é negado, regex sobre o comando sem aspas nem heredoc)
+    ("git push", re.compile(_EXT_GIT + r"push(?![-\w])")),
+    ("gh pr merge", re.compile(_EXT_GH + r"pr\s+merge(?![-\w])")),
+    ("gh workflow run (deploy)", re.compile(_EXT_GH + r"workflow\s+run(?![-\w])")),
+    ("git commit --no-verify", re.compile(_EXT_GIT + r"commit(?![-\w])[^;&|\n]*?\s(?:--no-verify|-[aeiopqsuvz]*n[a-zA-Z]*)(?=\s|$)")),
+    ("orca worktree rm --force", re.compile(_EXT_PRE + r"orca\s+worktree\s+rm(?![-\w])[^;&|\n]*\s(?:--force|-f)(?![-\w])")),
+]
+_EXT_RESET = re.compile(_EXT_GIT + r"reset(?![-\w])[^;&|\n]*\s--hard(?![-\w])")
+
+
+def _sem_texto(cmd):
+    """O comando sem corpo de heredoc nem texto entre aspas: o que está ali (uma mensagem de commit, um echo) não é comando."""
+    cmd = re.sub(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", r"\3", cmd, flags=re.S)
+    return re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
+
+
+def _externas_negada(ev, cur):
+    """O nome da ação externa que o Bash de `ev` faria com o modo noite ligado em `cur`, ou None. `git reset --hard` só vale dentro de
+    worktree ligada (a de um worker); no checkout principal perde o trabalho de todos. Só lê o cursor e, no reset, o git local."""
+    if (ev.get("tool_name") != "Bash" or not isinstance(ev.get("tool_input"), dict) or not isinstance(ev["tool_input"].get("command"), str)
+            or "--help" in ev["tool_input"]["command"]):
+        return None
+    cmd = _sem_texto(ev["tool_input"]["command"])
+    achado = next((nome for nome, rx in EXTERNAS_NOITE if rx.search(cmd)), None)
+    m = None if achado else _EXT_RESET.search(cmd)
+    if not (achado or m) or not noite_ativa(cur):
+        return None
+    if achado:
+        return achado
+    d = ev.get("cwd") or os.getcwd()
+    c = LUGAR_GIT_C.search(m.group(1) or "")
+    if c:
+        d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
+    gd, comum = ((_git(d, "rev-parse", "--absolute-git-dir", "--git-common-dir") or "").split() + ["", ""])[:2]
+    if not gd or os.path.realpath(gd) != os.path.realpath(os.path.join(d, comum)):
+        return None  # fora de repositório ou numa worktree ligada
+    return "git reset --hard no checkout principal"
+
+
+def hook_externas(ev, run):
+    """PreToolUse de Bash, em toda sessão (worker incluído): com o modo noite ligado nega push, merge de PR, deploy, commit sem hook,
+    `orca worktree rm --force` e `git reset --hard` no checkout principal. A mensagem diz para estacionar e como desligar. Desligado, nada muda."""
+    nome = _externas_negada(ev, _cursor_ro())
+    if not nome:
+        return None
+    motivo = (f"{MARCA} modo noite: `{nome}` é ação externa ou contorna um hook, e ninguém está olhando. Estacione a decisão com `orq pend add` e siga no que "
+              "é independente. Se o usuário voltou e autorizou, `orq noite desligar` libera. Commit que falha no pre-commit não se contorna: repare o que o hook apontou.")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
+
+
 # ---------- coordenador x worker ----------
 
 def _papeis():
@@ -2215,7 +2283,7 @@ def hook_session(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": contexto_sessao()}}
 
 
-HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar}
+HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar, "externas": hook_externas}
 
 
 def run_hook(kind):
@@ -2228,6 +2296,11 @@ def run_hook(kind):
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             return 0  # fora do Orca não há Run nem terminal: nem chama o Orca nem enche o log
         ev = json.load(sys.stdin)
+        if kind == "externas":  # todo Bash, de qualquer sessão: só lê o cursor, sem Orca
+            out = hook_externas(ev, None)
+            if out:
+                print(json.dumps(out, ensure_ascii=False))
+            return 0
         if kind == "lugar":  # a cada Bash/Edit: sem Orca, o coordenador é a sessão que já tem Run guardado e não é worker
             sid = ev.get("session_id") or ""
             if _dict(_cursor_ro().get("runs")).get(sid) and _papeis().get(sid) != "worker":
@@ -3265,13 +3338,14 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
     if spec is not None and not spec.lstrip().startswith("#"):
         spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
+    ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
     args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
             "--agent", "claude", "--model", modelo, "--effort", effort]
     for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
         if val:
             args += [flag, val]
     try:
-        res = orca(*args, timeout=180)
+        res = orca(*args, timeout=180, env_extra=ambiente)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"worker-start passou de 180 s sem resposta: o worker pode ter subido, confira com orq agentes --run {run}")
     task, dispatch = res.get("taskId"), res.get("dispatchId")
@@ -3285,7 +3359,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
     ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "modelo": modelo, "effort": effort, "terminal": terminal,
           **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
-          **({"ticket": tk["num"]} if tk else {})}
+          **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {})}
     append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if tk:  # B24: o ticket despachado deixa de ser "pronto para agente", senão uma sessão nova o despacharia de novo
