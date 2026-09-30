@@ -6569,6 +6569,255 @@ def test_despachar_fora_da_noite_nao_mexe_no_ambiente():
     assert _log(a, "started-env.log")[0]["GIT_CONFIG_COUNT"] is None
     assert "ambiente" not in [e for e in a.events() if e["tipo"] == "despacho"][0]
 
+# ---------- PR ligado à tarefa (ticket 42) ----------
+
+FAKE_GH = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+open(os.path.join(d, "gh.log"), "a").write(json.dumps(sys.argv[1:]) + "\\n")
+try:
+    dados = json.load(open(os.path.join(d, "gh.json")))
+except OSError:
+    dados = {}
+if sys.argv[3] not in dados:
+    sys.stderr.write("no pull requests found"); sys.exit(1)
+print(json.dumps(dados[sys.argv[3]]))
+"""
+PR1 = "https://github.com/acme/app/pull/1216"
+PR2 = "https://github.com/acme/app/pull/1220"
+
+
+def _gh(a, **env):
+    """Um gh falso no ambiente (ORQ_GH): responde com o que o gh.json tem por URL e anota cada chamada no gh.log."""
+    caminho = os.path.join(a.tmp.name, "gh")
+    with open(caminho, "w") as f:
+        f.write(FAKE_GH)
+    os.chmod(caminho, 0o755)
+    a.env.update({"ORQ_GH": caminho, "ORQ_PR_POLL_S": a.env.get("ORQ_PR_POLL_S", "0"), **env})
+
+
+def _pr(a, url, state="OPEN", base="development"):
+    dados = _log_json(a, "gh.json", {})
+    dados[url] = {"state": state, "mergedAt": "2026-09-30T12:00:00Z" if state == "MERGED" else None, "baseRefName": base}
+    a.set("gh.json", dados)
+
+
+def _log_json(a, nome, padrao):
+    try:
+        return json.load(open(os.path.join(a.fake, nome)))
+    except OSError:
+        return padrao
+
+
+def _gh_chamadas(a):
+    return _log(a, "gh.log")
+
+
+def _prs_env(**env):
+    a = Amb(run="run_a", **env)
+    _gh(a)
+    _pr(a, PR1)
+    return a
+
+
+def test_pr_ligar_lista_e_desligar():
+    a = _prs_env()
+    r = a.orq("pr", "ligar", "task_feat1", PR1, "--issue", "1210")
+    assert r.returncode == 0, r.stderr
+    item = json.loads(r.stdout)
+    assert (item["task"], item["url"], item["numero"], item["base"], item["estado"], item["issue"]) == ("task_feat1", PR1, 1216, "development", "aberto", 1210), item
+    (ev,) = [e for e in a.events() if e["tipo"] == "pr"]
+    assert (ev["op"], ev["task"], ev["url"]) == ("ligar", "task_feat1", PR1)
+    lista = a.orq("pr", "lista").stdout
+    assert "task_feat1" in lista and "#1216" in lista and "development" in lista and "aberto" in lista and "issue #1210" in lista, lista
+    assert "task_feat1" not in a.orq("pr", "lista", "--task", "task_outra").stdout
+    r = a.orq("pr", "desligar", "task_feat1", PR1)
+    assert r.returncode == 0, r.stderr
+    assert "nenhum PR" in a.orq("pr", "lista").stdout
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "desligar"]
+
+
+def test_pr_ligar_recusas():
+    a = _prs_env()
+    assert a.orq("pr", "ligar", "task_feat1", "https://example.com/x").returncode == 1
+    assert a.orq("pr", "ligar", "nao-e-task", PR1).returncode == 1
+    assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
+    r = a.orq("pr", "ligar", "task_feat1", PR1)
+    assert r.returncode == 1 and "já está ligado" in r.stderr, r
+    r = a.orq("pr", "desligar", "task_feat1", PR2)
+    assert r.returncode == 1 and "não está ligado" in r.stderr, r
+    assert len(json.load(open(os.path.join(a.home, "prs.json")))["itens"]) == 1
+
+
+def test_pr_ligar_guarda_o_estado_que_o_gh_ve_e_o_ja_mergeado_nao_acorda():
+    a = _prs_env()
+    _pr(a, PR1, "MERGED", "staging")
+    item = json.loads(a.orq("pr", "ligar", "task_feat1", PR1).stdout)
+    assert (item["estado"], item["base"], item["avisado"]) == ("mergeado", "staging", True), item
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert not [e for e in a.events() if e["tipo"] == "entrada"], "o usuário já sabe do PR que ele ligou depois do merge"
+
+
+def test_pr_ligar_sem_resposta_do_gh_registra_aberto_sem_base():
+    a = _prs_env()
+    item = json.loads(a.orq("pr", "ligar", "task_feat1", PR2).stdout)  # o gh falso não conhece o PR2
+    assert (item["estado"], item.get("base")) == ("aberto", None), item
+
+
+def test_pr_poll_merge_vira_uma_entrada_uma_so_vez():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    r = a.orq("pr", "poll", "--forcar")
+    assert r.returncode == 0, r.stderr
+    (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert ent["origem"] == "pr" and ent["ref"] == PR1 and ent["task"] == "task_feat1", ent
+    assert "PR #1216 entrou em development" in ent["texto"] and "pronto para staging" in ent["texto"], ent["texto"]
+    antes = len(_gh_chamadas(a))
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1, "o mesmo merge não vira outra entrada"
+    assert len(_gh_chamadas(a)) == antes, "PR já resolvido não volta ao gh"
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "entrou"]
+
+
+def test_pr_poll_fechado_sem_merge_vira_entrada_e_nao_sugere_o_proximo():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "CLOSED", "development")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert "PR #1216 fechado sem merge" in ent["texto"] and "pronto para" not in ent["texto"], ent["texto"]
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "fechou"]
+
+
+def test_pr_poll_pr_aberto_nao_gera_entrada():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert not [e for e in a.events() if e["tipo"] == "entrada"]
+
+
+def test_pr_poll_respeita_o_limite_de_frequencia():
+    a = _prs_env(ORQ_PR_POLL_S="600")
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    antes = len(_gh_chamadas(a))
+    assert a.orq("pr", "poll").returncode == 0
+    depois = len(_gh_chamadas(a))
+    assert depois == antes + 1, "o primeiro poll consulta o gh"
+    assert a.orq("pr", "poll").returncode == 0
+    assert len(_gh_chamadas(a)) == depois, "o segundo, dentro do limite, não chama o gh"
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert len(_gh_chamadas(a)) == depois + 1
+
+
+def test_pr_poll_sem_pr_aberto_nao_chama_o_gh():
+    a = _prs_env()
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert _gh_chamadas(a) == []
+
+
+def test_pr_poll_gh_fora_do_ar_deixa_o_pr_para_a_proxima_volta():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    a.env["ORQ_GH"] = "/nao/existe/gh"
+    r = a.orq("pr", "poll", "--forcar")
+    assert r.returncode == 0, r.stderr
+    assert json.load(open(os.path.join(a.home, "prs.json")))["itens"][0]["estado"] == "aberto"
+    assert not [e for e in a.events() if e["tipo"] == "entrada"]
+
+
+def test_pr_hooks_de_prompt_e_stop_nao_chamam_o_gh():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    antes = len(_gh_chamadas(a))
+    _pr(a, PR1, "MERGED")
+    assert a.prompt("oi").returncode == 0
+    assert a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"})).returncode == 0
+    assert a.orq("hook", "session", stdin=json.dumps({"session_id": "abcdef123456"})).returncode == 0
+    assert len(_gh_chamadas(a)) == antes, "só o poll fora dos hooks fala com a rede"
+
+
+def _linha_pr(a):
+    """A linha `PR <task>:` do `orq status` (a entrada aberta, no resumo, também cita o próximo ambiente)."""
+    (linha,) = [x for x in a.orq("status").stdout.splitlines() if x.startswith("PR task_")]
+    return linha
+
+
+def test_pr_status_mostra_o_ambiente_e_sugere_o_proximo_sem_abrir():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    assert "task_feat1" in _linha_pr(a) and "#1216 development aberto" in _linha_pr(a)
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    out = _linha_pr(a)
+    assert "#1216 development ✓" in out and "pronto para staging" in out, out
+    _pr(a, PR2, "OPEN", "staging")
+    a.orq("pr", "ligar", "task_feat1", PR2)
+    out = _linha_pr(a)
+    assert "#1220 staging aberto" in out and "pronto para" not in out, out
+    _pr(a, PR2, "MERGED", "staging")
+    a.orq("pr", "poll", "--forcar")
+    assert "pronto para main" in _linha_pr(a)
+    PR3 = PR1.replace("1216", "1230")
+    _pr(a, PR3, "MERGED", "main")
+    a.orq("pr", "ligar", "task_feat1", PR3)
+    out = _linha_pr(a)
+    assert "em main" in out and "pronto para" not in out, out
+
+
+def test_pr_entrada_aparece_no_prompt_e_fecha_com_intake():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "PR #1216 entrou em development" in ctx, ctx
+    assert len(ctx.splitlines()) <= 5
+    (ent,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    assert a.orq("intake", ent["id"], "conversa").returncode == 0
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "PR #1216" not in ctx, ctx
+
+
+def test_pr_aviso_digitado_no_coordenador_nao_vira_entrada_do_usuario():
+    assert orq_mod.origem("orq: PR #1216 entrou em development (task_feat1): pronto para staging.") == "aviso_orq"
+    a = _prs_env()
+    r = a.prompt("orq: PR #1216 entrou em development (task_feat1): pronto para staging. Entrada e1.")
+    assert r.returncode == 0 and not [e for e in a.events() if e.get("origem") == "usuario"]
+
+
+def test_pr_gerente_digita_o_aviso_no_coordenador_uma_vez():
+    a = _prs_env(ORCA_TERMINAL_HANDLE="term_ger")
+    _gerente(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert a.orq("gerente", "absorver").returncode == 0
+    envios = [e for e in _log(a, "send.log") if "--text" in e]
+    assert len(envios) == 1, envios
+    assert envios[0][envios[0].index("--terminal") + 1] == "term_coord"
+    texto = envios[0][envios[0].index("--text") + 1]
+    assert orq_mod.origem(texto) == "aviso_orq" and "PR #1216 entrou em development" in texto and "pronto para staging" in texto, texto
+    (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert ent["id"] in texto
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "entrou", "avisado"]
+
+
+def test_pr_gerente_com_coordenador_ocupado_tenta_de_novo_sem_duplicar_a_entrada():
+    a = _prs_env(ORCA_TERMINAL_HANDLE="term_ger")
+    _gerente(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    a.set("busy.json", ["term_coord"])
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert not [e for e in _log(a, "send.log") if "--text" in e]
+    a.set("busy.json", [])
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert len([e for e in _log(a, "send.log") if "--text" in e]) == 1
+    assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1
+
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
