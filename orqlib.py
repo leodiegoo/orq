@@ -433,11 +433,11 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
     agora = agora or datetime.now(timezone.utc)
     if isinstance((aberto or {}).get("agentes"), list):
         ags = reavalia(aberto["agentes"], events, agora, turnos)
-        vivos = [a for a in ags if a["estado"] in ("travado", "nao_comecou", "parado", "perguntando", "rodando")]
+        vivos = sorted((a for a in ags if a["estado"] in ("travado", "nao_comecou", "parado", "perguntando", "rodando")), key=lambda a: a.get("prioridade") or 2)
         sem_liberar = sum(a["estado"] == "entregue" and not a.get("retido") for a in ags)
         itens = []
         for a in vivos[:3]:
-            nome = f"{(a.get('task') or '?')[:9]}… "
+            nome = f"{'P' + str(a['prioridade']) + ' ' if a.get('prioridade') else ''}{(a.get('task') or '?')[:9]}… "
             itens.append(nome + (f"TRAVADO há {(a.get('idade_s') or 0) // 60} min" + (f" ({a['motivo']})" if a.get("motivo") else "") if a["estado"] == "travado"
                                  else f"NÃO COMEÇOU há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "nao_comecou"
                                  else f"parado no prompt há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "parado" else "pergunta" if a["estado"] == "perguntando"
@@ -2339,8 +2339,9 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
                          "nota": next((i["nota"] for i in ext if i.get("nota")), ""), "prs": [_pr_contrato(i) for i in g["itens"]]})
     hoje = agora.astimezone().date()
     pend = [{**i, "depois": bool(pend_depois(i, hoje))} for i in _dict(pendencias).get("itens", []) if isinstance(i, dict)]
-    rodando = [{"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde")}
-               for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA]
+    rodando = sorted(({"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde"),
+                       **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
+                      for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA), key=lambda r: r.get("prioridade") or 2)  # a mais alta primeiro
     if e2e:  # a fila do E2E é uma linha a mais em `rodando`: `presa` quando não anda
         rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
@@ -3977,6 +3978,7 @@ def agentes(run=None, todos=False, agora=None):
     for a in ags:
         if a["dispatch"] in nao_lidos:
             a["alerta"] = "steer não lido"
+        a["prioridade"] = prioridade_de(events, a["task"], a["dispatch"], a.get("titulo"))
     return ags if todos else [a for a in ags if not (a.get("titulo") or "").startswith(PREFIXO_PROVA)]
 
 
@@ -4003,7 +4005,7 @@ def texto_agentes(ags):
             hb += f" — esperando: {a['espera']}"
         elif a["estado"] == "travado" and a.get("motivo"):
             hb += f" — {a['motivo']}"
-        linhas.append(f"{a['estado']:<11} {a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
+        linhas.append(f"{a['estado']:<11} {'P' + str(a['prioridade']) + ' ' if a.get('prioridade') else ''}{a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
         for av in a.get("entrega") or []:
             linhas.append(f"            AVISO: {av}")
         if a.get("controle"):
@@ -4374,14 +4376,17 @@ def _conferir_inicio(dispatch, terminal, titulo, out):
     return _esperar_prompt(dispatch, terminal, titulo)
 
 
-def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None):
+def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
 
     Com `ticket` (o número de um `orq ticket novo`) o worker sobe na task que o ticket já criou (`worker-start --task`), sem título nem spec: o
-    ticket é o conteúdo. Com o modo noite ligado, recusa depois do horário, do teto de despachos ou das falhas seguidas (noite_checar).
+    ticket é o conteúdo. Com o modo noite ligado, recusa depois do horário, do teto de despachos ou das falhas seguidas (noite_checar). Recusa também
+    com o uso do plano acima do limiar (uso_checar). `prioridade` (1 alta a 3 baixa) fica no evento; sem ela vale a da frente do título (prioridade_padrao).
     """
+    if prioridade is not None and prioridade not in (1, 2, 3):
+        raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
     noite_checar()
     if (name or base_branch) and worktree != "new-top-level":
         raise ValueError("--name e --base-branch só valem com --worktree new-top-level (o Orca recusa criar worktree em current)")
@@ -4408,6 +4413,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 spec = f.read()
         except OSError as e:
             raise ValueError(f"não consegui ler {spec_arquivo}: {e.strerror}")
+    uso_checar(prioridade or prioridade_de(read_events(), tk and tk["task"], None, titulo))
     pedido = _texto_da_entrada(entrada)
     _adotar(run)
     if not run_do_coordenador(run):
@@ -4439,7 +4445,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
     ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "modelo": modelo, "effort": effort, "terminal": terminal,
           **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
-          **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {})}
+          **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
     append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if tk:  # B24: o ticket despachado deixa de ser "pronto para agente", senão uma sessão nova o despacharia de novo
@@ -4666,6 +4672,24 @@ def _gerente_a_religar(g, meu, vivos):
     return (morto, trocado) if morto or trocado else None
 
 
+def _subir_sessao(linha, sessao, modelo, cp, dica, msg=MSG_CONTINUE):
+    """`claude --resume` da `sessao` num terminal novo na worktree `linha["cwd"]`, evento `retomada` e conferência da tela. Devolve `linha` com o estado
+    (retomado, sem_atividade ou falhou)."""
+    comando = f"claude --resume {shlex.quote(sessao)}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(msg)}"
+    try:
+        novo = _terminal_novo(f"{linha['titulo']} (retomado)", comando, linha["cwd"])
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        return {**linha, "estado": "falhou", "aviso": f"terminal create falhou ({e}); {dica}"}
+    append_event({"tipo": "retomada", "dispatch": linha["dispatch"], "task": linha["task"], "run": linha["run"], "terminal": novo, "anterior": linha["terminal"],
+                  "sessao": sessao, "cwd": linha["cwd"], "modelo": modelo, "head": cp["head"], "sujo": cp["sujo"]})
+    try:
+        voltou = _voltou(novo)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        voltou, linha = False, {**linha, "aviso": f"não consegui ler a tela ({e})"}
+    return {**linha, "novo": novo, "estado": "retomado" if voltou else "sem_atividade",
+            **({} if voltou else {"aviso": f"{linha.get('aviso') or 'a tela não mostra atividade'}; {dica}"})}
+
+
 def retomar(dry_run=False, run=None):
     """Depois de uma queda: sobe o agent manager que morreu e retoma, em terminal novo, cada worker que ainda não deu worker_done e perdeu o terminal.
 
@@ -4691,7 +4715,8 @@ def retomar(dry_run=False, run=None):
                 novo = _terminal_novo("agent manager (retomado)", f"sh {shlex.quote(_path('painel-agent-manager.sh'))}")
             gerente_ligar(novo, g["runs"])
             res["gerente"] = {**res["gerente"], "novo": novo, "estado": "religado"}
-    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos]
+    pausados = _dict(_cursor_ro().get("pausados"))  # pausados pelo orçamento de uso voltam com `retomar --pausados`, não aqui
+    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and w.get("dispatchId") not in pausados]
     det, turnos, despachos = _detalhes(cand), _turnos_ro(), {e.get("dispatch"): e for e in read_events() if e.get("tipo") == "despacho"}
     for w in cand:
         d = w["dispatchId"]
@@ -4712,20 +4737,7 @@ def retomar(dry_run=False, run=None):
         if dry_run:
             res["workers"].append({**linha, "estado": "a_retomar"})
             continue
-        comando = f"claude --resume {shlex.quote(t['sessao'])}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(MSG_CONTINUE)}"
-        try:
-            novo = _terminal_novo(f"{titulo} (retomado)", comando, cwd)
-        except (RuntimeError, subprocess.TimeoutExpired) as e:
-            res["workers"].append({**linha, "estado": "falhou", "aviso": f"terminal create falhou ({e}); {dica}"})
-            continue
-        append_event({"tipo": "retomada", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": novo, "anterior": linha["terminal"],
-                      "sessao": t["sessao"], "cwd": cwd, "modelo": modelo, "head": cp["head"], "sujo": cp["sujo"]})
-        try:
-            voltou = _voltou(novo)
-        except (RuntimeError, subprocess.TimeoutExpired) as e:
-            voltou, linha["aviso"] = False, f"não consegui ler a tela ({e})"
-        res["workers"].append({**linha, "novo": novo, "estado": "retomado" if voltou else "sem_atividade",
-                               **({} if voltou else {"aviso": f"{linha.get('aviso') or 'a tela não mostra atividade'}; {dica}"})})
+        res["workers"].append(_subir_sessao(linha, t["sessao"], modelo, cp, dica))
     return res
 
 
@@ -4737,6 +4749,254 @@ def texto_retomar(res):
     for w in res["workers"]:
         ls.append(f"{w['dispatch']} {w['titulo']}: {w['estado']}" + (f" -> {w['novo']}" if w.get("novo") else "") + (f" ({w['aviso']})" if w.get("aviso") else ""))
     return "\n".join(ls) or "nada a retomar"
+
+
+# ---------- orçamento de uso do plano e pausa por prioridade (ticket 51) ----------
+
+# Fonte do uso: o Claude Code passa `rate_limits` ({five_hour, seven_day}: {used_percentage, resets_at}) no stdin do statusline, e o wrapper do HUD do
+# OMC (~/.claude/hud/omc-hud-cache.sh) grava esse JSON em hud/cache/stdin.<sessão>.json a cada quadro. É o mesmo número do rodapé (5h:…% wk:…%), o
+# mesmo para todas as sessões da conta, e ler o arquivo não chama rede nem o Orca: serve aos hooks.
+HUD_CACHE = os.environ.get("ORQ_HUD_CACHE") or os.path.expanduser("~/.claude/hud/cache")
+USO_FRESCO_S = 1800  # cache mais velho que isto não diz nada do uso de agora (nenhuma sessão desenhou o rodapé)
+USO = "uso.json"  # limiares, por cima de USO_PADRAO: {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}
+USO_PADRAO = {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}  # cinco_h: avisa e segura despacho novo até a janela virar
+PAUSA_ESPERA_S = float(os.environ.get("ORQ_PAUSA_ESPERA_S") or 300)  # quanto esperar cada worker escrever o PAUSA.md
+PAUSA_POLL_S = float(os.environ.get("ORQ_PAUSA_POLL_S") or 2)
+MSG_PAUSA = ("Pausa do coordenador (limite de uso do plano). Em até 3 linhas, escreva em PAUSA.md na raiz da sua worktree onde parou e o próximo passo, "
+             "pare qualquer E2E que tenha subido e encerre o turno. Não mande worker_done: você volta depois com claude --resume.")
+MSG_VOLTA = ("O uso do plano voltou ao normal e o coordenador retomou você. Leia o PAUSA.md na raiz da sua worktree, apague-o e siga do próximo passo. "
+             "Ao terminar, mande o worker_done como antes; se o Orca recusar por causa do handle novo, escreva o relatório final num arquivo "
+             "relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+_FRENTE_ALTA = re.compile(r"seguran|security|produ[cç][aã]o", re.I)
+_FRENTE_BAIXA = re.compile(r"failover|diagn[oó]stic|painel|digest", re.I)
+_FASE_FINAL = re.compile(r"review|verif|final", re.I)
+_FASE_INICIAL = re.compile(r"investig", re.I)
+
+
+def _janela_uso(j, agora):
+    """(percentual, reset) de uma janela do rate_limits; janela que já virou vale 0; sem número, (None, None)."""
+    p, r = _dict(j).get("used_percentage"), _dict(j).get("resets_at")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        return None, None
+    return (0 if isinstance(r, (int, float)) and r <= agora else p), r
+
+
+def uso_plano(agora=None):
+    """{semana, semana_reset, cinco_h, cinco_h_reset} do `rate_limits` do quadro mais novo do HUD (percentuais 0-100, resets em epoch), ou None
+    sem quadro fresco. Só lê arquivo: sem rede, sem Orca."""
+    agora = agora or time.time()
+    try:
+        arqs = sorted(glob.glob(os.path.join(HUD_CACHE, "stdin.*.json")), key=os.path.getmtime, reverse=True)
+    except OSError:
+        return None
+    for f in arqs:
+        try:
+            if agora - os.path.getmtime(f) > USO_FRESCO_S:
+                return None  # ordenado: os demais são mais velhos
+        except OSError:
+            continue
+        rl = _dict(_dict(_read_json(f)).get("rate_limits"))
+        (s, sr), (c, cr) = _janela_uso(rl.get("seven_day"), agora), _janela_uso(rl.get("five_hour"), agora)
+        if s is not None or c is not None:
+            return {"semana": s, "semana_reset": sr, "cinco_h": c, "cinco_h_reset": cr}
+    return None
+
+
+def _duracao(s):
+    """`1d8h` ou `0h19m`: o que falta para a janela virar."""
+    s = max(int(s), 0)
+    return f"{s // 86400}d{s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h{s % 3600 // 60:02d}m"
+
+
+def uso_nivel(uso, agora=None):
+    """(nivel, motivo, reset): `pausa` (semana acima do limiar de pausa) e `segura` (5 h acima do limiar) recusam despacho, `avisa` só avisa, `ok` ou
+    `desconhecido` (sem quadro fresco) não fazem nada. `reset` é o da janela que decidiu, para o aviso valer uma vez por janela."""
+    if not uso:
+        return "desconhecido", None, None
+    agora = agora or time.time()
+    cfg = {**USO_PADRAO, **{k: v for k, v in _dict(_read_json(_path(USO))).items() if k in USO_PADRAO and isinstance(v, (int, float))}}
+
+    def txt(nome, limiar):
+        r = uso[f"{nome}_reset"]
+        return f"{'semana' if nome == 'semana' else 'janela de 5 h'} em {uso[nome]:g}% (limiar {limiar:g}%)" + (f", vira em {_duracao(r - agora)}" if r else "")
+
+    s, c = uso["semana"], uso["cinco_h"]
+    if s is not None and s >= cfg["semana_pausa"]:
+        return "pausa", txt("semana", cfg["semana_pausa"]), uso["semana_reset"]
+    if c is not None and c >= cfg["cinco_h"]:
+        return "segura", txt("cinco_h", cfg["cinco_h"]), uso["cinco_h_reset"]
+    if s is not None and s >= cfg["semana_avisa"]:
+        return "avisa", txt("semana", cfg["semana_avisa"]), uso["semana_reset"]
+    return "ok", None, None
+
+
+def uso_checar(prioridade=2, agora=None):
+    """Recusa o despacho com ValueError se o uso do plano passou do limiar de pausa (semana) ou de segurar (5 h); a prioridade 1 passa pela segura da
+    janela de 5 h, mas não pela pausa da semana. Sem quadro fresco não recusa."""
+    nivel, motivo, _ = uso_nivel(uso_plano(agora), agora)
+    if nivel == "pausa" or (nivel == "segura" and prioridade != 1):
+        append_event({"tipo": "uso_parou", "nivel": nivel, "motivo": motivo})
+        raise ValueError(f"uso do plano: {motivo}; nada foi despachado. "
+                         + ("Rode orq pausar para abrir folga." if nivel == "pausa" else "Espere a janela virar, ou ajuste o limiar em uso.json."))
+
+
+def uso_avisar(agora=None):
+    """Digita no coordenador um aviso por (nível, janela): a primeira volta do painel depois de cruzar o limiar, e de novo só se o nível subir ou a
+    janela virar. Coordenador ocupado: a próxima volta tenta. Devolve as linhas do painel."""
+    g = _gerente_cfg()
+    if not g or not g.get("coordenador"):
+        return []
+    nivel, motivo, reset = uso_nivel(uso_plano(agora), agora)
+    if nivel in ("ok", "desconhecido"):
+        if nivel == "ok" and _cursor_ro().get("uso_aviso"):
+            _cursor_mut(lambda c: c.pop("uso_aviso", None))
+        return []
+    chave = f"{nivel}:{reset}"
+    if _dict(_cursor_ro().get("uso_aviso")).get("chave") == chave:
+        return []
+    acao = {"pausa": "orq despachar recusa; rode orq pausar", "segura": "orq despachar recusa até a janela virar", "avisa": "evite despachar o que não for urgente"}[nivel]
+    if digita(g["coordenador"], f"orq: uso do plano, {motivo}. {acao[0].upper() + acao[1:]}.") != "enviado":
+        return []
+    _cursor_mut(lambda c: c.__setitem__("uso_aviso", {"chave": chave, "ts": now()}))
+    append_event({"tipo": "uso_aviso", "nivel": nivel, "motivo": motivo})
+    return [f"uso do plano: {nivel} ({motivo}), coordenador avisado"]
+
+
+def prioridade_padrao(titulo):
+    """1 (alta) a 3 (baixa) pela frente do título: segurança e produção altas; failover, diagnóstico e painel baixas; o resto 2."""
+    return 1 if _FRENTE_ALTA.search(titulo or "") else 3 if _FRENTE_BAIXA.search(titulo or "") else 2
+
+
+def prioridade_de(events, task, dispatch, titulo):
+    """A prioridade da task: a última de `orq prioridade`, senão a do despacho (--prioridade), senão a da frente do título."""
+    for e in reversed(events):
+        if e.get("tipo") == "prioridade" and e.get("task") == task:
+            return e["valor"]
+    for e in reversed(events):
+        if e.get("tipo") == "despacho" and e.get("prioridade") and (e.get("dispatch") == dispatch or (task and e.get("task") == task)):
+            return e["prioridade"]
+    return prioridade_padrao(titulo)
+
+
+def prioridade_definir(task, valor):
+    """`orq prioridade <task> <1-3>`: troca a prioridade de uma task (a do despacho e a do padrão passam a valer menos). Vale antes e depois de a task rodar; o aberto.json é refeito para o digest e o orq agentes verem a troca."""
+    if valor not in (1, 2, 3):
+        raise ValueError("a prioridade é 1 (alta), 2 ou 3 (baixa)")
+    if not re.fullmatch(r"task_\w+", task or ""):
+        raise ValueError(f"{task!r} não é um id de task (task_…)")
+    ev = append_event({"tipo": "prioridade", "task": task, "valor": valor})
+    refresh_bg()
+    return ev
+
+
+def _lista_pausa(ags, events, tasks, ate_prioridade, pausados):
+    """(a pausar, preservados): os workers vivos escolhidos e os que o critério poupou, cada um com `prioridade`.
+
+    `tasks` (ids de task ou de dispatch) vale sozinho. Sem ele: prioridade >= `ate_prioridade`; sem o número, a baixa (3) e as que ainda só investigam.
+    Em verificação final a fase poupa em qualquer dos dois."""
+    vivos = [a for a in ags if a["estado"] in ("rodando", "travado", "nao_comecou", "parado", "perguntando") and a["dispatch"] not in pausados
+             and a.get("terminal") != os.environ.get("ORCA_TERMINAL_HANDLE")]
+    if tasks:
+        perdidas = set(tasks) - {x for a in vivos for x in (a["task"], a["dispatch"])}
+        if perdidas:
+            raise ValueError(f"sem worker vivo para {', '.join(sorted(perdidas))}")
+        return [a for a in vivos if a["task"] in tasks or a["dispatch"] in tasks], []
+    escolhidos, poupados = [], []
+    for a in vivos:
+        fase = a.get("fase") or ""
+        if a["prioridade"] >= (ate_prioridade or 3) or (ate_prioridade is None and _FASE_INICIAL.search(fase)):
+            (poupados if _FASE_FINAL.search(fase) else escolhidos).append(a)
+    return escolhidos, poupados
+
+
+def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
+    """Pausa workers para abrir folga no plano: manda MSG_PAUSA a cada um (steer), espera o PAUSA.md novo na worktree dele, fecha o terminal e grava o
+    dispatch em cursor.json `pausados` (sessão, cwd, modelo). O dispatch segue `dispatched` no Orca sem terminal; `orq retomar --pausados` o sobe.
+
+    Worker sem sessão ou cwd gravado não é pausado (não haveria como voltar). Sem PAUSA.md no prazo, o terminal fica aberto. Devolve
+    {pausados: [{dispatch, task, titulo, prioridade, estado…}], preservados: […]}."""
+    if ate_prioridade is not None and ate_prioridade not in (1, 2, 3):
+        raise ValueError("--ate-prioridade espera 1, 2 ou 3")
+    alvo, poupados = _lista_pausa(agentes(run), read_events(), set(tasks), ate_prioridade, _dict(_cursor_ro().get("pausados")))
+    turnos, saida, espera = _turnos_ro(), [], {}
+    for a in alvo:
+        t = _dict(turnos.get(a["dispatch"]))
+        cwd = t.get("cwd") or _checkpoint(a["dispatch"]).get("caminho")
+        linha = {"dispatch": a["dispatch"], "task": a["task"], "run": a["run"], "titulo": a.get("titulo"), "prioridade": a["prioridade"], "fase": a.get("fase"),
+                 "modelo": a.get("modelo"), "sessao": t.get("sessao"), "cwd": cwd, "terminal": a["terminal"]}
+        if not (linha["sessao"] and cwd and os.path.isdir(cwd) and a["terminal"]):
+            saida.append({**linha, "estado": "sem_sessao", "aviso": "sem session_id, worktree ou terminal: sem como voltar, não foi pausado"})
+        elif dry_run:
+            saida.append({**linha, "estado": "a_pausar"})
+        else:
+            arq = os.path.join(cwd, "PAUSA.md")
+            antes = os.path.getmtime(arq) if os.path.exists(arq) else 0
+            try:
+                steer(a["task"], MSG_PAUSA, a["run"])
+            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                saida.append({**linha, "estado": "falhou", "aviso": str(e)})
+                continue
+            espera[a["dispatch"]] = (linha, arq, antes)
+    fim = time.time() + PAUSA_ESPERA_S
+    while espera:
+        for d, (linha, arq, antes) in list(espera.items()):
+            if os.path.exists(arq) and os.path.getmtime(arq) > antes:
+                espera.pop(d)
+                saida.append(_fechar_pausado(linha))
+        if espera and time.time() < fim:
+            time.sleep(PAUSA_POLL_S)
+        elif espera:
+            saida += [{**linha, "estado": "sem_pausa_md", "aviso": f"sem PAUSA.md novo em {PAUSA_ESPERA_S:g} s: o terminal segue aberto"} for linha, _, _ in espera.values()]
+            break
+    return {"pausados": saida, "preservados": [{k: a.get(k) for k in ("dispatch", "task", "titulo", "prioridade", "fase")} for a in poupados]}
+
+
+def _fechar_pausado(linha):
+    """O PAUSA.md chegou: fecha o terminal do worker, guarda o dispatch em `pausados` e grava o evento."""
+    try:
+        orca("close", "--terminal", linha["terminal"], area="terminal")
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSA.md está escrito"}
+    guarda = {k: linha[k] for k in ("task", "run", "titulo", "prioridade", "modelo", "sessao", "cwd", "terminal")}
+    _cursor_mut(lambda c: c.setdefault("pausados", {}).__setitem__(linha["dispatch"], {**guarda, "desde": now()}))
+    append_event({"tipo": "pausa_plano", "dispatch": linha["dispatch"], **guarda})
+    return {**linha, "estado": "pausado"}
+
+
+def retomar_pausados(run=None, forcar=False):
+    """Sobe de volta (claude --resume, com MSG_VOLTA) os dispatches de cursor.json `pausados`, os de prioridade mais alta primeiro, e os tira da lista.
+    Com o uso ainda acima do limiar recusa, salvo `forcar`: senão o worker voltaria para pausar de novo."""
+    if not forcar:
+        nivel, motivo, _ = uso_nivel(uso_plano())
+        if nivel in ("pausa", "segura"):
+            raise ValueError(f"uso do plano ainda alto: {motivo}. Espere a janela virar ou use --forcar")
+    pausados = _dict(_cursor_ro().get("pausados"))
+    res = []
+    for d, p in sorted(pausados.items(), key=lambda kv: kv[1].get("prioridade") or 2):
+        if run and p.get("run") != run:
+            continue
+        linha = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p["titulo"], "prioridade": p.get("prioridade"), "modelo": p.get("modelo"),
+                 "sessao": p["sessao"], "cwd": p["cwd"], "terminal": p["terminal"]}
+        if not os.path.isdir(p["cwd"]):
+            res.append({**linha, "estado": "sem_worktree", "aviso": f"a pasta {p['cwd']} não existe: nada foi subido"})
+            continue
+        try:
+            cp = _checkpoint(d)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            cp = {"head": None, "sujo": None}
+        r = _subir_sessao(linha, p["sessao"], p.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão pausada não pôde ser retomada'", MSG_VOLTA)
+        if r["estado"] != "falhou":
+            _cursor_mut(lambda c, d=d: c.get("pausados", {}).pop(d, None))
+            append_event({"tipo": "pausa_fim", "dispatch": d, "task": p["task"], "terminal": r.get("novo")})
+        res.append(r)
+    return res
+
+
+def texto_pausar(res):
+    """Uma linha por worker pausado ou poupado."""
+    ls = [f"{w['dispatch']} P{w['prioridade']} {w.get('titulo') or w['task']}: {w['estado']}" + (f" ({w['aviso']})" if w.get("aviso") else "") for w in res["pausados"]]
+    ls += [f"{w['dispatch']} P{w['prioridade']} {w.get('titulo') or w['task']}: preservado (fase {w.get('fase')})" for w in res["preservados"]]
+    return "\n".join(ls) or "nenhum worker a pausar"
 
 
 def _avisos_gerente():
@@ -4847,7 +5107,7 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - o painel não cai por causa do acompanhamento dos steers; a próxima volta tenta
         log(f"steers: {type(e).__name__}: {e}")
     try:
-        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e()]
+        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar()]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     return "\n".join(linhas)
@@ -4960,6 +5220,7 @@ def main(argv=None):
     de.add_argument("--name")
     de.add_argument("--base-branch")
     de.add_argument("--entrada")
+    de.add_argument("--prioridade", type=int, choices=[1, 2, 3], help="1 alta a 3 baixa; sem ela vale a da frente do título (segurança e produção 1, failover, diagnóstico e painel 3)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
     tn = tk.add_parser("novo", help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
     tn.add_argument("--titulo", required=True)
@@ -4985,6 +5246,19 @@ def main(argv=None):
     rt.add_argument("--dry-run", action="store_true", help="só lista")
     rt.add_argument("--run", help="só os dispatches deste Run")
     rt.add_argument("--json", action="store_true")
+    rt.add_argument("--pausados", action="store_true", help="sobe os workers que o orq pausar parou (em vez dos que caíram); recusa com o uso ainda alto")
+    rt.add_argument("--forcar", action="store_true", help="com --pausados, sobe mesmo com o uso acima do limiar")
+    pz = sub.add_parser("pausar", help="pausa workers para abrir folga no plano: PAUSA.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
+    pz.add_argument("tasks", nargs="*", help="ids de task ou de dispatch; sem eles vale o critério de prioridade")
+    pz.add_argument("--ate-prioridade", type=int, choices=[1, 2, 3], help="pausa as de prioridade N e mais baixas (3 = só as baixas)")
+    pz.add_argument("--run")
+    pz.add_argument("--dry-run", action="store_true", help="só lista")
+    pz.add_argument("--json", action="store_true")
+    pr_ = sub.add_parser("prioridade", help="troca a prioridade (1 alta a 3 baixa) de uma task; o orq agentes, o digest, o orq pausar e a recusa por orçamento usam essa ordem")
+    pr_.add_argument("task")
+    pr_.add_argument("valor", type=int, choices=[1, 2, 3])
+    uz = sub.add_parser("uso", help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
+    uz.add_argument("--json", action="store_true")
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
@@ -5085,7 +5359,7 @@ def main(argv=None):
                 return 0
             print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
         elif a.cmd == "despachar":
-            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket)
+            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
@@ -5112,9 +5386,22 @@ def main(argv=None):
                 print(json.dumps(gerente_desligar(a.run), ensure_ascii=False))
             else:
                 print(gerente_absorver())
+        elif a.cmd == "retomar" and a.pausados:
+            r = {"gerente": None, "workers": retomar_pausados(a.run, a.forcar)}
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
         elif a.cmd == "retomar":
             r = retomar(a.dry_run, a.run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
+        elif a.cmd == "pausar":
+            r = pausar(a.tasks, a.ate_prioridade, a.run, a.dry_run)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_pausar(r))
+        elif a.cmd == "prioridade":
+            print(json.dumps(prioridade_definir(a.task, a.valor), ensure_ascii=False))
+        elif a.cmd == "uso":
+            u = uso_plano()
+            nivel, motivo, _ = uso_nivel(u)
+            print(json.dumps({"uso": u, "nivel": nivel, "motivo": motivo}, ensure_ascii=False) if a.json else
+                  f"{nivel}" + (f": {motivo}" if motivo else "") + (f" (semana {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (sem quadro fresco do HUD)"))
         elif a.cmd == "auditar-respostas":
             print(auditar_respostas(a.sessao), end="")
         else:

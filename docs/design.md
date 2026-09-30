@@ -57,6 +57,9 @@ The model does the classifying. The code only checks that a classification was r
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
 | `fim_dispatch` | `orq liberar`: `dispatch`, `motivo` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
 | `pr` (`op: ligar/desligar/sem_task/entrou/fechou/avisado`) | `orq pr`, the `prligar` hook, the poll, the manager loop |
+| `uso_aviso`, `uso_parou` | the manager loop warns the coordinator once per level and window; `orq despachar` refuses on budget |
+| `prioridade` | `orq prioridade <task> <1-3>`: `task`, `valor` |
+| `pausa_plano`, `pausa_fim` | `orq pausar` parked a worker (session, cwd, model); `orq retomar --pausados` resumed it |
 | `worker_done` | ingest: `msg`, `task`, `dispatch`, `outcome`, `subject`, one per inbox message (no report needed) |
 | `ausente_ligar`, `ausente_desligar` | `orq ausente` |
 | `resposta_coordenador` | the coordinator's Stop hook while away mode is on: `texto`, `sessao` |
@@ -256,6 +259,21 @@ From firstmate (`docs/agent-control.md`, `bin/fm-control.sh`): the session id is
 `worker_done` from a resumed session carries the same `dispatchId` in its payload, which is how ingest matches it, so the changed handle does not matter to orq. When Orca itself refuses the message the worker leaves `relatorio-final.md`; orq does not read it yet.
 
 `orq gerente desligar` used to refuse after a crash because `gerente.json` named the old coordinator. It now takes over when that coordinator's terminal is gone. `orq gerente ligar` does the same, and keeps the old Run list when the old coordinator or manager is gone (with both alive, a new manager still restarts the list).
+
+## Plan usage budget and pause by priority (ticket 51)
+
+Source of the numbers. Claude Code hands `rate_limits` (`five_hour` and `seven_day`, each `used_percentage` and `resets_at` in epoch seconds) to the statusline on stdin; the OMC HUD wrapper (`~/.claude/hud/omc-hud-cache.sh`) saves that JSON per session as `~/.claude/hud/cache/stdin.<session>.json` on every frame. It is the same figure as the footer (`5h:…% wk:…%`) and is account-wide, so `uso_plano` reads the newest frame (`ORQ_HUD_CACHE` overrides the folder). Reading a file means no network and no Orca call, so hooks can use it. A frame older than 30 min says nothing (level `desconhecido`, nothing is refused). A window whose `resets_at` already passed counts as 0%. Fixture: `fixtures/hud-stdin.json`.
+
+Thresholds live in `ORQ_HOME/uso.json`, over the defaults `{"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}`. Levels: `pausa` (week >= 92%), `segura` (5 h >= 90%), `avisa` (week >= 85%), `ok`. `orq uso` prints the level.
+
+- `orq despachar` refuses at `pausa` and `segura` (`uso_checar`, next to the night-mode breaker). Priority 1 passes the 5 h hold but not the weekly pause. The refusal names the window and when it turns.
+- The manager loop (`gerente absorver`) types one line into the coordinator per (level, window reset) through `uso_avisar`; going back to `ok` clears the memory, so the next crossing warns again.
+
+Priority. Every task has a priority, 1 (high) to 3 (low): the last `orq prioridade <task> <n>` event wins, then the `--prioridade` of the dispatch, then the default from the title (`prioridade_padrao`: security and production 1; failover, diagnostics, panel and digest 3; the rest 2). It shows in `orq agentes` (`P2`), in the "Vivos" line of `orq status`, and as `prioridade` on each `rodando` entry of `digest/atual.json`, sorted high first (the 8765 panel shows the same order with a `P<n>` badge). `orq pausar` and the budget refusal use it.
+
+`orq pausar [--ate-prioridade N] [task…]`. Targets: named tasks/dispatches alone; else priority >= N; with no argument priority 3 plus workers whose last heartbeat phase is `investigating`. A worker in a final phase (`review`, `verif`, `final`) is spared in both automatic modes (listed as `preservados`). For each target: refuse if `turnos.json` has no session/cwd (no way back), `steer` the pause message (write `PAUSA.md` at the worktree root with where it stopped and the next step, stop any E2E, end the turn, no `worker_done`), wait up to `ORQ_PAUSA_ESPERA_S` (300) for a `PAUSA.md` newer than the one that existed, then `orca terminal close` and store the dispatch in `cursor.json` `pausados` (task, session, cwd, model, priority) with a `pausa_plano` event. No new file in time: terminal stays open (`sem_pausa_md`). The dispatch stays `dispatched` in Orca with a dead terminal; plain `orq retomar` skips it.
+
+`orq retomar --pausados` resumes those with `claude --resume` (same `_subir_sessao` as the crash recovery, message asking to read and delete `PAUSA.md`), highest priority first, and writes `retomada` plus `pausa_fim`. It refuses while usage is still at `pausa`/`segura` unless `--forcar`.
 
 ## Worker idle state
 
