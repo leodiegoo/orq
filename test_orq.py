@@ -7877,6 +7877,38 @@ def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_gu
 
 
 
+# ---------- ticket 54: prligar com PRs de branches diferentes ----------
+
+PR3 = "https://github.com/acme/app/pull/1230"
+PR4 = "https://github.com/acme/app/pull/1231"
+
+
+def _despacho_por_nome(a, task, nome, dispatch):
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T03:00:00Z", "tipo": "despacho", "run": "run_a", "task": task, "dispatch": dispatch, "worktree": "new-top-level", "nome": nome}) + "\n")
+
+
+def test_it_should_link_each_pr_of_a_loop_to_the_task_that_owns_its_own_branch():
+    a, p, w = _ambiente_46()
+    a.set("workers.json", [])
+    _despacho_por_nome(a, "task_e2e", "fix/e2e-x", "ctx_e")
+    _despacho_por_nome(a, "task_2116", "fix/2116-y", "ctx_y")
+    for url, head in ((PR1, "fix/e2e-x"), (PR2, "fix/e2e-x"), (PR3, "fix/2116-y"), (PR4, "fix/2116-y")):
+        _pr(a, url)
+        dados = _log_json(a, "gh.json", {})
+        dados[url]["headRefName"] = head
+        a.set("gh.json", dados)
+    _pos_pr(a, p, cmd='for h in $HEADS; do gh pr create --head "$h" --base development; done', saida="\n".join([PR1, PR2, PR3, PR4]) + "\n")
+    por_task = {i["url"]: i["task"] for i in _prs_json(a)["itens"]}
+    assert por_task == {PR1: "task_e2e", PR2: "task_e2e", PR3: "task_2116", PR4: "task_2116"}, por_task
+
+
+def test_it_should_keep_one_literal_head_for_every_url_of_the_command():
+    a, p, w = _ambiente_46()
+    _pos_pr(a, p, cmd="for b in development staging; do gh pr create --head feat/w --base $b; done", saida=PR1 + "\n" + PR2 + "\n")
+    assert {i["task"] for i in _prs_json(a)["itens"]} == {"task_feat1"} and len(_prs_json(a)["itens"]) == 2
+
+
 # ---------- ticket 50: prligar com vários PRs, fila do E2E, aviso de PR uma vez só ----------
 
 def test_it_should_link_every_pr_url_in_one_gh_pr_create_command():

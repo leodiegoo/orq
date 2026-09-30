@@ -1895,11 +1895,25 @@ def task_do_ramo(head, wt, events):
     return None
 
 
-def pr_auto(url, head=None, wt=None):
-    """Liga o PR à task dona da branch (task_do_ramo) ou, sem dona, o põe em `sem_task`. Devolve o item; PR já conhecido: None."""
+def _head_do_pr(url):
+    """A branch de origem do PR pelo `gh pr view`, ou None (gh fora do ar, PR que não existe)."""
+    try:
+        r = subprocess.run([GH, "pr", "view", url, "--json", "headRefName"], capture_output=True, text=True, timeout=PR_GH_S)
+        return (json.loads(r.stdout).get("headRefName") or None) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return None
+
+
+def pr_auto(url, head=None, wt=None, cwd=None):
+    """Liga o PR à task dona da branch (task_do_ramo) ou, sem dona, o põe em `sem_task`. Devolve o item; PR já conhecido: None.
+
+    Sem `head` (o hook não soube a branch deste PR, como no laço de `gh pr create` com variável) ela vem do `gh pr view`, e a worktree dela do `cwd`."""
     d = _prs_ro()
     if any(i["url"] == url for i in d["itens"]) or any(x.get("url") == url for x in d.get("sem_task") or []):
         return None
+    if not head:
+        head = _head_do_pr(url)
+        wt = wt or (_worktrees_por_ramo(cwd).get(head) if head and cwd else None)
     task = task_do_ramo(head, wt, read_events())
     return pr_ligar(task, url) if task else pr_orfao(url, head)
 
@@ -3281,6 +3295,16 @@ def _orq_cli(*args):
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+def _worktrees_por_ramo(cwd):
+    """{branch: caminho da worktree} do `git worktree list` de `cwd`."""
+    wts = {}
+    for bloco in (_git(cwd, "worktree", "list", "--porcelain") or "").split("\n\n"):
+        campos = dict(l.split(" ", 1) for l in bloco.splitlines() if " " in l)
+        if campos.get("branch", "").startswith("refs/heads/"):
+            wts[campos["branch"][len("refs/heads/"):]] = campos.get("worktree")
+    return wts
+
+
 def hook_prligar(ev, run):
     """PostToolUse de Bash, só no coordenador: a saída de `gh pr create` traz a URL do PR; o orq a liga à task dona da branch (`orq pr auto`,
     fora do hook) ou a põe em "PR sem tarefa". A branch é a do `--head` ou a do cwd (com `cd <dir> &&` na frente, a dele). Só lê o prs.json."""
@@ -3302,16 +3326,18 @@ def hook_prligar(ev, run):
     heads = [h.split(":")[-1] for h in PR_HEAD.findall(cmd)]
     if not heads and (h := (_git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()):
         heads = [h]
-    # um --head por URL (laço com branches diferentes) casa na ordem; senão todas as URLs são da mesma branch
-    por_url = dict(zip(urls, heads)) if len(heads) == len(urls) > 1 else {u: (heads[0] if heads else None) for u in urls}
-    wts = {}
-    for bloco in (_git(cwd, "worktree", "list", "--porcelain") or "").split("\n\n"):
-        campos = dict(l.split(" ", 1) for l in bloco.splitlines() if " " in l)
-        if campos.get("branch", "").startswith("refs/heads/"):
-            wts[campos["branch"][len("refs/heads/"):]] = campos.get("worktree")
+    # um --head por URL (laço com branches diferentes) casa na ordem; um --head literal vale para todas; variável ou contagem que não fecha: a branch de cada
+    # URL vem do `gh pr view` no `orq pr auto`, fora do hook (None)
+    if len(heads) == len(urls) > 1:
+        por_url = dict(zip(urls, heads))
+    elif len(set(heads)) == 1 and "$" not in heads[0] and "`" not in heads[0]:
+        por_url = {u: heads[0] for u in urls}
+    else:
+        por_url = {u: None for u in urls}
+    wts = _worktrees_por_ramo(cwd)
     for url, head in por_url.items():
         wt = wts.get(head)
-        _orq_cli("pr", "auto", url, *(["--head", head] if head else []), *(["--wt", wt] if wt else []))
+        _orq_cli("pr", "auto", url, *(["--head", head] if head else ["--cwd", cwd]), *(["--wt", wt] if wt else []))
     quais = ", ".join(f"#{u.rsplit('/', 1)[1]} ({por_url[u] or 'branch desconhecida'})" for u in urls)
     msg = (f"{MARCA} PR {quais}: o orq os liga à task dona da branch; sem dona ele entra em "
            "\"PR sem tarefa\" no `orq status`. Confira com `orq pr lista`.")
@@ -5306,6 +5332,7 @@ def main(argv=None):
     pa.add_argument("url")
     pa.add_argument("--head")
     pa.add_argument("--wt")
+    pa.add_argument("--cwd", help="onde achar a worktree da branch quando o --head não veio (a branch sai do gh pr view)")
     pl2.add_argument("--tag", help="a etiqueta da feature no digest (segurança, failover, …)")
     pl2.add_argument("--nota", help="o que o PR faz, em uma ou duas frases, para o digest")
     pr.add_parser("lista").add_argument("--task")
@@ -5445,7 +5472,7 @@ def main(argv=None):
             if a.op == "ligar":
                 print(json.dumps(pr_ligar(a.task, a.url, a.issue, a.tag, a.nota), ensure_ascii=False))
             elif a.op == "auto":
-                print(json.dumps(pr_auto(a.url, a.head, a.wt), ensure_ascii=False))
+                print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
             elif a.op == "desligar":
                 pr_desligar(a.task, a.url)
                 print(f"PR desligado de {a.task}")
