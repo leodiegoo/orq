@@ -1,0 +1,67 @@
+{
+ "id": "abfb12e5-ca0d-bc5a-a621-0b8b05b72f2b",
+ "automationId": "4eb41ef5-5e02-a9c5-3537-ba7b0a4c0393",
+ "runNumber": 2,
+ "runContext": {
+  "kind": "workspace-run",
+  "projectId": "github:acme/demo-app",
+  "hostId": "local",
+  "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+  "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+  "path": "/home/user/demo-app"
+ },
+ "sourceContext": {
+  "kind": "task-source",
+  "provider": "github",
+  "projectId": "github:acme/demo-app",
+  "hostId": "local",
+  "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+  "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+  "providerIdentity": {
+   "provider": "github",
+   "owner": "acme",
+   "repo": "demo-app"
+  },
+  "accountLabel": null
+ },
+ "title": "Acompanhamento de cache (demo-app) run 2",
+ "scheduledFor": 1790701440000,
+ "status": "completed",
+ "trigger": "scheduled",
+ "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+ "workspaceDisplayName": "development",
+ "sessionKind": "terminal",
+ "chatSessionId": null,
+ "terminalSessionId": "b4b3fe9f-9902-f7d7-a6f3-cc89081f72d6",
+ "terminalPaneKey": "b4b3fe9f-9902-f7d7-a6f3-cc89081f72d6:f40b580c-9520-5702-b7b8-d396c0ae08de",
+ "terminalPtyId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app@@08825e85",
+ "outputSnapshot": {
+  "format": "plain_text",
+  "content": "Gravei o relatório em `.scratch/acompanhamento-cache/2026-09-29-tarde.md`. A janela vai das 12:08Z às 17:14Z e pega três deploys. Nenhum deles muda resultado de widget, e nenhum girou chave.\n\n## Itens da manhã, um a um\n\n1. **`schemaVersion` em PR que muda resultado: resolvido em parte.**\n2. **TTL de 48 h: resolvido.**\n3. **Segunda recarga: resolvido.**\n",
+  "capturedAt": 1790702223292,
+  "truncated": false
+ },
+ "precheckResult": null,
+ "usage": {
+  "status": "unavailable",
+  "provider": "claude",
+  "model": null,
+  "inputTokens": null,
+  "outputTokens": null,
+  "cacheReadTokens": null,
+  "cacheWriteTokens": null,
+  "reasoningOutputTokens": null,
+  "totalTokens": null,
+  "estimatedCostUsd": null,
+  "estimatedCostSource": null,
+  "providerSessionId": null,
+  "attribution": null,
+  "collectedAt": 1790701475775,
+  "unavailableReason": "no_matching_session",
+  "unavailableMessage": "No Claude usage session matched this run."
+ },
+ "error": null,
+ "startedAt": 1790701474929,
+ "dispatchedAt": 1790701475091,
+ "createdAt": 1790701474913
+}

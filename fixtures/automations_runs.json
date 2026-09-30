@@ -1,0 +1,176 @@
+{
+ "id": "88aa18a2-7518-266b-7ea2-472bbf6e9e74",
+ "ok": true,
+ "result": {
+  "runs": [
+   {
+    "id": "a1f03dec-d721-d2f5-ccbb-97a2a2f46e18",
+    "automationId": "4eb41ef5-5e02-a9c5-3537-ba7b0a4c0393",
+    "runNumber": 1,
+    "runContext": {
+     "kind": "workspace-run",
+     "projectId": "github:acme/demo-app",
+     "hostId": "local",
+     "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "path": "/home/user/demo-app"
+    },
+    "title": "Acompanhamento de cache (demo-app) run 1",
+    "scheduledFor": 1790683440000,
+    "status": "completed",
+    "trigger": "scheduled",
+    "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+    "workspaceDisplayName": "development",
+    "sessionKind": "terminal",
+    "chatSessionId": null,
+    "terminalSessionId": "0188f54d-246a-c690-0d89-c7a0588d172c",
+    "terminalPaneKey": "0188f54d-246a-c690-0d89-c7a0588d172c:711e2c29-3f9e-4fc9-1125-438813495b14",
+    "terminalPtyId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app@@766b801a",
+    "outputSnapshot": {
+     "format": "plain_text",
+     "content": "**Veredito: atenção.** O cache se comporta como projetado. A virada de dia saiu limpa, mas dois pontos pedem ação.\n\nO relatório está em `.scratch/acompanhamento-cache/2026-09-29-manha.md`. A janela vai de 28/09 22:58Z a 29/09 12:08Z.\n\n**Virada de dia (03:00Z) e primeira hora**\n- Às 03:00Z a marca d'água passou para o piso de 24 h e todas as chaves giraram.\n- Na primeira hora com tráfego, os métodos tiveram 0 acerto em 114 linhas.\n- Divergências: 0 em 6 comparações.\n",
+     "capturedAt": 1790684066535,
+     "truncated": false
+    },
+    "error": null,
+    "startedAt": 1790683468070,
+    "dispatchedAt": 1790683468186,
+    "createdAt": 1790683468061
+   },
+   {
+    "id": "99aeaa55-b701-4c22-b99a-66214acd4ac2",
+    "automationId": "823a3593-278d-4697-3f5a-6760a5ed07ad",
+    "runNumber": 4,
+    "runContext": {
+     "kind": "workspace-run",
+     "projectId": "github:acme/demo-app",
+     "hostId": "local",
+     "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "path": "/home/user/demo-app"
+    },
+    "title": "Auditoria diária (demo-app) run 4",
+    "scheduledFor": 1790679780000,
+    "status": "completed",
+    "trigger": "scheduled",
+    "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+    "workspaceDisplayName": "development",
+    "sessionKind": "terminal",
+    "chatSessionId": null,
+    "terminalSessionId": null,
+    "terminalPaneKey": null,
+    "terminalPtyId": null,
+    "outputSnapshot": {
+     "format": "plain_text",
+     "content": "O relatório está em `.scratch/auditoria-diaria/2026-09-29.md` e o resumo foi salvo na memória. É o primeiro relatório da pasta.\n\nOs erros de ontem pararam depois do deploy das 22:13Z. Os pods novos não reiniciaram nenhuma vez.\n\nNovo desde ontem, além do item 1 da lista abaixo:\n- Um cliente com token vencido tentou de novo cerca de 150 vezes.\n- O script diário de métricas sai com a lista de erros vazia.\n",
+     "capturedAt": 1790680194490,
+     "truncated": false
+    },
+    "error": null,
+    "startedAt": 1790679807989,
+    "dispatchedAt": 1790679808147,
+    "createdAt": 1790679807977
+   },
+   {
+    "id": "dae576a5-96d6-ba64-1c50-5add70b3ca60",
+    "automationId": "823a3593-278d-4697-3f5a-6760a5ed07ad",
+    "runNumber": 3,
+    "runContext": {
+     "kind": "workspace-run",
+     "projectId": "github:acme/demo-app",
+     "hostId": "local",
+     "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "path": "/home/user/demo-app"
+    },
+    "title": "Weekday repo audit run 3",
+    "scheduledFor": 1790597385839,
+    "status": "completed",
+    "trigger": "manual",
+    "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+    "workspaceDisplayName": "development",
+    "sessionKind": "terminal",
+    "chatSessionId": null,
+    "terminalSessionId": "d0abc735-5278-65ab-999a-f448ae2c0b82",
+    "terminalPaneKey": "d0abc735-5278-65ab-999a-f448ae2c0b82:d14c024e-c325-872e-7c68-3f1a7169c301",
+    "terminalPtyId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app@@34d89763",
+    "outputSnapshot": {
+     "format": "plain_text",
+     "content": "O repositório está saudável e nada em produção está quebrado agora. A única exceção é o script `test-unit` da raiz.\n\n## Repositório\n\n| Item | Estado |\n|---|---|\n| Branch | `development` sincronizada com a origin |\n| Testes | Todos passaram |\n| Dependências | Uma biblioteca de banco com vulnerabilidade alta; o PR de atualização já está aberto |\n",
+     "capturedAt": 1790597721848,
+     "truncated": false
+    },
+    "error": null,
+    "startedAt": 1790597385846,
+    "dispatchedAt": 1790597385966,
+    "createdAt": 1790597385839
+   },
+   {
+    "id": "0dbb63c1-2ff8-9415-0b2a-eb2af6419512",
+    "automationId": "823a3593-278d-4697-3f5a-6760a5ed07ad",
+    "runNumber": 2,
+    "runContext": {
+     "kind": "workspace-run",
+     "projectId": "github:acme/demo-app",
+     "hostId": "local",
+     "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "path": "/home/user/demo-app"
+    },
+    "title": "Weekday repo audit run 2",
+    "scheduledFor": 1790593200000,
+    "status": "skipped_unavailable",
+    "trigger": "scheduled",
+    "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+    "workspaceDisplayName": null,
+    "sessionKind": "terminal",
+    "chatSessionId": null,
+    "terminalSessionId": null,
+    "terminalPaneKey": null,
+    "terminalPtyId": null,
+    "outputSnapshot": null,
+    "error": "The target project is no longer available.",
+    "startedAt": 1790597337909,
+    "dispatchedAt": null,
+    "createdAt": 1790597337895
+   },
+   {
+    "id": "813db9e5-d572-7768-8acf-0592efd35ca6",
+    "automationId": "823a3593-278d-4697-3f5a-6760a5ed07ad",
+    "runNumber": 1,
+    "runContext": {
+     "kind": "workspace-run",
+     "projectId": "github:acme/demo-app",
+     "hostId": "local",
+     "projectHostSetupId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "repoId": "9019025a-a4c0-c239-37b0-57db39eae181",
+     "path": "/home/user/demo-app"
+    },
+    "title": "Weekday repo audit run 1",
+    "scheduledFor": 1790334000000,
+    "status": "completed",
+    "trigger": "scheduled",
+    "workspaceId": "9019025a-a4c0-c239-37b0-57db39eae181::/home/user/demo-app",
+    "workspaceDisplayName": "development",
+    "sessionKind": "terminal",
+    "chatSessionId": null,
+    "terminalSessionId": null,
+    "terminalPaneKey": null,
+    "terminalPtyId": null,
+    "outputSnapshot": {
+     "format": "plain_text",
+     "content": "Resumo: o repositório está saudável depois de reinstalar as dependências.\n\n## Saúde do repositório\n\n| Item | Estado |\n|---|---|\n| Lint e tipos | 0 erros, 50 warnings |\n| Testes unitários | Todos verdes |\n| Branch local | 14 commits atrás da origin |\n",
+     "capturedAt": 1790334382892,
+     "truncated": false
+    },
+    "error": null,
+    "startedAt": 1790334035442,
+    "dispatchedAt": 1790334035693,
+    "createdAt": 1790334035423
+   }
+  ]
+ },
+ "_meta": {
+  "runtimeId": "0ea7b425-c680-4a6f-bb30-1318a5025bfe"
+ }
+}
