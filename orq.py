@@ -1231,7 +1231,8 @@ def registra_turno(kind, ev):
             return False
         if kind == "prompt":
             antigo = _dict(turnos.pop(d, None))  # o pop leva o dispatch reaberto para o fim da ordem
-            turnos[d] = {"task": task or antigo.get("task"), "sessao": sid, "inicio": agora, "fim": None}
+            turnos[d] = {"task": task or antigo.get("task"), "sessao": sid, "inicio": agora, "fim": None,
+                         **({"cwd": antigo.get("cwd") or ev.get("cwd")} if antigo.get("cwd") or ev.get("cwd") else {})}  # o cwd é o do lançamento: o `claude --resume` só acha a sessão nele (ticket 48)
         else:
             turnos[d]["fim"] = agora
         corte = _ts(agora) - timedelta(days=TURNOS_DIAS)
@@ -3768,7 +3769,8 @@ def _workers_todos(run=None):
         cursor = (res.get("page") or {}).get("nextCursor")
         if not cursor:
             break
-    return ws
+    novos = {e["dispatch"]: e["terminal"] for e in read_events() if e.get("tipo") == "retomada" and e.get("dispatch") and e.get("terminal")}  # o `orq retomar` subiu outro terminal: o Orca segue apontando o morto
+    return [{**w, "agentTerminalHandle": novos[w["dispatchId"]]} if w.get("dispatchId") in novos else w for w in ws]
 
 
 def _retencao(w, humanos=frozenset()):
@@ -3803,6 +3805,12 @@ def _terminais_vivos():
     except Exception as e:  # noqa: BLE001
         log(f"agentes: terminal list: {type(e).__name__}: {e}")
         return None
+
+
+def _morto(handle):
+    """O terminal não está no `orca terminal list`. Sem lista (Orca falhou ou cortou) não prova nada: False."""
+    vivos = _terminais_vivos()
+    return vivos is not None and handle not in vivos
 
 
 def _ativo(w):
@@ -4484,6 +4492,8 @@ def gerente_ligar(terminal, runs=None):
         raise ValueError(f"terminal {terminal} não existe no Orca ({e})") from e
     antes = _gerente_cfg()
     ja = antes["runs"] if antes.get("coordenador") == meu and antes.get("gerente") == terminal else []
+    if antes and not ja and (_morto(antes.get("coordenador")) or _morto(antes.get("gerente"))):
+        ja = antes["runs"]  # queda: o coordenador ou o gerente antigo não existem mais, os Runs deles seguem no gerente novo (ticket 48)
     todos = list(dict.fromkeys([*ja, *runs]))
     _write_json(_path(GERENTE), {"coordenador": meu, "gerente": terminal, "runs": todos})
     try:
@@ -4503,6 +4513,8 @@ def gerente_desligar(run=None):
     ficam sem coordenador até um `run-use`."""
     g = _gerente_cfg()
     meu = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if g and g.get("coordenador") != meu and _morto(g.get("coordenador")):
+        g = {**g, "coordenador": meu}  # queda: o terminal do coordenador antigo não existe mais, este o substitui (ticket 48)
     if not g or g.get("coordenador") != meu:
         raise ValueError("agent manager não está ligado a este coordenador")
     if run and run not in g["runs"]:
@@ -4523,6 +4535,117 @@ def gerente_desligar(run=None):
         for r in devolvidos:
             orca("run-use", "--id", r, como=meu)
     return append_event({"tipo": "gerente", "op": "desligar", "terminal": g.get("gerente"), "run": devolvidos[-1] if devolvidos else None, "runs": devolvidos})
+
+
+# ---------- retomar depois de uma queda (ticket 48) ----------
+
+RETOMAR_ESPERA_S = float(os.environ.get("ORQ_RETOMAR_ESPERA_S") or 20)  # quanto esperar a sessão retomada mostrar atividade antes de dizer que não voltou
+MSG_CONTINUE = ("Continue de onde parou. A sessão caiu por uma queda de energia; o terminal e o handle do Orca mudaram. Antes: confira git status e o estado da "
+                "sua worktree, e se estava esperando uma suíte, rode-a de novo (a fila do E2E foi liberada). Ao terminar, mande o worker_done como antes; se o "
+                "Orca recusar por causa do handle novo, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
+
+
+def _terminal_novo(titulo, comando, cwd=None):
+    """`orca terminal create` (na worktree `cwd`, ou na atual) e o handle do terminal novo."""
+    args = ["create", "--title", titulo, "--command", comando, *(["--worktree", f"path:{cwd}"] if cwd else [])]
+    return orca(*args, area="terminal", timeout=30)["terminal"]["handle"]
+
+
+def _voltou(handle):
+    """A sessão do terminal mostra atividade: `esc to interrupt` na tela, ou a tela mudou entre duas leituras; TELA_FALHA é que não voltou."""
+    antes, fim = None, time.time() + RETOMAR_ESPERA_S
+    while True:
+        tela = "\n".join(orca("read", "--terminal", handle, "--screen", area="terminal")["terminal"].get("tail") or [])
+        if any(f in tela for f in TELA_FALHA):
+            return False
+        if "esc to interrupt" in tela or (antes is not None and tela != antes):
+            return True
+        antes = tela
+        if time.time() >= fim:
+            return False
+        time.sleep(1)
+
+
+def _gerente_a_religar(g, meu, vivos):
+    """(terminal do gerente morreu, coordenador do gerente.json mudou) quando o gerente.json é deste coordenador ou de um que morreu; senão None (outro coordenador vivo é dono)."""
+    if not g or (g.get("coordenador") != meu and g.get("coordenador") in vivos):
+        return None
+    morto, trocado = g["gerente"] not in vivos, g.get("coordenador") != meu
+    return (morto, trocado) if morto or trocado else None
+
+
+def retomar(dry_run=False, run=None):
+    """Depois de uma queda: sobe o agent manager que morreu e retoma, em terminal novo, cada worker que ainda não deu worker_done e perdeu o terminal.
+
+    Worker retomado: `orca terminal create --worktree path:<cwd> --command "claude --resume <sessão> --model <modelo> ... '<continue>'"`, com a sessão e o
+    cwd que os hooks do worker gravaram em turnos.json (o cwd cai para a worktree do worker-show). O terminal novo vira o do dispatch (evento `retomada`, que
+    o _workers_todos aplica) e a tela dele é conferida. O agent manager sobe `painel-agent-manager.sh` numa aba nova e religa os Runs dele a este coordenador.
+    `dry_run` só lista. Sem lista de terminais confiável (Orca falhou ou cortou) recusa: sem prova de quem morreu não se sobe nada."""
+    meu = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if not meu:
+        raise ValueError("fora de um terminal do Orca (sem ORCA_TERMINAL_HANDLE)")
+    vivos = _terminais_vivos()
+    if vivos is None:
+        raise ValueError("o Orca não listou os terminais: sem prova de quem morreu, nada foi retomado")
+    g = _gerente_cfg()
+    plano = _gerente_a_religar(g, meu, vivos)
+    res = {"gerente": None, "workers": []}
+    if plano:
+        morto, _ = plano
+        res["gerente"] = {"terminal": g["gerente"], "runs": g["runs"], "estado": "a_subir" if morto else "a_religar"}
+        if not dry_run:
+            novo = g["gerente"]
+            if morto:
+                novo = _terminal_novo("agent manager (retomado)", f"sh {shlex.quote(_path('painel-agent-manager.sh'))}")
+            gerente_ligar(novo, g["runs"])
+            res["gerente"] = {**res["gerente"], "novo": novo, "estado": "religado"}
+    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos]
+    det, turnos, despachos = _detalhes(cand), _turnos_ro(), {e.get("dispatch"): e for e in read_events() if e.get("tipo") == "despacho"}
+    for w in cand:
+        d = w["dispatchId"]
+        t = _dict(turnos.get(d))
+        modelo = (det.get(d) or {}).get("modelo") or (despachos.get(d) or {}).get("modelo")
+        titulo = (det.get(d) or {}).get("titulo") or (despachos.get(d) or {}).get("titulo") or d
+        cp = _checkpoint(d)  # do firstmate: a worktree tem de existir, e o head e os arquivos sujos ficam registrados antes de subir o agente
+        cwd = t.get("cwd") or cp["caminho"]
+        linha = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": titulo, "modelo": modelo, "sessao": t.get("sessao"), "cwd": cwd,
+                 "terminal": w.get("agentTerminalHandle")}
+        dica = f"suba outro worker do spec da task com: orq relancar {d} --nota 'a sessão não pôde ser retomada'"  # do firstmate: sem sessão, o brief em disco é a instrução durável
+        if not linha["sessao"] or not cwd:
+            res["workers"].append({**linha, "estado": "sem_sessao", "aviso": f"sem session_id ou cwd gravado (o hook de turno não viu este worker): {dica}"})
+            continue
+        if not os.path.isdir(cwd):
+            res["workers"].append({**linha, "estado": "sem_worktree", "aviso": f"a pasta {cwd} não existe: nada foi subido"})
+            continue
+        if dry_run:
+            res["workers"].append({**linha, "estado": "a_retomar"})
+            continue
+        comando = f"claude --resume {shlex.quote(t['sessao'])}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(MSG_CONTINUE)}"
+        try:
+            novo = _terminal_novo(f"{titulo} (retomado)", comando, cwd)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            res["workers"].append({**linha, "estado": "falhou", "aviso": f"terminal create falhou ({e}); {dica}"})
+            continue
+        append_event({"tipo": "retomada", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": novo, "anterior": linha["terminal"],
+                      "sessao": t["sessao"], "cwd": cwd, "modelo": modelo, "head": cp["head"], "sujo": cp["sujo"]})
+        try:
+            voltou = _voltou(novo)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            voltou, linha["aviso"] = False, f"não consegui ler a tela ({e})"
+        res["workers"].append({**linha, "novo": novo, "estado": "retomado" if voltou else "sem_atividade",
+                               **({} if voltou else {"aviso": f"{linha.get('aviso') or 'a tela não mostra atividade'}; {dica}"})})
+    return res
+
+
+def texto_retomar(res):
+    """Uma linha por item, dizendo o que foi (ou seria) feito."""
+    g, ls = res["gerente"], []
+    if g:
+        ls.append(f"gerente {g['terminal']}: {g['estado']}" + (f" -> {g['novo']}" if g.get("novo") else "") + f" ({len(g['runs'])} Run(s))")
+    for w in res["workers"]:
+        ls.append(f"{w['dispatch']} {w['titulo']}: {w['estado']}" + (f" -> {w['novo']}" if w.get("novo") else "") + (f" ({w['aviso']})" if w.get("aviso") else ""))
+    return "\n".join(ls) or "nada a retomar"
 
 
 def _avisos_gerente():
@@ -4767,6 +4890,10 @@ def main(argv=None):
     gd = ge.add_parser("desligar", help="no coordenador: devolve um Run (--run) ou todos a este terminal")
     gd.add_argument("--run")
     ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
+    rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
+    rt.add_argument("--dry-run", action="store_true", help="só lista")
+    rt.add_argument("--run", help="só os dispatches deste Run")
+    rt.add_argument("--json", action="store_true")
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
@@ -4894,6 +5021,9 @@ def main(argv=None):
                 print(json.dumps(gerente_desligar(a.run), ensure_ascii=False))
             else:
                 print(gerente_absorver())
+        elif a.cmd == "retomar":
+            r = retomar(a.dry_run, a.run)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
         elif a.cmd == "auditar-respostas":
             print(auditar_respostas(a.sessao), end="")
         else:

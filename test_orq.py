@@ -76,6 +76,14 @@ def turno_comeca(dispatch):
     os.makedirs(os.path.dirname(p), exist_ok=True); json.dump(t, open(p, "w"))
 if (os.environ.get("FAKE_FAIL") == cmd and cmd != "send") or (os.environ.get("FAKE_FAIL_RUN") and run == os.environ["FAKE_FAIL_RUN"]):
     falha("falhou " + cmd)
+if sys.argv[1] == "terminal" and cmd == "create":
+    # orca terminal create: grava no create.log, dá o handle term_ret<N> e o põe no terminals.json (ticket 48); FAKE_FAIL_CREATE_PATH falha nessa worktree
+    if os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", ""):
+        falha("selector_not_found")
+    open(os.path.join(d, "create.log"), "a").write(json.dumps(a) + "\\n")
+    novo = "term_ret%d" % len(ler_linhas("create.log"))
+    json.dump(ler("terminals.json", []) + [novo], open(os.path.join(d, "terminals.json"), "w"))
+    print(json.dumps({"ok": True, "result": {"terminal": {"handle": novo, "title": opt("--title")}}})); sys.exit(0)
 if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
     # orca terminal close|rename|send: grava no close.log|rename.log|send.log; close tira o handle do terminals.json
     open(os.path.join(d, cmd + ".log"), "a").write(json.dumps(a) + "\\n")
@@ -106,7 +114,7 @@ if sys.argv[1] == "terminal" and cmd == "wait":
 if sys.argv[1] == "terminal" and cmd == "read":
     # drafts.json: {handle: texto que o usuário deixou na caixa}
     rascunho = ler("drafts.json", {}).get(opt("--terminal"))
-    print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal"), "status": "running", "tail": [], **({"draft": rascunho} if rascunho else {})}}})); sys.exit(0)
+    print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal"), "status": "running", "tail": ler("screens.json", {}).get(opt("--terminal"), []), **({"draft": rascunho} if rascunho else {})}}})); sys.exit(0)
 if sys.argv[1] == "terminal" and cmd == "list":
     # orca terminal list: terminals.json guarda os handles vivos; sem o arquivo, todo worker do workers.json tem terminal aberto
     vivos = ler("terminals.json", None)
@@ -7696,6 +7704,163 @@ def test_ausente_stop_do_worker_nao_gera_digest():
     json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
     _stop(a, last_assistant_message="oi")
     assert not os.path.exists(os.path.join(a.home, "digest"))
+
+
+# ---------- ticket 48: orq retomar ----------
+
+def _w48(handle, run="run_a", **kw):
+    return {"handle": handle, "run": run, "status": "dispatched", "dispatch": "ctx_" + handle, "task": "task_" + handle, **kw}
+
+
+def _turno48(a, **por_dispatch):
+    json.dump({d: {"task": "task_x", "sessao": v[0], "inicio": "2026-09-30T14:00:00Z", "fim": None, **({"cwd": v[1]} if v[1] else {})} for d, v in por_dispatch.items()},
+              open(os.path.join(a.home, "turnos.json"), "w"))
+
+
+def _queda48(a):
+    """Depois da queda: o w1 (opus) e o w3 (sem sessão gravada) perderam o terminal, o w2 tem terminal vivo e o w4 já terminou."""
+    os.makedirs(a.home, exist_ok=True)
+    a.wt = os.path.join(a.tmp.name, "wt")
+    for n in ("w1", "w2", "w4"):
+        os.makedirs(os.path.join(a.wt, n))
+    a.set("workers.json", [_w48("term_w1", modelo="claude-opus-5-5"), _w48("term_w2"), _w48("term_w3"), _w48("term_w4", status="completed")])
+    a.set("tasks_run_a.json", [{"id": "task_term_w1", "task_title": "Ticket 99"}, {"id": "task_term_w3", "task_title": "Sem sessão"}])
+    a.set("terminals.json", ["term_coord", "term_w2"])
+    _turno48(a, ctx_term_w1=("sess-w1", a.wt + "/w1"), ctx_term_w2=("sess-w2", a.wt + "/w2"), ctx_term_w4=("sess-w4", a.wt + "/w4"))
+
+
+def test_ticket48_hook_do_worker_grava_sessao_e_cwd_do_lancamento_por_dispatch():
+    a = Amb(run=None)
+    _hook(a, "prompt", prompt=PREAMBULO_24, cwd="/wt/t24")
+    t = _turnos(a)["ctx_d24"]
+    assert t["sessao"] == "abcdef123456" and t["cwd"] == "/wt/t24", t
+    _hook(a, "stop", cwd="/wt/t24/sub")
+    _hook(a, "prompt", prompt="ajuste: use o outro arquivo", cwd="/wt/t24/sub")  # o worker deu cd: o cwd de lançamento é o que vale
+    assert _turnos(a)["ctx_d24"]["cwd"] == "/wt/t24" and _turnos(a)["ctx_d24"]["sessao"] == "abcdef123456"
+
+
+def test_ticket48_retomar_dry_run_lista_so_sem_worker_done_e_sem_terminal_vivo():
+    a = Amb(run="run_a")
+    _queda48(a)
+    r = a.orq("retomar", "--dry-run", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert [(w["dispatch"], w["estado"]) for w in res["workers"]] == [("ctx_term_w1", "a_retomar"), ("ctx_term_w3", "sem_sessao")], res
+    w1 = res["workers"][0]
+    assert (w1["sessao"], w1["cwd"], w1["modelo"], w1["titulo"]) == ("sess-w1", a.wt + "/w1", "claude-opus-5-5", "Ticket 99"), w1
+    assert not _log(a, "create.log") and res["gerente"] is None
+    assert "a_retomar" in a.orq("retomar", "--dry-run").stdout
+
+
+def test_ticket48_retomar_cria_o_terminal_com_o_comando_certo_liga_ao_dispatch_e_confere_a_tela():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="2")
+    _queda48(a)
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    r = a.orq("retomar", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert [(w["dispatch"], w["estado"], w.get("novo")) for w in res["workers"]] == [("ctx_term_w1", "retomado", "term_ret1"), ("ctx_term_w3", "sem_sessao", None)], res
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--worktree") + 1] == "path:" + a.wt + "/w1" and c[c.index("--title") + 1] == "Ticket 99 (retomado)", c
+    comando = c[c.index("--command") + 1]
+    assert comando.startswith("claude --resume sess-w1 --model claude-opus-5-5 --dangerously-skip-permissions 'Continue de onde parou."), comando
+    assert "relatorio-final.md" in comando
+    (ev,) = [e for e in a.events() if e["tipo"] == "retomada"]
+    assert (ev["dispatch"], ev["terminal"], ev["anterior"], ev["sessao"], ev["cwd"]) == ("ctx_term_w1", "term_ret1", "term_w1", "sess-w1", a.wt + "/w1"), ev
+    assert "head" in ev and "sujo" in ev, "o checkpoint da worktree fica no evento"
+    ags = {x["dispatch"]: x for x in json.loads(a.orq("agentes", "--json").stdout)}
+    assert ags["ctx_term_w1"]["terminal"] == "term_ret1", "o terminal novo é o do dispatch"
+    again = json.loads(a.orq("retomar", "--dry-run", "--json").stdout)
+    assert [w["dispatch"] for w in again["workers"]] == ["ctx_term_w3"], "o retomado não volta à lista"
+
+
+def test_ticket48_retomar_sessao_que_nao_voltou_ou_terminal_que_nao_abriu_nao_some():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _queda48(a)
+    a.set("screens.json", {"term_ret1": ["No conversation found with session ID: sess-w1"]})
+    (w1, _) = json.loads(a.orq("retomar", "--json").stdout)["workers"]
+    assert w1["estado"] == "sem_atividade" and "orq relancar ctx_term_w1" in w1["aviso"], w1
+    b = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _queda48(b)
+    res = json.loads(b.orq("retomar", "--json", FAKE_FAIL_CREATE_PATH="/wt/w1").stdout)
+    assert res["workers"][0]["estado"] == "falhou" and "selector_not_found" in res["workers"][0]["aviso"], res
+    assert not [e for e in b.events() if e["tipo"] == "retomada"]
+
+
+def test_ticket48_retomar_worktree_que_sumiu_nao_sobe_terminal():
+    a = Amb(run="run_a")
+    _queda48(a)
+    os.rmdir(a.wt + "/w1")
+    (w1, w3) = json.loads(a.orq("retomar", "--json").stdout)["workers"]
+    assert w1["estado"] == "sem_worktree" and "não existe" in w1["aviso"], w1
+    assert "orq relancar ctx_term_w3" in w3["aviso"], w3
+    assert not _log(a, "create.log")
+
+
+def test_ticket48_retomar_sem_lista_de_terminais_confiavel_recusa():
+    a = Amb(run="run_a")
+    _queda48(a)
+    open(os.path.join(a.fake, "terminals_truncados"), "w").close()
+    r = a.orq("retomar")
+    assert r.returncode == 1 and "nada foi retomado" in r.stderr, r
+    assert not _log(a, "create.log")
+
+
+def test_ticket48_retomar_sobe_o_painel_do_gerente_e_religa_os_runs():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _queda48(a)
+    a.set("workers.json", [])
+    json.dump({"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    seco = json.loads(a.orq("retomar", "--dry-run", "--json").stdout)
+    assert seco["gerente"]["estado"] == "a_subir" and not _log(a, "create.log")
+    res = json.loads(a.orq("retomar", "--json").stdout)
+    assert res["gerente"]["novo"] == "term_ret1" and res["gerente"]["estado"] == "religado", res
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}" and "--worktree" not in c, c
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a", "run_b"]}
+    assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
+    assert a.orq("retomar", "--dry-run").stdout.strip() == "nada a retomar", "religado, não há mais o que fazer"
+
+
+def test_ticket48_gerente_vivo_de_outro_coordenador_vivo_nao_e_tocado():
+    a = Amb(run="run_a")
+    _queda48(a)
+    a.set("workers.json", [])
+    a.set("terminals.json", ["term_coord", "term_old", "term_ger_old"])
+    velho = {"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}
+    json.dump(velho, open(os.path.join(a.home, "gerente.json"), "w"))
+    assert a.orq("retomar").stdout.strip() == "nada a retomar"
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == velho and not _log(a, "create.log")
+    r = a.orq("gerente", "desligar")
+    assert r.returncode == 1 and "não está ligado a este coordenador" in r.stderr, r
+
+
+def test_ticket48_gerente_desligar_depois_da_queda_aceita_o_coordenador_novo():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    a.set("terminals.json", ["term_coord"])  # o coordenador antigo (term_old) e o gerente antigo morreram
+    json.dump({"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    r = a.orq("gerente", "desligar")
+    assert r.returncode == 0, r.stderr
+    assert not os.path.exists(os.path.join(a.home, "gerente.json"))
+    assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
+
+
+def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_guarda_os_runs():
+    a = Amb(run="run_c")
+    os.makedirs(a.home, exist_ok=True)
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    json.dump({"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    r = a.orq("gerente", "ligar", "--terminal", "term_ger")
+    assert r.returncode == 0, r.stderr
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b", "run_c"]}
+    b = Amb(run="run_c")  # sem queda (o antigo segue vivo): outro gerente recomeça a lista, como antes
+    os.makedirs(b.home, exist_ok=True)
+    b.set("terminals.json", ["term_coord", "term_ger", "term_old", "term_ger_old"])
+    json.dump({"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}, open(os.path.join(b.home, "gerente.json"), "w"))
+    assert b.orq("gerente", "ligar", "--terminal", "term_ger").returncode == 0
+    assert json.load(open(os.path.join(b.home, "gerente.json")))["runs"] == ["run_c"]
+
 
 
 if __name__ == "__main__":
