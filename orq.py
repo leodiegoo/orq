@@ -1776,13 +1776,18 @@ def pr_proximo(itens):
     """O próximo ambiente da feature, só como sugestão (`pronto para staging`, ou `em main` no fim), ou None.
 
     Vem do PR mergeado mais adiante em development, staging e main. Com um PR da feature ainda aberto o próximo já está a caminho: None.
-    Nunca abre o PR. O PR `merge/<feature>-<ambiente>` tem o ambiente como base e conta como entrada nele."""
+    Com development e staging mergeados e nenhum PR aberto ou em main, o aviso diz que falta só o de main. Nunca abre o PR.
+    O PR `merge/<feature>-<ambiente>` tem o ambiente como base e conta como entrada nele."""
     if any(i["estado"] == "aberto" for i in itens):
         return None
     indices = [AMBIENTES.index(i["base"]) for i in itens if i["estado"] == "mergeado" and i.get("base") in AMBIENTES]
     if not indices:
         return None
-    return "em main" if max(indices) == len(AMBIENTES) - 1 else f"pronto para {AMBIENTES[max(indices) + 1]}"
+    if max(indices) == len(AMBIENTES) - 1:
+        return "em main"
+    if max(indices) == len(AMBIENTES) - 2 and AMBIENTES[0] in {i["base"] for i in itens if i["estado"] == "mergeado"}:
+        return f"pronto para {AMBIENTES[-1]} ({' e '.join(AMBIENTES[:-1])} entraram: abrir o de {AMBIENTES[-1]})"
+    return f"pronto para {AMBIENTES[max(indices) + 1]}"
 
 
 def _seg_pr(i):
@@ -1807,11 +1812,65 @@ def pr_ligar(task, url, issue=None):
                 "ligado_em": now(), "avisado": estado != "aberto", **({"resolvido_em": now()} if estado != "aberto" else {}),
                 **({"issue": int(issue)} if issue else {})}
         d["itens"].append(item)
+        d["sem_task"] = [x for x in d.get("sem_task") or [] if x.get("url") != url]
         append_event({"tipo": "pr", "op": "ligar", "task": task, "url": url, "numero": item["numero"], "base": item["base"], "estado": estado,
                       **({"issue": item["issue"]} if issue else {})})
         return item
 
     return _mutar_prs(add)
+
+
+def pr_orfao(url, head=None):
+    """Guarda o PR cuja branch não tem task conhecida na lista `sem_task` (o `orq status` mostra até alguém ligar). PR já conhecido: None."""
+    if not PR_RE.fullmatch(url or ""):
+        raise ValueError(f"URL de PR inválida: {url!r} (https://github.com/<org>/<repo>/pull/<n>)")
+
+    def add(d):
+        if any(i["url"] == url for i in d["itens"]) or any(x.get("url") == url for x in d.get("sem_task") or []):
+            return None
+        item = {"url": url, "numero": int(url.rsplit("/", 1)[1]), "head": head, "em": now()}
+        d["sem_task"] = [*(d.get("sem_task") or []), item]
+        append_event({"tipo": "pr", "op": "sem_task", "url": url, "numero": item["numero"], "head": head})
+        return item
+
+    return _mutar_prs(add)
+
+
+PR_DESPACHOS = 12  # quantos despachos recentes o pr_auto confere pela worktree (um worker-show cada)
+
+
+def _caminho_do_worker(res):
+    """O caminho da worktree de um `worker-show`: o do terminal ou, sem ele, o do `worktreeId` (`<repo>::<caminho>`)."""
+    wid = _fundo(res, "worker", "worktreeId")
+    return _fundo(res, "terminal", "worktreePath") or (wid.split("::", 1)[1] if isinstance(wid, str) and "::" in wid else None)
+
+
+def task_do_ramo(head, wt, events):
+    """A task do despacho dono da branch `head`, ou None. Primeiro pelo `--name` da worktree nova (sem rede); depois pela worktree onde a
+    branch está (`wt`), que o Orca diz em worker-show, nos PR_DESPACHOS despachos mais recentes. Duas tasks na mesma worktree (`current`): a mais nova."""
+    desp = [e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("task")]
+    for e in desp:
+        nome = e.get("nome")
+        if nome and head and (head == nome or head.endswith("/" + nome)):
+            return e["task"]
+    alvo = os.path.realpath(wt) if wt else None
+    for e in desp[:PR_DESPACHOS] if alvo else []:
+        try:
+            caminho = _caminho_do_worker(orca("worker-show", "--dispatch", e["dispatch"], timeout=10))
+        except Exception:  # noqa: BLE001 - dispatch que o Orca não conhece mais não impede os outros
+            continue
+        if caminho and os.path.realpath(caminho) == alvo:
+            return e["task"]
+    return None
+
+
+def pr_auto(url, head=None, wt=None):
+    """Liga o PR à task dona da branch (task_do_ramo) ou, sem dona, o põe em `sem_task`. Devolve o item; PR já conhecido: None."""
+    d = _prs_ro()
+    if any(i["url"] == url for i in d["itens"]) or any(x.get("url") == url for x in d.get("sem_task") or []):
+        return None
+    task = task_do_ramo(head, wt, read_events())
+    return pr_ligar(task, url) if task else pr_orfao(url, head)
 
 
 def pr_desligar(task, url):
@@ -1844,6 +1903,8 @@ def linhas_pr(agora=None):
             continue
         prox = pr_proximo(itens)
         linhas.append(f"PR {task}: " + " · ".join(_seg_pr(i) for i in itens) + (f" → {prox}" if prox else ""))
+    linhas += [f"PR sem tarefa: #{x.get('numero')} ({x.get('head') or '?'}) {x['url']}: `orq pr ligar <task> {x['url']}`"
+               for x in _prs_ro().get("sem_task") or [] if isinstance(x, dict) and x.get("url")]
     return linhas
 
 
@@ -2683,7 +2744,53 @@ def hook_session(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": contexto_sessao()}}
 
 
-HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar, "externas": hook_externas}
+PR_CREATE = re.compile(r"\bgh(?:-axi)?\s+pr\s+create\b")
+PR_HEAD = re.compile(r"(?<!\S)(?:--head[=\s]+|-H[=\s]*)['\"]?([^\s'\"]+)")
+PR_CD = re.compile(r"(?<![\w-])cd\s+(\S+)\s*&&")
+
+
+def _orq_cli(*args):
+    """Roda um subcomando do orq fora do hook (o hook só tem HOOK_TIMEOUT s e o Orca é lento): em segundo plano; com ORQ_NO_BG, até o fim."""
+    cmd = [sys.executable, os.path.abspath(__file__), *args]
+    if os.environ.get("ORQ_NO_BG"):
+        signal.alarm(0)  # só os testes chegam aqui: com a máquina carregada o alarme do hook cortaria o filho no meio
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    else:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def hook_prligar(ev, run):
+    """PostToolUse de Bash, só no coordenador: a saída de `gh pr create` traz a URL do PR; o orq a liga à task dona da branch (`orq pr auto`,
+    fora do hook) ou a põe em "PR sem tarefa". A branch é a do `--head` ou a do cwd (com `cd <dir> &&` na frente, a dele). Só lê o prs.json."""
+    ti, resp = ev.get("tool_input") or {}, ev.get("tool_response")
+    cmd = ti.get("command") or ""
+    if ev.get("tool_name") != "Bash" or not PR_CREATE.search(cmd):
+        return None
+    urls = PR_RE.findall((resp.get("stdout") or "") if isinstance(resp, dict) else str(resp or ""))
+    if not urls:
+        return None
+    url = urls[-1]
+    d = _prs_ro()
+    if any(i["url"] == url for i in d["itens"]) or any(x.get("url") == url for x in d.get("sem_task") or []):
+        return None
+    cwd = ev.get("cwd") or os.getcwd()
+    cd = PR_CD.search(cmd)
+    if cd and os.path.isdir(os.path.join(cwd, os.path.expanduser(cd.group(1).strip("'\"")))):
+        cwd = os.path.join(cwd, os.path.expanduser(cd.group(1).strip("'\"")))
+    h = PR_HEAD.search(cmd)
+    head = h.group(1).split(":")[-1] if h else (_git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None
+    wt = None
+    for bloco in (_git(cwd, "worktree", "list", "--porcelain") or "").split("\n\n"):
+        campos = dict(l.split(" ", 1) for l in bloco.splitlines() if " " in l)
+        if head and campos.get("branch") == f"refs/heads/{head}":
+            wt = campos.get("worktree")
+    _orq_cli("pr", "auto", url, *(["--head", head] if head else []), *(["--wt", wt] if wt else []))
+    msg = (f"{MARCA} PR #{url.rsplit('/', 1)[1]} ({head or 'branch desconhecida'}): o orq o liga à task dona da branch; sem dona ele entra em "
+           "\"PR sem tarefa\" no `orq status`. Confira com `orq pr lista`.")
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
+
+
+HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar, "externas": hook_externas, "prligar": hook_prligar}
 
 
 def run_hook(kind):
@@ -2705,6 +2812,13 @@ def run_hook(kind):
             sid = ev.get("session_id") or ""
             if _dict(_cursor_ro().get("runs")).get(sid) and _papeis().get(sid) != "worker":
                 out = hook_lugar(ev, None)
+                if out:
+                    print(json.dumps(out, ensure_ascii=False))
+            return 0
+        if kind == "prligar":  # a cada Bash: sem Orca, o coordenador é a sessão que já tem Run guardado e não é worker
+            sid = ev.get("session_id") or ""
+            if _dict(_cursor_ro().get("runs")).get(sid) and _papeis().get(sid) != "worker":
+                out = hook_prligar(ev, None)
                 if out:
                     print(json.dumps(out, ensure_ascii=False))
             return 0
@@ -3633,7 +3747,7 @@ def _checkpoint(dispatch):
     O caminho vem do terminal ou, sem ele, do `worktreeId` (`<repo>::<caminho>`). `head` e `sujo` são None se o caminho não é um repositório git legível."""
     res = orca("worker-show", "--dispatch", dispatch, timeout=10)
     wid = _fundo(res, "worker", "worktreeId")
-    caminho = _fundo(res, "terminal", "worktreePath") or (wid.split("::", 1)[1] if isinstance(wid, str) and "::" in wid else None)
+    caminho = _caminho_do_worker(res)
     pedido = _fundo(res, "worker", "startOptions", "launch", "requested") or {}
     head, sujo = (_git(caminho, "rev-parse", "HEAD"), _git(caminho, "status", "--porcelain")) if caminho and os.path.isdir(caminho) else (None, None)
     return {"worktree_id": wid, "caminho": caminho, "agente": _fundo(res, "worker", "startOptions", "agent"), "modelo": pedido.get("model"), "effort": pedido.get("effort"),
@@ -4188,6 +4302,10 @@ def main(argv=None):
     pl2.add_argument("task")
     pl2.add_argument("url")
     pl2.add_argument("--issue", type=int, help="número da issue do GitHub, quando houver")
+    pa = pr.add_parser("auto", help="orq pr auto <url> [--head B] [--wt DIR]: liga o PR à task dona da branch; sem dona, vai para 'PR sem tarefa' (o hook prligar chama)")
+    pa.add_argument("url")
+    pa.add_argument("--head")
+    pa.add_argument("--wt")
     pr.add_parser("lista").add_argument("--task")
     pd2 = pr.add_parser("desligar")
     pd2.add_argument("task")
@@ -4285,6 +4403,8 @@ def main(argv=None):
         elif a.cmd == "pr":
             if a.op == "ligar":
                 print(json.dumps(pr_ligar(a.task, a.url, a.issue), ensure_ascii=False))
+            elif a.op == "auto":
+                print(json.dumps(pr_auto(a.url, a.head, a.wt), ensure_ascii=False))
             elif a.op == "desligar":
                 pr_desligar(a.task, a.url)
                 print(f"PR desligado de {a.task}")
