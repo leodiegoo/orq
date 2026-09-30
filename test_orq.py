@@ -7038,6 +7038,112 @@ def test_pr_gerente_com_coordenador_ocupado_tenta_de_novo_sem_duplicar_a_entrada
     assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1
 
 
+# ---------- ticket 46: PR ligado à tarefa sozinho no gh pr create ----------
+
+def _pos_pr(a, cwd, cmd="gh pr create --base development --title x --body y", saida=PR1 + "\n", sid="abcdef123456", **env):
+    """O PostToolUse do Bash do coordenador com a saída (falsa) do gh pr create."""
+    ev = {"session_id": sid, "cwd": cwd, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {"stdout": saida, "stderr": ""}}
+    r = a.orq("hook", "prligar", stdin=json.dumps(ev), **env)
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def _prs_json(a):
+    return json.load(open(os.path.join(a.home, "prs.json")))
+
+
+def _ambiente_46(**env):
+    """Coordenador com gh falso e um worker cuja worktree é a `wt` (branch feat/w) do repo de teste; devolve (a, principal, worktree)."""
+    a = Amb(run="run_a", **env)
+    _gh(a)
+    _pr(a, PR1)
+    a.prompt("oi")
+    p, w = _repo(a.tmp.name)
+    a.set("workers.json", [{"handle": "term_w", "run": "run_a", "dispatch": "ctx_w", "worktree": w}])
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T01:00:00Z", "tipo": "despacho", "run": "run_a", "task": "task_feat1", "dispatch": "ctx_w", "worktree": "current"}) + "\n")
+    return a, p, w
+
+
+def test_it_should_link_the_pr_to_the_task_whose_worktree_holds_the_branch():
+    a, p, w = _ambiente_46()
+    r = _pos_pr(a, w)
+    (item,) = _prs_json(a)["itens"]
+    assert (item["task"], item["url"], item["numero"], item["base"], item["estado"]) == ("task_feat1", PR1, 1216, "development", "aberto"), item
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]
+    assert ctx["hookEventName"] == "PostToolUse" and "#1216" in ctx["additionalContext"] and "feat/w" in ctx["additionalContext"], ctx
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar"]
+
+
+def test_it_should_find_the_task_by_the_head_flag_even_when_run_from_the_main_checkout():
+    a, p, w = _ambiente_46()
+    _pos_pr(a, p, cmd="gh pr create --head feat/w --base development --title x")
+    (item,) = _prs_json(a)["itens"]
+    assert item["task"] == "task_feat1", item
+    a2, p2, w2 = _ambiente_46()
+    _pos_pr(a2, p2, cmd=f"cd {w2} && gh pr create --base development")
+    assert _prs_json(a2)["itens"][0]["task"] == "task_feat1"
+
+
+def test_it_should_find_the_task_by_the_worktree_name_without_asking_the_orca():
+    a, p, w = _ambiente_46()
+    a.set("workers.json", [])  # o Orca não conhece mais o worker
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T02:00:00Z", "tipo": "despacho", "run": "run_a", "task": "task_nome", "dispatch": "ctx_n", "worktree": "new-top-level", "nome": "feat/w"}) + "\n")
+    _pos_pr(a, p, cmd="gh pr create --head leodiegoo/feat/w")
+    assert _prs_json(a)["itens"][0]["task"] == "task_nome"
+
+
+def test_it_should_list_a_pr_without_a_known_task_and_show_it_in_status():
+    a, p, w = _ambiente_46()
+    a.set("workers.json", [])
+    r = _pos_pr(a, p, cmd="gh pr create --head feat/desconhecida --base development")
+    d = _prs_json(a)
+    assert d["itens"] == [] and [(x["url"], x["head"]) for x in d["sem_task"]] == [(PR1, "feat/desconhecida")], d
+    assert "sem tarefa" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    st = a.orq("status").stdout
+    assert "PR sem tarefa" in st and "#1216" in st and "feat/desconhecida" in st, st
+    a.orq("pr", "ligar", "task_feat1", PR1)  # ligar à mão tira o PR da lista
+    assert _prs_json(a)["sem_task"] == [] and "PR sem tarefa" not in a.orq("status").stdout
+
+
+def test_it_should_ignore_what_is_not_a_fresh_pr_create_or_not_the_coordinator():
+    a, p, w = _ambiente_46()
+    assert _pos_pr(a, w, cmd="gh pr view 1216", saida=PR1).stdout == ""
+    assert _pos_pr(a, w, saida="a pull request for branch already exists\n").stdout == ""
+    assert _pos_pr(a, w, sid="outra_sessao").stdout == "", "sessão sem Run guardado não é o coordenador"
+    assert not os.path.exists(os.path.join(a.home, "prs.json"))
+    _pos_pr(a, w)
+    assert _pos_pr(a, w).stdout == "", "PR já ligado não liga de novo"
+    assert len(_prs_json(a)["itens"]) == 1
+
+
+def test_it_should_tell_when_development_and_staging_both_merged_to_open_main():
+    a, p, w = _ambiente_46()
+    _pos_pr(a, w)
+    _pr(a, PR2, "OPEN", "staging")
+    _pos_pr(a, w, saida=PR2 + "\n")
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    _pr(a, PR2, "MERGED", "staging")
+    a.orq("pr", "poll", "--forcar")
+    ents = [e["texto"] for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    assert "abrir o de main" not in ents[0], "com o PR de staging ainda aberto, nada a abrir"
+    assert "development e staging entraram" in ents[1] and "abrir o de main" in ents[1], ents
+    assert "abrir o de main" in _linha_pr(a)
+
+
+def test_it_should_not_tell_to_open_main_when_the_main_pr_is_already_there():
+    a, p, w = _ambiente_46()
+    _pr(a, PR1, "MERGED", "development")
+    _pr(a, PR2, "MERGED", "staging")
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    a.orq("pr", "ligar", "task_feat1", PR2)
+    assert "abrir o de main" in _linha_pr(a)
+    PR3 = PR1.replace("1216", "1230")
+    _pr(a, PR3, "OPEN", "main")
+    a.orq("pr", "ligar", "task_feat1", PR3)
+    assert "abrir o de main" not in _linha_pr(a)
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
