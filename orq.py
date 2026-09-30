@@ -28,6 +28,7 @@ PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboa
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado")
 HOOK_TIMEOUT = 3
 TIPOS_PEND = ("acao", "decisao", "avisar")
+PEND_IDADE_DIAS = 14  # pendência sem mexer há mais de 14 dias sai da vista e vai para "Depois"
 ID_HEADER = 12  # o header do AskUserQuestion aceita até 12 caracteres
 SUSPEITA_S = 3  # resposta a menos de 3 s de uma notificação vista pelo hook de prompt
 JANELA_ORCA_S = 5  # mensagem entregue pelo Orca a ±5 s da resposta (inbox do Orca)
@@ -571,8 +572,10 @@ def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, tu
               f"{_linha_runs(aberto)}")
     else:
         l2 = "Aberto: cache ainda não existe (refresh em andamento)."
-    itens = (pendencias or {}).get("itens", [])
-    l3 = f"Com você: {len(itens)} ({sum(i.get('tipo') == 'decisao' for i in itens)} decisões)."
+    todos = (pendencias or {}).get("itens", [])
+    itens = [i for i in todos if not pend_depois(i, agora.astimezone().date())]
+    l3 = (f"Com você: {len(itens)} ({sum(i.get('tipo') == 'decisao' for i in itens)} decisões)."
+          + (f" Depois: {len(todos) - len(itens)}." if len(todos) > len(itens) else ""))
     l4 = "Efeito: orq intake <e> tarefa <task>|steer <task>|pend <id>|decisao <id>|conversa|descartado --nota <motivo>"
     return "\n".join([l1, *([extra] if extra else []), l2, l3, l4])
 
@@ -1366,7 +1369,36 @@ def _run_atual_id():
     return (orca("run-current")["run"] or {}).get("id")
 
 
-def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None):
+def pend_depois(item, hoje=None):
+    """Motivo de a pendência estar em "Depois" (data futura, espera, envelhecida) ou None se está viva.
+
+    `ate` no futuro esconde; `ate` vencida ou de hoje devolve a pendência à vista, mesmo esperando alguém ou envelhecida. Decisão com
+    gate trava uma task e nunca envelhece para fora da vista.
+    """
+    hoje = hoje or datetime.now().date()
+    if item.get("ate"):
+        return f"até {item['ate']}" if item["ate"] > hoje.isoformat() else None
+    if item.get("espera"):
+        return f"esperando {item['espera']}"
+    if item.get("gate"):
+        return None
+    dias = (hoje - datetime.fromisoformat(item["desde"]).date()).days if item.get("desde") else 0
+    return f"parada há {dias} d" if dias > PEND_IDADE_DIAS else None
+
+
+def pend_lista(todas=False, hoje=None):
+    """Linhas de `orq pend lista`: as vivas, e com `todas` também as de Depois com o motivo."""
+    itens = _load_pend()["itens"]
+    linhas = []
+    for depois in ((False, True) if todas else (False,)):
+        for i in itens:
+            motivo = pend_depois(i, hoje)
+            if bool(motivo) == depois:
+                linhas.append(f"{i['id']}  {i.get('tipo')}  {i.get('titulo')}" + (f"  [Depois: {motivo}]" if motivo else ""))
+    return linhas
+
+
+def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None, ate=None):
     """Acrescenta uma pendência do usuário (formato do painel; `espera` opcional) e registra o evento.
 
     Com `task`, a decisão trava a task: cria o gate no Orca e guarda o id na pendência (o hook ask o resolve).
@@ -1380,6 +1412,11 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
         raise ValueError(f"id de decisão tem até {ID_HEADER} caracteres para caber no header do AskUserQuestion ({id_!r} tem {len(id_)})")
     if tipo == "decisao" and espera:
         raise ValueError("decisão não tem espera: espera é pendência que aguarda terceiro e não vira pergunta")
+    if ate:
+        try:
+            datetime.strptime(ate, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"--ate pede AAAA-MM-DD ({ate!r})")
     if task and tipo != "decisao":
         raise ValueError("--task só vale para decisão (o gate trava a task até a resposta)")
     gate = gate_run = None
@@ -1405,7 +1442,7 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
             if v:
                 item[k] = v
         item["desde"] = datetime.now().date().isoformat()
-        for k, v in (("link", link), ("comando", comando), ("espera", espera), ("gate", gate), ("gate_run", gate_run)):
+        for k, v in (("link", link), ("comando", comando), ("espera", espera), ("ate", ate), ("gate", gate), ("gate_run", gate_run)):
             if v:
                 item[k] = v
         itens.append(item)
@@ -3043,8 +3080,10 @@ def main(argv=None):
     pa.add_argument("--id", required=True)
     pa.add_argument("--tipo", required=True, choices=TIPOS_PEND)
     pa.add_argument("--titulo", required=True)
-    for k in ("detalhe", "frente", "link", "comando", "espera", "task"):
+    for k in ("detalhe", "frente", "link", "comando", "espera", "task", "ate"):
         pa.add_argument(f"--{k}")
+    pl = p.add_parser("lista", help="as pendências vivas; --todas inclui as de Depois")
+    pl.add_argument("--todas", action="store_true")
     pd = p.add_parser("done")
     pd.add_argument("id")
     pd.add_argument("--resposta")
@@ -3111,7 +3150,9 @@ def main(argv=None):
             print(json.dumps(intake(a.entrada, a.efeito, a.ref, a.run, a.nota), ensure_ascii=False))
         elif a.cmd == "pend":
             if a.op == "add":
-                print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task), ensure_ascii=False))
+                print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate), ensure_ascii=False))
+            elif a.op == "lista":
+                print("\n".join(pend_lista(a.todas)) or "nenhuma pendência")
             else:
                 feito = pend_done(a.id, a.resposta)
                 print(json.dumps(feito, ensure_ascii=False))

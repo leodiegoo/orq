@@ -5451,6 +5451,47 @@ def test_ticket26_responder_recusa_run_que_o_coordenador_nao_segura_e_mensagem_i
     assert r.returncode == 1 and "msg_fantasma" in r.stderr and not _log(a, "replied.log")
 
 
+def test_ticket28_pendencia_viva_futura_vencida_esperando_e_envelhecida():
+    from datetime import date
+    hoje = date(2026, 9, 29)
+    base = {"id": "p", "tipo": "acao", "titulo": "t", "desde": "2026-09-25"}
+    assert orq_mod.pend_depois(base, hoje) is None, "viva"
+    assert orq_mod.pend_depois({**base, "ate": "2026-10-05"}, hoje) == "até 2026-10-05", "data futura"
+    assert orq_mod.pend_depois({**base, "ate": "2026-09-29"}, hoje) is None, "data de hoje volta"
+    assert orq_mod.pend_depois({**base, "ate": "2026-09-20", "espera": "Ana", "desde": "2026-08-01"}, hoje) is None, "data vencida volta, mesmo esperando e velha"
+    assert orq_mod.pend_depois({**base, "espera": "Ana"}, hoje) == "esperando Ana"
+    assert orq_mod.pend_depois({**base, "desde": "2026-09-15"}, hoje) is None, "14 dias ainda é viva"
+    assert orq_mod.pend_depois({**base, "desde": "2026-09-14"}, hoje) == "parada há 15 d", "envelhecida"
+    assert orq_mod.pend_depois({**base, "desde": "2026-08-01", "gate": "g1"}, hoje) is None, "decisão com gate não some"
+    assert orq_mod.pend_depois({"id": "sem-desde", "tipo": "avisar", "titulo": "t"}, hoje) is None, "item antigo sem desde segue vivo"
+
+
+def test_ticket28_resumo_mostra_so_as_vivas_e_conta_depois():
+    a = Amb()
+    a.set("../pendencias.json", {"itens": [
+        {"id": "viva", "tipo": "decisao", "titulo": "t", "desde": "2099-01-01"},
+        {"id": "futura", "tipo": "acao", "titulo": "t", "desde": "2099-01-01", "ate": "2099-12-31"},
+        {"id": "espera", "tipo": "acao", "titulo": "t", "desde": "2099-01-01", "espera": "Ana"},
+        {"id": "velha", "tipo": "acao", "titulo": "t", "desde": "2020-01-01"},
+    ]})
+    ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Com você: 1 (1 decisões). Depois: 3." in ctx, ctx
+    assert "Depois" not in orq_mod.resumo([], None, {"itens": [{"id": "v", "tipo": "acao", "titulo": "t", "desde": "2099-01-01"}]})
+
+
+def test_ticket28_pend_add_ate_e_lista():
+    a = Amb()
+    a.set("../pendencias.json", {"itens": [{"id": "antiga", "tipo": "decisao", "titulo": "sem ate nem desde"}]})
+    r = a.orq("pend", "add", "--id", "depois", "--tipo", "acao", "--titulo", "mais tarde", "--ate", "2099-12-31")
+    assert r.returncode == 0 and json.loads(r.stdout)["ate"] == "2099-12-31", r.stderr
+    r = a.orq("pend", "add", "--id", "ruim", "--tipo", "acao", "--titulo", "x", "--ate", "31/12/2099")
+    assert r.returncode == 1 and "AAAA-MM-DD" in r.stderr
+    viva = a.orq("pend", "lista").stdout
+    assert "antiga" in viva and "depois" not in viva, "as pendências atuais continuam aparecendo"
+    todas = a.orq("pend", "lista", "--todas").stdout
+    assert "antiga" in todas and "depois  acao  mais tarde  [Depois: até 2099-12-31]" in todas, todas
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
