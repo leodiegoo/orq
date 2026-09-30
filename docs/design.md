@@ -230,6 +230,28 @@ Going back after the stop is limited to what can be brought back. If the request
 
 An Orca task keeps its spec, so the note cannot go into it. It goes as the first steer of the new worker (`Relançado depois de <dispatch>. O que mudou: …`), with the usual notice and read check. If that steer or the release of the old dispatch fails, the event still says `ok` and the warning names the command to run.
 
+## Resuming after a crash
+
+A power cut kills every Orca terminal, but Orca keeps the dispatches as `dispatched` and Claude keeps each session's transcript. `orq retomar` brings the work back.
+
+What is recorded. The worker's prompt hook already writes `turnos.json` per dispatch; it now also stores `cwd` from the dispatch preamble (the launch directory, kept when the worker later `cd`s) next to `sessao`, the Claude session id. The model comes from `worker-show`, or the `despacho` event.
+
+What `orq retomar` does, in this order:
+
+1. Reads `orca terminal list`. A truncated or failed list refuses the whole command: without proof of who died nothing is started.
+2. Agent manager. When `gerente.json` belongs to this coordinator, or to a coordinator whose terminal is gone, and its manager terminal is gone (or only the coordinator changed), it opens a tab running `sh painel-agent-manager.sh` and calls `gerente_ligar` with the old Run list, so `gerente.json` ends as `{coordenador: <this one>, gerente: <new tab>, runs: <all old Runs>}`. A `gerente.json` of a live coordinator is left alone.
+3. Workers. Every dispatch with `dispatchStatus: dispatched` whose `agentTerminalHandle` is not in the terminal list gets `orca terminal create --worktree path:<cwd> --title "<title> (retomado)" --command "claude --resume <session> --model <model> --dangerously-skip-permissions '<continue message>'"`. The message is the one used by hand on 30/09: check `git status`, rerun the suite that was pending, send `worker_done` as before, and write `relatorio-final.md` at the worktree root if Orca refuses the new handle.
+4. Writes a `retomada` event (dispatch, new terminal, old terminal, session, cwd). `_workers_todos` applies it, so `agentes`, `liberar` and `steer` see the new terminal as the dispatch's own, and a second `retomar` does not list it again.
+5. Reads the new terminal's screen for up to `ORQ_RETOMAR_ESPERA_S` (20 s). `esc to interrupt`, or a screen that changed between reads, is `retomado`; `No conversation found` or no activity is `sem_atividade`. A dispatch with no stored session or cwd is `sem_sessao`, and one whose folder is gone is `sem_worktree`; none of these starts a terminal, and each warning carries the `orq relancar <dispatch>` line that starts a fresh worker from the task spec. The `retomada` event also stores the worktree's `head` and dirty-file count.
+
+From firstmate (`docs/agent-control.md`, `bin/fm-control.sh`): the session id is read from what the worker's own hook recorded, never guessed from the newest transcript; a missing worktree refuses before anything starts, and the head and dirty state are checkpointed; when the session cannot resume, the durable spec (here `relancar`) replaces it. firstmate does not copy: it has no `resume` verb (its relaunch restarts from the brief on disk), and orq adds one because Claude Code's `--resume <id>` is deterministic when the id and the folder are known.
+
+`--dry-run` lists the same rows and creates nothing. `--run` limits it to one Run, `--json` prints the raw result.
+
+`worker_done` from a resumed session carries the same `dispatchId` in its payload, which is how ingest matches it, so the changed handle does not matter to orq. When Orca itself refuses the message the worker leaves `relatorio-final.md`; orq does not read it yet.
+
+`orq gerente desligar` used to refuse after a crash because `gerente.json` named the old coordinator. It now takes over when that coordinator's terminal is gone. `orq gerente ligar` does the same, and keeps the old Run list when the old coordinator or manager is gone (with both alive, a new manager still restarts the list).
+
 ## Worker idle state
 
 Orca reports a working state for a dispatch (`projection.stage.activity` in `worker-list` and `worker-show`, fed by the terminal title), but it stays `working` from the moment the input is accepted until `worker_done`. Measured on a live worker sitting at its prompt for 100 s, with the terminal title already showing the idle glyph, the field never changed. It cannot tell a working worker from one that stopped, so orq records the turns itself.
