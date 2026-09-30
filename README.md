@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+  <img alt="orq: a task register and noise filter for coding agents in Orca" src="assets/banner.svg">
+</picture>
+
 # orq
 
 A task register and noise filter for a Claude Code session that coordinates coding agents in [Orca](https://www.onorca.dev).
