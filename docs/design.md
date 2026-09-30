@@ -53,6 +53,7 @@ The model does the classifying. The code only checks that a classification was r
 | `pend` (`op: add/done`), `gate_resolvido`, `gate_falha` | `orq pend`, ask hook, ingest |
 | `resposta`, `resposta_suspeita`, `resposta_lavish` | ask hook, `orq lavish-resposta` |
 | `heartbeat_absorvido`, `heartbeat_visto` | prompt hook, manager loop, waiter |
+| `nao_iniciou` | `orq despachar`: the prompt did not land, even after the Enter |
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
 | `fim_dispatch` | `orq liberar`: `dispatch`, `motivo` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
 | `pr` (`op: ligar/desligar/entrou/fechou/avisado`) | `orq pr`, the poll, the manager loop |
@@ -240,10 +241,14 @@ Orca reports a working state for a dispatch (`projection.stage.activity` in `wor
 
 | State | Rule |
 |---|---|
-| `nao_comecou` | No turn recorded and no heartbeat `NAO_COMECOU_S` (120 s) after the dispatch: the `worker-start` that never got its Enter |
+| `nao_comecou` | No turn recorded and no heartbeat `NAO_COMECOU_S` (120 s) after the dispatch: the `worker-start` that never got its Enter. Immediate when the log has a `nao_iniciou` event for the dispatch (see below) |
 | `parado` | The last turn ended at least `PARADO_S` (60 s) ago and no heartbeat came after it: the worker stopped at the prompt, shown as minutes since the turn ended |
 | `travado` | A turn is open and there is no heartbeat for `TRAVADO_S` (15 min), as before |
 | `rodando` | Anything else |
+
+`orq despachar` does not trust Orca's `input_accepted`. After `worker-start` it waits up to `INICIO_ESPERA_S` (8 s, `ORQ_INICIO_ESPERA_S`) for the prompt to land: the worker's prompt hook wrote a turn for the dispatch in `turnos.json`, or the terminal tail shows the title outside the input box. If not, it sends one Enter (harmless on an empty box, `enter: true` in the output) and waits again. If the prompt still did not land it logs `nao_iniciou` (`run`, `task`, `dispatch`, `terminal`), prints `estado: nao_iniciou` with an `aviso` (also on stderr) and the dispatch shows as `nao_comecou` from then on. Limit: a worker whose hooks are not installed also ends up here when the tail does not show the title.
+
+`entregue` needs a `worker_done` for the dispatch in the inbox. A dispatch that is no longer dispatched, has an open terminal and no `worker_done` (stopped, cancelled, inbox window passed) is `encerrado`, never `entregue`.
 
 A heartbeat whose phase is `esperando: <reason>` (optionally `esperando: <reason> até HH:MM`, local time) declares a wait. The dispatch stays `rodando` until the declared time, or `ESPERA_TETO_S` (60 min) after the heartbeat when no time is given. Past that it is `travado` with the reason `espera vencida`. Any other phase keeps the 15 min rule. The summary shows the phase once in `Vivos:`.
 

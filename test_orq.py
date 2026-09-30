@@ -64,6 +64,15 @@ def pagina(itens):
     return itens[ini:fim], (base64.b64encode(str(fim).encode()).decode() if fim < len(itens) else None)
 def falha(msg):
     print(json.dumps({"ok": False, "error": {"message": msg}})); sys.exit(0)
+def turno_comeca(dispatch):
+    # o hook prompt do worker grava o início do turno em turnos.json (ORQ_HOME); FAKE_INICIO: nunca (o spec não entra) | depois_do_enter (só o Enter submete)
+    p = os.path.join(os.environ["ORQ_HOME"], "turnos.json")
+    try:
+        t = json.load(open(p))
+    except (OSError, ValueError):
+        t = {}
+    t[dispatch] = {"task": None, "sessao": "s", "inicio": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "fim": None}
+    os.makedirs(os.path.dirname(p), exist_ok=True); json.dump(t, open(p, "w"))
 if (os.environ.get("FAKE_FAIL") == cmd and cmd != "send") or (os.environ.get("FAKE_FAIL_RUN") and run == os.environ["FAKE_FAIL_RUN"]):
     falha("falhou " + cmd)
 if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
@@ -78,6 +87,8 @@ if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
     if cmd == "close":
         json.dump([h for h in ler("terminals.json", []) if h != opt("--terminal")], open(os.path.join(d, "terminals.json"), "w"))
     res = {"handle": opt("--terminal")}
+    if cmd == "send" and "--text" not in a and os.environ.get("FAKE_INICIO") == "depois_do_enter":
+        turno_comeca("ctx_" + opt("--terminal"))
     if cmd == "send":
         # como o Orca real com o agente ocioso (conferido em 29/09): o turno começa; FAKE_ENTER_PERDIDO: o texto entra e o Enter não submete,
         # só um Enter sozinho começa o turno; FAKE_SEM_OBSERVACAO: o Orca não sabe observar (provider unsupported)
@@ -114,6 +125,12 @@ if sys.argv[1] == "automations":
 if cmd == "inbox":
     p = os.path.join(d, "inbox.json")
     msgs = (json.load(open(p))["result"]["messages"] if os.path.exists(p) else [])
+    # como o Orca real: dispatch completed traz o worker_done dele (sem_done no workers.json: concluído sem ele); fica fora do --limit e da sequência dos testes
+    for i, w in enumerate(ler("workers.json", [])):
+        dd = w.get("dispatch", "ctx_" + w["handle"])
+        if w.get("status", "completed") == "completed" and not w.get("sem_done") and not any(m.get("type") == "worker_done" and (m.get("payload") or "").find(dd) >= 0 for m in msgs):
+            msgs.append({"id": "msg_done%d" % i, "run_id": w["run"], "type": "worker_done", "subject": "done", "from_handle": "dispatch:" + dd, "to_handle": "run:" + w["run"],
+                         "read": 1, "sequence": -1 - i, "created_at": "2000-01-01 00:00:00", "payload": json.dumps({"taskId": w.get("task"), "dispatchId": dd, "outcome": "succeeded"})})
     msgs = sorted(msgs, key=lambda m: -m["sequence"])
     if opt("--terminal"):
         msgs = []  # como o Orca real: o destinatário é `run:<id>`, então o filtro por terminal do coordenador volta vazio
@@ -304,6 +321,8 @@ elif cmd == "worker-start":
         ts.append({"id": tid, "task_title": opt("--task-title"), "status": "dispatched", "dispatch_id": "ctx_term_novo%d" % n,
                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())})
     json.dump(ts, open(os.path.join(d, "tasks_%s.json" % (run or bound)), "w"))
+    if os.environ.get("FAKE_INICIO") not in ("nunca", "depois_do_enter"):
+        turno_comeca("ctx_term_novo%d" % n)
     res = {"runId": run or bound, "taskId": tid, "dispatchId": "ctx_term_novo%d" % n, "state": "ready", "stage": "input_accepted",
            "effects": [{"kind": "worktree", "action": "reused", "id": "wt"}, {"kind": "terminal", "role": "agent", "action": "created", "id": "term_novo%d" % n},
                        {"kind": "dispatch_input", "role": "agent", "id": "term_novo%d" % n, "state": "accepted"}]}
@@ -360,7 +379,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_OCIOSO_MS": "50", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
 
@@ -3568,6 +3587,40 @@ def test_despachar_falha_do_worker_start_nao_grava_evento():
     assert r.returncode == 1 and not [e for e in a.events() if e["tipo"] == "despacho"], r
 
 
+def test_despachar_com_o_prompt_que_entra_nao_manda_enter_nem_marca_nao_iniciou():
+    a = Amb(run="run_a")
+    out = json.loads(_despachar(a).stdout)
+    assert "estado" not in out and not _log(a, "send.log") and not [e for e in a.events() if e["tipo"] == "nao_iniciou"], out
+
+
+def test_despachar_com_o_prompt_que_so_entra_depois_do_enter_manda_um_enter_so():
+    a = Amb(run="run_a")
+    out = json.loads(_despachar(a, FAKE_INICIO="depois_do_enter").stdout)
+    assert "estado" not in out and out["enter"] is True, out
+    (env,) = _log(a, "send.log")
+    assert "--enter" in env and "--text" not in env
+    assert not [e for e in a.events() if e["tipo"] == "nao_iniciou"]
+
+
+def test_despachar_com_o_prompt_que_nunca_entra_marca_nao_iniciou_e_avisa():
+    a = Amb(run="run_a")
+    r = _despachar(a, FAKE_INICIO="nunca")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["estado"] == "nao_iniciou" and out["enter"] is True and "não entrou" in out["aviso"] and "aviso:" in r.stderr, out
+    assert len(_log(a, "send.log")) == 1, "um Enter só"
+    (ev,) = [e for e in a.events() if e["tipo"] == "nao_iniciou"]
+    assert ev["dispatch"] == "ctx_term_novo1" and ev["run"] == "run_a"
+    ag = _agentes(a)["ctx_term_novo1"]
+    assert ag["estado"] == "nao_comecou", "sem esperar NAO_COMECOU_S"
+
+
+def test_agentes_so_mostra_entregue_com_worker_done_registrado():
+    a = Amb(run="run_a")
+    a.set("workers.json", [{"handle": "term_e1", "run": "run_a", "task": "task_e1", "status": "completed", "terminal": "retained", "sem_done": True}])
+    assert _agentes(a)["ctx_term_e1"]["estado"] == "encerrado"
+
+
 def test_despachar_o_dispatch_novo_aparece_em_orq_agentes():
     a = Amb(run="run_a")
     _despachar(a)
@@ -6728,7 +6781,7 @@ def test_liberar_sem_worker_done_grava_sem_worker_done_e_o_estado_da_worktree(tm
     wt = os.path.join(a.tmp.name, "wt")
     subprocess.run(["git", "init", "-q", wt], check=True)
     open(os.path.join(wt, "sujo.txt"), "w").write("x")
-    _lib_env(a, worktree=wt)
+    _lib_env(a, worktree=wt, sem_done=True)
     a.set("inbox.json", {"ok": True, "result": {"messages": []}})
     assert a.orq("liberar", "ctx_term_w1").returncode == 0
     (f,) = _fim(a)
