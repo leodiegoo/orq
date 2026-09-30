@@ -99,6 +99,7 @@ DESPACHO_SEM_ABERTURA = re.compile(r"(?:<pasted_content\b[^>]*>\s*)?You are work
 PRS = "prs.json"  # {itens: [{task, url, numero, base, estado, ligado_em, avisado, ...}], ultimo_poll}: os PRs de cada feature, ligados por `orq pr ligar`
 PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # intervalo mínimo entre dois polls do gh (fora dos hooks); `orq pr poll --forcar` ignora
 PR_GH_S = 15  # tempo de cada `gh pr view`
+WT_PARADA_D = 3  # worktree sem worker e sem atividade há mais que isto entra na linha do `orq status`
 PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
 AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
@@ -1844,6 +1845,51 @@ def linhas_pr(agora=None):
         prox = pr_proximo(itens)
         linhas.append(f"PR {task}: " + " · ".join(_seg_pr(i) for i in itens) + (f" → {prox}" if prox else ""))
     return linhas
+
+
+def worktrees_paradas(wts, ocupadas, agora, fora):
+    """Pura: as worktrees (lista do `orca worktree list`) sem worker vivo (caminho fora de `ocupadas`) e sem atividade há mais de WT_PARADA_D dias,
+    a mais velha primeiro, com `fora(caminho)` = commits fora do origin/main. A principal e as arquivadas não entram."""
+    out = []
+    for w in wts:
+        ult = w.get("lastActivityAt")
+        if w.get("isMainWorktree") or w.get("isArchived") or w["path"] in ocupadas or not ult:
+            continue
+        dias = (agora - datetime.fromtimestamp(ult / 1000, timezone.utc)).days
+        if dias > WT_PARADA_D:
+            out.append({"caminho": w["path"], "branch": (w.get("branch") or "").removeprefix("refs/heads/") or os.path.basename(w["path"]),
+                        "dias": dias, "fora": fora(w["path"])})
+    return sorted(out, key=lambda x: -x["dias"])
+
+
+def worktrees_ocupadas():
+    """Os caminhos das worktrees com worker ainda não liberado (dispatched, ou terminal não released). Na dúvida o worker conta como vivo."""
+    return {p for w in _workers_todos() if w.get("dispatchStatus") == "dispatched" or w.get("terminalState") != "released"
+            for p in [((w.get("resource") or {}).get("worktreeId") or "").split("::", 1)[-1]] if p.startswith("/")}
+
+
+def _commits_fora(caminho):
+    n = _git(caminho, "rev-list", "--count", "origin/main..HEAD")
+    return int(n) if n and n.strip().isdigit() else 0
+
+
+def linhas_worktrees(agora=None, wts=None, ocupadas=None, fora=None):
+    """A linha do `orq status` com as worktrees paradas, uma vez por dia (worktrees-aviso.json guarda o dia). Orca fora do ar: sem linha."""
+    agora = agora or datetime.now(timezone.utc)
+    dia, arq = agora.astimezone().strftime("%Y-%m-%d"), _path("worktrees-aviso.json")
+    if _dict(_read_json(arq)).get("dia") == dia:
+        return []
+    try:
+        ps = worktrees_paradas(wts if wts is not None else orca("list", "--limit", "1000", area="worktree", timeout=15)["worktrees"],
+                               worktrees_ocupadas() if ocupadas is None else ocupadas, agora, fora or _commits_fora)
+    except Exception as e:  # noqa: BLE001
+        log(f"status: worktrees paradas: {type(e).__name__}: {e}")
+        return []
+    if not ps:
+        return []
+    _write_json(arq, {"dia": dia})
+    item = lambda x: f"{x['branch']} ({x['dias']} dias, {x['fora']} commit{'s' if x['fora'] != 1 else ''} fora da main)"
+    return [f"Worktrees paradas ({len(ps)}): " + "; ".join(_lim(ps, 3, item))]
 
 
 def _aplica_prs(d, vistos, agora):
@@ -4152,6 +4198,7 @@ def main(argv=None):
     rp.add_argument("msg_id")
     rp.add_argument("texto")
     sub.add_parser("status")
+    sub.add_parser("ocupadas", help="os caminhos das worktrees com worker vivo, um por linha (o limpar-mergeados não apaga essas)")
     rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
     rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
     rs.add_argument("--noite", action="store_true", help="o cartão da manhã da última noite (até 40 linhas)")
@@ -4253,8 +4300,10 @@ def main(argv=None):
             print(json.dumps(responder(a.msg_id, a.texto), ensure_ascii=False))
         elif a.cmd == "alerta":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
+        elif a.cmd == "ocupadas":
+            print("\n".join(sorted(worktrees_ocupadas())))
         elif a.cmd == "status":
-            print("\n".join([estado(), *linhas_pr()]))
+            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees()]))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":
