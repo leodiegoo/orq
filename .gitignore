@@ -3,6 +3,7 @@ events.jsonl
 aberto.json
 ativos.json
 cursor.json
+turnos.json
 gerente.json
 gerente-aviso.json
 pendencias.json

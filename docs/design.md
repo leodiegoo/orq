@@ -208,6 +208,25 @@ The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same fu
 
 It closes a terminal Orca owns with no retention reason. Orca also marks a terminal `user_takeover` whenever any data passes through its xterm, including the terminal's automatic replies, so that flag does not prove a person typed anything. orq therefore closes a `user_takeover` terminal only when it was created by this dispatch and the worker's own Claude Code transcript shows no human prompt. It never closes the coordinator's terminal, the Run's coordinator terminal, a terminal reused by another running dispatch, or one retained for any other reason.
 
+## Worker idle state
+
+Orca reports a working state for a dispatch (`projection.stage.activity` in `worker-list` and `worker-show`, fed by the terminal title), but it stays `working` from the moment the input is accepted until `worker_done`. Measured on a live worker sitting at its prompt for 100 s, with the terminal title already showing the idle glyph, the field never changed. It cannot tell a working worker from one that stopped, so orq records the turns itself.
+
+`orq hook prompt` and `orq hook stop` run in every Claude Code session, including a worker's. In a session already decided as a worker (the dispatch preamble was its first prompt), they write `turnos.json` (`{dispatch: {task, sessao, inicio, fim}}`) and do nothing else: no Orca call, no Run, about 65 ms. The preamble carries the dispatch (`--dispatch-id`) and the task (`Your task ID is`) and opens the record; later prompts (a steer, a notice) reopen the newest record of that session, and Stop closes it. Slash commands are not turns. A session without a decided role writes nothing, and records older than 7 days are dropped on the next write.
+
+`orq agentes`, the summary and the panel then split an open dispatch that has no `worker_done`, after the question check:
+
+| State | Rule |
+|---|---|
+| `nao_comecou` | No turn recorded and no heartbeat `NAO_COMECOU_S` (120 s) after the dispatch: the `worker-start` that never got its Enter |
+| `parado` | The last turn ended at least `PARADO_S` (60 s) ago and no heartbeat came after it: the worker stopped at the prompt, shown as minutes since the turn ended |
+| `travado` | A turn is open and there is no heartbeat for `TRAVADO_S` (15 min), as before |
+| `rodando` | Anything else |
+
+The three states that need a nudge print the `orq steer` command. `turno` in each row is `nao_comecou`, `parado`, `aberto` or `unknown`. `unknown` is never idle: it is what a dispatch gets when the agent is not Claude Code (no orq hooks), when Orca did not report the agent, or while it is still inside the 120 s window. `turnos.json` is read fresh by the summary, so a steered worker leaves `parado` on the next prompt instead of waiting for the cache.
+
+Limits: a Stop that another hook turns into a continuation is recorded as an end, so a worker can show `parado` for a moment while it is still going (a heartbeat after the end clears it). A dispatch that was already running when the hooks shipped has no record and shows `nao_comecou` only if it also has no heartbeat.
+
 ## Compaction handoff
 
 `precompact.py` runs on PreCompact in the coordinator. Within a 20 s budget (the hook timeout is 30 s) it writes `handoff/<date>.md` with the bound Run, the last ten user entries with their effects, the design notes path, live and delivered agents (with the `orq liberar` and waiter commands), the pending list, open tickets and the user's open PRs. Each section fails on its own. `handoff/ultimo.md` is a symlink to the newest file, and the snapshot is also saved to `engram` when that CLI exists.

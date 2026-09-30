@@ -245,7 +245,7 @@ elif cmd in ("worker-show", "worker-release"):
         # dispatch.dispatchedAt e worker.startOptions.launch.requested.model como no Orca real
         res = {"dispatch": {"status": w.get("status", "completed"), "dispatchedAt": w.get("desde", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 600))),
                             "lastHeartbeatAt": None},
-               "worker": {"startOptions": {"launch": {"requested": {"model": w.get("modelo", "claude-sonnet-5-5"), "effort": "high"}}}},
+               "worker": {"startOptions": {"agent": w.get("agente"), "launch": {"requested": {"model": w.get("modelo", "claude-sonnet-5-5"), "effort": "high"}}}},
                "terminal": {"handle": w["handle"], "title": "x"}}
     else:
         # worker-release: released | retained | release_pending | already_released (w["release"]); retained deixa o terminal aberto com o motivo
@@ -5017,6 +5017,153 @@ def test_resumo_e_aberto_mostram_so_runs_com_trabalho_aberto_ou_recentes():
     assert sorted(x["id"] for x in ab["runs"]) == ["run_a", "run_n"]
     st = a.orq("status").stdout
     assert "Frente viva" in st and "Frente nova" in st and "Frente antiga" not in st and "teste ticket" not in st, st
+
+
+# ---------- ticket 24: estado ocioso do worker pelos hooks do próprio worker ----------
+
+PREAMBULO_24 = ("Please carry out this task from my Orca coordinator by following the brief I pasted below. You are working inside Orca, a multi-agent IDE.\n"
+                "Your coordinator's terminal handle is: term_c\nYour task ID is: task_t24\n"
+                "orca orchestration send --from term_w --type worker_done --task-id task_t24 --dispatch-id ctx_d24 --outcome succeeded\n")
+
+
+def _turnos(a):
+    return json.load(open(os.path.join(a.home, "turnos.json")))
+
+
+def _hook(a, kind, **ev):
+    r = a.orq("hook", kind, stdin=json.dumps({"session_id": "abcdef123456", **ev}))
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def _chamadas_ao_orca(a):
+    p = os.path.join(a.fake, "calls.log")
+    return len(open(p).read().splitlines()) if os.path.exists(p) else 0
+
+
+def test_ticket24_hooks_do_worker_gravam_inicio_e_fim_do_turno_sem_chamar_o_orca():
+    a = Amb(run=None)
+    _hook(a, "prompt", prompt=PREAMBULO_24)
+    t = _turnos(a)["ctx_d24"]
+    assert t["task"] == "task_t24" and t["inicio"] and t["fim"] is None, t
+    _hook(a, "stop")
+    fim = _turnos(a)["ctx_d24"]["fim"]
+    assert fim and fim >= t["inicio"]
+    _hook(a, "prompt", prompt="ajuste: use o outro arquivo")  # steer: novo turno do mesmo dispatch, lido da sessão
+    t2 = _turnos(a)["ctx_d24"]
+    assert t2["fim"] is None and t2["inicio"] >= fim and list(_turnos(a)) == ["ctx_d24"], t2
+    assert _chamadas_ao_orca(a) == 0, "o hook do worker não chama o Orca"
+    assert a.events() == [], "o turno não vira evento do log"
+
+
+def test_ticket24_sessao_sem_papel_de_worker_nao_grava_turno():
+    a = Amb(run=None)
+    _hook(a, "stop")
+    _hook(a, "prompt", prompt="oi")
+    assert not os.path.exists(os.path.join(a.home, "turnos.json"))
+    a2 = Amb(run="run_a")  # coordenador: também não
+    _hook(a2, "prompt", prompt="oi")
+    _hook(a2, "stop")
+    assert not os.path.exists(os.path.join(a2.home, "turnos.json"))
+
+
+def test_ticket24_novo_preambulo_no_mesmo_terminal_abre_outro_dispatch():
+    a = Amb(run=None)
+    _hook(a, "prompt", prompt=PREAMBULO_24)
+    _hook(a, "stop")
+    _hook(a, "prompt", prompt=PREAMBULO_24.replace("ctx_d24", "ctx_d25").replace("task_t24", "task_t25"))
+    t = _turnos(a)
+    assert set(t) == {"ctx_d24", "ctx_d25"} and t["ctx_d24"]["fim"] and t["ctx_d25"]["fim"] is None and t["ctx_d25"]["task"] == "task_t25"
+    _hook(a, "stop")
+    assert _turnos(a)["ctx_d25"]["fim"], "o Stop fecha o dispatch mais novo da sessão"
+
+
+def test_ticket24_hook_do_worker_fica_abaixo_de_100_ms():
+    a = Amb(run=None)
+    _hook(a, "prompt", prompt=PREAMBULO_24)
+    tempos = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        _hook(a, "stop")
+        tempos.append(time.perf_counter() - t0)
+    assert min(tempos) < 0.1, tempos
+
+
+def _agentes_24(a, turnos):
+    a.set("workers.json", [{"handle": "term_n", "run": "run_a", "status": "dispatched", "desde": _iso(-180), "agente": "claude"},
+                           {"handle": "term_p", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
+                           {"handle": "term_t", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
+                           {"handle": "term_r", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
+                           {"handle": "term_j", "run": "run_a", "status": "dispatched", "desde": _iso(-60), "agente": "claude"},
+                           {"handle": "term_x", "run": "run_a", "status": "dispatched", "desde": _iso(-300), "agente": "codex"},
+                           {"handle": "term_s", "run": "run_a", "status": "dispatched", "desde": _iso(-300)}])
+    os.makedirs(a.home, exist_ok=True)
+    json.dump(turnos, open(os.path.join(a.home, "turnos.json"), "w"))
+    _inbox(a, _hbi(30, "ctx_term_t", "compilando", -1200), _hbi(20, "ctx_term_r", "testando", -30))
+
+
+def test_ticket24_agentes_distingue_nao_comecou_parado_e_travado():
+    a = Amb(run="run_a")
+    _agentes_24(a, {"ctx_term_p": {"task": "task_term_p", "inicio": now_iso(-600), "fim": now_iso(-300)},
+                    "ctx_term_t": {"task": "task_term_t", "inicio": now_iso(-2000), "fim": None},
+                    "ctx_term_r": {"task": "task_term_r", "inicio": now_iso(-100), "fim": None}})
+    ag = _agentes(a)
+    assert {d: x["estado"] for d, x in ag.items()} == {"ctx_term_n": "nao_comecou", "ctx_term_p": "parado", "ctx_term_t": "travado", "ctx_term_r": "rodando",
+                                                        "ctx_term_j": "rodando", "ctx_term_x": "rodando", "ctx_term_s": "rodando"}, ag
+    assert 150 <= ag["ctx_term_n"]["idade_s"] <= 260 and 250 <= ag["ctx_term_p"]["idade_s"] <= 400, "não começou conta desde o despacho; parado, desde o fim do turno"
+    assert [x["estado"] for x in _agentes(a).values()][:3] == ["travado", "nao_comecou", "parado"], "a ordem põe o que pede ação primeiro"
+    assert ag["ctx_term_j"]["turno"] == "unknown", "dentro da janela de 2 min não dá para dizer que não começou"
+
+
+def test_ticket24_worker_sem_hook_do_orq_ou_sem_agente_conhecido_fica_unknown_nunca_ocioso():
+    a = Amb(run="run_a")
+    _agentes_24(a, {})
+    ag = _agentes(a)
+    for d in ("ctx_term_x", "ctx_term_s"):  # codex não tem o hook; worker-show sem agente não prova nada
+        assert ag[d]["turno"] == "unknown" and ag[d]["estado"] == "rodando", ag[d]
+    assert ag["ctx_term_n"]["estado"] == "nao_comecou"
+
+
+def test_ticket24_heartbeat_depois_do_fim_do_turno_vale_como_rodando():
+    a = Amb(run="run_a")
+    a.set("workers.json", [{"handle": "term_p", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ctx_term_p": {"task": "task_term_p", "inicio": now_iso(-600), "fim": now_iso(-300)}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    _inbox(a, _hbi(30, "ctx_term_p", "voltei", -100))
+    assert _agentes(a)["ctx_term_p"]["estado"] == "rodando"
+
+
+def test_ticket24_dispatch_com_heartbeat_e_sem_registro_de_turno_nao_e_nao_comecou():
+    a = Amb(run="run_a")  # o worker que já rodava quando os hooks entraram
+    a.set("workers.json", [{"handle": "term_v", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    _inbox(a, _hbi(30, "ctx_term_v", "fase-1", -100))
+    v = _agentes(a)["ctx_term_v"]
+    assert v["estado"] == "rodando" and v["turno"] == "unknown", v
+
+
+def test_ticket24_texto_de_agentes_diz_nao_comecou_e_parado_no_prompt_com_o_steer():
+    a = Amb(run="run_a")
+    _agentes_24(a, {"ctx_term_p": {"task": "task_term_p", "inicio": now_iso(-600), "fim": now_iso(-300)}})
+    r = a.orq("agentes")
+    assert r.returncode == 0, r.stderr
+    assert "não começou" in r.stdout and "parado no prompt há 5 min" in r.stdout, r.stdout
+    assert 'orq steer task_term_p "' in r.stdout and 'orq steer task_term_n "' in r.stdout, r.stdout
+
+
+def test_ticket24_resumo_e_aberto_carregam_o_nao_comecou_e_o_parado():
+    from datetime import datetime, timezone
+    agora = datetime.now(timezone.utc)
+    ab = _aberto_ag("parado", agente="claude", desde=now_iso(-3000), turno_inicio=now_iso(-900), turno_fim=now_iso(-600), idade_s=600)
+    ab["agentes"].append({**ab["agentes"][0], "dispatch": "ctx_2", "task": "task_bbbbbbbbbb", "estado": "nao_comecou", "turno_inicio": None, "turno_fim": None, "desde": now_iso(-400)})
+    txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
+    assert "Parado no prompt: task_aaaaaaaaaa" in txt and "há 10 min" in txt and "Não começou: task_bbbbbbbbbb" in txt and 'orq steer task_aaaaaaaaaa "' in txt, txt
+    assert len(txt.splitlines()) <= 5
+    vivo = orq_mod.resumo([], ab, {"itens": []}, agora=agora, turnos={"ctx_1": {"inicio": now_iso(-5), "fim": None}})
+    assert "Parado no prompt" not in vivo, "o turnos.json mais novo que o cache tira o parado"
+
+
+def test_ticket24_constantes_com_nome():
+    assert (orq_mod.NAO_COMECOU_S, orq_mod.PARADO_S) == (120, 60)
 
 
 if __name__ == "__main__":
