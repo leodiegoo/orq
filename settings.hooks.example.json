@@ -20,6 +20,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/orq/orq.py hook lugar",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "SessionStart": [

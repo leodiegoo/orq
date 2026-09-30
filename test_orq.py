@@ -3946,6 +3946,86 @@ def test_hook_session_esta_registrado_no_settings_e_o_comando_funciona():
     assert r.returncode == 0 and "Pelo comando registrado" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r
 
 
+# guarda de lugar errado (ticket 33)
+
+def _repo(base, ramo="main"):
+    """Checkout principal com um commit, na branch `ramo`, e uma worktree ligada `wt`; devolve (principal, worktree)."""
+    p, w = os.path.join(base, "repo"), os.path.join(base, "wt")
+    g = lambda *a, cwd=p: subprocess.run(["git", "-C", cwd, *a], check=True, capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                                                                                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    os.makedirs(p)
+    g("init", "-q", "-b", "main")
+    g("commit", "-q", "--allow-empty", "-m", "x")
+    g("worktree", "add", "-q", "-b", "feat/w", w)
+    if ramo != "main":
+        g("checkout", "-q", "-b", ramo)
+    return p, w
+
+
+def _lugar(a, cwd, cmd="git commit -m x", tool="Bash", sid="abcdef123456", **env):
+    ti = {"command": cmd} if tool == "Bash" else {"file_path": os.path.join(cwd, "a.txt")}
+    return a.orq("hook", "lugar", stdin=json.dumps({"session_id": sid, "cwd": cwd, "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": ti}), **env)
+
+
+def _aviso(r):
+    assert r.returncode == 0, r
+    if not r.stdout:
+        return ""
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse" and "permissionDecision" not in out, "só avisa, nunca bloqueia"
+    return out["additionalContext"]
+
+
+def test_lugar_checkout_principal_na_branch_padrao_nao_avisa():
+    a = Amb(run="run_a")
+    a.prompt("oi")  # a sessão vira coordenadora (Run guardado)
+    p, _ = _repo(a.tmp.name)
+    assert _aviso(_lugar(a, p)) == ""
+    assert _aviso(_lugar(a, p, tool="Edit")) == ""
+    assert _aviso(_lugar(a, p, cmd="git status")) == "", "comando que não escreve passa"
+
+
+def test_lugar_checkout_principal_fora_da_branch_padrao_avisa():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, _ = _repo(a.tmp.name, ramo="feat/outra")
+    for r in (_lugar(a, p), _lugar(a, p, cmd="cd x && git push origin HEAD"), _lugar(a, p, tool="Write")):
+        msg = _aviso(r)
+        assert "lugar errado" in msg and "feat/outra" in msg and "main" in msg, msg
+    assert _aviso(_lugar(a, p, cmd="echo git commit")) == ""
+
+
+def test_lugar_cwd_em_worktree_de_worker_avisa_mas_a_casa_do_coordenador_nao():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, w = _repo(a.tmp.name)
+    msg = _aviso(_lugar(a, w, CLAUDE_PROJECT_DIR=p))
+    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+    assert _aviso(_lugar(a, w, CLAUDE_PROJECT_DIR=w)) == "", "coordenador que mora numa worktree ligada não é engano"
+
+
+def test_lugar_so_no_coordenador_e_abaixo_de_100_ms():
+    a = Amb(run="run_a")
+    p, _ = _repo(a.tmp.name, ramo="feat/outra")
+    assert _aviso(_lugar(a, p)) == "", "sessão sem Run guardado não é coordenador"
+    a.prompt("oi")
+    w = Amb(run="run_a")  # worker: preâmbulo de despacho grava o papel
+    pw, _ = _repo(w.tmp.name, ramo="feat/outra")
+    w.prompt(PREAMBULO)
+    assert _aviso(_lugar(w, pw)) == "" and _calls(w, "run-current") == []
+    assert _aviso(_lugar(a, p, ORCA_TERMINAL_HANDLE="")) == "", "fora do Orca"
+    ev = {"session_id": "abcdef123456", "cwd": p, "tool_name": "Bash", "tool_input": {"command": "git commit -m x"}}
+    t = time.perf_counter()
+    orq_mod.hook_lugar(ev, None)
+    assert time.perf_counter() - t < 0.1, "o hook em si (git incluído) passa de 100 ms"
+
+
+def test_lugar_esta_no_settings_de_exemplo():
+    cfg = json.load(open(os.path.join(AQUI, "settings.hooks.example.json")))
+    g = [x for x in cfg["hooks"]["PreToolUse"] if "orq.py hook lugar" in json.dumps(x)]
+    assert len(g) == 1 and "Bash" in g[0]["matcher"] and "Edit" in g[0]["matcher"], g
+
+
 # a migração
 
 MIGRACAO = os.path.join(AQUI, "fixtures", "issues-migracao")  # tickets 01 a 08 de exemplo (B20: nunca a pasta real, que muda a cada `orq ticket novo`)

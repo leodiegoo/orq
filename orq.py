@@ -1994,6 +1994,41 @@ def hook_guard(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
 
 
+LUGAR_ESCRITA = re.compile(r"(^|[;&|(]\s*)git(\s+-\S+(\s+\S+)?)*\s+(commit|push)\b")
+
+
+def hook_lugar(ev, run):
+    """PreToolUse de Bash/Edit/Write, só no coordenador: AVISA (não bloqueia) escrita no lugar errado, no checkout principal fora da
+    branch padrão ou com o cwd numa worktree que não é a do coordenador (CLAUDE_PROJECT_DIR). Só olha comando de escrita: git commit/push e edição de arquivo."""
+    ferr, ti = ev.get("tool_name"), ev.get("tool_input") or {}
+    if ferr == "Bash":
+        if not LUGAR_ESCRITA.search(ti.get("command") or ""):
+            return None
+        d = ev.get("cwd") or os.getcwd()
+    elif ferr in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        d = os.path.dirname(ti.get("file_path") or ti.get("notebook_path") or "")
+        d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
+    else:
+        return None
+    gd, comum, topo = ((_git(d, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel") or "").split() + ["", "", ""])[:3]
+    if not gd:
+        return None
+    comum = os.path.realpath(os.path.join(d, comum))
+    if os.path.realpath(gd) != comum:  # worktree ligada: só é engano se não é onde o coordenador mora
+        casa = os.environ.get("CLAUDE_PROJECT_DIR")
+        if casa and os.path.realpath(casa) == os.path.realpath(topo):
+            return None
+        aviso = f"o cwd está na worktree {topo}, que parece ser de um worker"
+    else:
+        ramo = (_git(d, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+        padrao = (_git(d, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "main").strip().split("/", 1)[-1]
+        if ramo in (padrao, "main", "master"):
+            return None
+        aviso = f"o checkout principal está em {ramo}, não em {padrao}"
+    msg = f"{MARCA} lugar errado? {aviso}. Confira `git status --short --branch` e o cwd antes de escrever (aviso, nada foi bloqueado)."
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg}}
+
+
 def hook_session(ev, run):
     """SessionStart: injeta o estado e os tickets abertos para a sessão nova retomar sem que ninguém conte nada."""
     if not os.path.exists(_path("aberto.json")):
@@ -2001,7 +2036,7 @@ def hook_session(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": contexto_sessao()}}
 
 
-HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session}
+HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar}
 
 
 def run_hook(kind):
@@ -2014,6 +2049,13 @@ def run_hook(kind):
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             return 0  # fora do Orca não há Run nem terminal: nem chama o Orca nem enche o log
         ev = json.load(sys.stdin)
+        if kind == "lugar":  # a cada Bash/Edit: sem Orca, o coordenador é a sessão que já tem Run guardado e não é worker
+            sid = ev.get("session_id") or ""
+            if _dict(_cursor_ro().get("runs")).get(sid) and _papeis().get(sid) != "worker":
+                out = hook_lugar(ev, None)
+                if out:
+                    print(json.dumps(out, ensure_ascii=False))
+            return 0
         run = coordenador(ev)
         if run is None:
             sid = ev.get("session_id") or ""
