@@ -1,0 +1,232 @@
+# orq
+
+A task register and noise filter for a Claude Code session that coordinates coding agents in [Orca](https://www.onorca.dev).
+
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python 3, stdlib only](https://img.shields.io/badge/python-3%20stdlib%20only-3776AB.svg)
+
+## The problem
+
+Orca runs several coding agents side by side: one coordinator session creates Runs and tasks with `orca orchestration`, and workers run in their own terminals. Two things go wrong once more than a couple of workers are busy.
+
+The coordinator drowns in noise. Orca types "You have N orchestration messages" into the coordinator's terminal for every worker message, heartbeats included, and each notice is a new prompt that wakes the model and eats context.
+
+Requests get dropped. The user asks for five things across a long session, the context gets compacted, and nothing records that the third request never became a task. Orca stores tasks, but it has no link between "the user asked for X at 14:02" and what that message turned into.
+
+orq handles both. Hooks record every user prompt as an entry that stays open until the coordinator records what it became. A separate manager terminal soaks up heartbeats so the coordinator only wakes up for results, questions and escalations.
+
+## How it works
+
+```mermaid
+flowchart LR
+    U([User]) -->|prompt| C["Coordinator<br/>Claude Code session"]
+    C -->|"orq despachar / steer / liberar"| O[("Orca orchestration")]
+    O -->|dispatch| W1[Worker]
+    O -->|dispatch| W2[Worker]
+    W1 -->|"heartbeat, worker_done, question"| O
+    W2 -->|"heartbeat, worker_done, question"| O
+    O -->|"notices go to the bound terminal"| M["Agent manager<br/>plain shell, no LLM"]
+    M -->|"ack heartbeats"| O
+    M -->|"one notice per new batch"| C
+    C -.->|hooks| H{{"orq hook prompt / stop / ask / guard / session"}}
+    H -->|append| E[("events.jsonl")]
+```
+
+The Runs are bound to the agent manager's terminal instead of the coordinator's, so Orca sends every notice there. The manager loop (`painel-agent-manager.sh`, which runs `orq gerente absorver` every 10 s) acknowledges batches that contain only heartbeats and types a single notice into the coordinator when something else arrives.
+
+Intake runs through Claude Code hooks:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant CC as Coordinator
+    participant H as orq hooks
+    participant L as events.jsonl
+    U->>CC: "add a login endpoint"
+    CC->>H: UserPromptSubmit
+    H->>L: append entrada e12
+    H-->>CC: context: open entries, Orca backlog, live workers
+    CC->>L: orq intake e12 tarefa task_abc123
+    CC->>H: Stop
+    H->>L: read entries without an effect
+    H-->>U: warning listing any entry still open
+```
+
+Every state change is a line appended to `events.jsonl`. Open entries, live workers, pending gates and suspicious answers are all computed from that log by pure functions; nothing reads "the last line" as current state.
+
+## Features
+
+- Deterministic intake. `orq hook prompt` classifies each prompt by its origin (user, Orca notice, task notification, slash command, compaction summary, worker dispatch preamble) and records only user prompts as entries, then injects a status summary of at most five lines.
+- Effects. `orq intake <entry> <effect> [ref]` closes an entry as `tarefa` (task), `steer`, `pend`, `decisao` (decision), `conversa` (nothing to do) or `descartado` (discarded, with a note). It refuses a task or pending id that does not exist.
+- Stop reminder. `orq hook stop` lists the entries still without an effect. It only warns for now; blocking the end of the turn is planned but not built.
+- Report ingestion. `orq ingest` turns completed Orca automation runs and `worker_done` messages carrying a `reportPath` into entries, one per numbered action item in the report.
+- Heartbeat absorption. Orca notices whose mailbox holds only heartbeats are acknowledged and blocked before they reach the model, both in the prompt hook and in the manager loop.
+- Agent manager. `orq gerente ligar|desligar|absorver` binds Runs to a separate terminal and rotates through several Runs, because Orca binds one Run per terminal.
+- `orq despachar` starts a worker with an explicit model and effort, renames its tab, records the dispatch and links the entry.
+- `orq agentes` shows every dispatch across all Runs as running, stuck (no heartbeat for 15 min), asking, delivered or released.
+- `orq liberar` acknowledges a finished worker's messages, releases it and closes its terminal when that is safe.
+- `orq steer` sends a correction to a running worker and, if the worker sits idle at its prompt, types the notice into its terminal.
+- Tickets as markdown files (`orq ticket novo|fechar|lista`), each backed by an Orca task with dependencies.
+- A pending list for the user (`orq pend add|done`), stored as JSON for a dashboard to read. A decision can hold an Orca gate on a task until it is answered.
+- AskUserQuestion guard. While any worker is running, the question widget is refused and the decision goes through a separate page (see [design](docs/design.md#askuserquestion-guard)).
+- Compaction handoff. `precompact.py` snapshots the coordinator's state on PreCompact and injects it back after `/compact`; `orq hook session` injects status and open tickets on every session start.
+- `worker-routing` skill plus a PreToolUse guard that refuses `orca orchestration worker-start`, `orq despachar` or an Agent call without an explicit model and effort.
+
+## Requirements
+
+- macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3 with the standard library only (developed and tested on 3.14)
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) for the coordinator and workers
+- [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
+- git
+
+Optional: `gh` (open PRs in the handoff, branch cleanup), `engram` (the handoff is also saved there), and `lavish-axi` if you want to use the decision page the guard points to. orq never runs `lavish-axi` itself; it only parses its `poll` output in `orq lavish-resposta`.
+
+## Install
+
+```sh
+git clone https://github.com/leodiegoo/orq.git ~/.claude/orq
+mkdir -p ~/.claude/hooks ~/.claude/scripts ~/.claude/skills ~/.local/bin
+mkdir -p ~/.claude/orquestrador-plan/issues
+
+for f in worker-routing-guard.py limpar-mergeados-hook.py; do
+  ln -s ~/.claude/orq/hooks/$f ~/.claude/hooks/$f
+done
+for f in limpar-mergeados.py orca-wait-runs.py trust-cwd.py; do
+  ln -s ~/.claude/orq/scripts/$f ~/.claude/scripts/$f
+done
+ln -s ~/.claude/orq/skills/worker-routing ~/.claude/skills/worker-routing
+ln -s ~/.claude/orq/orq.py ~/.local/bin/orq   # the manager loop calls `orq`
+```
+
+Then merge the `hooks` section of [`settings.hooks.example.json`](settings.hooks.example.json) into `~/.claude/settings.json`, next to any hooks you already have. The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
+
+The branch cleanup reads branch patterns to keep from `~/.claude/scripts/limpar-mergeados.keep` (one glob per line; a missing file means none). Write your own. It treats `main`, `development` and `staging` as protected branches (override with `ORQ_PROTECTED_BRANCHES`, comma-separated) and counts a branch as finished only when a PR into `main` merges it (`ORQ_FINAL_BASE`).
+
+### Where things live
+
+| Path | Contents | Override |
+|---|---|---|
+| `~/.claude/orq/` | runtime state: `events.jsonl`, `cursor.json`, `aberto.json`, `gerente.json`, locks, `handoff/` (all gitignored) | `ORQ_HOME` |
+| `~/.claude/orquestrador-plan/issues/` | tickets, `NN-<slug>.md` | `ORQ_ISSUES` |
+| `~/.claude/orquestrador-plan/desenho.md` | your own design notes; orq only prints this path at session start and in the handoff | `ORQ_MAPA`, `ORQ_DESENHO` (precompact) |
+| `~/.claude/dashboard/data/pendencias.json` | the user's pending list | `ORQ_PENDENCIAS` |
+| `~/.claude/logs/orq.log` | errors from hooks that failed open | `ORQ_LOG` |
+| `~/.claude/projects/` | Claude Code transcripts, read by `orq liberar` | `ORQ_PROJETOS` |
+
+`orq auditar-respostas` reads the coordinator's transcripts from `ORQ_TRANSCRITOS`. By default that is the Claude Code project folder for the current directory (`~/.claude/projects/` plus the cwd with every character outside `[A-Za-z0-9]` turned into `-`), so run it from the coordinator's working directory or set the variable. Other knobs: `ORQ_ORCA` (path to the Orca binary), `ORQ_ORCA_TIMEOUT` (seconds per Orca call, default 2.5), `ORQ_NO_BG=1` (no background refresh), `ORQ_GERENTE_PRESO_S`, `ORQ_OCIOSO_MS`, `ORQ_STEER_ESPERA_S`, `ORQ_WAIT_POLL`, `ORQ_WAIT_MAX`.
+
+## Usage
+
+Start the manager in a plain shell terminal inside Orca, then bind your Run to it from the coordinator:
+
+```sh
+# manager terminal
+echo $ORCA_TERMINAL_HANDLE          # term_manager
+~/.claude/orq/painel-agent-manager.sh
+
+# coordinator, after `orca orchestration run-create --objective "Auth work"`
+orq gerente ligar --terminal term_manager
+orq gerente desligar --run run_demo  # hand one Run back; without --run, all of them
+```
+
+Record what each entry became:
+
+```sh
+$ orq intake e12 tarefa task_abc123
+{"tipo": "intake", "entrada": "e12", "efeito": "tarefa", "ref": "task_abc123", "run": "run_demo", "origem": "usuario", "texto": "add a login endpoint with rate limiting"}
+$ orq intake e13 conversa
+$ orq intake e14 descartado --nota "duplicate of e12"
+```
+
+Tickets and dispatch:
+
+```sh
+$ orq ticket novo --titulo "Add login endpoint" --spec-arquivo spec.md --blocked-by 01
+{"ticket": "02", "arquivo": "~/.claude/orquestrador-plan/issues/02-add-login-endpoint.md", "task": "task_abc123", "run": "run_demo"}
+$ orq ticket lista
+01 Add session store (claimed)
+02 Add login endpoint (ready-for-agent; Blocked by: 01)
+$ orq despachar --run run_demo --ticket 02 --modelo <model-id> --effort medium \
+    --worktree new-top-level --name add-login-endpoint --entrada e12
+{"dispatchId": "ctx_abc123", "taskId": "task_abc123", "run": "run_demo", "terminal": "term_abc123", "espera": "python3 ~/.claude/scripts/orca-wait-runs.py run_demo", "entrada": "e12"}
+$ orq ticket fechar 02 --answer notes/login-done.md
+```
+
+Without a ticket, `orq despachar --run r --titulo "..." --spec-arquivo f --modelo m --effort e` creates the task itself. The spec for `ticket novo` must contain a `## Acceptance criteria` section.
+
+Workers:
+
+```sh
+$ orq agentes
+travado     task_abc123  Add login endpoint  <model-id>  term_abc123  implement 13:40 (há 22 min)
+            -> orq steer task_abc123 "<ajuste>" --run run_demo
+rodando     task_def456  Fix flaky test  <model-id>  term_def456  test 14:01 (há 1 min)
+entregue    task_789abc  Update the README  <model-id>  term_789abc
+            -> orq liberar ctx_789abc
+$ orq steer task_abc123 "Use the existing rate limiter instead of writing one" --run run_demo
+$ orq liberar ctx_789abc
+```
+
+`orq agentes` also takes `--json`, `--run r` and `--todos` (includes released workers and terminals Orca retained).
+
+The user's pending list:
+
+```sh
+$ orq pend add --id pick-db --tipo decisao --titulo "Postgres or SQLite for sessions?" --task task_abc123
+$ orq pend add --id rotate-key --tipo acao --titulo "Rotate the staging API key" --espera "ops team"
+$ orq pend done pick-db --resposta "Postgres"
+```
+
+`--tipo` is `acao`, `decisao` or `avisar`. A decision id is at most 12 characters because it doubles as the AskUserQuestion `header`, and answering that question closes it. `--task` creates an Orca gate that holds the task until the decision closes.
+
+Status at any time (the same summary the prompt hook injects):
+
+```sh
+$ orq status
+[orq] Sem efeito: e9 ('Fix flaky test in the auth suite').
+Aberto (cache de 14:02): backlog 3 (task_abc1… 'Add session store', 4 d), rodando 2, bloqueado 0, gates 0. Vivos: task_def4… test 14:01.
+Com você: 2 (1 decisões).
+Efeito: orq intake <e> tarefa <task>|steer <task>|pend <id>|decisao <id>|conversa|descartado --nota <motivo>
+```
+
+Also available: `orq ingest [--refresh]`, `orq alerta visto <task>`, `orq lavish-resposta <file|->` and `orq auditar-respostas [--sessao id]`.
+
+## Tests
+
+```sh
+python3 test_orq.py              # fake Orca, temporary ORQ_HOME
+python3 test_precompact.py
+python3 scripts/limpar-mergeados.py --self-test
+```
+
+## Portability and lock-in
+
+orq is a personal tool tuned for Claude Code plus Orca. It works, it has a large test suite, and it is shaped by one person's workflow.
+
+Tied to Claude Code: the hook events and their JSON formats (UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, SessionStart, Stop), the AskUserQuestion tool and its `questions`/`answers`/`annotations` payload, the transcript files under `~/.claude/projects`, the skill file format and `~/.claude/settings.json`.
+
+Tied to Orca: the `orca orchestration` CLI and its JSON (Runs, tasks, gates, dispatches, the mailbox with `check --peek`/`--ack`, the inbox), `orca terminal` (send, wait, read, rename, close), `orca automations runs`, the notice text Orca types into terminals, and the dispatch preamble that identifies a worker session.
+
+Generic: the Python core, the append-only `events.jsonl` and the functions that derive state from it, the markdown tickets, and the entry/effect state machine.
+
+Running it with Codex or pi would mean replacing the hook adapters (`orq hook *`, `precompact.py`) with that agent's lifecycle events, rewriting the transcript reader used by `orq liberar`, mapping the ask guard to whatever that agent uses to ask the user questions, and porting `skills/worker-routing/SKILL.md` to its instruction format. The log, the tickets and the core commands would stay as they are.
+
+## Language
+
+Code comments, docstrings, CLI names and messages are in Brazilian Portuguese, the author's language. A short glossary:
+
+| pt-BR | English |
+|---|---|
+| entrada / efeito | entry / effect |
+| tarefa, decisao, conversa, descartado | task, decision, conversation, discarded |
+| pend, pendência | pending item for the user |
+| acao, avisar, espera | action, notify, waiting on a third party |
+| despachar / liberar | dispatch / release |
+| gerente, ligar / desligar, absorver | manager, bind / unbind, absorb |
+| agentes: rodando, travado, perguntando, entregue, liberado | agents: running, stuck, asking, delivered, released |
+| ticket novo / fechar / lista | ticket new / close / list |
+| sem efeito, com você, aberto | without effect, with you, open |
+
+## License
+
+MIT. See [LICENSE](LICENSE). Copyright Leonardo Diego Barbosa.
