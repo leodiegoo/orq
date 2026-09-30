@@ -4734,12 +4734,13 @@ def _adotar(run):
     if (orca("run-show", "--id", run)["run"] or {}).get("coordinator_handle") in (None, meu, g["gerente"]):
         gerente_ligar(g["gerente"], [run])
 
-def gerente_ligar(terminal, runs=None):
+def gerente_ligar(terminal, runs=None, assumir=False):
     """Liga os Runs ao terminal do agent manager (`run-use` com o handle dele) e grava o gerente.json: daí em diante o orq deste coordenador fala
     com o Orca por esse handle, e os avisos do Orca (heartbeat incluído) vão para o terminal do agent manager, não para o coordenador.
 
     Soma aos Runs que o mesmo gerente já tem (sem duplicar); outro terminal de gerente recomeça a lista. Sem `runs`, entra o Run ligado ao
-    coordenador (o do `run-create` que acabou de rodar). O Orca liga um Run por terminal: só o último fica ligado, o painel os reveza."""
+    coordenador (o do `run-create` que acabou de rodar). O Orca liga um Run por terminal: só o último fica ligado, o painel os reveza.
+    `assumir`: este coordenador toma o gerente.json de outro que ainda aparece no Orca (troca de terminal sem o antigo sumir): os Runs dele vêm junto."""
     meu = os.environ.get("ORCA_TERMINAL_HANDLE")
     if not meu:
         raise ValueError("fora de um terminal do Orca (sem ORCA_TERMINAL_HANDLE)")
@@ -4757,7 +4758,7 @@ def gerente_ligar(terminal, runs=None):
         raise ValueError(f"terminal {terminal} não existe no Orca ({e})") from e
     antes = _gerente_cfg()
     ja = antes["runs"] if antes.get("coordenador") == meu and antes.get("gerente") == terminal else []
-    if antes and not ja and (_morto(antes.get("coordenador")) or _morto(antes.get("gerente"))):
+    if antes and not ja and (assumir or _morto(antes.get("coordenador")) or _morto(antes.get("gerente"))):
         ja = antes["runs"]  # queda: o coordenador ou o gerente antigo não existem mais, os Runs deles seguem no gerente novo (ticket 48)
     todos = list(dict.fromkeys([*ja, *runs]))
     _write_json(_path(GERENTE), {"coordenador": meu, "gerente": terminal, "runs": todos})
@@ -4771,14 +4772,14 @@ def gerente_ligar(terminal, runs=None):
     return append_event({"tipo": "gerente", "op": "ligar", "terminal": terminal, "run": runs[-1], "runs": todos})
 
 
-def gerente_desligar(run=None):
+def gerente_desligar(run=None, assumir=False):
     """Devolve ao terminal do coordenador (`run-use` com o handle próprio) o Run `run`, ou todos, e tira do gerente.json.
 
     Sem `run` o arquivo é apagado. O coordenador segura um Run só (um por terminal): fica com o que o gerente tinha ligado, e os outros
-    ficam sem coordenador até um `run-use`."""
+    ficam sem coordenador até um `run-use`. `assumir` desliga também o gerente.json de outro coordenador que ainda aparece no Orca."""
     g = _gerente_cfg()
     meu = os.environ.get("ORCA_TERMINAL_HANDLE")
-    if g and g.get("coordenador") != meu and _morto(g.get("coordenador")):
+    if g and g.get("coordenador") != meu and (assumir or _morto(g.get("coordenador"))):
         g = {**g, "coordenador": meu}  # queda: o terminal do coordenador antigo não existe mais, este o substitui (ticket 48)
     if not g or g.get("coordenador") != meu:
         raise ValueError("agent manager não está ligado a este coordenador")
@@ -5428,8 +5429,10 @@ def main(argv=None):
     gl = ge.add_parser("ligar", help="no coordenador: liga Runs ao terminal do agent manager (soma aos que ele já tem)")
     gl.add_argument("--terminal", required=True)
     gl.add_argument("--run", action="append", help="repita para ligar vários; sem --run entra o Run ligado ao coordenador")
+    gl.add_argument("--assumir", action="store_true", help="toma o gerente.json de outro coordenador que ainda aparece no Orca, com os Runs dele")
     gd = ge.add_parser("desligar", help="no coordenador: devolve um Run (--run) ou todos a este terminal")
     gd.add_argument("--run")
+    gd.add_argument("--assumir", action="store_true", help="desliga também o gerente.json de outro coordenador que ainda aparece no Orca")
     ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
     rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
     rt.add_argument("--dry-run", action="store_true", help="só lista")
@@ -5574,9 +5577,9 @@ def main(argv=None):
                 print(f"aviso: {x}", file=sys.stderr)
         elif a.cmd == "gerente":
             if a.op == "ligar":
-                print(json.dumps(gerente_ligar(a.terminal, a.run), ensure_ascii=False))
+                print(json.dumps(gerente_ligar(a.terminal, a.run, a.assumir), ensure_ascii=False))
             elif a.op == "desligar":
-                print(json.dumps(gerente_desligar(a.run), ensure_ascii=False))
+                print(json.dumps(gerente_desligar(a.run, a.assumir), ensure_ascii=False))
             else:
                 print(gerente_absorver())
         elif a.cmd == "retomar" and a.pausados:

@@ -7877,6 +7877,33 @@ def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_gu
 
 
 
+# ---------- ticket 54: --assumir troca de coordenador e de gerente sem mover o gerente.json ----------
+
+def _gerente_de_outro_vivo(run):
+    a = Amb(run=run)
+    os.makedirs(a.home, exist_ok=True)
+    a.set("terminals.json", ["term_coord", "term_ger", "term_old", "term_ger_old"])  # o coordenador e o gerente antigos seguem no Orca
+    json.dump({"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    return a
+
+
+def test_it_should_take_over_the_manager_of_another_live_coordinator_when_asked_to_on_ligar():
+    a = _gerente_de_outro_vivo("run_c")
+    r = a.orq("gerente", "ligar", "--terminal", "term_ger", "--assumir")
+    assert r.returncode == 0, r.stderr
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b", "run_c"]}
+    assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_c"}, "só o Run pedido é religado; os herdados já estavam no gerente"
+
+
+def test_it_should_take_over_the_manager_of_another_live_coordinator_when_asked_to_on_desligar():
+    a = _gerente_de_outro_vivo("run_a")
+    assert a.orq("gerente", "desligar").returncode == 1, "sem --assumir o coordenador de outro segue intocado"
+    r = a.orq("gerente", "desligar", "--assumir")
+    assert r.returncode == 0, r.stderr
+    assert not os.path.exists(os.path.join(a.home, "gerente.json"))
+    assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
+
+
 # ---------- ticket 54: prligar com PRs de branches diferentes ----------
 
 PR3 = "https://github.com/acme/app/pull/1230"
