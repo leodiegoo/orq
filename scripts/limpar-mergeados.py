@@ -18,6 +18,8 @@ KEEP_FILE = os.path.join(HOME, ".claude/scripts/limpar-mergeados.keep")
 LAST = os.path.join(HOME, ".claude/logs/limpar-mergeados.last.json")
 # Fluxo em que a mesma branch é promovida por PR para cada ambiente (development, staging, main): só o merge na base final a encerra.
 PROTECTED = set((os.environ.get("ORQ_PROTECTED_BRANCHES") or "main,development,staging").split(","))
+ORFA_OCIOSA_H = 24  # worktree órfã só sai depois deste tempo sem atividade
+ORQ = os.path.join(HOME, ".claude/orq/orq.py")
 FINAL_BASE = os.environ.get("ORQ_FINAL_BASE") or "main"
 
 
@@ -75,6 +77,24 @@ def decide(f):
     return "remove", "PR mergeado e sem trabalho pendente"
 
 
+def decide_orfa(f):
+    """Worktree sem PR mergeado. Só sai se nada nela se perde: todo commit já está na main (cherry sem "+", p.ex. cherry-pick), árvore limpa,
+    nenhum worker vivo do orq (`busy` None, sem resposta do orq, conta como vivo) e sem atividade recente (worktree que acabou de nascer também não tem commit)."""
+    if f["branch"] in PROTECTED or f["branch"].startswith("prototype/") or f["kept"]:
+        return "skip", "branch protegida ou listada em limpar-mergeados.keep"
+    if f["open_head"]:
+        return "skip", "PR aberto usa o branch como head"
+    if f["dirty"]:
+        return "skip", "worktree com alterações ou arquivos não rastreados"
+    if f["ahead"]:
+        return "skip", "commit fora da main"
+    if f["busy"] is not False:
+        return "skip", "worker vivo do orq usa a worktree"
+    if f["recente"]:
+        return "skip", f"atividade nas últimas {ORFA_OCIOSA_H} h"
+    return "remove", "sem commit fora da main, árvore limpa e sem worker"
+
+
 def is_ahead(base, head, cwd, pr_head_oid=None):
     """True se `head` tem trabalho fora de `base`. Falha de git conta como ahead (na dúvida, não apaga).
     `head` é uma revisão (nunca o caminho da worktree). Squash-merge: HEAD == headRefOid do PR prova que
@@ -113,11 +133,25 @@ def self_test_git():
         assert pr_final(prs[:1], "merge/feat-development")["number"] == 5 and pr_final(prs[:1], "feat/merge/x") is None
         assert not is_ahead("origin/nope", "feat/x", d, tip)  # HEAD == headRefOid do PR
         assert is_ahead("origin/nope", "feat/x", d, "0" * 40)
+        # cherry-pick: sha novo, mesmo patch-id; o cherry não vê commit "+" e a branch é órfã
+        g("checkout", "-q", "-b", "feat/cp", "origin/development")
+        open(f"{d}/cp", "w").write("cp"); g("add", "cp"); g("commit", "-qm", "cp")
+        g("checkout", "-q", "development")
+        assert is_ahead("origin/development", "feat/cp", d)  # ainda fora da base
+        g("cherry-pick", "feat/cp")
+        g("update-ref", "refs/remotes/origin/development", "HEAD")
+        assert not is_ahead("origin/development", "feat/cp", d)  # entrou por cherry-pick
         g("worktree", "remove", "--force", wt)
 
 
 def self_test():
     self_test_git()
+    orfa = dict(branch="feat/o", kept=False, open_head=False, dirty=False, ahead=False, busy=False, recente=False)
+    assert decide_orfa(orfa)[0] == "remove"  # cherry-pick: sem commit "+", árvore limpa, sem worker
+    for k, v in dict(branch="main", kept=True, open_head=True, dirty=True, ahead=True, busy=True, recente=True).items():
+        assert decide_orfa({**orfa, k: v})[0] == "skip", k
+    assert decide_orfa({**orfa, "branch": "prototype/2039-x"})[0] == "skip"  # prototype nunca, mesmo fora do .keep
+    assert decide_orfa({**orfa, "busy": None})[0] == "skip"  # sem resposta do orq sobre workers, na dúvida não apaga
     assert is_kept("prototype/2039-x", ["prototype/*"]) and not is_kept("feat/x", ["prototype/*"])
     assert is_kept("main_bkp_1", ["main_bkp_*"]) and is_kept("feat/plataform-metrics", ["feat/plataform-metrics"])
     base = dict(branch="feat/a", kind="worktree", kept=False, merged=True, open_head=False, open_base=False,
@@ -132,6 +166,12 @@ def self_test():
     for k, v in dict(mine=False, on_remote=False, open_base=True, tip_matches=False).items():
         assert decide({**r, k: v})[0] == "skip", k
     print("self-test ok")
+
+
+def worktrees_ocupadas():
+    """Caminhos das worktrees com worker vivo, pelo `orq ocupadas`; None se o orq não responder."""
+    p = run(["python3", ORQ, "ocupadas"])
+    return None if p.returncode else set(p.stdout.split("\n"))
 
 
 def gh_json(args, cwd):
@@ -222,13 +262,25 @@ def main():
     except Exception as e:
         wts = []
         add("worktree", "(orca worktree list)", "error", str(e))
+    busy = worktrees_ocupadas()
     for w in wts:
         if w.get("isMainWorktree") or not w.get("branch"):
             continue
         b = w["branch"].removeprefix("refs/heads/")
         try:
-            v, r = decide(facts("worktree", b, w["path"]))
+            fa = facts("worktree", b, w["path"])
+            v, r = decide(fa)
+            if not fa["merged"] and not fa["is_main_current"]:  # sem PR mergeado: talvez órfã (cherry-pick, pesquisa, parada)
+                fa["ahead"] = is_ahead("origin/main", "HEAD", w["path"])
+                fa["dirty"] = bool(run(["git", "status", "--porcelain"], w["path"]).stdout.strip())
+                fa["busy"] = None if busy is None else w["path"] in busy
+                fa["recente"] = (datetime.now(timezone.utc).timestamp() * 1000 - (w.get("lastActivityAt") or 0)) < ORFA_OCIOSA_H * 3600 * 1000
+                v, r = decide_orfa(fa)
+                if v == "remove":
+                    r += "; branch local apagada junto"
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
+            if v == "remove" and not fa["merged"] and not a.dry_run and items[-1]["action"] == "removed":
+                run(["git", "branch", "-D", b], main_path)  # o commit já está na main (cherry sem "+"), então -D não perde trabalho
         except Exception as e:
             add("worktree", b, "error", str(e))
 
