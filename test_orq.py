@@ -246,8 +246,9 @@ elif cmd in ("worker-show", "worker-release"):
         # dispatch.dispatchedAt e worker.startOptions.launch.requested.model como no Orca real
         res = {"dispatch": {"status": w.get("status", "completed"), "dispatchedAt": w.get("desde", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 600))),
                             "lastHeartbeatAt": None},
-               "worker": {"startOptions": {"agent": w.get("agente"), "launch": {"requested": {"model": w.get("modelo", "claude-sonnet-5-5"), "effort": "high"}}}},
-               "terminal": {"handle": w["handle"], "title": "x"}}
+               "worker": {"worktreeId": ("repo_1::" + w["worktree"]) if w.get("worktree") else None,
+                          "startOptions": {"agent": w.get("agente"), "launch": {"requested": {"model": w.get("modelo", "claude-sonnet-5-5"), "effort": w.get("effort", "high")}}}},
+               "terminal": {"handle": w["handle"], "title": "x", **({"worktreePath": w["worktree"]} if w.get("worktree") else {})}}
     else:
         # worker-release: released | retained | release_pending | already_released (w["release"]); retained deixa o terminal aberto com o motivo
         open(os.path.join(d, "released.log"), "a").write(json.dumps(a) + "\\n")
@@ -258,6 +259,23 @@ elif cmd in ("worker-show", "worker-release"):
             w["reason"], w["ownership"] = w.get("release_reason"), w.get("release_ownership", w.get("ownership", "owned"))
         json.dump(ws, open(os.path.join(d, "workers.json"), "w"))
         res = {"dispatchId": opt("--dispatch"), "state": estado, "processAction": "none"}
+elif cmd == "worker-stop":
+    # como o Orca real (conferido em 30/09): o dispatch vira failed, o terminal fica retained (o pty morre) e a task blocked; a worktree não é tocada
+    ws = ler("workers.json", [])
+    w = next((w for w in ws if w.get("dispatch", "ctx_" + w["handle"]) == opt("--dispatch")), None)
+    if w is None:
+        falha("Dispatch not found: " + str(opt("--dispatch")))
+    if os.path.exists(multi) and w["run"] != bound:
+        print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
+    open(os.path.join(d, "stopped.log"), "a").write(json.dumps(a) + "\\n")
+    w["status"], w["terminal"] = "failed", "retained"
+    json.dump(ws, open(os.path.join(d, "workers.json"), "w"))
+    ts = ler("tasks_%s.json" % w["run"], [])
+    for t in ts:
+        if t["id"] == w.get("task", "task_" + w["handle"]):
+            t["status"], t["dispatch_id"] = "blocked", None
+    json.dump(ts, open(os.path.join(d, "tasks_%s.json" % w["run"]), "w"))
+    res = {"dispatchId": opt("--dispatch"), "state": "stopped", "alreadySettled": False, "processAction": "closed_agent_terminal"}
 elif cmd == "worker-start":
     # como o Orca real: precisa do coordenador ligado ao Run; cria task + dispatch + terminal do agente e devolve runId/taskId/dispatchId/effects
     if os.path.exists(multi):  # a ligação vale na hora em que o worker-start termina de demorar, não na em que começou
@@ -266,10 +284,15 @@ elif cmd == "worker-start":
     if bound is None or (run and run != bound):
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
     open(os.path.join(d, "started.log"), "a").write(json.dumps(a) + "\\n")
+    if os.environ.get("FAKE_FAIL_START_MODEL") and os.environ["FAKE_FAIL_START_MODEL"] == opt("--model"):
+        falha("model not available: " + str(opt("--model")))
     ws = ler("workers.json", [])
     n = len(ws) + 1
     tid = opt("--task") or "task_novo%d" % n  # --task despacha uma task que já existe (a do ticket) em vez de criar outra
-    ws.insert(0, {"handle": "term_novo%d" % n, "run": run or bound, "task": tid, "status": "dispatched"})
+    novo = {"handle": "term_novo%d" % n, "run": run or bound, "task": tid, "status": "dispatched"}
+    if opt("--retry-of"):  # como o Orca real (30/09): a retentativa reaproveita a worktree que o --worktree nomeia e sobe com o perfil pedido
+        novo.update({"worktree": opt("--worktree", "").split("::", 1)[-1], "modelo": opt("--model"), "effort": opt("--effort"), "agente": opt("--agent")})
+    ws.insert(0, novo)
     json.dump(ws, open(os.path.join(d, "workers.json"), "w"))
     ts = ler("tasks_%s.json" % (run or bound), [])
     if opt("--task"):
@@ -5651,6 +5674,221 @@ def test_it_should_show_the_delivery_warning_in_the_resumo_and_in_orq_agentes():
         ags = orq_mod.monta_agentes([{"dispatchId": "ctx_e", "taskId": "task_e", "dispatchStatus": "completed", "agentTerminalHandle": "term_e"}],
                                     [], a.events(), datetime.now(timezone.utc), vivos=["term_e"])
         assert ags[0]["entrega"] and "AVISO: entrega sem commit" in orq_mod.texto_agentes(ags)
+
+
+# ---------- ticket 32: interromper, encerrar e relançar ----------
+
+def _ctl_env(a, repo, **w):
+    """Um worker rodando (ctx_w1, task_w1) numa worktree que é um repositório git de verdade."""
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "dispatch": "ctx_w1", "task": "task_w1", "status": "dispatched", "worktree": repo,
+                            "modelo": "claude-sonnet-5-5", "agente": "claude", **w}])
+    a.set("tasks_run_a.json", [{"id": "task_w1", "task_title": "Tarefa w1", "status": "dispatched", "dispatch_id": "ctx_w1"}])
+    a.set("inbox.json", {"result": {"messages": []}})
+
+
+def _ctl_eventos(a, acao=None):
+    return [e for e in a.events() if e["tipo"] == "controle" and (acao is None or e["acao"] == acao)]
+
+
+def _head(repo):
+    return subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+
+def test_it_should_send_an_interrupt_to_the_terminal_and_log_it():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        r = a.orq("interromper", "ctx_w1")
+        assert r.returncode == 0, r.stderr
+        envios = _log(a, "send.log")
+        assert envios and "--interrupt" in envios[0] and "term_w1" in envios[0], envios
+        assert "--text" not in envios[0], "o interrupt não digita texto"
+        (ev,) = _ctl_eventos(a, "interromper")
+        assert (ev["dispatch"], ev["task"], ev["run"], ev["terminal"], ev["resultado"]) == ("ctx_w1", "task_w1", "run_a", "term_w1", "ok"), ev
+        assert not _log(a, "stopped.log"), "interromper deixa o worker vivo"
+
+
+def test_it_should_refuse_to_interrupt_a_dispatch_that_is_not_running():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo, status="completed")
+        r = a.orq("interromper", "ctx_w1")
+        assert r.returncode == 1 and "não está rodando" in r.stderr, r
+        assert not _log(a, "send.log") and not _ctl_eventos(a)
+        assert a.orq("interromper", "ctx_fantasma").returncode == 1
+
+
+def test_it_should_log_a_failed_interrupt():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        r = a.orq("interromper", "ctx_w1", FAKE_FAIL_TERMINAL="send")
+        assert r.returncode == 1, r
+        (ev,) = _ctl_eventos(a, "interromper")
+        assert ev["resultado"] == "falhou" and "send" in ev["erro"], ev
+
+
+def test_it_should_stop_then_release_with_the_reason_and_keep_the_worktree():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        antes = _head(repo)
+        r = a.orq("encerrar", "ctx_w1", "--motivo", "travado no CI")
+        assert r.returncode == 0, r.stderr
+        chamadas = [c[0] for c in _log(a, "calls.log") if c[0] in ("worker-stop", "worker-release")]
+        assert chamadas == ["worker-stop", "worker-release"], chamadas
+        assert _log(a, "stopped.log")[0][:3] == ["worker-stop", "--dispatch", "ctx_w1"]
+        evs = _ctl_eventos(a, "encerrar")
+        assert [e["resultado"] for e in evs] == ["iniciado", "ok"], evs
+        assert evs[-1]["motivo"] == "travado no CI" and evs[-1]["head"] == antes[:12] and evs[-1]["sujo"] == 1, evs[-1]
+        assert os.path.isdir(repo) and _head(repo) == antes and os.path.exists(os.path.join(repo, "novo")), "a worktree e o trabalho não commitado seguem intactos"
+
+
+def test_it_should_require_a_reason_to_encerrar():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        assert a.orq("encerrar", "ctx_w1").returncode == 2
+        r = a.orq("encerrar", "ctx_w1", "--motivo", "  ")
+        assert r.returncode == 1 and "motivo" in r.stderr and not _log(a, "stopped.log")
+
+
+def test_it_should_only_release_when_the_dispatch_already_finished():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo, status="completed", terminal="active")
+        r = a.orq("encerrar", "ctx_w1", "--motivo", "entregue e esquecido")
+        assert r.returncode == 0, r.stderr
+        assert not _log(a, "stopped.log") and _log(a, "released.log"), "dispatch que já terminou não leva worker-stop"
+
+
+def test_it_should_leave_nothing_stopped_when_worker_stop_fails():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        r = a.orq("encerrar", "ctx_w1", "--motivo", "x", FAKE_FAIL="worker-stop")
+        assert r.returncode == 1, r
+        assert not _log(a, "released.log"), "sem parar não há release"
+        assert [e["resultado"] for e in _ctl_eventos(a, "encerrar")] == ["iniciado", "falhou"]
+        assert _ctl_eventos(a, "encerrar")[-1]["passo"] == "worker-stop"
+
+
+def test_it_should_report_a_partial_encerrar_when_the_release_fails_and_keep_the_worktree():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        antes = _head(repo)
+        r = a.orq("encerrar", "ctx_w1", "--motivo", "x", FAKE_FAIL="worker-release")
+        assert r.returncode == 1 and "orq liberar ctx_w1" in r.stderr, r.stderr
+        ev = _ctl_eventos(a, "encerrar")[-1]
+        assert ev["resultado"] == "parcial" and ev["passo"] == "release" and ev["worktree_intacta"] is True, ev
+        assert os.path.isdir(repo) and _head(repo) == antes
+
+
+def test_it_should_relaunch_in_the_same_worktree_and_task_with_retry_of_and_the_note():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo, effort="medium")
+        antes = _head(repo)
+        r = a.orq("relancar", "ctx_w1", "--nota", "o índice novo já existe: pule a migração")
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["novo_dispatch"] == "ctx_term_novo2" and out["resultado"] == "ok", out
+        (parar,) = _log(a, "stopped.log")
+        assert parar[:3] == ["worker-stop", "--dispatch", "ctx_w1"]
+        (subir,) = _log(a, "started.log")
+        assert subir[:1] == ["worker-start"] and subir[subir.index("--task") + 1] == "task_w1", subir
+        assert subir[subir.index("--retry-of") + 1] == "ctx_w1" and subir[subir.index("--worktree") + 1] == "id:repo_1::" + repo, subir
+        assert (subir[subir.index("--model") + 1], subir[subir.index("--effort") + 1], subir[subir.index("--agent") + 1]) == ("claude-sonnet-5-5", "medium", "claude"), "mantém o perfil do worker antigo"
+        assert "--spec" not in subir, "a task já existe no Orca: o spec não muda"
+        (nota,) = _enviados(a)
+        assert nota[nota.index("--to") + 1] == "dispatch:ctx_term_novo2" and "pule a migração" in nota[nota.index("--body") + 1], nota
+        (ev,) = [e for e in _ctl_eventos(a, "relancar") if e["resultado"] == "ok"]
+        assert (ev["dispatch"], ev["novo_dispatch"], ev["task"], ev["nota"]) == ("ctx_w1", "ctx_term_novo2", "task_w1", "o índice novo já existe: pule a migração"), ev
+        assert ev["worktree_intacta"] is True and _head(repo) == antes and os.path.exists(os.path.join(repo, "novo"))
+        assert _log(a, "released.log"), "o terminal do worker antigo é liberado depois que o novo sobe"
+
+
+def test_it_should_refuse_a_relaunch_without_a_note():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        assert a.orq("relancar", "ctx_w1").returncode == 2
+        r = a.orq("relancar", "ctx_w1", "--nota", " ")
+        assert r.returncode == 1 and "nota" in r.stderr and not _log(a, "stopped.log")
+
+
+def test_it_should_refuse_before_stopping_when_the_worktree_is_gone():
+    with tempfile.TemporaryDirectory() as t:
+        a = Amb(run="run_a")
+        _ctl_env(a, os.path.join(t, "sumiu"))
+        r = a.orq("relancar", "ctx_w1", "--nota", "x")
+        assert r.returncode == 1 and "worktree" in r.stderr, r
+        assert not _log(a, "stopped.log") and not _log(a, "started.log"), "a recusa vem antes de parar o worker"
+        assert not _ctl_eventos(a)
+
+
+def test_it_should_fall_back_to_the_old_profile_when_the_requested_one_does_not_start():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        r = a.orq("relancar", "ctx_w1", "--nota", "x", "--modelo", "claude-inexistente", "--effort", "max", FAKE_FAIL_START_MODEL="claude-inexistente")
+        assert r.returncode == 0, r.stderr
+        tentativas = _log(a, "started.log")
+        assert [x[x.index("--model") + 1] for x in tentativas] == ["claude-inexistente", "claude-sonnet-5-5"], tentativas
+        assert tentativas[1][tentativas[1].index("--effort") + 1] == "high", "a volta usa o effort de antes, não o pedido"
+        evs = [e for e in _ctl_eventos(a, "relancar")]
+        assert evs[-1]["resultado"] == "revertido" and evs[-1]["novo_dispatch"] == "ctx_term_novo2" and "claude-inexistente" in evs[-1]["erro"], evs[-1]
+        assert "claude-inexistente" in r.stderr, "o usuário fica sabendo que o perfil pedido não subiu"
+
+
+def test_it_should_keep_the_worktree_and_the_note_when_nothing_starts():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        antes = _head(repo)
+        r = a.orq("relancar", "ctx_w1", "--nota", "use a branch nova", FAKE_FAIL="worker-start")
+        assert r.returncode == 1, r
+        assert "orq relancar ctx_w1 --nota" in r.stderr and "use a branch nova" in r.stderr, "a mensagem traz o comando para repetir, com a nota"
+        ev = _ctl_eventos(a, "relancar")[-1]
+        assert ev["resultado"] == "falhou" and ev["passo"] == "worker-start" and ev["nota"] == "use a branch nova" and ev["worktree_intacta"] is True, ev
+        assert not _log(a, "released.log"), "o terminal do worker antigo fica retido para inspeção"
+        assert os.path.isdir(repo) and _head(repo) == antes and os.path.exists(os.path.join(repo, "novo"))
+        r2 = a.orq("relancar", "ctx_w1", "--nota", "use a branch nova")  # o dispatch parado (failed) sobe de novo sem novo worker-stop
+        assert r2.returncode == 0, r2.stderr
+        assert len(_log(a, "stopped.log")) == 1 and [c[0] for c in _log(a, "calls.log")].count("worker-start") == 2
+
+
+def test_it_should_show_the_control_history_in_orq_agentes():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        assert a.orq("interromper", "ctx_w1").returncode == 0
+        assert a.orq("relancar", "ctx_w1", "--nota", "pule a migração").returncode == 0
+        ags = {x["dispatch"]: x for x in json.loads(a.orq("agentes", "--json", "--todos").stdout)}
+        assert [c["acao"] for c in ags["ctx_w1"]["controle"]] == ["interromper", "relancar"], ags["ctx_w1"]
+        assert ags["ctx_term_novo2"]["controle"] == [c for c in ags["ctx_w1"]["controle"] if c["acao"] == "relancar"], "o novo dispatch cita o relançamento"
+        texto = a.orq("agentes", "--todos").stdout
+        assert "controle: interromper ok" in texto and "relancar ok" in texto and "ctx_w1" in texto, texto
+
+
+def test_it_should_not_list_control_lines_for_dispatches_without_history():
+    ags = orq_mod.monta_agentes([{"dispatchId": "ctx_x", "taskId": "task_x", "dispatchStatus": "dispatched", "agentTerminalHandle": "term_x"}],
+                                [], [], datetime.now(timezone.utc))
+    assert "controle" not in ags[0] and "controle:" not in orq_mod.texto_agentes(ags)
 
 
 if __name__ == "__main__":

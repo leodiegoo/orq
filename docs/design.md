@@ -53,6 +53,7 @@ The model does the classifying. The code only checks that a classification was r
 | `resposta`, `resposta_suspeita`, `resposta_lavish` | ask hook, `orq lavish-resposta` |
 | `heartbeat_absorvido`, `heartbeat_visto` | prompt hook, manager loop, waiter |
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
+| `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
 
 Current state is always computed from the whole log by pure functions:
@@ -207,6 +208,22 @@ The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same fu
 `orq liberar <dispatch>` acknowledges pending messages that belong only to that dispatch (a batch mixing another worker's messages is left alone), calls `worker-release`, and, if Orca reports the terminal as `retained`, decides whether to close it.
 
 It closes a terminal Orca owns with no retention reason. Orca also marks a terminal `user_takeover` whenever any data passes through its xterm, including the terminal's automatic replies, so that flag does not prove a person typed anything. orq therefore closes a `user_takeover` terminal only when it was created by this dispatch and the worker's own Claude Code transcript shows no human prompt. It never closes the coordinator's terminal, the Run's coordinator terminal, a terminal reused by another running dispatch, or one retained for any other reason.
+
+## Worker control
+
+Three commands act on a worker that is running (or, for `encerrar` and `relancar`, already stopped). Each is an event of type `controle`, and `orq agentes` prints the last five under the dispatch (`controle: interromper ok 14:02; relancar ok 14:03 (novo ctx_…)`); the new dispatch of a relaunch lists it too, as `(de ctx_…)`.
+
+| Command | Steps | If a step fails |
+|---|---|---|
+| `orq interromper <dispatch>` | `terminal send --interrupt` to the worker's terminal | Event `falhou`. Nothing to undo: the worker stays alive. Claude Code does not confirm a cancelled turn, so the event says so |
+| `orq encerrar <dispatch> --motivo <why>` | `worker-stop` if it still runs, then `orq liberar` | Stop fails: event `falhou`, nothing changed. Release fails: event `parcial`, the worker is stopped, its terminal retained and the worktree where it was; `orq liberar` finishes it. Stopping cannot be undone |
+| `orq relancar <dispatch> --nota <what changed>` | checks, `worker-stop`, `worker-start --task <same task> --retry-of <old dispatch> --worktree <same worktree>`, the note as a steer, `liberar` of the old dispatch | see below |
+
+`relancar` refuses before it stops anything when the worktree is gone, the coordinator is not bound to the worker's Run, the task is missing or the old model and effort are unknown. Orca's `worker-stop` fences the dispatch, closes its agent terminal and never touches the worktree; the task becomes `blocked`, which `worker-start --retry-of` accepts. The relaunch records the worktree's head and dirty-file count first and checks afterwards that the worktree exists and the head is still in its history (`worktree_intacta`).
+
+Going back after the stop is limited to what can be brought back. If the requested `--modelo`/`--effort` does not start, the worker starts with the old profile (`revertido`, the first error in `erro` and in the warning). If nothing starts (`falhou`), the old terminal stays retained for inspection, the worktree is untouched and the error prints `orq relancar <dispatch> --nota '<the note>'`; running it again skips the stop, because the dispatch is already settled. A `worker-start` that times out is never retried, since a second worker would land in the same worktree.
+
+An Orca task keeps its spec, so the note cannot go into it. It goes as the first steer of the new worker (`Relançado depois de <dispatch>. O que mudou: …`), with the usual notice and read check. If that steer or the release of the old dispatch fails, the event still says `ok` and the warning names the command to run.
 
 ## Worker idle state
 

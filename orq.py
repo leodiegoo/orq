@@ -56,6 +56,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 AGENTE_COM_HOOK = "claude"  # só o Claude Code roda os hooks do orq: de outro agente o orq não sabe se parou
+CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
 ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "liberado": 6}
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -295,6 +296,12 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados = _liberados(events)
     avisos_entrega = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
+    controles = {}
+    for e in events:
+        if e.get("tipo") == "controle" and e.get("resultado") != "iniciado":
+            c = {k: e[k] for k in ("ts", "acao", "resultado", "dispatch", "novo_dispatch", "motivo", "nota") if e.get(k)}
+            for d in {e.get("dispatch"), e.get("novo_dispatch")} - {None}:
+                controles.setdefault(d, []).append(c)
     out = []
     for w in workers:
         d = w.get("dispatchId")
@@ -323,6 +330,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             ag["motivo"] = motivo
         if avisos_entrega.get(d):
             ag["entrega"] = avisos_entrega[d]
+        if controles.get(d):
+            ag["controle"] = controles[d][-CONTROLE_LINHAS:]
         retido = _retencao(w, humanos)
         if estado == "entregue" and retido:
             ag["retido"] = retido
@@ -2662,6 +2671,12 @@ def agentes(run=None, todos=False, agora=None):
     return ags if todos else [a for a in ags if not (a.get("titulo") or "").startswith(PREFIXO_PROVA)]
 
 
+def _txt_controle(c, dispatch):
+    """`relancar ok 14:02 (novo ctx_…)`: uma entrada do histórico de controle; quem lê o dispatch novo vê de qual veio."""
+    ref = f" (de {c['dispatch']})" if c.get("novo_dispatch") == dispatch else f" (novo {c['novo_dispatch']})" if c.get("novo_dispatch") else ""
+    return f"{c['acao']} {c['resultado']} {_hora_local(c.get('ts'))}{ref}" + (f" [{_cita(c['motivo'], 40)}]" if c.get("motivo") else "")
+
+
 def texto_agentes(ags):
     """Uma linha por dispatch, com o que fazer logo abaixo do travado (orq steer) e do entregue sem liberar (orq liberar)."""
     if not ags:
@@ -2678,6 +2693,8 @@ def texto_agentes(ags):
         linhas.append(f"{a['estado']:<11} {a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
         for av in a.get("entrega") or []:
             linhas.append(f"            AVISO: {av}")
+        if a.get("controle"):
+            linhas.append("            controle: " + "; ".join(_txt_controle(c, a["dispatch"]) for c in a["controle"]))
         if a.get("alerta"):
             linhas.append(f"            ALERTA: {a['alerta']} (o worker não leu o ajuste depois de {STEER_TENTATIVAS} avisos; um check sem --ack esconde as mensagens novas)")
         if a["estado"] in ("travado", "nao_comecou", "parado"):
@@ -2840,6 +2857,149 @@ def liberar(dispatch, run=None):
     append_event({**ev, **({"aviso": "; ".join(avisos)} if avisos else {})})
     refresh_bg()  # o resumo do próximo prompt já sai sem o dispatch liberado (M13)
     return {**ev, "aviso": "; ".join(avisos)}
+
+
+# ---------- controle do worker: interromper, encerrar e relançar (ticket 32) ----------
+
+def _controle(acao, w, resultado, **campos):
+    """Grava o evento `controle` do dispatch `w` (do worker-list): o histórico que o `orq agentes` mostra. Campo vazio não entra."""
+    return append_event({"tipo": "controle", "acao": acao, "dispatch": w.get("dispatchId"), "task": w.get("taskId"), "run": w.get("runId"), "resultado": resultado,
+                         **{k: v for k, v in campos.items() if v not in (None, "")}})
+
+
+def _worker_do_dispatch(dispatch, run=None):
+    w = next((w for w in _workers_todos(run) if w.get("dispatchId") == dispatch), None)
+    if not w:
+        raise ValueError(f"dispatch {dispatch} não aparece no worker-list: o orq só controla worker de Run do Orca")
+    return w
+
+
+def _checkpoint(dispatch):
+    """A worktree do dispatch (caminho, head, arquivos sujos) e o perfil com que o worker subiu (agente, modelo, effort), pelo worker-show.
+
+    O caminho vem do terminal ou, sem ele, do `worktreeId` (`<repo>::<caminho>`). `head` e `sujo` são None se o caminho não é um repositório git legível."""
+    res = orca("worker-show", "--dispatch", dispatch, timeout=10)
+    wid = _fundo(res, "worker", "worktreeId")
+    caminho = _fundo(res, "terminal", "worktreePath") or (wid.split("::", 1)[1] if isinstance(wid, str) and "::" in wid else None)
+    pedido = _fundo(res, "worker", "startOptions", "launch", "requested") or {}
+    head, sujo = (_git(caminho, "rev-parse", "HEAD"), _git(caminho, "status", "--porcelain")) if caminho and os.path.isdir(caminho) else (None, None)
+    return {"worktree_id": wid, "caminho": caminho, "agente": _fundo(res, "worker", "startOptions", "agent"), "modelo": pedido.get("model"), "effort": pedido.get("effort"),
+            "head": (head or "").strip()[:12] or None, "sujo": len(sujo.splitlines()) if sujo is not None else None}
+
+
+def _intacta(cp):
+    """A worktree do checkpoint ainda existe e o commit em que estava continua no histórico dela (o worker pode ter commitado antes de parar)."""
+    c = cp.get("caminho")
+    return bool(c) and os.path.isdir(c) and (not cp.get("head") or _git(c, "merge-base", "--is-ancestor", cp["head"], "HEAD") is not None)
+
+
+def interromper(dispatch, run=None):
+    """Manda o interrupt do Orca ao terminal do worker que está rodando (`terminal send --interrupt`) e grava o evento.
+
+    O worker segue vivo e o Claude Code não confirma o cancelamento: quem chama confere com `orq agentes` ou `orca terminal read`."""
+    w = _worker_do_dispatch(dispatch, run)
+    if w.get("dispatchStatus") != "dispatched":
+        raise ValueError(f"dispatch {dispatch} não está rodando ({w.get('dispatchStatus')}): não há turno a interromper")
+    handle = w.get("agentTerminalHandle")
+    if not handle:
+        raise ValueError(f"dispatch {dispatch} não tem terminal de agente")
+    try:
+        orca("send", "--terminal", handle, "--interrupt", area="terminal")
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        _controle("interromper", w, "falhou", terminal=handle, erro=str(e))
+        raise
+    return _controle("interromper", w, "ok", terminal=handle, aviso="interrupt enviado, sem confirmação de que o turno parou")
+
+
+def _parar(acao, w, base):
+    """worker-stop do dispatch que ainda roda (o Orca fecha o terminal do agente e nunca apaga a worktree); dispatch que já terminou não leva nada."""
+    if w.get("dispatchStatus") != "dispatched":
+        return
+    try:
+        orca("worker-stop", "--dispatch", w["dispatchId"], timeout=30, run=w.get("runId"))
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        _controle(acao, w, "falhou", passo="worker-stop", erro=str(e), **base)
+        raise
+
+
+def encerrar(dispatch, motivo, run=None):
+    """worker-stop (se ainda roda) e depois o `liberar`, com o motivo no log. Parar não volta atrás: se o release falha, o worker fica parado, o
+    terminal retido e a worktree onde estava (evento `parcial`), e `orq liberar` termina o serviço."""
+    if not (motivo or "").strip():
+        raise ValueError("encerrar pede --motivo: ele fica no log e no orq agentes")
+    w = _worker_do_dispatch(dispatch, run)
+    try:
+        cp = _checkpoint(dispatch)
+    except RuntimeError as e:
+        log(f"encerrar: worker-show {dispatch}: {e}")
+        cp = {}
+    base = {"motivo": motivo.strip(), "terminal": w.get("agentTerminalHandle"), "head": cp.get("head"), "sujo": cp.get("sujo")}
+    _controle("encerrar", w, "iniciado", **base)
+    _parar("encerrar", w, base)
+    try:
+        lib = liberar(dispatch, w.get("runId"))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+        _controle("encerrar", w, "parcial", passo="release", erro=str(e), worktree_intacta=_intacta(cp), **base)
+        raise RuntimeError(f"o worker parou, mas o release falhou ({e}); a worktree segue em {cp.get('caminho') or '?'}: rode orq liberar {dispatch}")
+    return _controle("encerrar", w, "ok", worktree_intacta=_intacta(cp), aviso=lib.get("aviso"), **base)
+
+
+def relancar(dispatch, nota, modelo=None, effort=None, run=None):
+    """Para o worker e sobe outro na MESMA worktree e task (`worker-start --task --retry-of`), com o perfil do antigo ou o de --modelo/--effort.
+
+    Tudo o que pode recusar vem antes do worker-stop (worktree, Run ligado, task, perfil). Depois dele, a volta atrás é a que existe: se o perfil
+    pedido não sobe, sobe o de antes (`revertido`); se nada sobe, o terminal antigo fica retido, a worktree intacta e a mensagem traz o comando para
+    repetir com a nota (`falhou`). O spec de uma task do Orca não muda, então a nota vai como o primeiro ajuste do worker novo (`orq steer`).
+    O worker novo usa a política de setup do Orca para worktree existente (sem novo setup)."""
+    nota = (nota or "").strip()
+    if not nota:
+        raise ValueError("relancar pede --nota: o que mudou para o worker novo")
+    if bool(modelo) != bool(effort):
+        raise ValueError("--modelo e --effort vão juntos: o effort de um modelo não vale para outro")
+    w = _worker_do_dispatch(dispatch, run)
+    run_id, task = w.get("runId"), w.get("taskId")
+    cp = _checkpoint(dispatch)
+    if not cp["caminho"] or not os.path.isdir(cp["caminho"]):
+        raise ValueError(f"a worktree do dispatch {dispatch} não existe ({cp['caminho'] or 'o Orca não disse onde'}): nada foi parado")
+    pedido, antigo = (modelo or cp["modelo"], effort or cp["effort"]), (cp["modelo"], cp["effort"])
+    if not all(pedido):
+        raise ValueError("o Orca não informou o modelo e o effort do worker antigo: passe --modelo e --effort")
+    atual = (orca("run-current")["run"] or {}).get("id")
+    if atual != run_id and not _do_gerente(run_id):
+        raise ValueError(f"Run ligado é {atual or 'nenhum'}, o worker é do {run_id}: rode run-use --id {run_id}")
+    if not any(t["id"] == task for t in orca("task-list", "--run", run_id, timeout=20)["tasks"]):
+        raise ValueError(f"task {task} não existe no Run {run_id}")
+    base = {"nota": nota, "terminal": w.get("agentTerminalHandle"), "worktree": cp["caminho"], "head": cp["head"], "sujo": cp["sujo"]}
+    _controle("relancar", w, "iniciado", modelo=pedido[0], effort=pedido[1], **base)
+    _parar("relancar", w, {**base, "modelo": pedido[0], "effort": pedido[1]})
+    seletor = f"id:{cp['worktree_id']}" if cp["worktree_id"] else f"path:{cp['caminho']}"
+    res, erro, subiu = None, None, None
+    for perfil in [pedido, *([antigo] if pedido != antigo and all(antigo) else [])]:
+        try:
+            res = orca("worker-start", "--run", run_id, "--task", task, "--retry-of", dispatch, "--worktree", seletor, "--agent", cp["agente"] or "claude",
+                       "--model", perfil[0], "--effort", perfil[1], timeout=180)
+            subiu = perfil
+            break
+        except subprocess.TimeoutExpired:
+            erro = "worker-start passou de 180 s sem resposta: o worker pode ter subido, confira com orq agentes"
+            break  # repetir empilharia um segundo worker na mesma worktree
+        except RuntimeError as e:
+            erro = erro or str(e)
+    if not res or not res.get("dispatchId"):
+        _controle("relancar", w, "falhou", passo="worker-start", erro=erro, modelo=pedido[0], effort=pedido[1], worktree_intacta=_intacta(cp), **base)
+        raise RuntimeError(f"nenhum worker subiu ({erro}): o dispatch {dispatch} está parado, o terminal dele retido e a worktree intacta em {cp['caminho']}. "
+                           f"Repita com: orq relancar {dispatch} --nota {shlex.quote(nota)}")
+    novo, avisos = res["dispatchId"], []
+    if subiu != pedido:
+        avisos.append(f"o perfil pedido ({pedido[0]}/{pedido[1]}) não subiu ({erro}); o worker novo usa o de antes ({subiu[0]}/{subiu[1]})")
+    for passo, fn, volta in ((f"nota não entregue", lambda: steer(task, f"Relançado depois de {dispatch}. O que mudou: {nota}", run_id), f"orq steer {task} <nota>"),
+                             ("terminal do worker antigo não liberado", lambda: liberar(dispatch, run_id), f"orq liberar {dispatch}")):
+        try:
+            fn()
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+            avisos.append(f"{passo} ({e}): rode {volta}")
+    return _controle("relancar", w, "ok" if subiu == pedido else "revertido", novo_dispatch=novo, modelo=subiu[0], effort=subiu[1],
+                     erro=erro if subiu != pedido else None, worktree_intacta=_intacta(cp), aviso="; ".join(avisos), **base)
 
 
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None):
@@ -3236,6 +3396,19 @@ def main(argv=None):
     li = sub.add_parser("liberar", help="ack pendente, worker-release e terminal close se vier retained")
     li.add_argument("dispatch")
     li.add_argument("--run")
+    it = sub.add_parser("interromper", help="manda o interrupt ao terminal do worker que roda (o worker segue vivo)")
+    it.add_argument("dispatch")
+    it.add_argument("--run")
+    en = sub.add_parser("encerrar", help="worker-stop (se ainda roda) e release, com o motivo no log")
+    en.add_argument("dispatch")
+    en.add_argument("--motivo", required=True)
+    en.add_argument("--run")
+    rl = sub.add_parser("relancar", help="para o worker e sobe outro na mesma worktree e task (--retry-of), com a nota do que mudou")
+    rl.add_argument("dispatch")
+    rl.add_argument("--nota", required=True)
+    rl.add_argument("--modelo", help="troca o modelo (vai junto com --effort); sem ele, o do worker antigo")
+    rl.add_argument("--effort")
+    rl.add_argument("--run")
     de = sub.add_parser("despachar", help="worker-start com modelo e effort, evento e intake")
     de.add_argument("--run", required=True)
     de.add_argument("--titulo")
@@ -3312,6 +3485,12 @@ def main(argv=None):
             r = liberar(a.dispatch, a.run)
             print(json.dumps(r, ensure_ascii=False))
             if r["aviso"]:
+                print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd in ("interromper", "encerrar", "relancar"):
+            r = interromper(a.dispatch, a.run) if a.cmd == "interromper" else encerrar(a.dispatch, a.motivo, a.run) if a.cmd == "encerrar" \
+                else relancar(a.dispatch, a.nota, a.modelo, a.effort, a.run)
+            print(json.dumps(r, ensure_ascii=False))
+            if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
         elif a.cmd == "despachar":
             r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket)
