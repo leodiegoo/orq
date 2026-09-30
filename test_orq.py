@@ -5492,6 +5492,74 @@ def test_ticket28_pend_add_ate_e_lista():
     assert "antiga" in todas and "depois  acao  mais tarde  [Depois: até 2099-12-31]" in todas, todas
 
 
+def _amb_resumo():
+    """Fixture do ticket 29: um dia de eventos, um aberto.json com um worker vivo e tickets em todos os estados."""
+    a = Amb()
+    ev = [
+        {"ts": "2026-09-29T09:00:00Z", "tipo": "entrada", "id": "e1", "origem": "usuario", "texto": "pedido antigo"},
+        {"ts": "2026-09-29T09:01:00Z", "tipo": "intake", "entrada": "e1", "efeito": "conversa"},
+        {"ts": "2026-09-29T09:02:00Z", "tipo": "resposta", "header": "Antiga", "resposta": "Sim"},
+        {"ts": "2026-09-29T10:00:00Z", "tipo": "entrada", "id": "e2", "origem": "usuario", "texto": "corrija o filtro de marca"},
+        {"ts": "2026-09-29T10:01:00Z", "tipo": "intake", "entrada": "e2", "efeito": "tarefa", "ref": "task_f1"},
+        {"ts": "2026-09-29T10:05:00Z", "tipo": "entrada", "id": "e3", "origem": "relatorio", "texto": "Relatório semanal: 3 itens"},
+        {"ts": "2026-09-29T10:06:00Z", "tipo": "entrada", "id": "e4", "origem": "relatorio_worker", "texto": "worker_done da task_f1"},
+        {"ts": "2026-09-29T10:07:00Z", "tipo": "intake", "entrada": "e4", "efeito": "pend", "ref": "revisar-pr"},
+        {"ts": "2026-09-29T10:08:00Z", "tipo": "resposta", "header": "Publicar orq", "resposta": "Recriar o repo (Recomendado)"},
+        {"ts": "2026-09-29T10:09:00Z", "tipo": "resposta_lavish", "item": "D01", "header": "Inspetor", "resposta": "Mascarada + id", "disposicao": "manter"},
+        {"ts": "2026-09-29T10:10:00Z", "tipo": "pend", "op": "done", "pend": "freio-prod", "resposta": "liberado"},
+    ]
+    with open(os.path.join(a.home, "events.jsonl") if os.path.isdir(a.home) else _mk29(a.home), "a") as f:
+        f.write("\n".join(json.dumps(e) for e in ev) + "\n")
+    with open(os.path.join(a.home, "aberto.json"), "w") as f:
+        json.dump({"ts": "2026-09-29T10:11:00Z", "backlog": [], "rodando": 1, "andamento": [], "bloqueado": [], "gates": [], "falhas": [], "runs": [],
+                   "agentes": [{"dispatch": "ctx_1", "task": "task_f1", "run": "run_a", "titulo": "Corrigir o filtro de marca", "estado": "rodando", "fase": "implementing"},
+                               {"dispatch": "ctx_2", "task": "task_f2", "run": "run_a", "titulo": "Worker parado", "estado": "entregue_sem_liberar", "fase": None}]}, f)
+    with open(a.env["ORQ_PENDENCIAS"], "w") as f:
+        json.dump({"itens": [{"id": "publicar", "tipo": "decisao", "titulo": "Publicar o repositório"},
+                             {"id": "depois", "tipo": "acao", "titulo": "Fica pra depois", "ate": "2099-12-31"}]}, f)
+    os.makedirs(a.env["ORQ_ISSUES"])
+    for n, nome, status, bl in (("01", "Base", "resolved", ""), ("02", "Pronto", "ready-for-agent", "01"), ("03", "Andando", "claimed", "01"),
+                                ("04", "Travado", "ready-for-agent", "02")):
+        with open(os.path.join(a.env["ORQ_ISSUES"], f"{n}-{nome.lower()}.md"), "w") as f:
+            f.write(f"# {n}: {nome}\n\nStatus: {status}\nBlocked by: {bl or '(nenhum)'}\n")
+    return a
+
+
+def _mk29(home):
+    os.makedirs(home)
+    return os.path.join(home, "events.jsonl")
+
+
+def test_ticket29_resumo_traz_as_quatro_partes_e_as_decisoes():
+    a = _amb_resumo()
+    r = a.orq("resumo")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "Com você (1)" in out and "publicar" in out and "Publicar o repositório" in out and "Fica pra depois" not in out, out
+    assert "Entrou" in out and "e2" in out and "tarefa task_f1" in out and "e3" in out and "sem efeito" in out and "e4" in out and "pend revisar-pr" in out, out
+    assert "e1" not in out, "a entrada anterior à última mensagem do usuário fica de fora"
+    assert "Anda (1)" in out and "Corrigir o filtro de marca" in out and "implementing" in out and "Worker parado" not in out, out
+    assert "Vem" in out and "pronto: 02 Pronto" in out and "bloqueado: 04 Travado (espera 02)" in out and "Andando" not in out and "Base" not in out, out
+    assert "Decisões (3)" in out and "Publicar orq: Recriar o repo" in out and "Inspetor: Mascarada + id" in out and "freio-prod: liberado" in out and "Antiga" not in out, out
+
+
+def test_ticket29_resumo_desde_muda_a_janela():
+    a = _amb_resumo()
+    out = a.orq("resumo", "--desde", "2026-09-29T08:00:00Z").stdout
+    assert "e1" in out and "Antiga: Sim" in out, out
+    vazio = a.orq("resumo", "--desde", "2026-09-30T00:00:00Z").stdout
+    assert "Entrou: nada" in vazio and "Decisões: nenhuma" in vazio, vazio
+
+
+def test_ticket29_resumo_e_curto_e_sem_dados_nao_cai():
+    a = _amb_resumo()
+    assert len(a.orq("resumo").stdout.splitlines()) <= 40
+    b = Amb()
+    r = b.orq("resumo")
+    assert r.returncode == 0 and "Com você" in r.stdout and "Vem: nenhum ticket aberto" in r.stdout, r.stdout + r.stderr
+    assert b.orq("resumo", "--desde", "ontem").returncode == 1
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

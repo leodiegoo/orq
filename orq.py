@@ -580,6 +580,58 @@ def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, tu
     return "\n".join([l1, *([extra] if extra else []), l2, l3, l4])
 
 
+def _lim(itens, n, fmt):
+    """Até n itens formatados, mais `+k` do que sobrou."""
+    return [fmt(i) for i in itens[:n]] + ([f"+{len(itens) - n}"] if len(itens) > n else [])
+
+
+def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None):
+    """`orq resumo`: as quatro partes desde `desde` (padrão: a última mensagem do usuário) e as decisões, até ~20 linhas.
+
+    Com você = pendências fora do Depois; Entrou = entradas da janela e o efeito de cada; Anda = workers rodando e a fase;
+    Vem = tickets prontos (Blocked by todos resolvidos) e bloqueados. `ts` são os tickets já lidos.
+    """
+    agora = agora or datetime.now(timezone.utc)
+    users = [e["ts"] for e in events if e.get("tipo") == "entrada" and e.get("origem", "usuario") == "usuario" and e.get("ts")]
+    desde = desde or (users[-1] if users else "")
+    na_janela = [e for e in events if (e.get("ts") or "") >= desde]
+    efeito = {e["entrada"]: e for e in events if e.get("tipo") == "intake"}
+    itens = [i for i in (pendencias or {}).get("itens", []) if not pend_depois(i, agora.astimezone().date())]
+    entrou = [e for e in na_janela if e.get("tipo") == "entrada" and e.get("id")]
+    rodando = [a for a in (aberto or {}).get("agentes", []) if a.get("estado") == "rodando"]
+    resolvidos = {t["num"] for t in ts if t["status"] == STATUS_FECHADO}
+    abertos = [t for t in ts if t["status"] not in (STATUS_FECHADO, STATUS_ANDAMENTO)]
+    prontos = [t for t in abertos if set(t["blocked_by"]) <= resolvidos]
+    travados = [t for t in abertos if t not in prontos]
+    dec = []
+    for e in na_janela:
+        if e.get("tipo") in ("resposta", "resposta_lavish") and e.get("resposta"):
+            dec.append(f"{e.get('header') or e.get('item')}: {_cita(e['resposta'], 60)}")
+        elif e.get("tipo") == "pend" and e.get("op") == "done" and e.get("resposta"):
+            dec.append(f"{e['pend']}: {_cita(e['resposta'], 60)}")
+
+    def efeito_de(e):
+        i = efeito.get(e["id"])
+        return f"{e['id']} ({e.get('origem', 'usuario')}) {_cita(e.get('texto'), 40)!r} -> " + (f"{i['efeito']}{' ' + i['ref'] if i.get('ref') else ''}" if i else "sem efeito")
+
+    def bloq(t):
+        falta = [n for n in t["blocked_by"] if n not in resolvidos]
+        return f"{t['num']} {_cita(t['titulo'], 40)} (espera {', '.join(falta)})"
+
+    def parte(nome, lst, vazio, fmt, n=5):
+        return [f"{nome} ({len(lst)}):", *("  " + x for x in _lim(lst, n, fmt))] if lst else [f"{nome}: {vazio}"]
+
+    vem = [f"pronto: {t['num']} {_cita(t['titulo'], 40)}" for t in prontos[:5]] + [f"bloqueado: {bloq(t)}" for t in travados[:5]]
+    return "\n".join([
+        f"[orq resumo] desde {_hora_local(desde) if desde else 'o início'}",
+        *parte("Com você", itens, "nada", lambda i: f"{i['id']}  {i.get('tipo')}  {_cita(i.get('titulo'), 50)}"),
+        *parte("Entrou", entrou, "nada", efeito_de, 6),
+        *parte("Anda", rodando, "ninguém rodando", lambda a: f"{_cita(a.get('titulo') or a.get('task'), 40)} [{a.get('fase') or 'sem fase'}]"),
+        *(["Vem:", *("  " + x for x in vem)] if vem else ["Vem: nenhum ticket aberto"]),
+        *parte("Decisões", dec, "nenhuma", lambda d: d, 6),
+    ])
+
+
 def itens_de_acao(md):
     """Itens numerados (lista ou tabela) da seção de ação do relatório; None se não há seção ou ela não tem itens.
 
@@ -3097,6 +3149,8 @@ def main(argv=None):
     rp.add_argument("msg_id")
     rp.add_argument("texto")
     sub.add_parser("status")
+    rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
+    rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
     al = sub.add_parser("alerta", help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
     al.add_parser("visto").add_argument("task")
     ag = sub.add_parser("agentes", help="o estado de cada dispatch em todos os Runs")
@@ -3168,6 +3222,10 @@ def main(argv=None):
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
         elif a.cmd == "status":
             print(estado())
+        elif a.cmd == "resumo":
+            if a.desde:
+                _dt(a.desde)  # ValueError vira exit 1
+            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ")))
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             print(json.dumps(ags, ensure_ascii=False) if a.json else texto_agentes(ags))
