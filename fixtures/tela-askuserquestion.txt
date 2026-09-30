@@ -1,0 +1,14 @@
+● Vou perguntar qual caminho seguir.
+
+☐ Escopo
+
+Qual escopo o ajuste deve cobrir?
+
+❯ 1. Só o seletor de marca
+     Mantém o diff pequeno
+  2. O seletor e o cache
+     Cobre o bug inteiro
+  3. Type something.
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

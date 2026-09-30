@@ -53,7 +53,12 @@ TRAVADO_S = 15 * 60  # dispatch rodando sem heartbeat há mais que isto está tr
 ESPERA_TETO_S = 60 * 60  # heartbeat `esperando: <motivo>` sem `até HH:MM` vale por tanto tempo; depois disso o dispatch é travado por "espera vencida"
 TELA_TETO_S = 45 * 60  # shell/monitor em execução na tela sem heartbeat por tanto tempo: deixa de ser espera e vira travado ("shell sem heartbeat")
 TELA_ESPERA = re.compile(r"(?:\d+\s+)?(?:shell|monitor)s?\s+still\s+running", re.I)  # o rodapé do Claude Code com o turno encerrado esperando um processo em segundo plano
-TELA_LINHAS = 15  # linhas do fim da tela lidas por terminal (o rodapé fica nas últimas)
+TELA_LINHAS = 30  # linhas do fim da tela lidas por terminal (o rodapé fica nas últimas; o prompt de permissão com o comando e o aviso passa de 15)
+TELA_OPCAO = re.compile(r"^\s*([❯>])?\s*(\d{1,2})\.\s+(\S.*?)\s*$")  # `❯ 1. Yes`: a opção de um menu do Claude Code, com o cursor na escolhida
+TELA_PERGUNTAS = (("trust", re.compile(r"trust (?:this|the files in this) folder|Is this a project you (?:created|trust)", re.I)),
+                  ("permissao", re.compile(r"Do you want to \w+|Yes, and don't ask again", re.I)),
+                  ("pergunta", re.compile(r"Enter to select|Type something|Chat about this", re.I)))  # o AskUserQuestion aberto
+TELA_RODAPE_MAX = 4  # linhas não vazias depois das opções (rodapé do menu) para o menu ainda contar como aberto
 ESPERA_FASE = re.compile(r"^\s*(?:esperando:|waiting\b[:\s.…-]*)\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
 STEER_LEITURA_S = 90  # ajuste que o dispatch não leu (`read` no inbox do Orca ou o id no transcrito do worker) tanto tempo depois do envio, ou da última redigitação, é reentregue
 STEER_TENTATIVAS = 3  # redigitações do aviso ao worker parado; sem leitura STEER_LEITURA_S depois da terceira, vira o alerta "steer não lido"
@@ -326,13 +331,14 @@ def _sem_terminal(w, liberados, vivos):
     return w.get("dispatchStatus") != "dispatched" and (w.get("dispatchId") in liberados or (vivos is not None and w.get("agentTerminalHandle") not in vivos))
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None):
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
     último heartbeat (ou, sem nenhum, o despacho) tem mais de TRAVADO_S; completed com o terminal released é `liberado`, o resto é `entregue`
     (worker_done dado, terminal ainda aberto). `detalhes` é {dispatch: titulo, modelo, desde, agente}; `vivos` são os handles do `orca terminal list`;
-    `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando.
+    `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando;
+    `perguntas_tela` é {dispatch: tela_pergunta} dos menus esperando resposta humana no terminal (o worker vira `perguntando`, com a `pergunta` na linha).
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados, pausas, telas, nao_iniciou = _liberados(events), interrompidos(events), telas or {}, _nao_iniciou(events)
@@ -358,7 +364,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
                     idade = int((agora - quando).total_seconds())
             pausa = _pausado(pausas.get(d), sinal.get("ts"), t)
             estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade_hb, agora, telas.get(d), pausa)
-            estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
+            estado = "perguntando" if d in perguntas or (perguntas_tela or {}).get(d) else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
             if d in nao_iniciou and not (t.get("inicio") or sinal):  # o despachar viu o prompt não entrar: não espera NAO_COMECOU_S
                 estado = "nao_comecou"
         else:
@@ -371,6 +377,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
               "turno_inicio": _z(t.get("inicio")), "turno_fim": _z(t.get("fim"))}
         if espera:
             ag["espera"] = espera
+        if (perguntas_tela or {}).get(d) and w.get("dispatchStatus") == "dispatched":
+            ag["pergunta"] = perguntas_tela[d]
         if telas.get(d):
             ag["tela"], ag["tela_ts"] = telas[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
         if motivo and estado == "travado":
@@ -2054,6 +2062,45 @@ def pr_avisar():
     return linhas
 
 
+def _pergunta_aberta(events):
+    """{dispatch: evento pergunta_tela} dos menus da tela que o gerente já avisou e ainda não sumiram (o `pergunta_tela_fim` depois dele fecha)."""
+    abertas = {}
+    for e in events:
+        if e.get("tipo") == "pergunta_tela" and e.get("dispatch"):
+            abertas[e["dispatch"]] = e
+        elif e.get("tipo") == "pergunta_tela_fim":
+            abertas.pop(e.get("dispatch"), None)
+    return abertas
+
+
+def telas_avisar():
+    """Uma volta do gerente sobre as telas dos workers: prompt de permissão, AskUserQuestion ou "trust this folder" preso no terminal de um worker
+    vira uma linha digitada no coordenador, uma vez por menu (evento `pergunta_tela`, com a pergunta e as opções), com o `orq responder-tela` a rodar.
+    Coordenador ocupado ou com rascunho: nada é digitado e a próxima volta tenta. O menu que sumiu da tela fecha o evento (`pergunta_tela_fim`),
+    então o mesmo texto volta a ser avisado se reaparecer. Só lê as telas de quem tem turno nos hooks do worker (Claude Code). Devolve as linhas do painel."""
+    g = _gerente_cfg()
+    if not g or not g.get("coordenador"):
+        return []
+    turnos, ws = _turnos_ro(), []
+    for r in g["runs"]:
+        ws += [w for w in _workers_todos(r) if w.get("dispatchId") in turnos]
+    lidas = _ler_telas(ws, {w["dispatchId"]: {"agente": AGENTE_COM_HOOK} for w in ws})
+    abertas, linhas = _pergunta_aberta(read_events()), []
+    for w in ws:
+        d, p = w["dispatchId"], (lidas.get(w["dispatchId"]) or {}).get("pergunta")
+        if not p and d in abertas:
+            append_event({"tipo": "pergunta_tela_fim", "dispatch": d})
+        if not p or (d in abertas and abertas[d].get("texto") == p["texto"] and abertas[d].get("opcoes") == p["opcoes"]):
+            continue
+        ops = " ".join(f"{n}) {r}" for n, r in p["opcoes"])
+        aviso = f"orq: worker {w.get('taskId')} pergunta na tela ({p['tipo']}): {p['texto']} Opções: {ops}. Responda com: orq responder-tela {w.get('taskId')} <opção>."
+        if digita(g["coordenador"], re.sub(r"\s+", " ", aviso)) != "enviado":
+            break
+        append_event({"tipo": "pergunta_tela", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": w.get("agentTerminalHandle"), "menu": p["tipo"], "texto": p["texto"], "opcoes": p["opcoes"]})
+        linhas.append(f"{w.get('taskId')}: pergunta na tela ({p['tipo']}) avisada ao coordenador")
+    return linhas
+
+
 def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
     txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
@@ -3164,6 +3211,15 @@ def hook_prligar(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
 
 
+def guard_worker():
+    """PreToolUse de AskUserQuestion num worker: recusa a caixa, que ficaria presa no terminal, e manda escalar pelo Orca."""
+    motivo = (f"{MARCA} worker não abre pergunta no terminal: o coordenador não vê esta tela. Escale pelo Orca com os dados do preâmbulo de despacho: "
+              "`orca orchestration ask --from <seu terminal> --dispatch-capability <cap> --question \"<pergunta>\" --options \"a,b\"` (espera a resposta) ou "
+              "`orca orchestration send ... --type escalation --subject \"Blocked: <motivo>\" --body \"<detalhes>\"`. Sem o preâmbulo, use o handle do "
+              "coordenador que veio na mensagem de continuação.")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
+
+
 HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar, "externas": hook_externas, "prligar": hook_prligar}
 
 
@@ -3201,6 +3257,9 @@ def run_hook(kind):
             sid = ev.get("session_id") or ""
             if kind in ("prompt", "stop") and _papeis().get(sid) == "worker":
                 registra_turno(kind, ev)  # o worker só grava o turno: sem Orca, sem Run
+            if kind == "guard" and ev.get("tool_name") == "AskUserQuestion" and _papeis().get(sid) == "worker":
+                print(json.dumps(guard_worker(), ensure_ascii=False))  # sem Orca: a caixa abre no terminal, onde só quem olha a vê
+                return 0
             ultimo = _dict(_cursor_ro().get("runs")).get(sid)
             if ultimo and kind == "guard" and _papeis().get(sid) != "worker":
                 run = {"id": ultimo}  # binding perdido (hibernação, resume): a sessão que já coordenou continua com a caixa travada
@@ -3857,10 +3916,37 @@ def _detalhes(ws):
     return {w["dispatchId"]: {"titulo": tits.get(w.get("runId"), {}).get(w.get("taskId")), **vivos.get(w["dispatchId"], {})} for w in ws}
 
 
-def _telas(ws, detalhes):
-    """{dispatch: motivo} dos workers do Claude Code rodando cuja tela (fim do `terminal read --screen`) mostra shell/monitor ainda em execução.
+def tela_pergunta(linhas):
+    """{tipo, texto, opcoes: [[n, rótulo]]} se o fim da tela é um menu do Claude Code esperando resposta humana, senão None.
 
-    Só o refresh e o `orq agentes` chamam isto (um read por worker, em paralelo); os hooks de prompt leem o que ficou no cache. Falha de leitura não prova nada.
+    Três tipos: `trust` (confiar na pasta), `permissao` (Do you want to proceed?…) e `pergunta` (AskUserQuestion). Menu aberto = opções numeradas
+    1, 2… seguidas, uma com o cursor `❯`, no fim da tela (no máximo TELA_RODAPE_MAX linhas de rodapé depois); um `❯ 1. …` solto no histórico não conta.
+    """
+    tela = [re.sub(r"[│╭╮╰╯─]", " ", str(l)).rstrip() for l in linhas or []]
+    ops = [(i, TELA_OPCAO.match(l)) for i, l in enumerate(tela)]
+    ops = [(i, m) for i, m in ops if m]
+    bloco = []
+    for i, m in reversed(ops):  # o último bloco de opções consecutivas
+        if bloco and (bloco[0][0] - i > 2 or int(m.group(2)) != int(bloco[0][1].group(2)) - 1):
+            break
+        bloco.insert(0, (i, m))
+    if len(bloco) < 2 or int(bloco[0][1].group(2)) != 1 or not any(m.group(1) == "❯" for _, m in bloco):
+        return None
+    if sum(bool(l.strip()) for l in tela[bloco[-1][0] + 1:]) > TELA_RODAPE_MAX:
+        return None
+    texto = "\n".join(tela)
+    tipo = next((t for t, r in TELA_PERGUNTAS if r.search(texto)), None)
+    if not tipo:
+        return None
+    acima = [l.strip() for l in tela[:bloco[0][0]] if l.strip()][-3:]
+    return {"tipo": tipo, "texto": _cita(" ".join(acima), 300), "opcoes": [[int(m.group(2)), m.group(3)] for _, m in bloco]}
+
+
+def _ler_telas(ws, detalhes):
+    """{dispatch: {espera, pergunta}} dos workers do Claude Code rodando cuja tela (fim do `terminal read --screen`) mostra shell/monitor ainda em execução
+    (`espera`, o motivo) ou um menu esperando resposta humana (`pergunta`, de tela_pergunta). Só entra quem tem um dos dois.
+
+    Só o refresh, o gerente e o `orq agentes` chamam isto (um read por worker, em paralelo); os hooks de prompt leem o que ficou no cache. Falha de leitura não prova nada.
     """
     def le(w):
         try:
@@ -3868,11 +3954,17 @@ def _telas(ws, detalhes):
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
             log(f"agentes: tela de {w['dispatchId']}: {type(e).__name__}: {e}")
             return w["dispatchId"], None
-        m = TELA_ESPERA.search("\n".join(map(str, tail)))
-        return w["dispatchId"], f"{m.group(0).strip()} (tela)" if m else None
+        m = TELA_ESPERA.search("\n".join(map(str, tail[-15:])))
+        achado = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": tela_pergunta(tail)}
+        return w["dispatchId"], achado if m or achado["pergunta"] else None
     alvo = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (detalhes.get(w.get("dispatchId")) or {}).get("agente") == AGENTE_COM_HOOK]
     with ThreadPoolExecutor(8) as ex:
-        return {d: m for d, m in ex.map(le, alvo) if m}
+        return {d: a for d, a in ex.map(le, alvo) if a}
+
+
+def _telas(ws, detalhes):
+    """{dispatch: motivo} da parte `espera` de _ler_telas."""
+    return {d: a["espera"] for d, a in _ler_telas(ws, detalhes).items() if a["espera"]}
 
 
 def agentes(run=None, todos=False, agora=None):
@@ -3886,7 +3978,9 @@ def agentes(run=None, todos=False, agora=None):
     msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
     agora = agora or datetime.now(timezone.utc)
     det = _detalhes(ws)
-    ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), _telas(ws, det))
+    lidas = _ler_telas(ws, det)
+    ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), {d: a["espera"] for d, a in lidas.items() if a["espera"]},
+                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]})
     nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
     for a in ags:
         if a["dispatch"] in nao_lidos:
@@ -3922,6 +4016,10 @@ def texto_agentes(ags):
             linhas.append(f"            AVISO: {av}")
         if a.get("controle"):
             linhas.append("            controle: " + "; ".join(_txt_controle(c, a["dispatch"]) for c in a["controle"]))
+        if a.get("pergunta"):
+            p = a["pergunta"]
+            linhas.append(f"            PERGUNTA NA TELA ({p['tipo']}): {p['texto']} [{' | '.join(f'{n}) {r}' for n, r in p['opcoes'])}]")
+            linhas.append(f'            -> orq responder-tela {a["task"]} <opção>')
         if a.get("alerta"):
             linhas.append(f"            ALERTA: {a['alerta']} (o worker não leu o ajuste depois de {STEER_TENTATIVAS} avisos; um check sem --ack esconde as mensagens novas)")
         if a["estado"] in ("travado", "nao_comecou", "parado"):
@@ -4159,6 +4257,30 @@ def interromper(dispatch, run=None):
         _controle("interromper", w, "falhou", terminal=handle, erro=str(e))
         raise
     return _controle("interromper", w, "ok", terminal=handle, aviso="interrupt enviado, sem confirmação de que o turno parou")
+
+
+def responder_tela(task, opcao, run=None):
+    """Responde o menu preso na tela do worker da task: lê a tela de novo (o menu tem de estar aberto e a opção existir), digita o número da opção com Enter
+    no terminal dele e grava quem respondeu e o quê (evento `controle` responder-tela, com `por` = este terminal). `opcao` é o número ou o começo do rótulo.
+
+    Sem menu aberto, ou opção que não existe, recusa sem digitar nada: um número digitado no prompt comum viraria mensagem ao worker."""
+    w = next((w for w in _workers_todos(run) if w.get("taskId") == task and w.get("dispatchStatus") == "dispatched"), None)
+    if not w or not w.get("agentTerminalHandle"):
+        raise ValueError(f"task {task} não tem worker rodando com terminal: nada a responder")
+    handle = w["agentTerminalHandle"]
+    p = tela_pergunta(_fundo(orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal", timeout=10), "terminal", "tail") or [])
+    if not p:
+        raise ValueError(f"a tela de {handle} não mostra um menu esperando resposta: nada foi digitado")
+    alvo = next((o for o in p["opcoes"] if str(o[0]) == opcao.strip() or o[1].lower().startswith(opcao.strip().lower())), None)
+    if not alvo:
+        raise ValueError(f"opção {opcao!r} não existe no menu ({' | '.join(f'{n}) {r}' for n, r in p['opcoes'])})")
+    try:
+        orca("send", "--terminal", handle, "--text", str(alvo[0]), "--enter", area="terminal", timeout=10)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        _controle("responder-tela", w, "falhou", terminal=handle, erro=str(e), por=os.environ.get("ORCA_TERMINAL_HANDLE"))
+        raise
+    append_event({"tipo": "pergunta_tela_fim", "dispatch": w["dispatchId"]})
+    return _controle("responder-tela", w, "ok", terminal=handle, por=os.environ.get("ORCA_TERMINAL_HANDLE"), opcao=f"{alvo[0]}) {alvo[1]}", pergunta=p["texto"], tipo_pergunta=p["tipo"])
 
 
 def _parar(acao, w, base):
@@ -4548,6 +4670,16 @@ RETOMAR_ESPERA_S = float(os.environ.get("ORQ_RETOMAR_ESPERA_S") or 20)  # quanto
 MSG_CONTINUE = ("Continue de onde parou. A sessão caiu por uma queda de energia; o terminal e o handle do Orca mudaram. Antes: confira git status e o estado da "
                 "sua worktree, e se estava esperando uma suíte, rode-a de novo (a fila do E2E foi liberada). Ao terminar, mande o worker_done como antes; se o "
                 "Orca recusar por causa do handle novo, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+MSG_ESCALAR = ("Nunca deixe uma pergunta ou confirmação esperando no terminal: o coordenador ({coord}) não vê esta tela e o AskUserQuestion é recusado. Dúvida, permissão ou bloqueio: "
+               "`orca orchestration send --from \"$ORCA_TERMINAL_HANDLE\" --to run:{run} --type escalation --subject \"<resumo>\" --body \"<detalhes>\" --task-id {task} --dispatch-id {dispatch}`. "
+               "Antes de comandos com `rm` e variável, proteja a variável (`\"${{VAR:?}}\"/*`) para o guard do Claude Code não pedir confirmação.")
+
+
+def msg_continuar(coord, task, dispatch, run):
+    """A mensagem de continuação da sessão retomada: o MSG_CONTINUE e o jeito de escalar (handle do coordenador e comando), já que o contexto de despacho se perdeu."""
+    return f"{MSG_CONTINUE} {MSG_ESCALAR.format(coord=coord or '<coordenador>', run=run or '<run>', task=task or '<task>', dispatch=dispatch)}"
+
+
 TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
 
 
@@ -4626,7 +4758,7 @@ def retomar(dry_run=False, run=None):
         if dry_run:
             res["workers"].append({**linha, "estado": "a_retomar"})
             continue
-        comando = f"claude --resume {shlex.quote(t['sessao'])}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(MSG_CONTINUE)}"
+        comando = f"claude --resume {shlex.quote(t['sessao'])}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(msg_continuar(meu, w.get('taskId'), d, w.get('runId')))}"
         try:
             novo = _terminal_novo(f"{titulo} (retomado)", comando, cwd)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -4761,6 +4893,10 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - o painel não cai por causa do acompanhamento dos steers; a próxima volta tenta
         log(f"steers: {type(e).__name__}: {e}")
     try:
+        linhas += telas_avisar()
+    except Exception as e:  # noqa: BLE001 - a tela ilegível não derruba o painel; a próxima volta tenta
+        log(f"telas: {type(e).__name__}: {e}")
+    try:
         linhas += [*pr_poll(), *pr_avisar()]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
@@ -4847,6 +4983,10 @@ def main(argv=None):
     it = sub.add_parser("interromper", help="manda o interrupt ao terminal do worker que roda (o worker segue vivo)")
     it.add_argument("dispatch")
     it.add_argument("--run")
+    rt = sub.add_parser("responder-tela", help="digita a opção de um menu preso na tela do worker (permissão, AskUserQuestion, trust)")
+    rt.add_argument("task")
+    rt.add_argument("opcao", help="o número da opção ou o começo do rótulo")
+    rt.add_argument("--run")
     en = sub.add_parser("encerrar", help="worker-stop (se ainda roda) e release, com o motivo no log")
     en.add_argument("dispatch")
     en.add_argument("--motivo", required=True)
@@ -4961,6 +5101,8 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             if r["aviso"]:
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd == "responder-tela":
+            print(json.dumps(responder_tela(a.task, a.opcao, a.run), ensure_ascii=False))
         elif a.cmd in ("interromper", "encerrar", "relancar"):
             r = interromper(a.dispatch, a.run) if a.cmd == "interromper" else encerrar(a.dispatch, a.motivo, a.run, a.parada) if a.cmd == "encerrar" \
                 else relancar(a.dispatch, a.nota, a.modelo, a.effort, a.run)

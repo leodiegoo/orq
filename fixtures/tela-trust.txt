@@ -1,0 +1,10 @@
+ Quick safety check: Is this a project you created or one you trust?
+
+ /home/dev/wt/fix-x
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel

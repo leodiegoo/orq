@@ -1,0 +1,9 @@
+> 1. corrija o seletor
+● Feito. Os passos foram:
+  1. Ajustei o filtro
+  2. Rodei a suíte
+✻ Cogitating… (12s · esc to interrupt)
+
+╭──────────────────────────────╮
+│ >                            │
+╰──────────────────────────────╯

@@ -2387,7 +2387,7 @@ def test_guard_recusa_a_caixa_com_despacho_ativo_em_qualquer_run():
     assert lista and "--run" not in lista[0], "lista de todos os Runs: o worker-list escopado só veria o Run ligado"
 
 
-def test_guard_libera_sem_despacho_ativo_para_worker_e_fora_do_orca():
+def test_guard_libera_sem_despacho_ativo_e_fora_do_orca():
     a = Amb(run="run_a")
     _workers(a, ("w1", "run_a", "completed"), ("w2", "run_b", "failed"))
     r = _guard(a)
@@ -2395,7 +2395,7 @@ def test_guard_libera_sem_despacho_ativo_para_worker_e_fora_do_orca():
     b = Amb(run="run_a")
     _workers(b, ("w1", "run_b", "dispatched"))
     b.prompt(PREAMBULO)  # esta sessão é de worker
-    assert (_guard(b).stdout, _calls(b, "worker-list")) == ("", []), "worker pode usar a caixa e nem chama o Orca"
+    assert "deny" in _guard(b).stdout and _calls(b, "worker-list") == [], "worker não usa a caixa (ticket 52: escala pelo Orca) e nem chama o Orca"
     c = Amb(run="run_a")
     _workers(c, ("w1", "run_b", "dispatched"))
     r = _guard(c, ORCA_TERMINAL_HANDLE="")
@@ -3052,7 +3052,7 @@ def test_review4_b15_coordenador_sem_run_ligado_com_worker_ativo_continua_travad
     c.prompt(PREAMBULO)
     c.set("run.json", None)
     _workers(c, ("w1", "run_a", "dispatched"))
-    assert _guard(c).stdout == "", "worker"
+    assert "orchestration ask" in _guard(c).stdout, "worker: a caixa é recusada com o jeito de escalar (ticket 52), não pela regra do despacho ativo"
 
 
 def test_review4_b16_preambulo_colado_numa_sessao_que_coordena_nao_a_vira_worker():
@@ -7861,6 +7861,131 @@ def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_gu
     assert b.orq("gerente", "ligar", "--terminal", "term_ger").returncode == 0
     assert json.load(open(os.path.join(b.home, "gerente.json")))["runs"] == ["run_c"]
 
+
+
+# ---------- ticket 52: pergunta ou permissão presa no terminal do worker ----------
+
+def _tela52(nome):
+    return open(os.path.join(AQUI, "fixtures", nome), encoding="utf-8").read().splitlines()
+
+
+def test_ticket52_tela_pergunta_reconhece_permissao_askuserquestion_e_trust():
+    p = orq_mod.tela_pergunta(_tela52("tela-permissao.txt"))
+    assert p["tipo"] == "permissao" and "Do you want to proceed?" in p["texto"] and "Dangerous rm" in p["texto"], p
+    assert [o[0] for o in p["opcoes"]] == [1, 2, 3] and p["opcoes"][0][1] == "Yes", p
+    q = orq_mod.tela_pergunta(_tela52("tela-askuserquestion.txt"))
+    assert q["tipo"] == "pergunta" and "Qual escopo" in q["texto"], q
+    assert [o[0] for o in q["opcoes"]] == [1, 2, 3, 4], q
+    t = orq_mod.tela_pergunta(_tela52("tela-trust.txt"))
+    assert t["tipo"] == "trust" and [o[0] for o in t["opcoes"]] == [1, 2] and t["opcoes"][1][1] == "No, exit", t
+
+
+def test_ticket52_tela_pergunta_ignora_lista_no_historico_e_tela_ociosa():
+    assert orq_mod.tela_pergunta(_tela52("tela-lista-no-historico.txt")) is None
+    assert orq_mod.tela_pergunta([]) is None and orq_mod.tela_pergunta(None) is None
+    assert orq_mod.tela_pergunta(["Do you want to proceed?", "  1. Yes", "  2. No"]) is None, "sem o cursor ❯ não é um menu aberto"
+    assert orq_mod.tela_pergunta(_tela52("tela-permissao.txt") + ["saída nova"] * 6) is None, "o menu já foi respondido e a tela seguiu"
+
+
+def _tela_no_gerente52(a, tela="tela-permissao.txt"):
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    a.set("workers.json", [_w48("term_w1", agente="claude")])
+    _turno48(a, ctx_term_w1=("sess-w1", None))
+    a.set("screens.json", {"term_w1": _tela52(tela)})
+
+
+def test_ticket52_gerente_avisa_o_coordenador_uma_vez_e_o_agentes_mostra_a_pergunta():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _tela_no_gerente52(a)
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0 and "pergunta na tela (permissao)" in r.stdout, r
+    (env,) = _avisos_enviados(a)
+    texto = env[env.index("--text") + 1]
+    assert "Do you want to proceed?" in texto and "1) Yes" in texto and "orq responder-tela task_term_w1 <opção>" in texto, texto
+    a.orq("gerente", "absorver")
+    assert len(_avisos_enviados(a)) == 1, "o mesmo menu não é avisado de novo"
+    (ev,) = [e for e in a.events() if e["tipo"] == "pergunta_tela"]
+    assert ev["dispatch"] == "ctx_term_w1" and ev["menu"] == "permissao", ev
+    ag = json.loads(a.orq("agentes", "--json", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout)
+    w = next(x for x in ag if x["dispatch"] == "ctx_term_w1")
+    assert w["estado"] == "perguntando" and w["pergunta"]["tipo"] == "permissao", w
+    txt = a.orq("agentes", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout
+    assert "PERGUNTA NA TELA (permissao)" in txt and "orq responder-tela task_term_w1" in txt, txt
+    a.set("screens.json", {"term_w1": ["● seguindo"]})  # respondido: o evento fecha
+    a.orq("gerente", "absorver")
+    a.set("screens.json", {"term_w1": _tela52("tela-permissao.txt")})
+    a.orq("gerente", "absorver")
+    assert len(_avisos_enviados(a)) == 2, "o mesmo texto volta a ser avisado depois que sumiu da tela"
+
+
+def test_ticket52_gerente_com_coordenador_ocupado_nao_digita_e_tenta_na_proxima_volta():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _tela_no_gerente52(a, "tela-trust.txt")
+    a.set("busy.json", ["term_coord"])
+    a.orq("gerente", "absorver")
+    assert _avisos_enviados(a) == [] and not [e for e in a.events() if e["tipo"] == "pergunta_tela"]
+    a.set("busy.json", [])
+    a.orq("gerente", "absorver")
+    assert len(_avisos_enviados(a)) == 1
+
+
+def test_ticket52_responder_tela_digita_a_opcao_com_enter_e_registra_quem_respondeu():
+    a = Amb(run="run_a")
+    _tela_no_gerente52(a)
+    r = a.orq("responder-tela", "task_term_w1", "2", ORCA_TERMINAL_HANDLE="term_coord")
+    assert r.returncode == 0, r.stderr
+    (env,) = [e for e in _log(a, "send.log") if e[e.index("--terminal") + 1] == "term_w1"]
+    assert env[env.index("--text") + 1] == "2" and "--enter" in env, env
+    (c,) = [e for e in a.events() if e["tipo"] == "controle" and e["acao"] == "responder-tela"]
+    assert c["por"] == "term_coord" and c["opcao"].startswith("2) Yes, and") and c["resultado"] == "ok" and "Do you want to proceed?" in c["pergunta"], c
+    r = a.orq("responder-tela", "task_term_w1", "no, and", ORCA_TERMINAL_HANDLE="term_coord")
+    assert r.returncode == 0 and _log(a, "send.log")[-1][_log(a, "send.log")[-1].index("--text") + 1] == "3", "o começo do rótulo também vale"
+
+
+def test_ticket52_responder_tela_recusa_sem_menu_aberto_ou_com_opcao_que_nao_existe():
+    a = Amb(run="run_a")
+    _tela_no_gerente52(a)
+    r = a.orq("responder-tela", "task_term_w1", "9", ORCA_TERMINAL_HANDLE="term_coord")
+    assert r.returncode != 0 and "não existe no menu" in r.stderr and not _log(a, "send.log"), r
+    a.set("screens.json", {"term_w1": ["● trabalhando"]})
+    r = a.orq("responder-tela", "task_term_w1", "1", ORCA_TERMINAL_HANDLE="term_coord")
+    assert r.returncode != 0 and "não mostra um menu" in r.stderr and not _log(a, "send.log"), "um número digitado no prompt comum viraria mensagem ao worker"
+    r = a.orq("responder-tela", "task_nao_existe", "1", ORCA_TERMINAL_HANDLE="term_coord")
+    assert r.returncode != 0 and "nada a responder" in r.stderr
+
+
+def test_ticket52_hook_guard_recusa_askuserquestion_so_no_worker_e_rapido():
+    a = Amb(run="run_a")
+    a.prompt(PREAMBULO)  # esta sessão é de worker
+    t = time.time()
+    r = _guard(a)
+    dt = time.time() - t
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert r.returncode == 0 and out["permissionDecision"] == "deny" and "escalation" in out["permissionDecisionReason"] and "orchestration ask" in out["permissionDecisionReason"], r
+    assert not _calls(a, "worker-list") and not _calls(a, "run-current"), "o worker nem chama o Orca"
+    assert dt < 0.5, dt  # o teto do ticket é 100 ms do hook; o resto é a partida do python no subprocess
+    t = time.perf_counter()
+    orq_mod.guard_worker()
+    assert time.perf_counter() - t < 0.1
+    c = Amb(run="run_a")  # coordenador sem despacho ativo: a caixa passa
+    assert _guard(c).stdout == ""
+    assert _guard(a, tool="Bash").stdout == "", "só o AskUserQuestion"
+
+
+def test_ticket52_retomar_leva_o_jeito_de_escalar_na_mensagem_de_continuacao():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="2", ORCA_TERMINAL_HANDLE="term_coord")
+    _queda48(a)
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    assert a.orq("retomar", "--json").returncode == 0
+    (c,) = _log(a, "create.log")
+    comando = c[c.index("--command") + 1]
+    assert "orca orchestration send" in comando and "--type escalation" in comando and "term_coord" in comando, comando
+    assert "--to run:run_a" in comando and "--task-id task_term_w1" in comando and "--dispatch-id ctx_term_w1" in comando, comando
+    assert "${VAR:?}" in comando
+
+
+def test_ticket52_tela_tem_15_linhas_de_folga_para_o_prompt_de_permissao():
+    assert orq_mod.TELA_LINHAS >= 25 and len(_tela52("tela-permissao.txt")) <= orq_mod.TELA_LINHAS
 
 
 if __name__ == "__main__":
