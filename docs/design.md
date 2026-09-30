@@ -1,0 +1,273 @@
+# orq design
+
+This document explains the concepts behind orq and why it is built the way it is. The README covers installation and commands.
+
+Names in code and in the event log are Portuguese (see the glossary in the README). They are kept verbatim here in `code` so you can grep for them.
+
+## Roles
+
+Three kinds of terminal take part.
+
+The coordinator is the Claude Code session the user talks to. It creates Runs and tasks in Orca and dispatches workers.
+
+Workers are Claude Code sessions Orca starts for a task. Their first prompt is always Orca's dispatch preamble.
+
+The agent manager (`gerente`) is a plain shell running `painel-agent-manager.sh`. It has no model and costs no tokens.
+
+The hooks are installed globally, so they run in every session, workers included. Each one first works out its role:
+
+1. No `ORCA_TERMINAL_HANDLE` in the environment means the session is outside Orca, and the hook exits without calling anything.
+2. A prompt that is the dispatch preamble marks the session as a worker in `cursor.json` (`papeis[session_id] = "worker"`). From then on the session stays a worker, even if it later runs `run-create` by mistake.
+3. A session with no worker mark and a Run bound to its terminal (`orca orchestration run-current`) is the coordinator. orq remembers that session's Run so it can report a lost binding later, for example after hibernation or resume.
+
+Orca's `worker-list` is not used as a role signal. Without `--run` it is scoped to the Run bound to the calling terminal, and a Run a worker created by mistake never lists that worker.
+
+## Entries and effects
+
+An entry (`entrada`) is something that demands a decision from the coordinator. There are three sources:
+
+- a prompt typed by the user (`origem: usuario`)
+- an action item from an automation report (`origem: relatorio`)
+- a `worker_done` message that carries a `reportPath` (`origem: relatorio_worker`)
+
+Each entry gets a sequential id (`e1`, `e2`, ...). It stays open until an `intake` event with the same id records its effect:
+
+| Effect | Meaning | Reference checked |
+|---|---|---|
+| `tarefa` | created or changed an Orca task | the task exists in the Run |
+| `steer` | adjusted a running task (`orq steer`) | the task exists |
+| `pend` / `decisao` | became something only the user can do or decide | the pending id exists in the file or in a `pend add` event |
+| `conversa` | answered on the spot, nothing to track | none; refused for report items |
+| `descartado` | dropped on purpose | none; `--nota` gives the reason |
+
+The model does the classifying. The code only checks that a classification was recorded and that it points at something real, so closing an entry dishonestly would mean citing a task that exists and that the dashboard shows.
+
+## events.jsonl
+
+`events.jsonl` in `ORQ_HOME` is an append-only log with one JSON object per line and a `ts` field. Nothing is ever rewritten. Main event types:
+
+| `tipo` | Written by |
+|---|---|
+| `entrada`, `intake` | prompt hook, ingest, `orq intake` |
+| `pend` (`op: add/done`), `gate_resolvido`, `gate_falha` | `orq pend`, ask hook, ingest |
+| `resposta`, `resposta_suspeita`, `resposta_lavish` | ask hook, `orq lavish-resposta` |
+| `heartbeat_absorvido`, `heartbeat_visto` | prompt hook, manager loop, waiter |
+| `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
+| `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
+
+Current state is always computed from the whole log by pure functions:
+
+```mermaid
+flowchart TD
+    E[("events.jsonl")] --> A["abertas()<br/>entrada without a matching intake"]
+    E --> S["sinais_de_vida()<br/>latest heartbeat per dispatch"]
+    E --> G["gates_pendentes()<br/>pend done without gate_resolvido"]
+    E --> Q["suspeitas()<br/>resposta_suspeita not yet cleared"]
+    E --> L["_liberados()<br/>dispatches already released"]
+    A --> R["prompt summary, Stop warning"]
+    S --> V["orq agentes, Vivos line, stuck detection"]
+    G --> R
+    Q --> R
+    L --> V
+    O[("Orca: runs, tasks, gates")] --> C["aberto.json cache"]
+    C --> R
+```
+
+`aberto.json` is a cache of what is open across all Runs (backlog, running, blocked, gates, agents). Reading every Run takes seconds, so the prompt hook reads the cache left by the previous prompt and starts a background `orq ingest --refresh`. The cache is at most one prompt old and can be deleted at any time.
+
+`cursor.json` holds bookkeeping that does not belong in the log: the next entry number, ingest positions, session roles and the last Run per session. The next id is `max(cursor counter, highest eN in the log) + 1`, so losing `cursor.json` never reuses an id. An unreadable `cursor.json` is moved aside as `cursor.json.corrompido-<time>` and rebuilt, and the summary reports the recovery for 24 hours.
+
+Concurrency. Hooks, the manager loop, the waiter and manual commands can run at the same moment, so every shared file is protected:
+
+- `flock` on one lock file per resource: `cursor.lock` (log appends and cursor), `pend.lock` (pending list), `ticket.lock` (ticket numbering), `gerente.lock` (the manager's Run binding), plus non-blocking `ingest.lock` and `refresh.lock` so only one ingest or refresh runs. When two are needed, the order is fixed: `pend.lock`, then `cursor.lock`.
+- JSON files and tickets are written to a temporary file in the same directory and renamed into place, so a reader (such as a dashboard using `fs.watch`) never sees a half-written file.
+- Two-step writes, such as updating the pending file and appending its event, block `SIGALRM` until both are done, so the hook's time limit cannot leave one without the other.
+
+## Intake and the Stop hook
+
+`orq hook prompt` (UserPromptSubmit) classifies the prompt with a regex on its start:
+
+| Origin | Rule | Becomes an entry |
+|---|---|---|
+| `notificacao` | starts with `<task-notification` | no |
+| `orca` | starts with `You have N orchestration` | no; may be absorbed as a heartbeat |
+| `comando` | `<command-`, `<local-command`, `/compact` | no |
+| `resumo` | `This session is being continued` | no |
+| `despacho` | Orca's dispatch preamble | no; marks the session as a worker |
+| `usuario` | anything else | yes |
+
+Orca types its notice into the terminal even while the user is typing, so a user prompt that ends with the notice is split: the text before it becomes the entry (flagged `com_aviso`), and the notice is handled as an Orca notice.
+
+For a user prompt the hook appends the entry and injects at most five lines of context: the new entry id and the entries still without effect, one line for alerts (stuck workers, suspicious or free-text answers, pending gates, untriaged reports), the open work in Orca with the live workers, the size of the user's pending list, and the `orq intake` syntax.
+
+`orq hook stop` computes the open entries. If there are any, it appends a `gate_aviso` event and shows the user a `systemMessage` naming up to three of them. Today it only warns. The plan is to measure how many entries end a turn without an effect before deciding to block, and then block at most once per turn using Claude Code's `stop_hook_active` flag, so a blocked turn can never loop.
+
+## Report ingestion
+
+`orq ingest` runs in the background after each prompt and after each Orca notice. It reads two sources.
+
+Completed automation runs (`orca automations runs`). orq finds the report file the run's output cites under `.scratch/` in the run's repository and turns each numbered item under an action heading (`Itens de ação`, or two older titles) into its own entry. A report without that section becomes a single "ler <file>" (read the file) entry, so a report can never vanish. Orca marks a terminal automation complete before the agent writes the file, so a run without a readable report waits up to an hour.
+
+`worker_done` messages from the inbox. One with a `reportPath` becomes an entry. A task whose title starts with `[scout]` is expected to produce a report; if its `worker_done` has none, orq raises an alert in the summary until `orq alerta visto <task>`.
+
+Every message and run is isolated: a bad one is logged and skipped, and a transient Orca failure is retried up to three times. Anything already in the log (matched by its `ref`) is never ingested twice, even if `cursor.json` is lost.
+
+## Tickets
+
+A ticket is a markdown file in `ORQ_ISSUES`, `NN-<slug>.md`, numbered from 01 without reusing numbers:
+
+```
+# 02: Add login endpoint
+
+Status: ready-for-agent
+Blocked by: 01
+Run: run_demo
+Task: task_abc123
+
+## What to build
+...
+## Acceptance criteria
+...
+## Answer          (added when the ticket closes)
+```
+
+The file is the only copy of the content. `orq ticket novo` creates the Orca task with the ticket title and a one-line spec, "read and execute the ticket at <path>", with `--deps` pointing at the tasks of any open blockers in the same Run. If `task-create` fails, the file is removed, so no ticket exists without a task.
+
+```mermaid
+stateDiagram-v2
+    state "ready-for-agent" as ready
+    state "claimed" as claimed
+    state "resolved" as resolved
+    [*] --> ready: orq ticket novo
+    ready --> claimed: orq despachar --ticket
+    claimed --> resolved: orq ticket fechar
+    ready --> resolved: orq ticket fechar
+```
+
+`orq ticket fechar` writes the `## Answer` section and sets `Status: resolved` first, then completes the Orca task. If Orca fails at that point the ticket stays resolved and the command prints the manual fix. Completing a blocker's task lets Orca move the dependent task from `pending` to `ready`.
+
+## Pending list (pendências)
+
+The user's own to-do items live in `pendencias.json`, which a dashboard can watch. orq is the only writer: `orq pend add` and `orq pend done` change the file under a lock and log each change as a `pend` event.
+
+An item has an `id`, a type (`acao` for an action, `decisao` for a decision, `avisar` for someone to notify), a title and optional fields (`detalhe`, `frente`, `link`, `comando`, `espera`). `espera` marks an item waiting on a third party, and such an item is never asked as a question.
+
+A decision is asked in the same turn it is created, with the AskUserQuestion `header` equal to its id (hence the 12-character limit). The PostToolUse hook `orq hook ask` records the answer and closes the decision only when exactly one option was picked. Free text, "Other", or an option with a note attached is recorded with `livre: true` and leaves the decision open, because orq cannot tell whether the user has decided. The summary keeps asking the coordinator to close it with the decided wording. A multi-select question with the header `ja-fez` ("already done?") closes every item whose option description starts with `[<id>]`.
+
+A decision created with `--task` also creates an Orca gate that holds that task. Closing the decision resolves the gate with the answer. Orca only resolves a gate from a terminal bound to the gate's Run, so orq records the Run, waits until it is bound, and retries from the next ingest.
+
+## Agent manager
+
+Orca types "You have N orchestration messages" into the terminal bound to a Run, and only if that terminal runs a recognized agent. A plain shell gets nothing typed. Orca also identifies the caller by `ORCA_TERMINAL_HANDLE`, so another process can act for the bound terminal by setting that variable.
+
+orq uses both facts. `orq gerente ligar --terminal <manager>` runs `run-use` with the manager's handle and writes `gerente.json` (`{coordenador, gerente, runs}`). After that, every Orca call orq makes from the coordinator goes out with the manager's handle, and Orca's notices go to a terminal that ignores them.
+
+Orca binds one Run per terminal, and binding another Run fences the first. To serve several Runs, the manager rotates: before any command that has to come from the bound terminal (`worker-start`, `send`, `check`, `task-create`, `task-update`, `worker-release`), orq rebinds the manager to that command's Run, holding `gerente.lock` across the bind, the read and the acknowledgement. The lock matters because a delivery read under one binding cannot be acknowledged after the terminal has left the Run and come back. `orq despachar` into a new Run adopts that Run into the manager first, so the coordinator is never left bound to it.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant O as Orca
+    participant M as Manager loop
+    participant C as Coordinator
+    W->>O: heartbeat
+    O-->>M: nothing typed, the shell has no agent
+    loop every 10 s, for each Run
+        M->>O: run-use, then check
+        alt batch holds only heartbeats
+            M->>O: check --ack
+            M->>M: append heartbeat_absorvido
+        else batch holds worker_done, question or escalation
+            M->>C: types one notice naming the Run and the manager terminal
+            C->>O: check --run r --terminal manager, then --ack
+        end
+    end
+```
+
+Repeated notices. `gerente-aviso.json` stores, per Run, the ids of messages already announced and the time of the last notice. A notice goes out only for ids not seen before, and ids are marked seen only after the text was actually submitted. Before typing, orq checks that the coordinator is idle (`orca terminal wait --for tui-idle`) and that the user has no half-typed draft (`orca terminal read`). Orca itself refuses to type into a busy agent (`agent_prompt_blocked`), which catches the cases `tui-idle` misses. If the coordinator is busy, the loop tries again next round.
+
+While a notice waits to be read, the loop stays on that Run for up to 120 s (`ORQ_GERENTE_PRESO_S`), because the coordinator's raw `check` only works while the manager is bound to it.
+
+## Heartbeat handling
+
+There are three paths, all built on the same rule: only a batch made entirely of heartbeats is ever acknowledged. Any other type, including an unknown or missing one, lets the notice through untouched.
+
+Notice for the coordinator's own Run (or a Run of its manager). The prompt hook peeks at the mailbox (`check --peek`). If everything unacknowledged is a heartbeat, it consumes and acknowledges up to four consecutive batches, records `heartbeat_absorvido` with each heartbeat's dispatch, task and phase, and blocks the prompt with `decision: block`, so the model never sees it. A batch that is not all heartbeats stays open for the coordinator.
+
+Late notices. A busy coordinator receives queued notices one after another. The first absorbs the whole mailbox and the rest find it empty. An empty mailbox within 120 s of an absorbed batch is blocked too; outside that window the notice passes.
+
+Notice for another Run. `check` on a Run the terminal is not bound to fails, so orq reads the global inbox instead. If every unread message addressed to that Run is a heartbeat, the prompt is blocked and `heartbeat_visto` is recorded, but nothing is consumed; the messages come out in a batch when the coordinator binds that Run.
+
+The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same function. Acknowledging the same delivery twice is harmless in Orca, so the hook, the waiter and the manager loop can race without losing messages. The recorded heartbeats feed `orq agentes`: a running dispatch whose last heartbeat is older than 15 minutes is shown as stuck, with the `orq steer` command to send.
+
+## Releasing workers
+
+`orq liberar <dispatch>` acknowledges pending messages that belong only to that dispatch (a batch mixing another worker's messages is left alone), calls `worker-release`, and, if Orca reports the terminal as `retained`, decides whether to close it.
+
+It closes a terminal Orca owns with no retention reason. Orca also marks a terminal `user_takeover` whenever any data passes through its xterm, including the terminal's automatic replies, so that flag does not prove a person typed anything. orq therefore closes a `user_takeover` terminal only when it was created by this dispatch and the worker's own Claude Code transcript shows no human prompt. It never closes the coordinator's terminal, the Run's coordinator terminal, a terminal reused by another running dispatch, or one retained for any other reason.
+
+## Compaction handoff
+
+`precompact.py` runs on PreCompact in the coordinator. Within a 20 s budget (the hook timeout is 30 s) it writes `handoff/<date>.md` with the bound Run, the last ten user entries with their effects, the design notes path, live and delivered agents (with the `orq liberar` and waiter commands), the pending list, open tickets and the user's open PRs. Each section fails on its own. `handoff/ultimo.md` is a symlink to the newest file, and the snapshot is also saved to `engram` when that CLI exists.
+
+After compaction, `precompact.py retomar` (SessionStart with source `compact`) injects the first 60 lines of `ultimo.md`, and flags it as stale if it is older than 15 minutes. The most important sections come first so the cut never drops them. `orq hook session` runs on every session start and adds a fresh status, the open tickets and the notes path in at most 12 lines, so a new coordinator session can resume without the user explaining anything.
+
+## AskUserQuestion guard
+
+Orca's notice is typed into the coordinator's terminal. When an AskUserQuestion widget is open, that text lands in the widget, and Enter picks the first (recommended) option on the user's behalf.
+
+Two defenses follow.
+
+`orq hook guard` (PreToolUse on AskUserQuestion) refuses the widget while any worker is dispatched in any Run, apart from Runs another live terminal coordinates. The refusal tells the coordinator to put the decision on a review page instead, a browser page whose answer cannot be typed by a terminal notice. In the author's setup that page is built with `lavish-axi`, and `orq lavish-resposta` records its answers under the same rules as the widget: only an explicit choice closes a decision. The list of active dispatches is cached for 10 s. `touch ~/.claude/orq/ask-guard.off` disables the guard if a dispatch is stuck.
+
+Without active workers the widget is allowed, and `orq hook ask` still checks each answer. It is marked suspicious (recorded, but closing nothing) if the prompt hook saw an Orca notice in the previous 3 s, if the answer text is itself a notice, or if Orca delivered a message within 5 s and the answer is just the recommended option. `orq auditar-respostas` scans a past transcript for answers that picked only the recommended option within 2 s of an Orca delivery and lists them for the user to check.
+
+## Worker-routing guard
+
+`hooks/worker-routing-guard.py` (PreToolUse on Bash and Agent) refuses `orca orchestration worker-start` without `--model` and `--effort`, `orq despachar` without `--modelo` and `--effort`, an Agent call without `model` (forks excepted), and `orca worktree rm` without `--run-hooks`. It only matches `orq despachar` in command position, so text inside quotes such as a commit message does not trigger it. The refusal points to the `worker-routing` skill, which picks the model from how ambiguous the task is and the effort from how much reasoning this run needs.
+
+## Design decisions
+
+Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.
+
+The Python standard library only. The hooks run in every Claude Code session, workers included, so they must start fast and install with a `git clone`. There is no virtualenv to break and no dependency to audit.
+
+An append-only log instead of a database. A log can be inspected with `grep`, cannot be corrupted by a partial update, and makes every state a pure function over past events, which the tests exercise directly with fixture events. A lost or corrupt cursor can be rebuilt from it. The cost is that every read scans the whole file and nothing rotates it yet.
+
+Scripts own the mechanics and the model owns the judgment. Asking the model to remember every request fails exactly when context is compacted. So hooks record entries deterministically, the model classifies each one with a single command, and the code rejects a classification that points at nothing.
+
+Warn before blocking. The Stop hook only warns until real usage shows how often entries end a turn without an effect. A block costs a turn and can annoy, so it has to be justified by data first.
+
+Heartbeats stay out of the coordinator's context. Orca has no option to silence notices, and each one is a prompt that wakes the model. Blocking in UserPromptSubmit stops them at no model cost. A shell as the manager, rather than a second Claude session, costs no tokens per message and does not depend on a model to relay messages correctly.
+
+In doubt, wake the coordinator. Anything not provably a heartbeat passes. A spurious wake-up costs a few tokens; a swallowed `worker_done` or question stalls a worker.
+
+Hooks fail open, fast. A hook that crashes or hangs must never stand between the user and the model. Every hook has an internal 3 s `SIGALRM` limit (inside a 5 s timeout in `settings.json`) that also covers a stdin that never closes and a stuck lock. Errors go to `orq.log`, and the slow work (reading every Run) happens in a detached background process.
+
+Files with locks and atomic renames. The state is small, several processes touch it, and a dashboard reads it with file watchers. `flock` plus rename gives consistency without a server.
+
+One gateway to Orca. Every call goes through `orca()`, which handles the manager's handle and rebinding. `ORQ_ORCA` points it at a fake Orca in tests, and the fake reproduces the real scoping and fencing rules, since tests against a lenient fake once hid a real bug.
+
+Do not trust a signal that cannot bear weight. `user_takeover` fires without a person, and `tui-idle` is satisfied early in a turn. orq checks such signals against a second source (the worker's transcript, Orca's own refusal to type) before acting on them.
+
+The ticket file is the only copy of its content. Orca's task only points at the file, so there is one place to edit and nothing to keep in sync.
+
+A visible mark instead of colour. Messages orq shows the user start with a fixed emoji prefix, because ANSI colour in hook messages could not be shown to render and would show up as escape codes if it did not.
+
+## Non-goals and known limits
+
+Non-goals: replacing Orca's task store, scheduling work in code (the model decides what to dispatch and with which model), and shipping a UI. A dashboard can read `pendencias.json`, `events.jsonl` and `aberto.json`, but none is included here.
+
+Known limits:
+
+- The Stop hook warns and never blocks.
+- `events.jsonl` is never rotated, and every read scans all of it.
+- `orq agentes` and the guard look at the 300 newest dispatches; the "asking" state looks at the last 200 inbox messages.
+- Everything about the manager depends on its loop running. With the loop stopped nothing is acknowledged or announced, and a notice can take one round (about 10 s plus the `orq agentes` call) to arrive. While a notice is waiting, the other Runs are not visited for up to 120 s.
+- Raw `orca` commands against a manager-bound Run need `env ORCA_TERMINAL_HANDLE=<manager>` and only work while the manager is bound to that Run. Gate creation and resolution do not rebind.
+- A worker is recognized only if its first prompt passed through an orq hook.
+- `orq ticket novo`, `orq steer` and `orq intake ... tarefa` only work on the Run bound to the coordinator or its manager, because Orca refuses task writes from other terminals.
+- The worker's tab title set by `orq despachar` does not stick; Claude Code rewrites it.
+- `orq liberar` reads the worker's whole transcript and needs it under `~/.claude/projects`, so non-Claude workers keep their terminals open.
+- Some constants are tuned to the author's setup: the ingest start date, reports living under `.scratch/`, the Portuguese action headings, and the default protected branch names in the cleanup script (overridable with `ORQ_PROTECTED_BRANCHES` and `ORQ_FINAL_BASE`).
+- macOS and Linux only, single user, one machine.
