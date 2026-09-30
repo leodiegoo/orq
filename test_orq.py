@@ -7605,6 +7605,19 @@ def test_ausente_ligar_e_desligar_guardam_o_estado_e_o_log():
     assert [e["tipo"] for e in a.events() if e["tipo"].startswith("ausente")] == ["ausente_ligar", "ausente_desligar"]
 
 
+def test_away_alterna_e_aceita_on_off_status_sem_tirar_o_ausente():
+    a = Amb(run="run_a")
+    assert "away mode ligado" in a.orq("away").stdout and _cursor(a)["ausente"]["ligada_em"]
+    assert "ligado" in a.orq("away", "status").stdout and "desligado" not in a.orq("away", "status").stdout
+    assert "away mode ligado" in a.orq("away", "on").stdout
+    r = a.orq("away")
+    assert "away mode desligado" in r.stdout and "entradas na linha do tempo" in r.stdout and "localhost:8765" in r.stdout and "ausente" not in _cursor(a), r
+    assert "desligado" in a.orq("away", "status").stdout
+    assert not os.path.exists(os.path.join(a.fake, "calls.log")) or "8765" not in open(os.path.join(a.fake, "calls.log")).read()
+    assert "ligado" in a.orq("away", "on").stdout and "ligado" in a.orq("ausente").stdout
+    assert "away mode desligado" in a.orq("away", "off").stdout
+
+
 def _stop(a, **ev):
     return a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456", **ev}))
 
