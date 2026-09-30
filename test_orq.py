@@ -2,6 +2,7 @@
 """Testes do orq (fatias 1 e 3). Rodam com `python3 test_orq.py`: ORQ_HOME num diretório temporário e ORQ_ORCA num Orca falso."""
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -118,6 +119,9 @@ if sys.argv[1] == "terminal":
     if opt("--terminal") in ler("terminals.json", []):
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal")}}})); sys.exit(0)
     print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}})); sys.exit(0)
+if sys.argv[1] == "tab":
+    # orca tab create --url <url>: só o calls.log guarda a chamada (FAKE_FAIL=create a recusa)
+    print(json.dumps({"ok": True, "result": {"tab": {"id": "tab_1", "url": opt("--url")}}})); sys.exit(0)
 if sys.argv[1] == "automations":
     p = os.path.join(d, "automations_runs.json")
     print(open(p).read() if os.path.exists(p) else json.dumps({"ok": True, "result": {"runs": []}}))
@@ -6956,9 +6960,9 @@ def _gh(a, **env):
     a.env.update({"ORQ_GH": caminho, "ORQ_PR_POLL_S": a.env.get("ORQ_PR_POLL_S", "0"), **env})
 
 
-def _pr(a, url, state="OPEN", base="development"):
+def _pr(a, url, state="OPEN", base="development", titulo=None):
     dados = _log_json(a, "gh.json", {})
-    dados[url] = {"state": state, "mergedAt": "2026-09-30T12:00:00Z" if state == "MERGED" else None, "baseRefName": base}
+    dados[url] = {"state": state, "mergedAt": "2026-09-30T12:00:00Z" if state == "MERGED" else None, "baseRefName": base, **({"title": titulo} if titulo else {})}
     a.set("gh.json", dados)
 
 
@@ -7314,6 +7318,385 @@ def test_it_should_not_tell_to_open_main_when_the_main_pr_is_already_there():
     _pr(a, PR3, "OPEN", "main")
     a.orq("pr", "ligar", "task_feat1", PR3)
     assert "abrir o de main" not in _linha_pr(a)
+
+
+# ---------- digest e modo ausente (ticket 47) ----------
+
+def _tk_arq(a, nn, titulo, task=None, bloqueado=None):
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    cab = f"# {nn}: {titulo}\n\nStatus: claimed\nBlocked by: {bloqueado or '(nenhum)'}\nRun: run_a\n" + (f"Task: {task}\n" if task else "")
+    with open(os.path.join(a.env["ORQ_ISSUES"], f"{nn}-t.md"), "w") as f:
+        f.write(cab + "\n## What to build\n\nx\n")
+
+
+def _evs(a, *evs):
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.writelines(json.dumps(e) + "\n" for e in evs)
+
+
+PR3 = "https://github.com/acme/app/pull/1230"
+
+
+def _digest_env(**env):
+    """Dois tickets (02 depende do 01), PRs ligados fora de ordem, uma pendência, um worker rodando e um log com uma janela."""
+    a = Amb(run="run_a", **env)
+    _gh(a)
+    _tk_arq(a, "01", "Base de auth", "task_a")
+    _tk_arq(a, "02", "Tela nova", "task_b", "01")
+    for url, base, titulo in ((PR2, "development", "feat: tela nova"), (PR1, "development", "feat: base de auth"), (PR3, "staging", "feat: base de auth (staging)")):
+        _pr(a, url, "OPEN", base, titulo)
+    a.orq("pr", "ligar", "task_b", PR2)
+    a.orq("pr", "ligar", "task_a", PR1, "--tag", "segurança", "--nota", "A regra de auth fica num pacote só.")
+    a.orq("pr", "ligar", "task_a", PR3)
+    a.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao", "titulo": "Escolher o freio de produção", "detalhe": "teto por pod ou sem freio"}]})
+    a.set("../orq/aberto.json", _aberto_ag("rodando", titulo="Ticket 47 digest"))
+    _evs(a, _ev("09:00:00", "resposta_worker", texto="ANTIGA resposta", dispatch="ctx_1"),
+         _ev("10:00:00", "entrada", id="e1", origem="usuario", texto="sigo amanhã"),
+         _ev("11:00:00", "resposta_worker", texto="use o índice novo", dispatch="ctx_1"),
+         _ev("11:30:00", "worker_done", msg="m1", task="task_a", dispatch="ctx_1", outcome="succeeded", subject="Base de auth entregue"),
+         _ev("12:00:00", "pend", op="done", pend="avisar-x", resposta="pode seguir"))
+    return a
+
+
+def _json_digest(a, *args):
+    r = a.orq("digest", *args)
+    assert r.returncode == 0, r.stderr
+    return json.load(open(os.path.join(a.home, "digest", "atual.json")))
+
+
+def _html(a, *args):
+    r = a.orq("digest", "--html", *args)
+    assert r.returncode == 0, r.stderr
+    (caminho,) = [l for l in r.stdout.splitlines() if l.endswith(".html")]
+    return r, open(caminho).read()
+
+
+def _ev_depois(tipo, **k):
+    return {"ts": "2099-01-01T00:00:00Z", "tipo": tipo, **k}
+
+
+def test_digest_grava_o_contrato_v1_no_caminho_fixo():
+    a = _digest_env()
+    r = a.orq("digest")
+    assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
+    d = json.load(open(r.stdout.splitlines()[0]))
+    assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "features", "pendencias", "linha", "rodando"}, set(d)
+    assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
+    assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito"} and d["fila"][0]["feito"] is False
+    assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
+        (1216, "development", "OPEN", "feat: base de auth"), (1230, "staging", "OPEN", "feat: base de auth (staging)")], d["fila"][0]["prs"]
+    assert d["fila"][0]["prs"][0]["url"] == PR1
+    f = {x["nome"]: x for x in d["features"]}
+    assert (f["Base de auth"]["tag"], f["Base de auth"]["nota"]) == ("segurança", "A regra de auth fica num pacote só.") and f["Tela nova"]["tag"] is None, f
+    assert [x["numero"] for x in f["Base de auth"]["prs"]] == [1216, 1230]
+    (pend,) = d["pendencias"]
+    assert pend["id"] == "freio-prod" and pend["detalhe"] == "teto por pod ou sem freio" and pend["depois"] is False, pend
+    assert d["rodando"] == [{"titulo": "Ticket 47 digest", "estado": "fase-3", "desde": None}], d["rodando"]
+    assert d["linha"] == [], "a linha só existe com o modo ausente ligado"
+    assert "task_aaaa" not in json.dumps(d["rodando"]) and "ctx_1" not in json.dumps(d["rodando"]) and "term_1" not in json.dumps(d["rodando"])
+
+
+def test_digest_pendencia_em_depois_sai_marcada_no_contrato():
+    a = _digest_env()
+    a.set("../pendencias.json", {"itens": [{"id": "x", "tipo": "acao", "titulo": "Adiada", "ate": "2999-01-01"}, {"id": "y", "tipo": "acao", "titulo": "Viva"}]})
+    d = _json_digest(a)
+    assert {p["id"]: p["depois"] for p in d["pendencias"]} == {"x": True, "y": False}, d["pendencias"]
+
+
+def test_digest_reune_prs_pendencias_workers_e_respostas_na_pagina():
+    a = _digest_env()
+    r, h = _html(a)
+    assert r.stdout.splitlines()[1].startswith(os.path.join(a.home, "digest") + os.sep) and r.stdout.splitlines()[1].endswith(".html"), r.stdout
+    for trecho in ("#1216", "#1220", "#1230", "Base de auth", "Tela nova", "Escolher o freio de produção", "Ticket 47 digest", "fase-3",
+                   "use o índice novo", "Base de auth entregue", "pode seguir"):
+        assert trecho in h, (trecho, h[:400])
+    assert "ANTIGA resposta" not in h, "sem o modo ausente a janela começa na última mensagem do usuário"
+
+
+def test_digest_ordem_de_merge_segue_o_blocked_by_e_development_vem_antes_de_staging():
+    a = _digest_env()
+    _, h = _html(a)
+    assert h.index("Base de auth") < h.index("Tela nova"), "o ticket 02 espera o 01 mesmo com o PR ligado antes"
+    assert h.index("#1216") < h.index("#1230"), "development antes de staging dentro do passo"
+    assert "Espera: Base de auth" in h, "o passo bloqueado diz de quem espera"
+    assert "Blocked by dos tickets" in h, "a página diz que a ordem veio dos tickets"
+
+
+def test_digest_ordem_pura_com_ciclo_e_transitivo_sem_travar():
+    g = lambda t, ligado: {"task": t, "ligado_em": ligado, "itens": []}  # noqa: E731
+    tk = lambda n, t, b: {"num": n, "task": t, "blocked_by": b, "titulo": n, "status": "claimed"}  # noqa: E731
+    # c depende de b, que depende de a; b não tem PR: c ainda espera a
+    ordem = orq_mod.ordem_de_merge([g("task_c", "3"), g("task_a", "2")], [tk("01", "task_a", []), tk("02", "task_b", ["01"]), tk("03", "task_c", ["02"])])
+    assert [x["task"] for x in ordem] == ["task_a", "task_c"], ordem
+    assert ordem[1]["espera"] == ["task_a"], ordem
+    # ciclo: todos saem, na ordem do ligado_em, e a ordem avisa
+    ordem = orq_mod.ordem_de_merge([g("task_y", "2"), g("task_x", "1")], [tk("01", "task_x", ["02"]), tk("02", "task_y", ["01"])])
+    assert [x["task"] for x in ordem] == ["task_x", "task_y"] and all(x.get("ciclo") for x in ordem), ordem
+    # sem ticket: sem dependência declarada, vale o ligado_em
+    assert [x["task"] for x in orq_mod.ordem_de_merge([g("task_2", "2"), g("task_1", "1")], [])] == ["task_1", "task_2"]
+
+
+def test_digest_passo_fica_feito_so_quando_entrou_em_main_ou_so_tem_fechado():
+    a = _digest_env()
+    _pr(a, PR2, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    d = _json_digest(a, "--html")
+    _, h = _html(a)
+    assert "Próximo: pronto para staging" in h and 'class="feito"' not in h, "development entrou, falta promover: ainda não é feito"
+    assert [p["feito"] for p in d["fila"]] == [False, False]
+    _pr(a, PR1, "MERGED", "development")
+    _pr(a, PR3, "MERGED", "main")
+    a.orq("pr", "poll", "--forcar")
+    d = _json_digest(a)
+    _, h = _html(a)
+    assert [p["feito"] for p in d["fila"]] == [True, False], d["fila"]
+    assert h.count('class="feito"') == 1 and "Base de auth" in h.split('class="feito"', 1)[1].split("</li>", 1)[0]
+
+
+def test_digest_desde_aceita_um_carimbo_e_escapa_o_html():
+    a = _digest_env()
+    _evs(a, _ev("13:00:00", "resposta_worker", texto="<script>alert(1)</script>", dispatch="ctx_1"))
+    _, h = _html(a, "--desde", "2026-09-30T08:00:00Z")
+    assert "ANTIGA resposta" in h and "<script>alert(1)</script>" not in h and "&lt;script&gt;" in h, h[:500]
+    assert a.orq("digest", "--desde", "ontem").returncode == 1
+
+
+def test_digest_nao_chama_gh_nem_orca_e_le_o_estado_dos_prs_do_poll():
+    a = _digest_env()
+    a.orq("pr", "poll", "--forcar")
+    antes_gh, antes_orca = len(_gh_chamadas(a)), len(_log(a, "calls.log"))
+    _, h = _html(a)
+    assert (len(_gh_chamadas(a)), len(_log(a, "calls.log"))) == (antes_gh, antes_orca), "o digest só lê arquivos locais"
+    assert "estado dos PRs é do poll das" in h
+
+
+def test_digest_abrir_pede_a_aba_ao_orca_com_a_url_do_arquivo():
+    a = _digest_env()
+    r = a.orq("digest", "--abrir")
+    (pagina,) = [l for l in r.stdout.splitlines() if l.endswith(".html")]
+    (chamada,) = [c for c in _log(a, "calls.log") if c[0] == "create"]
+    assert chamada[chamada.index("--url") + 1] == pathlib.Path(pagina).as_uri(), chamada
+
+
+def test_digest_abrir_com_o_orca_fora_do_ar_mostra_o_caminho_e_nao_falha():
+    a = _digest_env()
+    r = a.orq("digest", "--abrir", FAKE_FAIL="create")
+    assert r.returncode == 0 and "aviso" in r.stderr and os.path.exists(os.path.join(a.home, "digest", "atual.json")), r
+    (pagina,) = [l for l in r.stdout.splitlines() if l.endswith(".html")]
+    assert os.path.exists(pagina)
+
+
+def test_digest_vazio_gera_o_arquivo_e_a_pagina_dizendo_que_nao_ha_nada():
+    a = Amb(run="run_a")
+    a.set("../pendencias.json", {"itens": []})
+    d = _json_digest(a)
+    assert (d["fila"], d["features"], d["pendencias"], d["linha"], d["rodando"]) == ([], [], [], [], []), d
+    _, h = _html(a)
+    assert h.lower().count("nada") >= 4 and "<!doctype html>" in h.lower(), h[:400]
+
+
+def test_pr_ligar_guarda_titulo_tag_e_nota_para_o_digest():
+    a = _prs_env()
+    _pr(a, PR1, "OPEN", "development", "feat: x")
+    item = json.loads(a.orq("pr", "ligar", "task_feat1", PR1, "--tag", "qualidade", "--nota", "Faz x.").stdout)
+    assert (item["titulo"], item["tag"], item["nota"]) == ("feat: x", "qualidade", "Faz x."), item
+    sem = json.loads(a.orq("pr", "ligar", "task_feat2", PR2).stdout)
+    assert "tag" not in sem and "nota" not in sem, sem
+
+
+def test_ingest_grava_o_worker_done_no_log_uma_vez_so():
+    a = Amb(run="run_a")
+    a.env["ORQ_NO_BG"] = "1"
+    m = {"id": "msg_w1", "run_id": "run_a", "sequence": 1, "type": "worker_done", "subject": "Ticket 47 pronto", "body": "feito", "created_at": "2099-01-01T00:00:00Z",
+         "payload": json.dumps({"dispatchId": "ctx_w", "taskId": "task_w", "outcome": "succeeded"})}
+    _inbox(a, m)
+    assert a.orq("ingest").returncode == 0
+    assert a.orq("ingest").returncode == 0
+    (ev,) = [e for e in a.events() if e["tipo"] == "worker_done"]
+    assert (ev["msg"], ev["task"], ev["dispatch"], ev["outcome"], ev["subject"]) == ("msg_w1", "task_w", "ctx_w", "succeeded", "Ticket 47 pronto"), ev
+
+
+# ---- orq fila ----
+
+def _fila_add(a, passo="1", nome="Plano 2 para main", por="Destrava o plano 1", *prs):
+    return a.orq("fila", "add", "--passo", passo, "--nome", nome, "--por", por, *(prs or ("1216", "1230")))
+
+
+def test_fila_add_lista_feito_e_rm():
+    a = _digest_env()
+    assert "nenhum passo" in a.orq("fila", "lista").stdout
+    r = _fila_add(a)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == {"passo": 1, "nome": "Plano 2 para main", "por": "Destrava o plano 1", "prs": [1216, 1230], "feito": False}
+    _fila_add(a, "2", "Tela", "Depende do 1", "1220")
+    lista = a.orq("fila", "lista").stdout.splitlines()
+    assert lista[0].startswith("1  Plano 2 para main  [a fazer]  #1216 open, #1230 open") and "Destrava o plano 1" in lista[0] and lista[1].startswith("2  Tela"), lista
+    assert a.orq("fila", "feito", "1").returncode == 0
+    assert "[feito]" in a.orq("fila", "lista").stdout.splitlines()[0]
+    assert a.orq("fila", "rm", "2").returncode == 0
+    assert len(a.orq("fila", "lista").stdout.splitlines()) == 1
+    assert [(e["op"], e["passo"]) for e in a.events() if e["tipo"] == "fila"] == [("add", 1), ("add", 2), ("feito", 1), ("rm", 2)]
+
+
+def test_fila_add_troca_o_passo_de_mesmo_numero_e_recusa_pr_nao_ligado_e_passo_inexistente():
+    a = _digest_env()
+    _fila_add(a)
+    _fila_add(a, "1", "Outro nome", "Outro motivo", "1220")
+    (p,) = json.load(open(os.path.join(a.home, "fila.json")))["passos"]
+    assert (p["nome"], p["prs"]) == ("Outro nome", [1220]), p
+    r = _fila_add(a, "3", "x", "y", "9999")
+    assert r.returncode == 1 and "#9999" in r.stderr and "orq pr ligar" in r.stderr, r
+    assert _fila_add(a, "0").returncode == 1
+    assert a.orq("fila", "feito", "7").returncode == 1 and a.orq("fila", "rm", "7").returncode == 1
+
+
+def test_digest_fila_declarada_vale_mais_que_a_dos_tickets_com_o_estado_real_dos_prs():
+    a = _digest_env()
+    _fila_add(a, "1", "Tela primeiro", "Decisão do coordenador", "1220")
+    _fila_add(a, "2", "Auth depois", "Vem por último", "1216", "1230")
+    d = _json_digest(a)
+    assert [(p["passo"], p["nome"], p["por"]) for p in d["fila"]] == [(1, "Tela primeiro", "Decisão do coordenador"), (2, "Auth depois", "Vem por último")], d["fila"]
+    assert [x["estado"] for x in d["fila"][0]["prs"]] == ["OPEN"] and d["fila"][0]["prs"][0]["titulo"] == "feat: tela nova"
+    _pr(a, PR2, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    d = _json_digest(a)
+    assert [p["feito"] for p in d["fila"]] == [True, False] and d["fila"][0]["prs"][0]["estado"] == "MERGED", d["fila"]
+    assert [x["nome"] for x in d["features"]] == ["Base de auth", "Tela nova"], "features seguem a ordem pelos tickets"
+    _, h = _html(a)
+    assert "Ordem declarada com" in h and h.index("Tela primeiro") < h.index("Auth depois")
+
+
+def test_digest_passo_declarado_marcado_feito_a_mao_vale_com_pr_aberto():
+    a = _digest_env()
+    _fila_add(a, "1", "Auth", "x", "1216")
+    a.orq("fila", "feito", "1")
+    assert _json_digest(a)["fila"][0]["feito"] is True
+
+
+def test_digest_passo_declarado_ignora_pr_desligado():
+    a = _digest_env()
+    _fila_add(a, "1", "Auth", "x", "1216", "1230")
+    a.orq("pr", "desligar", "task_a", PR3)
+    d = _json_digest(a)
+    assert [x["numero"] for x in d["fila"][0]["prs"]] == [1216], d["fila"]
+
+
+# ---- modo ausente ----
+
+def test_ausente_ligar_e_desligar_guardam_o_estado_e_o_log():
+    a = Amb(run="run_a")
+    assert "desligado" in a.orq("ausente").stdout
+    r = a.orq("ausente", "ligar")
+    assert r.returncode == 0 and "ligado" in r.stdout and os.path.join(a.home, "digest", "atual.json") in r.stdout, r
+    assert _cursor(a)["ausente"]["ligada_em"]
+    r = a.orq("ausente")
+    assert "ligado" in r.stdout and "desligado" not in r.stdout
+    assert "desligado" in a.orq("ausente", "desligar").stdout and "ausente" not in _cursor(a)
+    assert [e["tipo"] for e in a.events() if e["tipo"].startswith("ausente")] == ["ausente_ligar", "ausente_desligar"]
+
+
+def _stop(a, **ev):
+    return a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456", **ev}))
+
+
+def _atual(a):
+    return json.load(open(os.path.join(a.home, "digest", "atual.json")))
+
+
+def test_ausente_stop_atualiza_o_atual_json_com_cada_resposta_do_coordenador_sem_rede():
+    a = _digest_env()
+    a.orq("ausente", "ligar")
+    antes_gh = len(_gh_chamadas(a))
+    r = _stop(a, last_assistant_message="Fechei o passo 1 e segui no passo 2.")
+    assert r.returncode == 0, r
+    d = _atual(a)
+    assert d["ausente"]["ligado"] is True and d["ausente"]["desde"] == _cursor(a)["ausente"]["ligada_em"]
+    assert [x["titulo"] for x in d["linha"]] == ["Fechei o passo 1 e segui no passo 2."] and d["linha"][0]["tipo"] == "info", d["linha"]
+    assert d["linha"][0]["detalhe"] == "Fechei o passo 1 e segui no passo 2." and d["linha"][0]["ts"].endswith("Z")
+    assert len(_gh_chamadas(a)) == antes_gh, "o hook não chama o gh: o estado dos PRs vem do poll"
+    _stop(a, last_assistant_message="Segunda resposta")
+    assert [x["detalhe"] for x in _atual(a)["linha"]] == ["Fechei o passo 1 e segui no passo 2.", "Segunda resposta"], "cada resposta vira uma entrada"
+    assert [e["texto"] for e in a.events() if e["tipo"] == "resposta_coordenador"] == ["Fechei o passo 1 e segui no passo 2.", "Segunda resposta"]
+
+
+def test_ausente_stop_le_a_resposta_do_transcrito_quando_o_stop_nao_a_traz():
+    a = _digest_env()
+    a.orq("ausente", "ligar")
+    arq = os.path.join(a.tmp.name, "transcrito.jsonl")
+    with open(arq, "w") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "oi"}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Resposta do transcrito"}]}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}}) + "\n")
+        f.write("linha quebrada\n")
+    _stop(a, transcript_path=arq)
+    assert [x["detalhe"] for x in _atual(a)["linha"]] == ["Resposta do transcrito"]
+    _stop(a, transcript_path=os.path.join(a.tmp.name, "nao-existe.jsonl"))
+    assert len(_atual(a)["linha"]) == 1, "sem resposta achada não há entrada nova, e o Stop não quebra"
+
+
+def test_ausente_linha_guarda_so_o_que_aconteceu_desde_que_ligou():
+    a = _digest_env()
+    _evs(a, {"ts": "2020-01-01T00:00:00Z", "tipo": "resposta_worker", "texto": "ANTIGA de 2020", "dispatch": "ctx_1"})
+    a.orq("ausente", "ligar")
+    _evs(a, _ev_depois("worker_done", msg="m9", task="task_a", outcome="failed", subject="Falhou no E2E"),
+         _ev_depois("pr", op="entrou", numero=1216, base="development", task="task_a"),
+         _ev_depois("pr", op="fechou", numero=1220, base="development", task="task_b"),
+         _ev_depois("resposta_worker", texto="use o índice", dispatch="ctx_1"))
+    _stop(a)
+    linha = _atual(a)["linha"]
+    assert "ANTIGA de 2020" not in json.dumps(linha) and "use o índice novo" not in json.dumps(linha), "o que veio antes de ligar fica de fora"
+    assert [(x["tipo"], x["titulo"]) for x in linha] == [
+        ("sec", "Worker falhou: Falhou no E2E"), ("ok", "PR #1216 entrou em development"), ("sec", "PR #1220 fechado sem merge"), ("info", "Coordenador respondeu a um worker")], linha
+
+
+def test_ausente_desligado_a_linha_do_contrato_volta_vazia_mesmo_com_eventos():
+    a = _digest_env()
+    a.orq("ausente", "ligar")
+    _evs(a, _ev_depois("resposta_worker", texto="algo", dispatch="ctx_1"))
+    assert _json_digest(a)["linha"]
+    a.orq("ausente", "desligar")
+    assert _json_digest(a)["linha"] == [] and _atual(a)["ausente"] == {"ligado": False, "desde": None}
+
+
+def test_ausente_stop_nao_chama_o_orca_alem_do_que_o_stop_ja_chamava():
+    com, sem = _digest_env(), _digest_env()
+    com.orq("ausente", "ligar")
+    n_com, n_sem = len(_log(com, "calls.log")), len(_log(sem, "calls.log"))
+    _stop(com, last_assistant_message="oi"), _stop(sem, last_assistant_message="oi")
+    assert len(_log(com, "calls.log")) - n_com == len(_log(sem, "calls.log")) - n_sem, "o digest do Stop não faz chamada ao Orca"
+
+
+def test_ausente_desligado_o_stop_nao_gera_digest_nem_evento():
+    a = _digest_env()
+    assert _stop(a, last_assistant_message="oi").returncode == 0
+    assert not os.path.exists(os.path.join(a.home, "digest"))
+    a.orq("ausente", "ligar")
+    a.orq("ausente", "desligar")
+    _stop(a, last_assistant_message="oi")
+    assert not os.path.exists(os.path.join(a.home, "digest")) and not [e for e in a.events() if e["tipo"] == "resposta_coordenador"]
+
+
+def test_ausente_falha_do_digest_nao_derruba_o_stop_nem_o_aviso_de_entrada():
+    a = _digest_env()
+    a.orq("ausente", "ligar")
+    open(os.path.join(a.home, "digest"), "w").write("arquivo no lugar da pasta")  # mkdir falha
+    _evs(a, _ev("15:00:00", "entrada", id="e9", origem="usuario", texto="sem efeito ainda"))
+    r = _stop(a, last_assistant_message="oi")
+    assert r.returncode == 0 and "e9" in json.loads(r.stdout)["systemMessage"], r
+    assert "digest" in a.log(), "a falha vai para o log"
+
+
+def test_ausente_stop_do_worker_nao_gera_digest():
+    a = _digest_env()
+    a.orq("ausente", "ligar")
+    a.set("workers.json", [{"handle": "term_coord", "run": "run_do_despacho"}])
+    cur = _cursor(a)
+    cur["papeis"] = {"abcdef123456": "worker"}
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    _stop(a, last_assistant_message="oi")
+    assert not os.path.exists(os.path.join(a.home, "digest"))
+
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
