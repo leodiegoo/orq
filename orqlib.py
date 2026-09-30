@@ -1981,6 +1981,77 @@ def linhas_worktrees(agora=None, wts=None, ocupadas=None, fora=None):
     return [f"Worktrees paradas ({len(ps)}): " + "; ".join(_lim(ps, 3, item))]
 
 
+E2E_SESSAO_MIN = 15  # minutos que uma sessão de `e2e-infra.sh start` pode ficar sem processo de teste vivo antes de a fila contar como presa
+
+
+def _pid_vivo(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # existe, é de outro usuário
+    except (ValueError, OverflowError):
+        return False
+    return True
+
+
+def fila_e2e(fila=None, agora=None, limite_min=E2E_SESSAO_MIN):
+    """A fila global do E2E do repositório de produto (scripts/e2e-lock.sh: um ticket `<ordem>-<pid>` por chegada em ~/.cache/<projeto>-e2e/queue), só lida.
+
+    Devolve None com a fila vazia, senão {ticket, worktree, projeto, comando, min, esperam, presa}. O dono é o primeiro ticket; `presa` é o
+    motivo quando ele não anda: nenhum pid do ticket vivo e sem sessão (dono morto, o próximo a esperar o limparia), ou sessão aberta por
+    `start` sem processo de teste vivo há mais de `limite_min` minutos. Limite: não olha o Docker, então uma stack aberta de propósito
+    por mais de `limite_min` sem teste também aparece como presa."""
+    import glob  # só aqui: fora do topo para não pesar nos hooks
+    fila = fila or os.environ.get("E2E_LOCK_DIR") or next(iter(sorted(glob.glob(os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "*-e2e", "queue")))), "")
+    agora = time.time() if agora is None else agora
+    tickets = []
+    for nome in sorted(os.listdir(fila)) if os.path.isdir(fila) else []:
+        d = os.path.join(fila, nome)
+        try:
+            owner = dict(l.rstrip("\n").split("=", 1) for l in open(os.path.join(d, "owner")) if "=" in l)
+            pids = os.listdir(os.path.join(d, "pids")) if os.path.isdir(os.path.join(d, "pids")) else []
+            ini = int(open(os.path.join(d, "acquired")).read().strip()) if os.path.exists(os.path.join(d, "acquired")) else int(owner.get("started") or agora)
+        except (OSError, ValueError):
+            continue  # ticket ainda sendo escrito ou ilegível
+        tickets.append({"nome": nome, "owner": owner, "vivo": any(_pid_vivo(x) for x in pids), "sessao": os.path.exists(os.path.join(d, "session")), "ini": ini})
+    if not tickets:
+        return None
+    dono, resto = tickets[0], tickets[1:]
+    minutos = max(0, int((agora - dono["ini"]) // 60))
+    presa = None
+    if not dono["vivo"] and not dono["sessao"]:
+        presa = f"o dono (pid {dono['owner'].get('pid')}) morreu e o ticket ficou"
+    elif not dono["vivo"] and minutos > limite_min:
+        presa = f"sessão aberta por start sem processo de teste vivo há {minutos} min"
+    o = dono["owner"]
+    return {"ticket": dono["nome"], "worktree": os.path.basename(o.get("worktree", "")), "projeto": o.get("project"), "comando": o.get("command"),
+            "min": minutos, "esperam": sum(1 for t in resto if t["vivo"] or t["sessao"]), "presa": presa}
+
+
+def linha_e2e(f):
+    """A linha do `orq status` para a fila do E2E (`fila_e2e`); vazia com a fila vazia."""
+    if not f:
+        return ""
+    txt = f"Fila do E2E: {f['worktree']} ({f['projeto']}) segura há {f['min']} min, {f['esperam']} esperando"
+    return txt + (f". PRESA: {f['presa']}; `scripts/e2e-infra.sh lock-release` no repositório do produto solta" if f["presa"] else "")
+
+
+def avisa_fila_e2e(f=None):
+    """Digita no coordenador uma vez por ticket que a fila do E2E está presa (e2e-aviso.json guarda o ticket). Coordenador ocupado: a próxima volta tenta."""
+    g, f = _gerente_cfg(), f or fila_e2e()
+    if not g or not g.get("coordenador") or not f or not f["presa"]:
+        return []
+    arq = _path("e2e-aviso.json")
+    if _dict(_read_json(arq)).get("ticket") == f["ticket"]:
+        return []
+    if digita(g["coordenador"], f"orq: {linha_e2e(f)}.") != "enviado":
+        return []
+    _write_json(arq, {"ticket": f["ticket"]})
+    return [f"fila do E2E presa ({f['ticket']}): aviso digitado no coordenador"]
+
+
 def _aplica_prs(d, vistos, agora):
     """Passa ao estado novo cada PR aberto que o gh viu mergeado ou fechado: um evento `pr` e uma entrada `pr` por PR, uma vez só (o `ref` da
     entrada é a URL, então repetir a passagem não a duplica). Devolve as linhas do que mudou."""
@@ -2040,16 +2111,23 @@ def pr_avisar():
         return []
     linhas = []
     for i in [x for x in _prs_ro()["itens"] if x["estado"] != "aberto" and not x.get("avisado") and x.get("entrada")]:
-        if digita(g["coordenador"], f"orq: {i['texto']}. Entrada {i['entrada']}.") != "enviado":
-            break
-
-        def marca(d, url=i["url"]):
+        def reserva(d, url=i["url"], valor=True):
+            """Marca/desmarca o aviso sob o pr.lock; devolve False se já estava marcado (outro painel ou um restart chegou antes)."""
             for x in d["itens"]:
                 if x["url"] == url:
-                    x["avisado"] = True
-            append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": url, "numero": i["numero"]})
+                    if valor and (x.get("avisado") or any(e.get("op") == "avisado" and e.get("url") == url for e in read_events())):
+                        x["avisado"] = True
+                        return False
+                    x["avisado"] = valor
+            return True
 
-        _mutar_prs(marca)
+        # reserva antes de digitar: dois painéis (ou um restart no meio da volta) não digitam o mesmo aviso duas vezes
+        if not _mutar_prs(reserva):
+            continue
+        if digita(g["coordenador"], f"orq: {i['texto']}. Entrada {i['entrada']}.") != "enviado":
+            _mutar_prs(lambda d, f=reserva: f(d, valor=False))  # nada foi digitado: a próxima volta tenta
+            break
+        append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
         linhas.append(f"{i['task']}: aviso do PR #{i['numero']} digitado no coordenador")
     return linhas
 
@@ -2234,7 +2312,7 @@ def _linha_do_log(e, titulo):
     return None
 
 
-def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None):
+def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None, e2e=None):
     """O digest como dados no formato do contrato (contratos/digest-v1.md) mais o que só a página usa. Só arquivos do orq: nada de gh nem de Orca.
 
     fila = a ordem que o coordenador declarou (`orq fila`); sem nenhum passo declarado, sai da ordem pelos `Blocked by` dos tickets, um passo por
@@ -2263,6 +2341,8 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
     pend = [{**i, "depois": bool(pend_depois(i, hoje))} for i in _dict(pendencias).get("itens", []) if isinstance(i, dict)]
     rodando = [{"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde")}
                for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA]
+    if e2e:  # a fila do E2E é uma linha a mais em `rodando`: `presa` quando não anda
+        rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
     return {"versao": 1, "geradoEm": agora.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(ausente), "desde": _dict(ausente).get("ligada_em")},
             "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando,
@@ -2323,7 +2403,7 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     agora = agora or datetime.now(timezone.utc)
     events, ausente = read_events(), _dict(_cursor_ro().get("ausente")) or None
     janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
-    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente)
+    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e())
     os.makedirs(_path(DIGEST), exist_ok=True)
     _write_json(_path(os.path.join(DIGEST, "atual.json")), digest_json(d), indent=2)
     pagina = None
@@ -3143,23 +3223,29 @@ def hook_prligar(ev, run):
     urls = PR_RE.findall((resp.get("stdout") or "") if isinstance(resp, dict) else str(resp or ""))
     if not urls:
         return None
-    url = urls[-1]
     d = _prs_ro()
-    if any(i["url"] == url for i in d["itens"]) or any(x.get("url") == url for x in d.get("sem_task") or []):
+    urls = [u for u in dict.fromkeys(urls) if not any(i["url"] == u for i in d["itens"]) and not any(x.get("url") == u for x in d.get("sem_task") or [])]
+    if not urls:
         return None
     cwd = ev.get("cwd") or os.getcwd()
     cd = PR_CD.search(cmd)
     if cd and os.path.isdir(os.path.join(cwd, os.path.expanduser(cd.group(1).strip("'\"")))):
         cwd = os.path.join(cwd, os.path.expanduser(cd.group(1).strip("'\"")))
-    h = PR_HEAD.search(cmd)
-    head = h.group(1).split(":")[-1] if h else (_git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None
-    wt = None
+    heads = [h.split(":")[-1] for h in PR_HEAD.findall(cmd)]
+    if not heads and (h := (_git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()):
+        heads = [h]
+    # um --head por URL (laço com branches diferentes) casa na ordem; senão todas as URLs são da mesma branch
+    por_url = dict(zip(urls, heads)) if len(heads) == len(urls) > 1 else {u: (heads[0] if heads else None) for u in urls}
+    wts = {}
     for bloco in (_git(cwd, "worktree", "list", "--porcelain") or "").split("\n\n"):
         campos = dict(l.split(" ", 1) for l in bloco.splitlines() if " " in l)
-        if head and campos.get("branch") == f"refs/heads/{head}":
-            wt = campos.get("worktree")
-    _orq_cli("pr", "auto", url, *(["--head", head] if head else []), *(["--wt", wt] if wt else []))
-    msg = (f"{MARCA} PR #{url.rsplit('/', 1)[1]} ({head or 'branch desconhecida'}): o orq o liga à task dona da branch; sem dona ele entra em "
+        if campos.get("branch", "").startswith("refs/heads/"):
+            wts[campos["branch"][len("refs/heads/"):]] = campos.get("worktree")
+    for url, head in por_url.items():
+        wt = wts.get(head)
+        _orq_cli("pr", "auto", url, *(["--head", head] if head else []), *(["--wt", wt] if wt else []))
+    quais = ", ".join(f"#{u.rsplit('/', 1)[1]} ({por_url[u] or 'branch desconhecida'})" for u in urls)
+    msg = (f"{MARCA} PR {quais}: o orq os liga à task dona da branch; sem dona ele entra em "
            "\"PR sem tarefa\" no `orq status`. Confira com `orq pr lista`.")
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
 
@@ -4761,7 +4847,7 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - o painel não cai por causa do acompanhamento dos steers; a próxima volta tenta
         log(f"steers: {type(e).__name__}: {e}")
     try:
-        linhas += [*pr_poll(), *pr_avisar()]
+        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e()]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     return "\n".join(linhas)
@@ -4942,7 +5028,7 @@ def main(argv=None):
         elif a.cmd == "ocupadas":
             print("\n".join(sorted(worktrees_ocupadas())))
         elif a.cmd == "status":
-            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees()]))
+            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e())])]))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":
