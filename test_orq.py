@@ -15,6 +15,7 @@ ORQ = os.path.join(AQUI, "orq.py")
 LIMPAR = os.path.join(AQUI, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
+os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
 
 FAKE = '''#!/usr/bin/env python3
 import base64, json, os, sys, time
@@ -7861,6 +7862,128 @@ def test_ticket48_gerente_ligar_depois_da_queda_troca_coordenador_e_gerente_e_gu
     assert b.orq("gerente", "ligar", "--terminal", "term_ger").returncode == 0
     assert json.load(open(os.path.join(b.home, "gerente.json")))["runs"] == ["run_c"]
 
+
+
+# ---------- ticket 50: prligar com vários PRs, fila do E2E, aviso de PR uma vez só ----------
+
+def test_it_should_link_every_pr_url_in_one_gh_pr_create_command():
+    a, p, w = _ambiente_46()
+    saida = PR1 + "\n" + PR2 + "\n"
+    r = _pos_pr(a, w, cmd="for b in development staging; do gh pr create --base $b --title x; done", saida=saida)
+    itens = _prs_json(a)["itens"]
+    assert sorted(i["url"] for i in itens) == [PR1, PR2] and {i["task"] for i in itens} == {"task_feat1"}, itens
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "#1216" in ctx and "#1220" in ctx, ctx
+
+
+def test_it_should_link_only_the_urls_not_yet_linked_when_a_command_creates_two_prs():
+    a, p, w = _ambiente_46()
+    _pos_pr(a, w, saida=PR1 + "\n")
+    _pos_pr(a, w, cmd="gh pr create --base staging", saida=PR1 + "\n" + PR2 + "\n")
+    assert sorted(i["url"] for i in _prs_json(a)["itens"]) == [PR1, PR2]
+
+
+def _ticket_e2e(fila, nome, pid, vivo, sessao=False, inicio=0, projeto="e2e-x", worktree="/w/feat-x"):
+    d = os.path.join(fila, nome)
+    os.makedirs(os.path.join(d, "pids"))
+    open(os.path.join(d, "owner"), "w").write(f"pid={pid}\nworktree={worktree}\nproject={projeto}\ncommand=teste\nstarted={inicio}\nstarted_at=x\n")
+    if vivo:
+        open(os.path.join(d, "pids", str(os.getpid())), "w").write("lstart")
+    else:
+        open(os.path.join(d, "pids", "999999"), "w").write("lstart")
+    if sessao:
+        open(os.path.join(d, "session"), "w").close()
+    open(os.path.join(d, "acquired"), "w").write(str(inicio))
+
+
+def test_it_should_show_who_holds_the_e2e_queue_and_how_many_wait():
+    with tempfile.TemporaryDirectory() as fila:
+        assert orq_mod.fila_e2e(fila) is None and orq_mod.linha_e2e(None) == ""
+        _ticket_e2e(fila, "0000000001-1", 1, vivo=True, inicio=1000)
+        _ticket_e2e(fila, "0000000002-2", 2, vivo=True, inicio=1500, projeto="e2e-y")
+        _ticket_e2e(fila, "0000000003-3", 3, vivo=True, inicio=1600, projeto="e2e-z")
+        f = orq_mod.fila_e2e(fila, agora=1000 + 600)
+        assert (f["projeto"], f["min"], f["esperam"], f["presa"]) == ("e2e-x", 10, 2, None), f
+        assert "e2e-x" in orq_mod.linha_e2e(f) and "10 min" in orq_mod.linha_e2e(f) and "2 esperando" in orq_mod.linha_e2e(f) and "PRESA" not in orq_mod.linha_e2e(f)
+
+
+def test_it_should_mark_the_e2e_queue_stuck_when_the_owner_died_or_the_session_has_no_test():
+    with tempfile.TemporaryDirectory() as fila:
+        _ticket_e2e(fila, "0000000001-1", 1, vivo=False, inicio=1000)
+        _ticket_e2e(fila, "0000000002-2", 2, vivo=True, inicio=1100)
+        f = orq_mod.fila_e2e(fila, agora=1100)
+        assert "dono" in f["presa"] and f["esperam"] == 1 and "PRESA" in orq_mod.linha_e2e(f), f
+    with tempfile.TemporaryDirectory() as fila:
+        _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=1000)
+        assert orq_mod.fila_e2e(fila, agora=1000 + 5 * 60)["presa"] is None, "sessão recém-aberta ainda não está presa"
+        f = orq_mod.fila_e2e(fila, agora=1000 + 30 * 60)
+        assert "sessão" in f["presa"] and f["min"] == 30, f
+
+
+def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append((h, t)) or "enviado"
+        try:
+            json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=0)
+            f = orq_mod.fila_e2e(fila, agora=40 * 60)
+            assert orq_mod.avisa_fila_e2e(f) and len(enviados) == 1 and "PRESA" in enviados[0][1], enviados
+            assert orq_mod.avisa_fila_e2e(f) == [] and len(enviados) == 1, "o mesmo ticket não avisa de novo"
+            assert orq_mod.avisa_fila_e2e(None) == []
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def _prs_avisar(home, avisado=False):
+    json.dump({"itens": [{"task": "task_a", "url": PR1, "numero": 1216, "base": "development", "estado": "mergeado", "avisado": avisado,
+                          "entrada": "e292", "texto": "PR #1216 entrou em development (task_a)"}], "sem_task": []}, open(os.path.join(home, "prs.json"), "w"))
+    json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+
+
+def test_it_should_type_the_pr_notice_once_even_when_another_panel_runs_at_the_same_time():
+    with tempfile.TemporaryDirectory() as home:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+
+        def digita(h, t):
+            enviados.append(t)
+            if len(enviados) == 1:
+                assert orq_mod.pr_avisar() == [], "o segundo painel chega no meio do envio do primeiro"
+            return "enviado"
+        orq_mod.HOME, orq_mod.digita = home, digita
+        try:
+            _prs_avisar(home)
+            assert len(orq_mod.pr_avisar()) == 1 and len(enviados) == 1, enviados
+            assert orq_mod.pr_avisar() == [] and len(enviados) == 1
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def test_it_should_not_retype_the_pr_notice_after_a_restart_that_lost_the_flag():
+    with tempfile.TemporaryDirectory() as home:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append(t) or "enviado"
+        try:
+            _prs_avisar(home)
+            orq_mod.append_event({"tipo": "pr", "op": "avisado", "task": "task_a", "url": PR1, "numero": 1216})
+            assert orq_mod.pr_avisar() == [] and enviados == [], "o log já diz que foi avisado"
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def test_it_should_retry_the_pr_notice_when_the_coordinator_was_busy():
+    with tempfile.TemporaryDirectory() as home:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        respostas = iter(["ocupado", "enviado"])
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: next(respostas)
+        try:
+            _prs_avisar(home)
+            assert orq_mod.pr_avisar() == [] and len(orq_mod.pr_avisar()) == 1
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
 
 
 if __name__ == "__main__":
