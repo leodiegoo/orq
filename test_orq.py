@@ -5971,6 +5971,241 @@ def test_it_should_not_list_control_lines_for_dispatches_without_history():
     assert "controle" not in ags[0] and "controle:" not in orq_mod.texto_agentes(ags)
 
 
+# ---------- review-8 (M14 a M19) ----------
+
+def test_review8_m14_guard_com_gerente_ve_o_despacho_de_run_do_proprio_coordenador():
+    a = Amb(run="run_a")
+    _gerente(a)  # o gerente term_ger segura run_a; o coordenador term_coord criou run_b com run-create cru e o segura sozinho
+    a.set("runs.json", [{"id": "run_a", "coordinator_handle": "term_ger"}, {"id": "run_b", "coordinator_handle": "term_coord"}])
+    a.set("terminals.json", ["term_ger", "term_coord"])
+    _workers(a, ("w_b", "run_b", "dispatched"))
+    out = json.loads(_guard(a).stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "run_b" in out["permissionDecisionReason"], "o Run é deste coordenador, mesmo fora do gerente"
+    a.set("runs.json", [{"id": "run_a", "coordinator_handle": "term_ger"}, {"id": "run_b", "coordinator_handle": "term_outro"}])
+    a.set("terminals.json", ["term_ger", "term_coord", "term_outro"])
+    a.set("ativos.json", None)
+    os.remove(os.path.join(a.home, "ativos.json"))
+    assert _guard(a).stdout == "", "o Run de outro terminal vivo continua fora"
+
+
+def _run_fora_do_gerente(a):
+    """Gerente (term_ger) no run_a e o coordenador (term_coord) ligado ao run_b, com um worker rodando e um entregue em run_b."""
+    _multi(a, {"run_a": "term_ger", "run_b": "term_coord"}, ["run_a"])
+    a.set("tasks_run_b.json", [{"id": "t2", "status": "dispatched", "dispatch_id": "ctx_1"}])
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_b", "task": "t2", "dispatch": "ctx_1", "status": "dispatched"},
+                           {"handle": "term_w2", "run": "run_b", "task": "t3", "dispatch": "ctx_2", "status": "completed"}])
+    a.set("terminals.json", ["term_ger", "term_coord", "term_w1", "term_w2"])
+    a.prompt("oi")
+
+
+def test_review8_m15_a_steer_num_run_que_o_coordenador_segura_fora_do_gerente_funciona():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    r = a.orq("steer", "t2", "ajuste", "--run", "run_b")
+    assert r.returncode == 0, r.stderr
+    (env,) = _log(a, "sent.log")
+    assert env[env.index("--run") + 1] == "run_b", env
+    assert _binds(a) == {"run_a": "term_ger", "run_b": "term_coord"}, "o gerente não foi tirado do Run dele para falar do run_b"
+
+
+def test_review8_m15_a_liberar_num_run_que_o_coordenador_segura_fora_do_gerente_funciona():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    r = a.orq("liberar", "ctx_2", "--run", "run_b")
+    assert r.returncode == 0, r.stderr
+    (rel,) = _log(a, "released.log")
+    assert rel[rel.index("--dispatch") + 1] == "ctx_2"
+
+
+def test_review8_m15_a_responder_num_run_que_o_coordenador_segura_fora_do_gerente_funciona():
+    a = Amb()
+    _run_fora_do_gerente(a)
+    _inbox(a, _pergunta_ask(50, "ctx_q", run="run_b"))
+    r = a.orq("responder", "msg_q50", "sim")
+    assert r.returncode == 0, r.stderr
+    assert len(_log(a, "replied.log")) == 1
+
+
+def test_review8_m15_a_run_solto_pede_o_gerente_ligar_e_nao_o_run_use():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a"])  # run_b saiu do gerente (gerente_soltar) e ninguém o segura
+    a.set("tasks_run_b.json", [{"id": "t2", "status": "dispatched", "dispatch_id": "ctx_1"}])
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_b", "task": "t2", "dispatch": "ctx_1", "status": "dispatched"},
+                           {"handle": "term_w2", "run": "run_b", "task": "t3", "dispatch": "ctx_2", "status": "completed"}])
+    a.prompt("oi")
+    for r in (a.orq("steer", "t2", "ajuste", "--run", "run_b"), a.orq("liberar", "ctx_2", "--run", "run_b")):
+        assert r.returncode == 1 and "orq gerente ligar --terminal term_ger --run run_b" in r.stderr and "run-use" not in r.stderr, r.stderr
+    assert not _log(a, "sent.log") and not _log(a, "released.log")
+    assert a.orq("gerente", "ligar", "--terminal", "term_ger", "--run", "run_b").returncode == 0  # o que a mensagem manda fazer resolve
+    assert a.orq("steer", "t2", "ajuste", "--run", "run_b").returncode == 0
+
+
+def test_review8_m15_b_sem_run_e_com_o_gerente_em_dois_runs_recusa_em_vez_de_sortear():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.set("tasks_run_a.json", [{"id": "t1", "status": "dispatched", "dispatch_id": "ctx_1"}])
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "t1", "dispatch": "ctx_1", "status": "dispatched"}])
+    a.prompt("oi")
+    r = a.orq("steer", "t1", "ajuste")
+    assert r.returncode == 1 and "passe --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr, r.stderr
+    assert not _log(a, "sent.log"), "o painel estar no run_a não pode decidir o alvo"
+    r = _novo(a)
+    assert r.returncode == 1 and "passe --run" in r.stderr and not _log(a, "created.log"), r.stderr
+    assert a.orq("steer", "t1", "ajuste", "--run", "run_a").returncode == 0
+
+
+def _gate_no_run_b(a):
+    """Gerente nos dois Runs, painel parado no run_a; a decisão trava a task_b1 do run_b."""
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.prompt("oi")
+    r = a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_b1", "--run", "run_b")
+    assert r.returncode == 0, r.stderr
+    a.set("binds.json", {"run_a": {"handle": "term_ger", "gen": 9}, "run_b": {"handle": None, "gen": 9}})  # o painel voltou ao run_a
+
+
+def test_review8_m15_c_gate_nasce_no_run_da_task_e_resolve_com_o_painel_em_outro_run():
+    a = Amb()
+    _gate_no_run_b(a)
+    assert json.load(open(os.path.join(a.fake, "gates_map.json"))) == {"gate_1": "run_b"}, "gate-create com o Run da task, não o em que o painel estava"
+    (item,) = [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "add"]
+    assert item["gate_run"] == "run_b", item
+    r = a.orq("pend", "done", "gate-dec", "--resposta", "Sim")
+    assert r.returncode == 0 and "aviso" not in json.loads(r.stdout), r
+    assert _resolucoes(a) == ["Sim"] and [e["gate"] for e in a.events() if e["tipo"] == "gate_resolvido"] == ["gate_1"]
+
+
+def test_review8_m15_c_reconciliar_gates_resolve_no_run_certo_sem_gastar_as_tentativas():
+    a = Amb()
+    _gate_no_run_b(a)
+    a.orq("pend", "done", "gate-dec", "--resposta", "Sim", FAKE_FAIL="gate-resolve")  # Orca fora do ar: fica sem gate_resolvido
+    assert not _resolucoes(a)
+    assert a.orq("ingest").returncode == 0
+    assert _resolucoes(a) == ["Sim"], "o painel em outro Run não pode deixar o gate para sempre"
+
+
+def test_review8_m15_c_gate_com_o_gerente_em_dois_runs_pede_o_run():
+    a = Amb()
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.prompt("oi")
+    r = a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_b1")
+    assert r.returncode == 1 and "passe --run" in r.stderr and not _gates_log(a), r.stderr
+
+
+def test_review8_m16_espera_declarada_com_o_turno_encerrado_continua_rodando_e_vencida_e_travado():
+    agora = datetime.now(timezone.utc)
+    ws = [{"dispatchId": "ctx_1", "taskId": "task_1", "runId": "run_a", "dispatchStatus": "dispatched"}]
+    det = {"ctx_1": {"agente": "claude", "desde": _iso(-3600).replace(" ", "T") + "Z"}}
+    turnos = {"ctx_1": {"task": "task_1", "inicio": now_iso(-700), "fim": now_iso(-580)}}  # encerrou o turno esperando, 10 min atrás
+
+    def msgs(fase):
+        return [{"id": "m1", "type": "heartbeat", "payload": json.dumps({"taskId": "task_1", "dispatchId": "ctx_1", "phase": fase}), "created_at": _iso(-600)}]
+    ag = orq_mod.monta_agentes(ws, msgs(f"esperando: fila de E2E até {_hhmm_25(50)}"), [], agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "rodando" and ag["espera"] == "fila de E2E" and ag["turno"] == "parado", ag
+    ab = {"agentes": [ag]}
+    assert orq_mod.reavalia(ab["agentes"], [], agora, turnos)[0]["estado"] == "rodando"
+    assert "parado no prompt" not in orq_mod.linha_vivos([], ab, agora, turnos)
+    ag = orq_mod.monta_agentes(ws, msgs(f"esperando: fila de E2E até {_hhmm_25(-5)}"), [], agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+    assert orq_mod.reavalia([ag], [], agora, turnos)[0]["estado"] == "travado"
+    ag = orq_mod.monta_agentes(ws, msgs("compilando"), [], agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "parado", "sem espera declarada o turno encerrado continua parado"
+
+
+def test_review8_m17_resumo_sem_desde_nao_conta_o_pedido_do_proprio_resumo():
+    a = _amb_resumo()
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": now_iso(-5), "tipo": "entrada", "id": "e5", "origem": "usuario", "texto": "me dá o resumo do que rolou"}) + "\n")
+    out = a.orq("resumo").stdout
+    assert "Com você (1)" in out and "e2" in out and "tarefa task_f1" in out and "e4" in out and "pend revisar-pr" in out, out
+    assert "e1" not in out and "Decisões (3)" in out and "freio-prod: liberado" in out, out
+    assert "Anda (1)" in out and "Corrigir o filtro de marca" in out, out
+
+
+def test_review8_m17_anda_mostra_o_worker_perguntando_e_o_travado():
+    ab = {"agentes": [{"dispatch": "ctx_9", "task": "t9", "titulo": "Worker perguntando", "estado": "perguntando"},
+                      {"dispatch": "ctx_8", "task": "t8", "titulo": "Worker rodando", "estado": "rodando", "fase": "testando"},
+                      {"dispatch": "ctx_7", "task": "t7", "titulo": "Worker entregue", "estado": "entregue"}]}
+    out = orq_mod.resumo_quatro([], ab, {"itens": []}, [], agora=datetime.now(timezone.utc))
+    assert "Anda (2)" in out and "Worker perguntando [perguntando]" in out and "Worker rodando [testando]" in out and "entregue" not in out, out
+
+
+def test_review8_m18_lugar_reconhece_prefixos_antes_do_git():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, _ = _repo(a.tmp.name, ramo="feat/outra")
+    for cmd in ("git commit -m x", "cd /x && git push", "git -C /r commit", "rtk git commit -m x", "GIT_EDITOR=true git commit --amend",
+                "env git push", "command git push", "time git commit", "sudo git push"):
+        assert "lugar errado" in _aviso(_lugar(a, p, cmd=cmd)), cmd
+    for cmd in ("rtk git status", "echo git commit", "git log --oneline", "GIT_EDITOR=true git rebase --continue"):
+        assert _aviso(_lugar(a, p, cmd=cmd)) == "", cmd
+
+
+def test_review8_m18_lugar_olha_o_dash_c_e_nao_so_o_cwd():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, w = _repo(a.tmp.name)  # o cwd é o checkout principal, limpo, em main
+    assert _aviso(_lugar(a, p, CLAUDE_PROJECT_DIR=p)) == ""
+    msg = _aviso(_lugar(a, p, cmd=f"git -C {w} commit -m x", CLAUDE_PROJECT_DIR=p))
+    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+
+
+def test_review8_m18_lugar_usa_a_branch_padrao_do_origin_head():
+    a = Amb(run="run_a")
+    a.prompt("oi")
+    p, _ = _repo(a.tmp.name, ramo="develop")
+    assert "lugar errado" in _aviso(_lugar(a, p)), "sem origin/HEAD a padrão é main"
+    subprocess.run(["git", "-C", p, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"], check=True, capture_output=True)
+    assert _aviso(_lugar(a, p)) == "", "develop é a branch padrão deste repositório: não é engano"
+
+
+def _painel_tocado(a, segundos_atras=None):
+    p = os.path.join(a.home, orq_mod.PAINEL_VIVO)
+    if segundos_atras is not None:
+        open(p, "w").close()
+        os.utime(p, (time.time() - segundos_atras,) * 2)
+
+
+def test_review8_m19_painel_parado_aparece_no_prompt_no_status_e_no_resumo():
+    a = Amb(run="run_a")
+    _gerente(a)
+    for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
+        assert "painel do agent manager sem carimbo" in saida, saida
+    _painel_tocado(a, 200)
+    for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
+        assert "painel do agent manager parado há 3 min" in saida, saida
+    _painel_tocado(a, 20)
+    for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
+        assert "painel do agent manager" not in saida, "carimbo de 20 s: o painel está vivo"
+
+
+def test_review8_m19_sem_gerente_ou_de_outro_coordenador_nao_avisa_do_painel():
+    a = Amb(run="run_a")
+    assert "painel do agent manager" not in a.orq("status").stdout
+    b = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_outro")
+    _gerente(b)
+    assert "painel do agent manager" not in b.orq("status").stdout, "o gerente.json só vale para o coordenador que o ligou"
+
+
+def test_review8_m19_o_painel_toca_o_carimbo_antes_do_orq_e_com_o_orq_quebrado():
+    with tempfile.TemporaryDirectory() as t:
+        bin_ = os.path.join(t, "bin")
+        os.makedirs(bin_)
+        for nome, corpo in (("orq", "exit 1"), ("clear", ":"), ("sleep", "kill $PPID")):  # orq quebrado; o sleep mata o laço na primeira volta
+            with open(os.path.join(bin_, nome), "w") as f:
+                f.write("#!/bin/sh\n" + corpo + "\n")
+            os.chmod(os.path.join(bin_, nome), 0o755)
+        home = os.path.join(t, "orq")
+        os.makedirs(home)
+        subprocess.run(["sh", os.path.join(AQUI, "painel-agent-manager.sh")], env={**os.environ, "PATH": bin_ + os.pathsep + os.environ["PATH"], "ORQ_HOME": home},
+                       capture_output=True, timeout=20)
+        assert os.path.exists(os.path.join(home, orq_mod.PAINEL_VIVO)), "o carimbo sai do shell do painel, sem depender do orq"
+
+
+def test_review8_m19_o_spec_de_worker_do_orq_manda_worktree_propria():
+    skill = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
+    assert "git worktree add" in skill and "git pull" in skill and "~/.claude/orq" in skill
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

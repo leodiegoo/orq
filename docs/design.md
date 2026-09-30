@@ -165,6 +165,8 @@ orq uses both facts. `orq gerente ligar --terminal <manager>` runs `run-use` wit
 
 Orca binds one Run per terminal, and binding another Run fences the first. To serve several Runs, the manager rotates: before any command that has to come from the bound terminal (`worker-start`, `send`, `check`, `task-create`, `task-update`, `worker-release`), orq rebinds the manager to that command's Run, holding `gerente.lock` across the bind, the read and the acknowledgement. The lock matters because a delivery read under one binding cannot be acknowledged after the terminal has left the Run and come back. `orq despachar` into a new Run adopts that Run into the manager first, so the coordinator is never left bound to it.
 
+A Run the manager does not hold goes out under the coordinator's own handle instead, so a Run the coordinator created with a raw `run-create` stays reachable. Which Run a command targets never comes from the manager's `run-current`: that is wherever the panel stopped and changes every lap. Without `--run`, orq uses the Run bound to the coordinator's own terminal, or the manager's only Run, and refuses when the manager holds several. Decision gates are created in the task's Run and resolved under the same lock as the check that the coordinator commands that Run. The panel writes `gerente-vivo` from its own shell on every lap; when it is older than 60 s, `orq status`, `orq resumo` and the prompt hook say the panel stopped, because Orca notices reach the coordinator only through it.
+
 ```mermaid
 sequenceDiagram
     participant W as Worker

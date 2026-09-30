@@ -63,11 +63,16 @@ ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
 HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorvido encontra a caixa vazia: também é bloqueado
 HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack devolve o próximo lote)
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
+RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do próprio `orq resumo`
+ANDA = ("rodando", "perguntando", "travado", "parado", "nao_comecou")  # estados que aparecem em "Anda" do `orq resumo`
+PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
+PAINEL_PARADO_S = 60
 GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
 RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
 RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
 RUN_TESTE = re.compile(r"teste|descart[aá]vel", re.I)  # objetivo de Run de teste: nunca aparece por padrão
 GERENTE_PRESO_S = float(os.environ.get("ORQ_GERENTE_PRESO_S") or 120)  # o painel fica no Run do aviso até o coordenador confirmar, ou por este prazo
+_DESCONHECIDO = object()  # "ainda não perguntei ao Orca qual é o Run ligado"
 MUTA_RUN = {"worker-start", "send", "check", "reply", "task-create", "task-update"}  # o Orca só aceita estes do terminal ligado ao Run do --run
 AVISO_FINAL = re.compile(r"You have \d+ orchestration messages?\. Run `orca orchestration check --run run_\w+(?: --terminal [\w-]+)?`\.?\s*$")  # o aviso do Orca no fim do prompt (B26)  # o aviso do Orca cita o Run: "Run `orca orchestration check --run <r>`."
 ESPERA_RELATORIO_S = 3600  # o Orca marca a automation de terminal como completed antes de o agente gravar o relatório: espera até 1 h pelo arquivo
@@ -83,7 +88,6 @@ JA_FEZ = "ja-fez"  # id/header do item que lista as pendências já feitas, como
 CONVERSAR_LAVISH = "__conversar"  # a resposta que a página manda com a disposicao "conversar": adiamento, não texto do usuário
 MARCA_LAVISH = "\n\nContext data:\n"  # o lavish-axi poll põe o data do queuePrompt depois disso, dentro do texto do prompt
 _STRING_JSON = re.compile(r'"(?:[^"\\\n]|\\.)*"')
-_DESCONHECIDO = object()  # "ainda não perguntei ao Orca qual é o Run ligado"
 # o detector do próprio Orca (findOrcaDispatchPreambleStart): linha de abertura opcional, <pasted_content> opcional, e o preâmbulo;
 # hosts sem a linha de abertura mandam o preâmbulo puro
 DESPACHO_SEM_ABERTURA = re.compile(r"(?:<pasted_content\b[^>]*>\s*)?You are working inside Orca, a multi-agent IDE\.")
@@ -316,7 +320,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
                 if quando:
                     idade = int((agora - quando).total_seconds())
             estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade, agora)
-            estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") else estado
+            estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
         else:
             espera = motivo = None
             estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue"), None
@@ -362,7 +366,7 @@ def reavalia(agentes_, events, agora, turnos=None):
                 ag["motivo"] = motivo
             t = _dict(turnos.get(ag.get("dispatch"))) if turnos is not None else {"inicio": ag.get("turno_inicio"), "fim": ag.get("turno_fim")}
             ag["turno"], quando = turno_do_dispatch(t, ag.get("agente"), _ts(ag.get("desde")), _ts(ag.get("ultimo_heartbeat")), agora)
-            if ag["turno"] in ("nao_comecou", "parado"):
+            if ag["turno"] in ("nao_comecou", "parado") and not (espera or motivo):  # quem espera de propósito (fila de E2E, CI) encerra o turno e não está parado; vencida, é travado (M16)
                 ag["estado"], ag["idade_s"] = ag["turno"], int((agora - quando).total_seconds())
         out.append(ag)
     return out
@@ -483,7 +487,7 @@ def ultima_livre(events, id_):
 
 
 def aviso_gate(gate, run):
-    return f"gate {gate} do Run {run} fica pendente até run-use --id {run}"
+    return f"gate {gate} do Run {run} fica pendente até o coordenador comandar o Run: {dica_ligar(run)}"
 
 
 def gates_pendentes(events):
@@ -510,9 +514,24 @@ def aviso_recuperado(r):
     return f"cursor.json estava ilegível: reconstruído do events.jsonl (cópia em {r.get('copia')}); papéis e ingest recomeçaram."
 
 
-def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turnos=None):
-    """A linha única para o que não é mensagem do usuário: cursor recuperado, resposta suspeita ou livre, alerta de scout e relatórios sem triar."""
-    partes = []
+def aviso_painel(agora=None):
+    """Aviso de que o painel do agent manager parou, ou None: com o gerente ligado a este coordenador, os avisos do Orca vão para o terminal do
+    gerente e só o painel os repassa; o carimbo `gerente-vivo` é do shell do painel, então vale mesmo com o orq.py quebrado (M19)."""
+    g = _gerente_cfg()
+    if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return None
+    try:
+        idade = (agora or time.time()) - os.path.getmtime(_path(PAINEL_VIVO))
+    except OSError:
+        return f"painel do agent manager sem carimbo ({PAINEL_VIVO}): ele não subiu ou roda o script antigo; nenhum aviso de worker chega enquanto isso"
+    if idade <= PAINEL_PARADO_S:
+        return None
+    return f"painel do agent manager parado há {int(idade // 60)} min: nenhum aviso de worker chega; reinicie painel-agent-manager.sh no terminal dele"
+
+
+def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turnos=None, painel=None):
+    """A linha única para o que não é mensagem do usuário: painel parado, cursor recuperado, resposta suspeita ou livre, alerta de scout e relatórios sem triar."""
+    partes = [painel] if painel else []
     rec = cursor_recuperado(cursor, agora)
     if rec:
         partes.append("[aviso] " + aviso_recuperado(rec))
@@ -524,7 +543,7 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
         partes.append("; ".join(f'resposta livre em {h}: se decidiu, feche com orq pend done {shlex.quote(h)} --resposta "<o que foi decidido>"' for h in liv[:2]) + ".")
     gp = gates_pendentes(events)
     if gp:
-        partes.append("Gates de decisão fechada ainda pendentes: " + "; ".join(f"{g} (Run {r}: run-use --id {r})" if r else g for g, r in gp[:2])
+        partes.append("Gates de decisão fechada ainda pendentes: " + "; ".join(f"{g} (Run {r}: {dica_ligar(r)})" if r else g for g, r in gp[:2])
                       + (f" +{len(gp) - 2}" if len(gp) > 2 else "") + ".")
     ags = reavalia((aberto or {}).get("agentes") or [], events, agora, turnos)
     for estado, rotulo in (("travado", "Travado"), ("nao_comecou", "Não começou"), ("parado", "Parado no prompt")):
@@ -565,7 +584,7 @@ def _linha_runs(aberto):
     return " Runs: " + ", ".join(f"{_cita(x['objetivo'], 30)} ({x['abertas']} abertas)" for x in rs[:3]) + (f" +{len(rs) - 3}" if len(rs) > 3 else "") + "." if rs else ""
 
 
-def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, turnos=None):
+def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, turnos=None, painel=None):
     """No máximo 5 linhas: entrada e o que está sem efeito, uma linha extra (suspeita, alerta, relatórios), aberto no Orca, pendências, como dar efeito."""
     todas = abertas(events)
     sem = [e for e in todas if e["id"] != (entrada or {}).get("id") and e.get("origem", "usuario") == "usuario"]
@@ -573,7 +592,7 @@ def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, tu
     lista = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
     l1 = f"[orq] {quem}Sem efeito: {lista or 'nenhum'}."
     agora = agora or datetime.now(timezone.utc)
-    extra = _extra(events, todas, agora, pendencias, cursor, aberto, turnos)
+    extra = _extra(events, todas, agora, pendencias, cursor, aberto, turnos, painel)
     if aberto:
         bl = aberto["backlog"]
         velho = f" ({bl[0]['id'][:9]}… {_cita(bl[0]['titulo'])!r}, {bl[0]['dias']} d)" if bl else ""
@@ -597,20 +616,22 @@ def _lim(itens, n, fmt):
     return [fmt(i) for i in itens[:n]] + ([f"+{len(itens) - n}"] if len(itens) > n else [])
 
 
-def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None):
-    """`orq resumo`: as quatro partes desde `desde` (padrão: a última mensagem do usuário) e as decisões, até ~20 linhas.
+def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None, painel=None):
+    """`orq resumo`: as quatro partes desde `desde` (padrão: a última mensagem do usuário, sem contar o pedido do próprio resumo) e as decisões, até ~20 linhas.
 
     Com você = pendências fora do Depois; Entrou = entradas da janela e o efeito de cada; Anda = workers rodando e a fase;
     Vem = tickets prontos (Blocked by todos resolvidos) e bloqueados. `ts` são os tickets já lidos.
     """
     agora = agora or datetime.now(timezone.utc)
     users = [e["ts"] for e in events if e.get("tipo") == "entrada" and e.get("origem", "usuario") == "usuario" and e.get("ts")]
+    if users and 0 <= (agora - _dt(users[-1])).total_seconds() < RESUMO_PEDIDO_S:
+        users.pop()  # o hook de prompt grava o pedido do resumo antes de o `orq resumo` rodar: a janela começa na mensagem anterior (M17)
     desde = desde or (users[-1] if users else "")
     na_janela = [e for e in events if (e.get("ts") or "") >= desde]
     efeito = {e["entrada"]: e for e in events if e.get("tipo") == "intake"}
     itens = [i for i in (pendencias or {}).get("itens", []) if not pend_depois(i, agora.astimezone().date())]
     entrou = [e for e in na_janela if e.get("tipo") == "entrada" and e.get("id")]
-    rodando = [a for a in (aberto or {}).get("agentes", []) if a.get("estado") == "rodando"]
+    rodando = [a for a in reavalia((aberto or {}).get("agentes") or [], events, agora) if a.get("estado") in ANDA]  # o perguntando também anda (M17)
     resolvidos = {t["num"] for t in ts if t["status"] == STATUS_FECHADO}
     abertos = [t for t in ts if t["status"] not in (STATUS_FECHADO, STATUS_ANDAMENTO)]
     prontos = [t for t in abertos if set(t["blocked_by"]) <= resolvidos]
@@ -637,10 +658,11 @@ def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None):
     vem = [f"pronto: {t['num']} {_cita(t['titulo'], 40)}" for t in prontos[:5]] + [f"bloqueado: {bloq(t)}" for t in travados[:5]]
     return "\n".join([
         f"[orq resumo] desde {_hora_local(desde) if desde else 'o início'}",
+        *([f"[aviso] {painel}"] if painel else []),
         *parte("Com você", itens, "nada", lambda i: f"{i['id']}  {i.get('tipo')}  {_cita(i.get('titulo'), 50)}"),
         *parte("Entrou", entrou, "nada", efeito_de, 6),
         *(parte("Entrega sem prova", entregas, "", lambda x: x, 4) if entregas else []),
-        *parte("Anda", rodando, "ninguém rodando", lambda a: f"{_cita(a.get('titulo') or a.get('task'), 40)} [{a.get('fase') or 'sem fase'}]"),
+        *parte("Anda", rodando, "ninguém rodando", lambda a: f"{_cita(a.get('titulo') or a.get('task'), 40)} [{(a.get('fase') or 'sem fase') if a['estado'] == 'rodando' else a['estado']}]"),
         *(["Vem:", *("  " + x for x in vem)] if vem else ["Vem: nenhum ticket aberto"]),
         *parte("Decisões", dec, "nenhuma", lambda d: d, 6),
     ])
@@ -729,8 +751,12 @@ def orca(*args, timeout=TIMEOUT_ORCA, area="orchestration", sem_terminal=False, 
     Tirar a variável não serve: sem ela o Orca cai no Run do coordenador ativo (`scope.source` bound, conferido em 29/09 com o Orca de verdade).
 
     Com o agent manager segurando o Run do comando (`run`, ou o --run de um comando de MUTA_RUN), liga o gerente a ele antes, sob a trava:
-    o Orca liga um Run por terminal. `run-use` no Run já ligado não muda nada."""
-    liga = None if sem_terminal or como else run if run and _do_gerente(run) else _run_do_gerente(area, args)
+    o Orca liga um Run por terminal. `run-use` no Run já ligado não muda nada. Run que o gerente não segura vai pelo handle do próprio
+    coordenador, o dono do Run fora do gerente (M15)."""
+    alvo = None if sem_terminal or como else run or _run_do_comando(area, args)
+    liga = alvo if alvo and _do_gerente(alvo) else None
+    if alvo and not liga and runs_do_gerente():
+        como = os.environ.get("ORCA_TERMINAL_HANDLE")
     if liga:
         with trava_gerente():
             _orca("run-use", "--id", liga, timeout=timeout, h=handle_orca())
@@ -738,12 +764,11 @@ def orca(*args, timeout=TIMEOUT_ORCA, area="orchestration", sem_terminal=False, 
     return _orca(*args, timeout=timeout, area=area, h=SEM_LIGACAO if sem_terminal else como or handle_orca())
 
 
-def _run_do_gerente(area, args):
-    """O Run do --run de um comando que exige o terminal ligado, se o agent manager deste coordenador o segura; senão None."""
+def _run_do_comando(area, args):
+    """O Run do --run de um comando que exige o terminal ligado; senão None."""
     if area != "orchestration" or not args or args[0] not in MUTA_RUN or "--run" not in args:
         return None
-    alvo = args[args.index("--run") + 1]
-    return alvo if _do_gerente(alvo) else None
+    return args[args.index("--run") + 1]
 
 
 def runs_do_gerente():
@@ -756,6 +781,36 @@ def _do_gerente(run):
     """O Run é de um agent manager ligado por ESTE coordenador?"""
     g = _gerente_cfg()
     return bool(g) and g.get("coordenador") == os.environ.get("ORCA_TERMINAL_HANDLE") and run in g["runs"]
+
+
+def _run_proprio():
+    """O Run ligado ao terminal do próprio coordenador (com o gerente ligado, o `run-current` sem `como` é onde o painel parou, M15)."""
+    return _run_atual_id(como=os.environ.get("ORCA_TERMINAL_HANDLE") if runs_do_gerente() else None)
+
+
+def run_do_coordenador(run, proprio=_DESCONHECIDO):
+    """O coordenador comanda o Run: o agent manager dele o segura, ou é o Run ligado ao terminal do próprio coordenador (`proprio`, se o
+    chamador já o perguntou ao Orca). O `run-current` do gerente não serve, troca a cada volta do painel (M15)."""
+    return _do_gerente(run) or (_run_proprio() if proprio is _DESCONHECIDO else proprio) == run
+
+
+def run_padrao(run=None):
+    """O Run alvo de um comando: `run`, senão o ligado ao coordenador (o único do gerente, se o próprio terminal não segura nenhum).
+    O gerente em mais de um Run não tem Run padrão: o `run-current` dele é sorteado pelo revezamento do painel (M15)."""
+    if run:
+        return run
+    g = runs_do_gerente()
+    if len(g) > 1:
+        raise ValueError(f"o agent manager segura {len(g)} Runs ({', '.join(g)}): passe --run")
+    return _run_proprio() or (g[0] if g else None)
+
+
+def dica_ligar(run):
+    """O que rodar para o coordenador voltar a comandar o Run: religar o gerente a ele, ou o run-use quando não há gerente."""
+    g = _gerente_cfg()
+    if g and g.get("coordenador") == os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return f"rode orq gerente ligar --terminal {g['gerente']} --run {run}"
+    return f"rode run-use --id {run}"
 
 
 def _gerente_cfg():
@@ -1458,15 +1513,17 @@ def _mutar_pend(fn, evento=None):
     return out
 
 
-def _resolve_gate(gate, resolucao):
-    """Resolve o gate do Orca ligado a uma decisão e grava `gate_resolvido`; True se resolveu.
+def _resolve_gate(gate, resolucao, run=None):
+    """Resolve o gate do Orca ligado a uma decisão e grava `gate_resolvido`; True se resolveu. `run` é o Run do gate (`gate_run`): o orca()
+    liga o gerente a ele, ou usa o handle do coordenador que o segura, e a conferência de que o coordenador o comanda cabe na mesma trava.
 
     A falha vai para o log e não desfaz o fechamento da pendência. Sem o `gate_resolvido` no log, o próximo ingest tenta de novo
     (reconciliar_gates), e é isso que cobre o alarme de 3 s que vence depois da gravação. Recusa do Orca (gate já resolvido, fora do
     Run ligado) grava `gate_falha`; depois de MAX_TENTATIVAS recusas o gate deixa de ser tentado.
     """
     try:
-        orca("gate-resolve", "--id", gate, "--resolution", resolucao)
+        with trava_gerente():
+            orca("gate-resolve", "--id", gate, "--resolution", resolucao, run=run)
     except RuntimeError as e:
         log(f"gate-resolve {gate}: recusado: {e}")
         append_event({"tipo": "gate_falha", "gate": gate, "erro": str(e)})
@@ -1484,24 +1541,22 @@ def reconciliar_gates():
     feitos = {e.get("gate") for e in eventos if e.get("tipo") == "gate_resolvido"}
     recusas = [e.get("gate") for e in eventos if e.get("tipo") == "gate_falha"]
     feitos |= {g for g in recusas if recusas.count(g) >= MAX_TENTATIVAS}
-    n, atual = 0, _DESCONHECIDO
+    n = 0
     for e in eventos:
         g = e.get("gate")
         if e.get("tipo") == "pend" and e.get("op") == "done" and g and g not in feitos:
             run = e.get("gate_run")
-            if run:  # o Orca só resolve gate do Run ligado: em outro Run a recusa gastaria as tentativas e o gate nunca mais seria tentado
-                if atual is _DESCONHECIDO:
-                    atual = _run_atual_id()
-                if atual != run:
+            with trava_gerente():  # a conferência e o gate-resolve na mesma ligação: o painel trocando de Run no meio gastaria as tentativas (M15)
+                if run and not run_do_coordenador(run):  # o Orca só resolve gate do Run que o coordenador comanda; a recusa gastaria as tentativas
                     continue
-            feitos.add(g)
-            n += _resolve_gate(g, e.get("resposta") or "fechada sem resposta")
+                feitos.add(g)
+                n += _resolve_gate(g, e.get("resposta") or "fechada sem resposta", run)
     return n
 
 
-def _run_atual_id():
-    """Id do Run ligado ao terminal que chama, ou None."""
-    return (orca("run-current")["run"] or {}).get("id")
+def _run_atual_id(como=None):
+    """Id do Run ligado ao terminal que chama (ou ao handle `como`), ou None."""
+    return (orca("run-current", como=como)["run"] or {}).get("id")
 
 
 def pend_depois(item, hoje=None):
@@ -1533,10 +1588,11 @@ def pend_lista(todas=False, hoje=None):
     return linhas
 
 
-def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None, ate=None):
+def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None, ate=None, run=None):
     """Acrescenta uma pendência do usuário (formato do painel; `espera` opcional) e registra o evento.
 
-    Com `task`, a decisão trava a task: cria o gate no Orca e guarda o id na pendência (o hook ask o resolve).
+    Com `task`, a decisão trava a task: cria o gate no Orca, no Run da task (`run`, senão o do coordenador; run_padrao recusa o gerente com
+    vários Runs), e guarda o id na pendência (o hook ask o resolve).
     """
     id_, titulo = (id_ or "").strip(), (titulo or "").strip()
     if not id_ or not titulo:
@@ -1556,18 +1612,16 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
         raise ValueError("--task só vale para decisão (o gate trava a task até a resposta)")
     gate = gate_run = None
     if task:
+        run = run_padrao(run)
         try:
-            res = orca("gate-create", "--task", task, "--question", titulo)
+            res = orca("gate-create", "--task", task, "--question", titulo, run=run)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise ValueError(f"gate-create falhou, a pendência não foi criada: {e}")
         g = res.get("gate") or res
         gate = g.get("id")
         if not gate:
             raise ValueError("gate-create não devolveu o id do gate, a pendência não foi criada")
-        gate_run = g.get("run_id") or g.get("runId") or res.get("run_id")
-        if not gate_run:  # o gate nasce no Run ligado; sem o campo na resposta, pergunta
-            with contextlib.suppress(Exception):
-                gate_run = _run_atual_id()
+        gate_run = g.get("run_id") or g.get("runId") or res.get("run_id") or run  # o gate nasce no Run pedido
 
     def add(itens):
         if any(i.get("id") == id_ for i in itens):
@@ -1588,7 +1642,7 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
                                                **({"gate": gate} if gate else {}), **({"gate_run": gate_run} if gate and gate_run else {})})
     except Exception:
         if gate:
-            _resolve_gate(gate, "cancelada: a pendência não foi criada")
+            _resolve_gate(gate, "cancelada: a pendência não foi criada", gate_run)
         raise
 
 
@@ -1596,8 +1650,8 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
     """Fecha (remove) uma pendência aberta e resolve o gate dela, se houver. `resposta` fica no evento e na resolução.
 
     Sem `resposta`, vale a última resposta livre dada ao header (AskUserQuestion ou Lavish): o texto do usuário chega ao worker destravado.
-    O gate é do Run em que nasceu (`gate_run`): com o coordenador ligado a outro Run o Orca o recusaria, então não tenta, e o item
-    devolvido traz `aviso`; o próximo ingest resolve quando o Run certo estiver ligado. `atual` é o Run ligado, se o chamador já o sabe.
+    O gate é do Run em que nasceu (`gate_run`): se o coordenador não comanda esse Run o Orca o recusaria, então não tenta, e o item
+    devolvido traz `aviso`; o próximo ingest resolve quando o coordenador voltar a comandá-lo. `atual` é o Run ligado ao terminal próprio, se o chamador já o sabe.
     """
     resposta = resposta or ultima_livre(read_events(), id_)
 
@@ -1612,15 +1666,16 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
                                        **({"gate_run": it["gate_run"]} if it.get("gate") and it.get("gate_run") else {})})
     if item.get("gate"):
         run = item.get("gate_run")
-        if run and (_run_atual_id() if atual is _DESCONHECIDO else atual) != run:
-            log(f"pend done {id_}: {aviso_gate(item['gate'], run)}")
-            return {**item, "aviso": aviso_gate(item["gate"], run)}
-        _resolve_gate(item["gate"], resposta or "fechada sem resposta")
+        with trava_gerente():  # conferir e resolver na mesma ligação (M15)
+            if run and not run_do_coordenador(run, atual):
+                log(f"pend done {id_}: {aviso_gate(item['gate'], run)}")
+                return {**item, "aviso": aviso_gate(item["gate"], run)}
+            _resolve_gate(item["gate"], resposta or "fechada sem resposta", run)
     return item
 
 
 def estado(entrada=None):
-    return resumo(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=_cursor_ro(), turnos=_turnos_ro())
+    return resumo(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=_cursor_ro(), turnos=_turnos_ro(), painel=aviso_painel())
 
 
 # ---------- coordenador x worker ----------
@@ -1916,7 +1971,7 @@ def hook_ask(ev, run):
                       **({"fechou": fechou} if fechou else {})})
         for i in fechou:
             try:
-                feito = pend_done(i, resposta if header != "ja-fez" else None, run["id"])
+                feito = pend_done(i, resposta if header != "ja-fez" else None, None if runs_do_gerente() else run["id"])
             except ValueError as e:  # outro orq fechou no meio: as próximas perguntas seguem
                 log(f"ask: {e}")
             else:
@@ -1956,11 +2011,11 @@ def despachos_ativos():
 def _de_outro_coordenador(ativos):
     """Tira os despachos de Run coordenado por outro terminal que ainda existe: o Orca avisa o coordenador ligado ao Run, então eles não
     são deste terminal. Coordenador fechado (terminal_handle_stale) não avisa ninguém: o despacho continua valendo. Erro do Orca sobe."""
-    meu = handle_orca()  # com o agent manager ligado, o Run dele é deste coordenador
+    meu = {os.environ.get("ORCA_TERMINAL_HANDLE"), handle_orca()}  # com o agent manager ligado, o Run dele e o que o coordenador segura são deste coordenador (M14)
     dono = {}
     for run in {a["run"] for a in ativos if a.get("run")}:
         h = (orca("run-show", "--id", run)["run"] or {}).get("coordinator_handle")
-        if h and h != meu:
+        if h and h not in meu:
             dono[run] = h
     vivos = {}
     for h in set(dono.values()):
@@ -1994,7 +2049,8 @@ def hook_guard(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
 
 
-LUGAR_ESCRITA = re.compile(r"(^|[;&|(]\s*)git(\s+-\S+(\s+\S+)?)*\s+(commit|push)\b")
+LUGAR_ESCRITA = re.compile(r"(^|[;&|(]\s*)((\w+=\S*|rtk|env|command|time|sudo)\s+)*git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # M18: prefixos antes do git
+LUGAR_GIT_C = re.compile(r"\s-C\s+(\S+)")
 
 
 def hook_lugar(ev, run):
@@ -2002,9 +2058,14 @@ def hook_lugar(ev, run):
     branch padrão ou com o cwd numa worktree que não é a do coordenador (CLAUDE_PROJECT_DIR). Só olha comando de escrita: git commit/push e edição de arquivo."""
     ferr, ti = ev.get("tool_name"), ev.get("tool_input") or {}
     if ferr == "Bash":
-        if not LUGAR_ESCRITA.search(ti.get("command") or ""):
+        m = LUGAR_ESCRITA.search(ti.get("command") or "")
+        if not m:
             return None
         d = ev.get("cwd") or os.getcwd()
+        c = LUGAR_GIT_C.search(m.group(4) or "")  # `git -C <dir> commit` escreve em <dir>, não no cwd
+        if c:
+            d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
+            d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
     elif ferr in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         d = os.path.dirname(ti.get("file_path") or ti.get("notebook_path") or "")
         d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
@@ -2095,13 +2156,12 @@ def intake(e, efeito, ref=None, run=None, nota=None):
     if efeito in ("tarefa", "steer"):
         if not ref:
             raise ValueError(f"{efeito} pede o id da task")
-        atual = orca("run-current")["run"]
-        alvo = run or (atual or {}).get("id")
+        alvo = run_padrao(run)
         if not alvo:
             raise ValueError("sem Run ligado: passe --run")
-        if atual and alvo != atual["id"] and efeito == "tarefa" and not _do_gerente(alvo):
-            print(f"aviso: task-create --run {alvo} é recusado (consumer_fenced) com o coordenador ligado a {atual['id']}; "
-                  f"para criar task em outro Run, rode run-use --id {alvo} antes (run-create e run-use tiram o coordenador do Run anterior).",
+        if efeito == "tarefa" and not run_do_coordenador(alvo):
+            print(f"aviso: task-create --run {alvo} é recusado (consumer_fenced) porque o coordenador não comanda esse Run; "
+                  f"para criar task nele, {dica_ligar(alvo)} antes (run-create e run-use tiram o coordenador do Run anterior).",
                   file=sys.stderr)
         if not any(t["id"] == ref for t in orca("task-list", "--run", alvo, timeout=20)["tasks"]):
             raise ValueError(f"task {ref} não existe no Run {alvo}")
@@ -2212,8 +2272,9 @@ def lavish_resposta(caminho):
             alvos = [header] if explicita and pend is not None and pend.get("tipo") == "decisao" else []
         fechou = []
         for alvo in alvos:
-            if pends[alvo].get("gate_run") and atual is _DESCONHECIDO:
-                atual = _run_atual_id()
+            gr = pends[alvo].get("gate_run")
+            if gr and atual is _DESCONHECIDO and not _do_gerente(gr):
+                atual = _run_proprio()  # antes de gravar: o Orca fora do ar não deixa a pendência fechada sem o evento
             try:
                 feito_ = pend_done(alvo, None if feito else resposta, atual)
             except ValueError as e:  # outro orq fechou no meio
@@ -2359,10 +2420,9 @@ def responder(msg_id, texto):
     if not linha:
         raise ValueError(f"mensagem {msg_id} não está entre as 200 mais novas do inbox")
     alvo = linha.get("run_id")
-    atual = (orca("run-current")["run"] or {}).get("id")
-    fenced = f"o coordenador precisa estar ligado ao Run da mensagem: rode run-use --id {alvo}"
-    if atual != alvo and not _do_gerente(alvo):
-        raise ValueError(f"Run ligado é {atual or 'nenhum'}, a mensagem é do {alvo}; {fenced}")
+    fenced = f"o coordenador precisa comandar o Run da mensagem: {dica_ligar(alvo)}"
+    if not run_do_coordenador(alvo):
+        raise ValueError(f"a mensagem é do Run {alvo}; {fenced}")
     try:
         res = orca("reply", "--id", msg_id, "--body", texto, "--run", alvo, timeout=10)
     except RuntimeError as e:
@@ -2378,13 +2438,12 @@ def steer(task, texto, run=None, entrada=None):
     """
     if entrada and not any(x.get("id") == entrada and x.get("tipo") == "entrada" for x in read_events()):
         raise ValueError(f"entrada {entrada} não existe")
-    atual = (orca("run-current")["run"] or {}).get("id")
-    alvo = run or atual
+    alvo = run_padrao(run)
     if not alvo:
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
-    fenced = f"o coordenador precisa estar ligado ao Run do worker: rode run-use --id {alvo}"
-    if atual != alvo and not _do_gerente(alvo):
-        raise ValueError(f"Run ligado é {atual or 'nenhum'}, a task está em {alvo}; {fenced}")
+    fenced = f"o coordenador precisa comandar o Run do worker: {dica_ligar(alvo)}"
+    if not run_do_coordenador(alvo):
+        raise ValueError(f"a task está em {alvo}; {fenced}")
     t = next((t for t in orca("task-list", "--run", alvo, timeout=20)["tasks"] if t["id"] == task), None)
     if not t:
         raise ValueError(f"task {task} não existe no Run {alvo}")
@@ -2509,8 +2568,7 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
         corpo = f"## What to build\n\n{corpo}"
     existentes = {t["num"]: t for t in tickets()}
     bloqueios = list(dict.fromkeys(n.zfill(2) for n in re.findall(r"\d+", blocked_by or "")))
-    atual = (orca("run-current")["run"] or {}).get("id")
-    alvo = run or atual
+    alvo = run_padrao(run)
     deps, avisos = [], []
     for n in bloqueios:
         t = existentes.get(n)
@@ -2524,8 +2582,8 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
             deps.append(t["task"])
     if not alvo:
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
-    if atual != alvo and not _do_gerente(alvo):
-        raise ValueError(f"Run ligado é {atual or 'nenhum'}, o ticket é para {alvo}: o Orca recusa task-create em outro Run (consumer_fenced); rode run-use --id {alvo}")
+    if not run_do_coordenador(alvo):
+        raise ValueError(f"o ticket é para o Run {alvo}, que o coordenador não comanda: o Orca recusa task-create em outro Run (consumer_fenced); {dica_ligar(alvo)}")
     os.makedirs(ISSUES, exist_ok=True)
     with _trava("ticket.lock"):  # B25: dois `ticket novo` ao mesmo tempo não escolhem o mesmo número
         try:
@@ -2578,7 +2636,7 @@ def ticket_fechar(numero, answer):
                 if tk.get("status") == "dispatched":
                     aviso = f"a task {t['task']} estava dispatched: confira se o worker ainda roda (orq agentes)"
         except Exception as e:  # noqa: BLE001 - o ticket já está resolvido: a task fecha à mão
-            aviso = f"task {t['task']} não fechada ({e}): rode run-use --id {t['run']} e orca orchestration task-update --id {t['task']} --status completed"
+            aviso = f"task {t['task']} não fechada ({e}): {dica_ligar(t['run'])} e orca orchestration task-update --id {t['task']} --status completed"
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": fechada, **({"aviso": aviso} if aviso else {})})
     return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso}
 
@@ -2765,7 +2823,7 @@ def _ack_do_dispatch(run_id, dispatch):
                 entregas.append(res["deliveryId"])
                 res = orca("check", "--run", run_id, "--ack", res["deliveryId"])
     except RuntimeError as e:
-        return entregas, f"ack pulado ({e}): rode run-use --id {run_id} e confirme depois"
+        return entregas, f"ack pulado ({e}): {dica_ligar(run_id)} e confirme depois"
     return entregas, ""
 
 
@@ -2880,7 +2938,12 @@ def liberar(dispatch, run=None):
     entregas, aviso = _ack_do_dispatch(run_id, dispatch)
     if aviso:
         avisos.append(aviso)
-    estado = orca("worker-release", "--dispatch", dispatch, timeout=30, run=run_id).get("state")
+    try:
+        estado = orca("worker-release", "--dispatch", dispatch, timeout=30, run=run_id).get("state")
+    except RuntimeError as e:
+        if "consumer_fenced" in str(e):
+            raise ValueError(f"o coordenador precisa comandar o Run {run_id} para liberar o dispatch: {dica_ligar(run_id)}")
+        raise
     fechado, humano = False, False
     if estado == "retained":
         try:
@@ -3006,9 +3069,8 @@ def relancar(dispatch, nota, modelo=None, effort=None, run=None):
     pedido, antigo = (modelo or cp["modelo"], effort or cp["effort"]), (cp["modelo"], cp["effort"])
     if not all(pedido):
         raise ValueError("o Orca não informou o modelo e o effort do worker antigo: passe --modelo e --effort")
-    atual = (orca("run-current")["run"] or {}).get("id")
-    if atual != run_id and not _do_gerente(run_id):
-        raise ValueError(f"Run ligado é {atual or 'nenhum'}, o worker é do {run_id}: rode run-use --id {run_id}")
+    if not run_do_coordenador(run_id):
+        raise ValueError(f"o worker é do Run {run_id}, que o coordenador não comanda: {dica_ligar(run_id)}")
     if not any(t["id"] == task for t in orca("task-list", "--run", run_id, timeout=20)["tasks"]):
         raise ValueError(f"task {task} não existe no Run {run_id}")
     base = {"nota": nota, "terminal": w.get("agentTerminalHandle"), "worktree": cp["caminho"], "head": cp["head"], "sujo": cp["sujo"]}
@@ -3080,9 +3142,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     if entrada and not any(x.get("id") == entrada and x.get("tipo") == "entrada" for x in read_events()):
         raise ValueError(f"entrada {entrada} não existe")
     _adotar(run)
-    atual = (orca("run-current")["run"] or {}).get("id")
-    if atual != run and not _do_gerente(run):
-        raise ValueError(f"Run ligado é {atual or 'nenhum'}, o despacho é para {run}: rode run-use --id {run}")
+    if not run_do_coordenador(run):
+        raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
     if spec is not None and not spec.lstrip().startswith("#"):
         spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
     args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
@@ -3412,6 +3473,7 @@ def main(argv=None):
     pa.add_argument("--titulo", required=True)
     for k in ("detalhe", "frente", "link", "comando", "espera", "task", "ate"):
         pa.add_argument(f"--{k}")
+    pa.add_argument("--run", help="o Run da task do gate (obrigatório com o agent manager em mais de um Run)")
     pl = p.add_parser("lista", help="as pendências vivas; --todas inclui as de Depois")
     pl.add_argument("--todas", action="store_true")
     pd = p.add_parser("done")
@@ -3495,7 +3557,7 @@ def main(argv=None):
             print(json.dumps(intake(a.entrada, a.efeito, a.ref, a.run, a.nota), ensure_ascii=False))
         elif a.cmd == "pend":
             if a.op == "add":
-                print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate), ensure_ascii=False))
+                print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate, a.run), ensure_ascii=False))
             elif a.op == "lista":
                 print("\n".join(pend_lista(a.todas)) or "nenhuma pendência")
             else:
@@ -3516,7 +3578,7 @@ def main(argv=None):
         elif a.cmd == "resumo":
             if a.desde:
                 _dt(a.desde)  # ValueError vira exit 1
-            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ")))
+            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             print(json.dumps(ags, ensure_ascii=False) if a.json else texto_agentes(ags))

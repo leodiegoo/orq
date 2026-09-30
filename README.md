@@ -115,7 +115,7 @@ The branch cleanup reads branch patterns to keep from `~/.claude/scripts/limpar-
 
 | Path | Contents | Override |
 |---|---|---|
-| `~/.claude/orq/` | runtime state: `events.jsonl`, `cursor.json`, `aberto.json`, `gerente.json`, locks, `handoff/` (all gitignored) | `ORQ_HOME` |
+| `~/.claude/orq/` | runtime state: `events.jsonl`, `cursor.json`, `aberto.json`, `gerente.json`, `gerente-vivo` (the manager panel's heartbeat), locks, `handoff/` (all gitignored) | `ORQ_HOME` |
 | `~/.claude/orquestrador-plan/issues/` | tickets, `NN-<slug>.md` | `ORQ_ISSUES` |
 | `~/.claude/orquestrador-plan/desenho.md` | your own design notes; orq only prints this path at session start and in the handoff | `ORQ_MAPA`, `ORQ_DESENHO` (precompact) |
 | `~/.claude/dashboard/data/pendencias.json` | the user's pending list | `ORQ_PENDENCIAS` |
@@ -207,6 +207,8 @@ python3 test_orq.py              # fake Orca, temporary ORQ_HOME
 python3 test_precompact.py
 python3 scripts/limpar-mergeados.py --self-test
 ```
+
+Editing orq: hooks and the manager panel execute `~/.claude/orq/orq.py` while it runs, so a half-edited file stops them (the panel once died ten laps in a row on a `NameError`). Work in a separate worktree (`git worktree add ../orq-<topic>`), run the tests there, and update the live copy with `git pull` only after the commit is green. The panel writes `gerente-vivo` on every lap from its own shell; `orq status`, `orq resumo` and the prompt hook warn when it is older than 60 s.
 
 Audience check: `git config core.hooksPath githooks` runs `scripts/audiencia-check.py` before each commit. It scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, default `~/.claude/orquestrador-plan/termos-proibidos.txt`: one term per line, `re:` prefix for a regex) and prints `file:line`. Without the list it skips with a warning.
 

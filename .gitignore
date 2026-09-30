@@ -6,6 +6,7 @@ cursor.json
 turnos.json
 gerente.json
 gerente-aviso.json
+gerente-vivo
 pendencias.json
 ask-guard.off
 *.lock

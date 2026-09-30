@@ -1,8 +1,9 @@
 #!/bin/sh
 # Painel do agent manager: roda no terminal dele (sem LLM) e atualiza a cada 10 s. Com `orq gerente ligar` feito no coordenador, o Run
 # fica ligado a este terminal: cada volta percorre os Runs do gerente, confirma os heartbeats e avisa o coordenador do resto, uma linha por
-# Run.
+# Run. O carimbo `gerente-vivo` sai antes de chamar o orq: o coordenador sabe que o painel parou mesmo com o orq.py quebrado.
 while true; do
+  touch "${ORQ_HOME:-$HOME/.claude/orq}/gerente-vivo"
   linha=$(orq gerente absorver 2>&1)
   clear
   printf 'agent manager (orq) — %s\n%s\n\n' "$(date '+%H:%M:%S')" "$linha"
