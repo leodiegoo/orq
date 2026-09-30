@@ -5356,6 +5356,92 @@ def test_ticket25_resumo_mostra_a_espera_numa_linha_so_uma_vez():
     assert "espera vencida" in venc and "Travado: task_aaaaaaaaaa" in venc, venc
 
 
+def _ws_43(hb_min, fase="compilando", controle_min=None, turno=True):
+    """monta_agentes de um worker que encerrou o turno há 10 min (parado), com o último heartbeat de `hb_min` atrás; `controle_min`: interromper ok há tanto."""
+    agora = datetime.now(timezone.utc)
+    ws = [{"dispatchId": "ctx_1", "taskId": "task_1", "runId": "run_a", "dispatchStatus": "dispatched"}]
+    det = {"ctx_1": {"agente": "claude", "desde": _iso(-7200).replace(" ", "T") + "Z"}}
+    turnos = {"ctx_1": {"task": "task_1", "inicio": now_iso(-(hb_min + 5) * 60), "fim": now_iso(-600)}}
+    msgs = [{"id": "m1", "type": "heartbeat", "payload": json.dumps({"taskId": "task_1", "dispatchId": "ctx_1", "phase": fase}), "created_at": _iso(-hb_min * 60)}]
+    events = [{"tipo": "controle", "acao": "interromper", "resultado": "ok", "dispatch": "ctx_1", "ts": now_iso(-controle_min * 60)}] if controle_min else []
+    return ws, msgs, events, agora, det, turnos
+
+
+def test_ticket43_tela_com_shell_em_execucao_e_espera_e_nao_parado():
+    ws, msgs, ev, agora, det, turnos = _ws_43(20)
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos, telas={"ctx_1": "1 shell still running (tela)"})[0]
+    assert ag["estado"] == "rodando" and ag["espera"] == "1 shell still running (tela)" and ag["turno"] == "parado", ag
+    sem = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
+    assert sem["estado"] == "parado", "sem a tela o turno encerrado continua parado"
+    r = orq_mod.reavalia([ag], ev, agora, turnos)[0]
+    assert r["estado"] == "rodando" and r["espera"], "o cache dos hooks de prompt guarda a espera sem ler a tela"
+    assert "esperando: 1 shell still running" in orq_mod.texto_agentes([ag])
+
+
+def test_ticket43_shell_em_execucao_sem_heartbeat_alem_do_teto_e_travado():
+    ws, msgs, ev, agora, det, turnos = _ws_43(46)
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos, telas={"ctx_1": "shell still running (tela)"})[0]
+    assert ag["estado"] == "travado" and ag["motivo"] == "shell sem heartbeat", ag
+    assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["motivo"] == "shell sem heartbeat"
+
+
+def test_ticket43_tela_lida_antes_de_novo_heartbeat_deixa_de_valer():
+    ws, msgs, ev, agora, det, turnos = _ws_43(20)
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos, telas={"ctx_1": "shell still running (tela)"})[0]
+    ag["tela_ts"] = now_iso(-900)  # lida há 15 min; o heartbeat (20 min atrás) é anterior, vale
+    assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["estado"] == "rodando"
+    ag["tela_ts"] = now_iso(-1500)  # lida antes do heartbeat: o worker deu sinal depois, a tela é velha
+    assert not orq_mod.reavalia([ag], ev, agora, turnos)[0].get("espera")
+
+
+def test_ticket43_heartbeat_waiting_em_ingles_e_espera():
+    ws, msgs, ev, agora, det, turnos = _ws_43(30, fase="waiting for E2E queue")
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "rodando" and ag["espera"] == "for E2E queue", ag
+    ws, msgs, ev, agora, det, turnos = _ws_43(61, fase="waiting…")
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", "waiting sem prazo vence no teto"
+    assert orq_mod.espera_declarada("waiting…", now_iso(0))[0] == "esperando"
+
+
+def test_ticket43_interromper_pausa_o_worker_e_nao_e_travado():
+    ws, msgs, ev, agora, det, turnos = _ws_43(127, controle_min=5)
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "rodando" and ag["espera"] == "interrompido pelo coordenador", ag
+    assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["estado"] == "rodando"
+    ws, msgs, ev, agora, det, turnos = _ws_43(127, controle_min=200)  # interrompido antes do último heartbeat: o worker voltou a dar sinal
+    assert orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]["estado"] == "parado"
+    ws, msgs, ev, agora, det, turnos = _ws_43(127, controle_min=5)
+    turnos["ctx_1"]["inicio"], turnos["ctx_1"]["fim"] = now_iso(-60), None  # o steer abriu turno novo depois do interrupt
+    ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
+    assert ag["estado"] == "travado" and "espera" not in ag, ag
+
+
+def test_ticket43_telas_le_so_worker_claude_rodando_e_falha_de_leitura_nao_prova_nada():
+    lidos, orig = [], orq_mod.orca
+
+    def falso(*args, **k):
+        lidos.append(args[args.index("--terminal") + 1])
+        if args[args.index("--terminal") + 1] == "term_f":
+            raise RuntimeError("orca fora")
+        return {"terminal": {"tail": ["x", "  2 shells still running"]}}
+    orq_mod.orca = falso
+    try:
+        ws = [{"dispatchId": f"ctx_{h}", "agentTerminalHandle": f"term_{h}", "dispatchStatus": st} for h, st in (("a", "dispatched"), ("f", "dispatched"), ("c", "dispatched"), ("d", "completed"))]
+        det = {"ctx_a": {"agente": "claude"}, "ctx_f": {"agente": "claude"}, "ctx_c": {"agente": "codex"}, "ctx_d": {"agente": "claude"}}
+        assert orq_mod._telas(ws, det) == {"ctx_a": "2 shells still running (tela)"}, "codex e completed nem são lidos; o read que falha fica de fora"
+        assert sorted(lidos) == ["term_a", "term_f"], lidos
+    finally:
+        orq_mod.orca = orig
+
+
+def test_ticket43_tela_espera_reconhece_o_rodape_do_claude_code():
+    for t in ("1 shell still running", "2 shells still running", "monitor still running", "3 monitors still running"):
+        assert orq_mod.TELA_ESPERA.search(f"  ⏵⏵ bypass permissions on · {t}"), t
+    assert not orq_mod.TELA_ESPERA.search("esc to interrupt")
+    assert orq_mod.TELA_TETO_S == 45 * 60
+
+
 def test_ticket25_teto_com_nome():
     assert orq_mod.ESPERA_TETO_S == 60 * 60
 

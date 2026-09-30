@@ -47,7 +47,10 @@ PAGINAS_ATIVOS = 3  # o worker-list vem dos mais novos para os mais velhos: 300 
 SEM_LIGACAO = "term_00000000-0000-0000-0000-000000000000"  # handle que o Orca não conhece: sem Run ligado, o worker-list dá o escopo all
 TRAVADO_S = 15 * 60  # dispatch rodando sem heartbeat há mais que isto está travado: aparece no resumo e no painel com o orq steer sugerido
 ESPERA_TETO_S = 60 * 60  # heartbeat `esperando: <motivo>` sem `até HH:MM` vale por tanto tempo; depois disso o dispatch é travado por "espera vencida"
-ESPERA_FASE = re.compile(r"^\s*esperando:\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
+TELA_TETO_S = 45 * 60  # shell/monitor em execução na tela sem heartbeat por tanto tempo: deixa de ser espera e vira travado ("shell sem heartbeat")
+TELA_ESPERA = re.compile(r"(?:\d+\s+)?(?:shell|monitor)s?\s+still\s+running", re.I)  # o rodapé do Claude Code com o turno encerrado esperando um processo em segundo plano
+TELA_LINHAS = 15  # linhas do fim da tela lidas por terminal (o rodapé fica nas últimas)
+ESPERA_FASE = re.compile(r"^\s*(?:esperando:|waiting\b[:\s.…-]*)\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
 STEER_LEITURA_S = 90  # ajuste que o dispatch não leu (`read` no inbox do Orca ou o id no transcrito do worker) tanto tempo depois do envio, ou da última redigitação, é reentregue
 STEER_TENTATIVAS = 3  # redigitações do aviso ao worker parado; sem leitura STEER_LEITURA_S depois da terceira, vira o alerta "steer não lido"
 STEER_TRANSCRITO_BYTES = 4_000_000  # o fim do transcrito do worker onde se procura o id da mensagem do steer
@@ -189,21 +192,41 @@ def espera_declarada(fase, ts):
     ts = _ts(ts) if isinstance(ts, str) else ts
     if not m or not ts:
         return None
+    motivo = m.group(1) or "esperando"
     if m.group(2) is None:
-        return m.group(1), ts + timedelta(seconds=ESPERA_TETO_S)
+        return motivo, ts + timedelta(seconds=ESPERA_TETO_S)
     local = ts.astimezone()
     prazo = local.replace(hour=int(m.group(2)) % 24, minute=int(m.group(3)) % 60, second=0, microsecond=0)
-    return m.group(1), (prazo if prazo >= local else prazo + timedelta(days=1)).astimezone(timezone.utc)
+    return motivo, (prazo if prazo >= local else prazo + timedelta(days=1)).astimezone(timezone.utc)
 
 
-def _vivo_ou_travado(fase, ts, idade, agora):
-    """(estado, espera, motivo) de um dispatch aberto pelo último heartbeat: esperando declarado dentro do prazo não é travado; vencido, é "espera vencida"."""
+def _vivo_ou_travado(fase, ts, idade, agora, tela=None, interrompido=False):
+    """(estado, espera, motivo) de um dispatch aberto pelo último heartbeat: esperando declarado dentro do prazo não é travado; vencido, é "espera vencida".
+
+    Sem espera declarada: `interrompido` (o coordenador pausou o worker) e `tela` (shell/monitor em execução no rodapé) também são espera, esta só até
+    TELA_TETO_S sem heartbeat. `idade` é a do último heartbeat (ou do despacho).
+    """
     esp = espera_declarada(fase, ts)
     if esp and agora <= esp[1]:
         return "rodando", esp[0], None
     if esp:
         return "travado", None, "espera vencida"
+    if interrompido:
+        return "rodando", "interrompido pelo coordenador", None
+    if tela:
+        return ("travado", None, "shell sem heartbeat") if idade is not None and idade > TELA_TETO_S else ("rodando", tela, None)
     return ("travado" if idade is not None and idade > TRAVADO_S else "rodando"), None, None
+
+
+def interrompidos(events):
+    """{dispatch: ts} do último `orq interromper` bem-sucedido de cada dispatch."""
+    return {e["dispatch"]: e.get("ts") for e in events if e.get("tipo") == "controle" and e.get("acao") == "interromper" and e.get("resultado") == "ok" and e.get("dispatch")}
+
+
+def _pausado(ts_interrupt, ultimo_hb, t):
+    """O interromper vale até o worker dar sinal depois dele: heartbeat ou novo turno (prompt) mais novos que o interrupt o encerram."""
+    i = _ts(ts_interrupt)
+    return bool(i) and not (ultimo_hb and _ts(ultimo_hb) > i) and not (_ts(_dict(t).get("inicio")) and _ts(t["inicio"]) > i)
 
 
 def sinais_de_vida(events):
@@ -297,16 +320,16 @@ def _sem_terminal(w, liberados, vivos):
     return w.get("dispatchStatus") != "dispatched" and (w.get("dispatchId") in liberados or (vivos is not None and w.get("agentTerminalHandle") not in vivos))
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None):
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
     último heartbeat (ou, sem nenhum, o despacho) tem mais de TRAVADO_S; completed com o terminal released é `liberado`, o resto é `entregue`
     (worker_done dado, terminal ainda aberto). `detalhes` é {dispatch: titulo, modelo, desde, agente}; `vivos` são os handles do `orca terminal list`;
-    `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`).
+    `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando.
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
-    liberados = _liberados(events)
+    liberados, pausas, telas = _liberados(events), interrompidos(events), telas or {}
     avisos_entrega = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
     controles = {}
     for e in events:
@@ -321,13 +344,14 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
         ref = _ts(sinal.get("ts")) or _ts(det.get("desde"))  # o último heartbeat; sem nenhum, o despacho
         idade = int((agora - ref).total_seconds()) if ref else None
         t = _dict((turnos or {}).get(d))
-        turno = "unknown"
+        turno, idade_hb = "unknown", idade
         if w.get("dispatchStatus") == "dispatched":
             if turnos is not None:
                 turno, quando = turno_do_dispatch(t, det.get("agente"), _ts(det.get("desde")), _ts(sinal.get("ts")), agora)
                 if quando:
                     idade = int((agora - quando).total_seconds())
-            estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade, agora)
+            pausa = _pausado(pausas.get(d), sinal.get("ts"), t)
+            estado, espera, motivo = _vivo_ou_travado(sinal.get("fase"), sinal.get("ts"), idade_hb, agora, telas.get(d), pausa)
             estado = "perguntando" if d in perguntas else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
         else:
             espera = motivo = None
@@ -338,6 +362,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
               "turno_inicio": _z(t.get("inicio")), "turno_fim": _z(t.get("fim"))}
         if espera:
             ag["espera"] = espera
+        if telas.get(d):
+            ag["tela"], ag["tela_ts"] = telas[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
         if motivo and estado == "travado":
             ag["motivo"] = motivo
         if avisos_entrega.get(d):
@@ -355,7 +381,7 @@ def reavalia(agentes_, events, agora, turnos=None):
     """Os agentes do cache do aberto.json com rodando/travado/nao_comecou/parado refeito pelo heartbeat mais novo do log e, com `turnos`, pelo turnos.json (o cache atrasa até um prompt)."""
     sinais = sinais_de_vida(events)
     liberados = _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}
-    out = []
+    pausas, out = interrompidos(events), []
     for ag in agentes_:
         ag = dict(ag)
         if ag.get("estado") in ("entregue", "rodando", "travado", "nao_comecou", "parado") and ag.get("dispatch") in liberados:
@@ -366,13 +392,16 @@ def reavalia(agentes_, events, agora, turnos=None):
                 ag["fase"], ag["ultimo_heartbeat"] = h.get("fase"), _z(h["ts"])
             ref = _ts(ag.get("ultimo_heartbeat")) or _ts(ag.get("desde"))
             ag["idade_s"] = int((agora - ref).total_seconds()) if ref else None
-            ag["estado"], espera, motivo = _vivo_ou_travado(ag.get("fase"), ag.get("ultimo_heartbeat"), ag["idade_s"], agora)
+            t = _dict(turnos.get(ag.get("dispatch"))) if turnos is not None else {"inicio": ag.get("turno_inicio"), "fim": ag.get("turno_fim")}
+            tela = ag.get("tela") if ag.get("tela") and _ts(ag.get("tela_ts")) and not (_ts(ag.get("ultimo_heartbeat")) and _ts(ag["ultimo_heartbeat"]) > _ts(ag["tela_ts"])) \
+                and not (_ts(t.get("inicio")) and _ts(t["inicio"]) > _ts(ag["tela_ts"])) else None  # a tela lida só vale até o worker dar sinal depois dela
+            ag["estado"], espera, motivo = _vivo_ou_travado(ag.get("fase"), ag.get("ultimo_heartbeat"), ag["idade_s"], agora, tela,
+                                                            _pausado(pausas.get(ag.get("dispatch")), ag.get("ultimo_heartbeat"), t))
             ag.pop("espera", None), ag.pop("motivo", None)
             if espera:
                 ag["espera"] = espera
             if motivo:
                 ag["motivo"] = motivo
-            t = _dict(turnos.get(ag.get("dispatch"))) if turnos is not None else {"inicio": ag.get("turno_inicio"), "fim": ag.get("turno_fim")}
             ag["turno"], quando = turno_do_dispatch(t, ag.get("agente"), _ts(ag.get("desde")), _ts(ag.get("ultimo_heartbeat")), agora)
             if ag["turno"] in ("nao_comecou", "parado") and not (espera or motivo):  # quem espera de propósito (fila de E2E, CI) encerra o turno e não está parado; vencida, é travado (M16)
                 ag["estado"], ag["idade_s"] = ag["turno"], int((agora - quando).total_seconds())
@@ -397,6 +426,8 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
                                  else f"NÃO COMEÇOU há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "nao_comecou"
                                  else f"parado no prompt há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "parado" else "pergunta" if a["estado"] == "perguntando"
                                  else f"{a.get('fase') or '?'} {_hora_local(a['ultimo_heartbeat'])}" if a.get("ultimo_heartbeat") else "sem heartbeat"))
+            if a["estado"] == "rodando" and a.get("espera") and a["espera"] not in (a.get("fase") or ""):
+                itens[-1] += f" (esperando: {a['espera']})"
         return ((" Vivos: " + ", ".join(itens) + (f" +{len(vivos) - 3}" if len(vivos) > 3 else "") + ".") if vivos else "") + \
             (f" Entregues sem liberar {sem_liberar} (orq agentes)." if sem_liberar else "")
     andamento = (aberto or {}).get("andamento") or []
@@ -3272,6 +3303,24 @@ def _detalhes(ws):
     return {w["dispatchId"]: {"titulo": tits.get(w.get("runId"), {}).get(w.get("taskId")), **vivos.get(w["dispatchId"], {})} for w in ws}
 
 
+def _telas(ws, detalhes):
+    """{dispatch: motivo} dos workers do Claude Code rodando cuja tela (fim do `terminal read --screen`) mostra shell/monitor ainda em execução.
+
+    Só o refresh e o `orq agentes` chamam isto (um read por worker, em paralelo); os hooks de prompt leem o que ficou no cache. Falha de leitura não prova nada.
+    """
+    def le(w):
+        try:
+            tail = _fundo(orca("read", "--terminal", w["agentTerminalHandle"], "--screen", "--limit", str(TELA_LINHAS), area="terminal", timeout=10), "terminal", "tail") or []
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            log(f"agentes: tela de {w['dispatchId']}: {type(e).__name__}: {e}")
+            return w["dispatchId"], None
+        m = TELA_ESPERA.search("\n".join(map(str, tail)))
+        return w["dispatchId"], f"{m.group(0).strip()} (tela)" if m else None
+    alvo = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (detalhes.get(w.get("dispatchId")) or {}).get("agente") == AGENTE_COM_HOOK]
+    with ThreadPoolExecutor(8) as ex:
+        return {d: m for d, m in ex.map(le, alvo) if m}
+
+
 def agentes(run=None, todos=False, agora=None):
     """O estado de cada dispatch: worker-list de todos os Runs (ou de `run`) mais o inbox. Liberados, sem terminal, retidos pelo Orca e as tasks "Prova r5" só com `todos`."""
     ws, events, vivos = _workers_todos(run), read_events(), _terminais_vivos()
@@ -3282,7 +3331,8 @@ def agentes(run=None, todos=False, agora=None):
         ws = [w for w in ws if _ativo(w) and (w.get("dispatchStatus") == "dispatched" or not _retencao(w, humanos))]
     msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
     agora = agora or datetime.now(timezone.utc)
-    ags = monta_agentes(ws, msgs, events, agora, _detalhes(ws), vivos, _turnos_ro())
+    det = _detalhes(ws)
+    ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), _telas(ws, det))
     nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
     for a in ags:
         if a["dispatch"] in nao_lidos:
@@ -3309,6 +3359,10 @@ def texto_agentes(ags):
             hb = f"não começou: nenhum turno {a['idade_s'] // 60} min depois do despacho ({_hora_local(a.get('desde'))})"
         elif a["estado"] == "parado":
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
+        if a.get("espera") and a["espera"] not in (a.get("fase") or ""):  # espera vista na tela ou pausa do coordenador: não está na fase do heartbeat
+            hb += f" — esperando: {a['espera']}"
+        elif a["estado"] == "travado" and a.get("motivo"):
+            hb += f" — {a['motivo']}"
         linhas.append(f"{a['estado']:<11} {a['task']}  {_cita(a.get('titulo') or '?', 36)}  {a.get('modelo') or '?'}  {a['terminal']}  {hb}".rstrip())
         for av in a.get("entrega") or []:
             linhas.append(f"            AVISO: {av}")
