@@ -258,7 +258,7 @@ From firstmate (`docs/agent-control.md`, `bin/fm-control.sh`): the session id is
 
 `worker_done` from a resumed session carries the same `dispatchId` in its payload, which is how ingest matches it, so the changed handle does not matter to orq. When Orca itself refuses the message the worker leaves `relatorio-final.md`; orq does not read it yet.
 
-`orq gerente desligar` used to refuse after a crash because `gerente.json` named the old coordinator. It now takes over when that coordinator's terminal is gone. `orq gerente ligar` does the same, and keeps the old Run list when the old coordinator or manager is gone (with both alive, a new manager still restarts the list).
+`orq gerente desligar` used to refuse after a crash because `gerente.json` named the old coordinator. It now takes over when that coordinator's terminal is gone. `orq gerente ligar` does the same, and keeps the old Run list when the old coordinator or manager is gone (with both alive, a new manager still restarts the list unless `--assumir` is given; ticket 54).
 
 ## Plan usage budget and pause by priority (ticket 51)
 
@@ -274,6 +274,18 @@ Priority. Every task has a priority, 1 (high) to 3 (low): the last `orq priorida
 `orq pausar [--ate-prioridade N] [task…]`. Targets: named tasks/dispatches alone; else priority >= N; with no argument priority 3 plus workers whose last heartbeat phase is `investigating`. A worker in a final phase (`review`, `verif`, `final`) is spared in both automatic modes (listed as `preservados`). For each target: refuse if `turnos.json` has no session/cwd (no way back), `steer` the pause message (write `PAUSA.md` at the worktree root with where it stopped and the next step, stop any E2E, end the turn, no `worker_done`), wait up to `ORQ_PAUSA_ESPERA_S` (300) for a `PAUSA.md` newer than the one that existed, then `orca terminal close` and store the dispatch in `cursor.json` `pausados` (task, session, cwd, model, priority) with a `pausa_plano` event. No new file in time: terminal stays open (`sem_pausa_md`). The dispatch stays `dispatched` in Orca with a dead terminal; plain `orq retomar` skips it.
 
 `orq retomar --pausados` resumes those with `claude --resume` (same `_subir_sessao` as the crash recovery, message asking to read and delete `PAUSA.md`), highest priority first, and writes `retomada` plus `pausa_fim`. It refuses while usage is still at `pausa`/`segura` unless `--forcar`.
+
+## Dead manager, takeover and PR heads (ticket 54)
+
+Three bugs seen on 2026-09-30.
+
+**A manager terminal that disappears.** After a terminal switch the agent manager's terminal was gone and six `worker_done` sat in the inbox unannounced, because Orca routes the notices to the manager and nothing noticed it was missing. The coordinator's `prompt` hook now runs `checar_gerente_bg`: when the `gerente-vivo` stamp is older than `PAINEL_PARADO_S` (60 s) or missing, and the last check is also older than 60 s, it starts `orq gerente checar` detached. That command asks `orca terminal list` whether the `gerente.json` manager still exists and writes `{ts, terminal, morto}` to `gerente-checagem.json`. The hook never waits for Orca; `aviso_painel` only reads the file, so the one-line warning (`o terminal do agent manager (<handle>) sumiu do Orca ... Suba de novo com: orq gerente subir`) shows on the next prompt, in `orq status` and in `orq resumo`. A fresh stamp means no Orca call at all, and a stale one costs at most one call a minute. A list that failed or was truncated proves nothing and does not mark the manager dead. A dead file whose `terminal` is no longer the one in `gerente.json` is ignored.
+
+`orq gerente subir` replaces the by-hand recipe (move `gerente.json`, run `gerente ligar` per Run): it creates a terminal running `painel-agent-manager.sh` and rebinds every Run of `gerente.json` to it, taking the file over for this coordinator. It refuses while the old terminal is still listed (`--forcar` raises another anyway) and when Orca gave no reliable list.
+
+**`gerente ligar` and `desligar` after a switch.** With the old coordinator still listed in Orca, `ligar` dropped its Runs and `desligar` refused. `--assumir` on both makes this coordinator take the file: `ligar` keeps the old Run list and adds the new ones, `desligar` hands every Run back. Without the flag another live coordinator's file is left alone, as before.
+
+**`prligar` with several PRs from different branches.** A loop creating four PRs from two branches (`--head "$h"`) linked all four to the first branch. The hook now keeps a head only when it is sure: one literal `--head` for every URL (a loop over `--base`), one `--head` per URL in order, or the cwd's branch. A variable (`$h`) or a count that does not match leaves that URL without a head, and `orq pr auto <url> --cwd <dir>` asks `gh pr view <url> --json headRefName` (outside the hook, same 15 s ceiling as the poll) and finds the worktree of that branch from `<dir>`. If `gh` cannot answer, the PR lands in `sem_task` as before.
 
 ## Worker idle state
 
