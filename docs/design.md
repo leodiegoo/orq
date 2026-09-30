@@ -56,6 +56,10 @@ The model does the classifying. The code only checks that a classification was r
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
 | `fim_dispatch` | `orq liberar`: `dispatch`, `motivo` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
 | `pr` (`op: ligar/desligar/entrou/fechou/avisado`) | `orq pr`, the poll, the manager loop |
+| `worker_done` | ingest: `msg`, `task`, `dispatch`, `outcome`, `subject`, one per inbox message (no report needed) |
+| `ausente_ligar`, `ausente_desligar` | `orq ausente` |
+| `resposta_coordenador` | the coordinator's Stop hook while away mode is on: `texto`, `sessao` |
+| `fila` (`op: add/feito/rm`) | `orq fila` |
 | `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
 
@@ -336,6 +340,26 @@ A merge or close moves the item to its new state and appends an event `entrou` o
 `orq status` adds one line per feature: `PR task_abc: #1216 development ✓ · #1220 staging aberto`, plus the next step. The suggestion (`pr_proximo`) comes from the furthest merged base along development, staging, main: `pronto para staging`, `pronto para main`, or `em main` at the end. It is empty while a request of that feature is still open, or when only closed requests exist. orq never opens the next request; the line is a hint for the coordinator. A feature whose requests were all resolved more than 7 days ago leaves the status line. The per-prompt context never carries this list, only the open entry.
 
 Limits: a `merge/` request counts as entering its base environment, so its merge can hide that the feature's own request has not gone in. The panel's lap waits for its slowest `gh` call (15 s at most). `gh` is asked by URL, so a private repository needs the user's own `gh` login. The order development, staging, main is fixed in `AMBIENTES`.
+
+## Digest and away mode
+
+`orq digest [--desde ISO] [--html] [--abrir]` writes `ORQ_HOME/digest/atual.json`, the file the dashboard reads (contract: `orquestrador-plan/contratos/digest-v1.md`, version 1), replaced in one step, and prints its path plus a count line. `--html` also writes a page, `digest/<YYYY-MM-DD>.html` (self-contained, light and dark by the system, every outside string through `html.escape`). `--abrir` writes the page and opens it in an Orca tab (`orca tab create --url file://…`, in the worktree of the terminal that calls); if Orca does not answer, the paths are still printed and the exit code stays 0.
+
+The JSON has `fila`, `features`, `pendencias`, `linha` and `rodando`, plus `versao`, `geradoEm` and `ausente {ligado, desde}`:
+
+- `fila`: steps `{passo, nome, por, prs, feito}`. When the coordinator declared steps with `orq fila`, those are the list. With none declared, the order comes from the tickets' `Blocked by`: one step per feature (the task that has PRs linked), where a feature waits for the features of the tickets its own ticket depends on, directly or through a ticket in the middle that has no PR; without a ticket or a dependency the link order holds, and a cycle cannot block the page (link order, warning on the page). Each PR carries `numero`, `url`, `base`, `estado` (`OPEN`, `MERGED`, `CLOSED`, from the last poll) and `titulo` (from `gh` when the PR was linked, else `PR #N`), development before staging before main. `feito` is: marked with `orq fila feito`, or every PR of the step MERGED or CLOSED. In the derived list a step is done when it has PRs, none is open and nothing is left to promote (`pr_proximo` is empty or `em main`).
+- `features`: one group per task with linked PRs, in the merge order from the tickets: `{tag, nome, nota, prs}`. `nome` is the ticket title (the task id without a ticket); `tag` and `nota` come from `orq pr ligar --tag --nota` (null and empty when not given).
+- `pendencias`: the pending file items as they are, plus `depois` (true for those the summary hides in "Depois").
+- `linha`: empty unless away mode is on; then every event since it was turned on (or since `--desde`): worker deliveries and failures (`worker_done`: `ok` or `sec`), PRs that went in (`ok`) or were closed (`sec`), the coordinator's replies to workers and its own replies (`info`), and decisions (`ok`). At most 100, newest kept. The page always shows a window (away-mode start, else the user's last message, skipping the request that started the digest).
+- `rodando`: one item per live worker, `{titulo, estado, desde}`, the state in plain words (the phase it declared, `parado no prompt`, `esperando a sua resposta`…), with no task, Run or terminal id.
+
+`orq fila add --passo N --nome <name> --por <why> <PR>…` declares (or replaces) step N, refusing PR numbers that are not linked to a task with `orq pr ligar`; `feito N` marks it done by hand (valid even with an open PR); `rm N` drops it; `lista` prints each step with its PRs as the poll last saw them. The steps live in `fila.json` (`{passos}`, under `fila.lock`, tmp plus rename) and each change is logged as a `fila` event. A PR unlinked later disappears from its step.
+
+Everything is read from orq's own files (`events.jsonl`, `prs.json`, `fila.json`, the pending file, `aberto.json`, the tickets). No `gh`, no Orca call (except `--abrir`). PR state is whatever the last poll left in `prs.json`, and the page says when that was, or that no poll has run. `worker_done` exists in the log because ingest now writes one event per inbox message, once (`msg` is the dedup key); before, only messages with a `reportPath` left a trace.
+
+`orq ausente ligar` stores `ausente` in `cursor.json` and logs `ausente_ligar`; `desligar` clears it; `orq ausente` prints the state (with a warning when no manager is connected, since nobody then runs the PR poll). While it is on, `orq hook stop` of the coordinator records its reply as a `resposta_coordenador` event (`last_assistant_message` from the Stop input, else the last assistant text at the end of `transcript_path`) and calls `digest_gerar`, so each reply refreshes `atual.json`. It is fail-open: a failure goes to the log and the Stop goes on, including its unmatched-entry warning. The hook never runs `gh` or Orca for this; a worker's Stop never gets here. It stays on until `orq ausente desligar`.
+
+Limits: the file is only as fresh as the last PR poll (the manager loop or `orq pr poll`). PR numbers are taken as unique (one repository). Delivery warnings (`entrega`) are not in the digest. A feature with no ticket shows its task id. A reply of the coordinator that has no text (only tool calls) leaves no entry. `linha` turns empty the moment away mode is turned off, although the events stay in the log.
 
 ## Design decisions
 
