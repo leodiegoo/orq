@@ -8,8 +8,10 @@ import contextlib
 import fcntl
 import glob
 import hashlib
+import html
 import json
 import os
+import pathlib
 import re
 import shlex
 import signal
@@ -627,6 +629,14 @@ def _lim(itens, n, fmt):
     return [fmt(i) for i in itens[:n]] + ([f"+{len(itens) - n}"] if len(itens) > n else [])
 
 
+def ultima_do_usuario(events, agora):
+    """O carimbo da última mensagem do usuário, sem contar o pedido do próprio resumo ou digest (feito há menos de RESUMO_PEDIDO_S); "" sem nenhuma."""
+    users = [e["ts"] for e in events if e.get("tipo") == "entrada" and e.get("origem", "usuario") == "usuario" and e.get("ts")]
+    if users and 0 <= (agora - _dt(users[-1])).total_seconds() < RESUMO_PEDIDO_S:
+        users.pop()  # o hook de prompt grava o pedido antes de o comando rodar: a janela começa na mensagem anterior (M17)
+    return users[-1] if users else ""
+
+
 def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None, painel=None):
     """`orq resumo`: as quatro partes desde `desde` (padrão: a última mensagem do usuário, sem contar o pedido do próprio resumo) e as decisões, até ~20 linhas.
 
@@ -634,10 +644,7 @@ def resumo_quatro(events, aberto, pendencias, ts, desde=None, agora=None, painel
     Vem = tickets prontos (Blocked by todos resolvidos) e bloqueados. `ts` são os tickets já lidos.
     """
     agora = agora or datetime.now(timezone.utc)
-    users = [e["ts"] for e in events if e.get("tipo") == "entrada" and e.get("origem", "usuario") == "usuario" and e.get("ts")]
-    if users and 0 <= (agora - _dt(users[-1])).total_seconds() < RESUMO_PEDIDO_S:
-        users.pop()  # o hook de prompt grava o pedido do resumo antes de o `orq resumo` rodar: a janela começa na mensagem anterior (M17)
-    desde = desde or (users[-1] if users else "")
+    desde = desde or ultima_do_usuario(events, agora)
     na_janela = [e for e in events if (e.get("ts") or "") >= desde]
     efeito = {e["entrada"]: e for e in events if e.get("tipo") == "intake"}
     itens = [i for i in (pendencias or {}).get("itens", []) if not pend_depois(i, agora.astimezone().date())]
@@ -1435,6 +1442,13 @@ def _ingest_msg(m, desde, ja, titulos):
     return 0
 
 
+def _registra_worker_done(m):
+    """Um evento `worker_done` por mensagem: quem entregou, com que resultado e o assunto. É o que o digest lê, sem chamar o Orca."""
+    p = _payload(m)
+    append_event({"tipo": "worker_done", "msg": m["id"], "run": m.get("run_id"), "task": p.get("taskId"), "dispatch": p.get("dispatchId"),
+                  "outcome": p.get("outcome"), "subject": m.get("subject") or ""})
+
+
 def ingest_inbox():
     """worker_done novo com reportPath -> entrada relatorio_worker; scout sem reportPath -> alerta; o resto só no log.
 
@@ -1446,6 +1460,7 @@ def ingest_inbox():
     avancou, tent = ultimo, dict(ing.get("tentativas") or {})
     eventos = read_events()
     ja = {e.get("ref") for e in eventos if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in eventos if e.get("tipo") == "alerta"}
+    feitos = {e.get("msg") for e in eventos if e.get("tipo") == "worker_done"}  # o digest lê daqui o que cada worker entregou
     msgs = sorted((m for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m.get("sequence"), int)),
                   key=lambda m: m["sequence"])
     if ultimo and msgs and msgs[0]["sequence"] > ultimo + 1:
@@ -1454,6 +1469,9 @@ def ingest_inbox():
         if m["sequence"] <= ultimo:
             continue
         try:
+            if m.get("type") == "worker_done" and _dt(m["created_at"]) > desde and m["id"] not in feitos:
+                _registra_worker_done(m)
+                feitos.add(m["id"])
             novos += _ingest_msg(m, desde, ja, titulos)
         except _Transitorio as e:
             chave = f"msg:{m.get('id')}"
@@ -1703,7 +1721,7 @@ _ESTADO_PR = {"aberto": "aberto", "mergeado": "✓", "fechado": "fechado"}
 def _pr_estado(url):
     """{state, mergedAt, baseRefName} do PR pelo gh, ou None se o gh não existe, falha, demora ou não há rede."""
     try:
-        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName"], capture_output=True, text=True, timeout=PR_GH_S)
+        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName,title"], capture_output=True, text=True, timeout=PR_GH_S)
         d = json.loads(r.stdout) if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
@@ -1746,7 +1764,7 @@ def _seg_pr(i):
     return f"#{i.get('numero')} {i.get('base') or '?'} {_ESTADO_PR.get(i.get('estado'), i.get('estado'))}"
 
 
-def pr_ligar(task, url, issue=None):
+def pr_ligar(task, url, issue=None, tag=None, nota=None):
     """Liga um PR à task (a mesma feature tem um por ambiente). Consulta o gh uma vez, sem obrigar: sem resposta o PR entra `aberto` e sem base,
     e o poll completa. PR já mergeado ou fechado entra resolvido e avisado: quem o liga já sabe. Não confere a task no Orca (sem rede aqui)."""
     if not re.fullmatch(r"task_\w+", task or ""):
@@ -1762,7 +1780,8 @@ def pr_ligar(task, url, issue=None):
         estado = _estado_do_gh(visto) or "aberto"
         item = {"task": task, "url": url, "numero": int(url.rsplit("/", 1)[1]), "base": visto.get("baseRefName"), "estado": estado,
                 "ligado_em": now(), "avisado": estado != "aberto", **({"resolvido_em": now()} if estado != "aberto" else {}),
-                **({"issue": int(issue)} if issue else {})}
+                **({"issue": int(issue)} if issue else {}), **({"titulo": visto["title"]} if visto.get("title") else {}),
+                **({"tag": tag} if tag else {}), **({"nota": nota} if nota else {})}
         d["itens"].append(item)
         append_event({"tipo": "pr", "op": "ligar", "task": task, "url": url, "numero": item["numero"], "base": item["base"], "estado": estado,
                       **({"issue": item["issue"]} if issue else {})})
@@ -1788,6 +1807,11 @@ def pr_lista(task=None):
             for i in _prs_ro()["itens"] if not task or i["task"] == task]
 
 
+def _pr_antigo(itens, agora):
+    """Todos os PRs da feature resolvidos há mais de PR_VISIVEL_D dias: ela sai do `orq status` e do digest."""
+    return all(i["estado"] != "aberto" and i.get("resolvido_em") and (agora - _dt(i["resolvido_em"])).days > PR_VISIVEL_D for i in itens)
+
+
 def linhas_pr(agora=None):
     """Uma linha por feature para o `orq status`: os PRs com o ambiente de cada um e a sugestão do próximo. Feature com tudo resolvido há
     mais de PR_VISIVEL_D dias sai. Só lê o prs.json."""
@@ -1797,7 +1821,7 @@ def linhas_pr(agora=None):
         por_task.setdefault(i["task"], []).append(i)
     linhas = []
     for task, itens in por_task.items():
-        if all(i["estado"] != "aberto" and i.get("resolvido_em") and (agora - _dt(i["resolvido_em"])).days > PR_VISIVEL_D for i in itens):
+        if _pr_antigo(itens, agora):
             continue
         prox = pr_proximo(itens)
         linhas.append(f"PR {task}: " + " · ".join(_seg_pr(i) for i in itens) + (f" → {prox}" if prox else ""))
@@ -1881,6 +1905,351 @@ def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
     txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
     return "\n".join([txt, *linhas_noite(cur, events)])
+
+
+# ---------- digest e modo ausente ----------
+
+DIGEST = "digest"  # ORQ_HOME/digest/<AAAA-MM-DD>.html: um arquivo por dia, sempre no mesmo lugar
+DIGEST_LINHAS = 100  # entradas de `linha`; as mais antigas ficam só no log (a página diz "+N antes")
+FILA = "fila.json"  # {passos: [{passo, nome, por, prs: [números], feito}]}: a ordem de merge que o coordenador declara com `orq fila`
+ESTADO_GH = {"aberto": "OPEN", "mergeado": "MERGED", "fechado": "CLOSED"}  # o estado do PR no contrato do digest
+TRANSCRITO_FIM = 400_000  # bytes do fim do transcrito onde o Stop procura a última resposta do coordenador
+RESPOSTA_MAX = 4000  # caracteres da resposta do coordenador que vão para o log
+DIGEST_BASE = {"development": "d", "staging": "s", "main": "p"}  # a cor do ponto de cada ambiente
+DIGEST_ESTADO = {"MERGED": ("m", "merged"), "CLOSED": ("x", "fechado"), "OPEN": ("o", "aberto")}
+DIGEST_CSS = """:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e4e4e0;--dev:#2f6fdb;--stg:#b7791f;--ok:#2e8b57;--warn:#c2410c;--sec:#b91c1c;--chip:#f0efeb}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1d1d20;--ink:#ededed;--mute:#9a9aa2;--line:#2c2c31;--chip:#26262b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 10px}.sub{color:var(--mute);margin:0 0 8px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}
+.card h3{margin:0 0 6px;font-size:15px}.card p{margin:6px 0 0;color:var(--mute);font-size:13.5px}.card.dec{border-left:4px solid var(--warn)}
+.prs{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.pr{display:inline-flex;align-items:center;gap:6px;text-decoration:none;color:var(--ink);background:var(--chip);border-radius:999px;padding:3px 10px;font-size:13px;border:1px solid var(--line)}
+.pr em{font-style:normal;font-size:11px;color:var(--mute)}.pr.m{opacity:.6}.pr.m em{color:var(--ok)}
+.dot{width:8px;height:8px;border-radius:50%}.d{background:var(--dev)}.s{background:var(--stg)}.p{background:var(--ok)}
+.legend{font-size:12.5px;color:var(--mute);display:flex;gap:12px;align-items:center;flex-wrap:wrap}.legend .dot{display:inline-block}
+.fila{list-style:none;padding:0;margin:0;display:grid;gap:10px}.fila li{display:flex;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
+.fila li>div{min-width:0}.fila .num{flex:0 0 28px;height:28px;border-radius:50%;background:var(--ink);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
+.fila li.feito{opacity:.5}.fila li.feito .num{background:var(--ok)}.fila p{margin:2px 0 0;color:var(--mute);font-size:13.5px}.fila .aviso{color:var(--warn)}
+ol.tl{list-style:none;padding:0;margin:0;border-left:2px solid var(--line)}
+ol.tl li{position:relative;padding:0 0 14px 18px}ol.tl li::before{content:"";position:absolute;left:-7px;top:6px;width:12px;height:12px;border-radius:50%;background:var(--card);border:2px solid var(--mute)}
+ol.tl li.sec::before{border-color:var(--sec)}ol.tl li.fo::before{border-color:var(--dev)}ol.tl li.ok::before{border-color:var(--ok)}ol.tl li.warn::before{border-color:var(--warn)}
+ol.tl b{font-weight:600}ol.tl p{margin:2px 0 0;color:var(--mute);font-size:13.5px;overflow-wrap:anywhere}
+.run{display:flex;gap:8px;flex-wrap:wrap}.run span{background:var(--chip);border-radius:8px;padding:6px 10px;font-size:13px}
+code{font-size:12.5px;background:var(--chip);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}"""
+
+
+def _passo_feito(itens):
+    """A feature acabou: tem PR, nenhum está aberto e não falta promover (entrou em main, ou só restam PRs fechados)."""
+    return bool(itens) and all(i["estado"] != "aberto" for i in itens) and pr_proximo(itens) in (None, "em main")
+
+
+def ordem_de_merge(grupos, ts):
+    """Os grupos de PR (`{task, ligado_em, itens}`, um por feature) na ordem em que devem entrar, pelos `Blocked by` dos tickets.
+
+    A feature do ticket N espera as features dos tickets de que N depende, direta ou por outro ticket (o ticket do meio pode nem ter PR).
+    Sem dependência declarada, ou sem ticket, vale a ordem de ligação. Cada grupo volta com `espera` (as tasks de que depende) e, em ciclo
+    ou atrás de um, `ciclo`: o resto sai na ordem de ligação em vez de travar a página."""
+    por_num = {t["num"]: t for t in ts}
+    num_da_task = {t["task"]: t["num"] for t in ts if t.get("task")}
+
+    def ancestrais(num):
+        vistos, pilha = set(), list(_dict(por_num.get(num)).get("blocked_by") or [])
+        while pilha:
+            n = pilha.pop()
+            if n not in vistos:
+                vistos.add(n)
+                pilha += _dict(por_num.get(n)).get("blocked_by") or []
+        return vistos
+
+    deps = {}
+    for g in grupos:
+        acima = ancestrais(num_da_task[g["task"]]) if g["task"] in num_da_task else set()
+        deps[g["task"]] = {h["task"] for h in grupos if h["task"] != g["task"] and num_da_task.get(h["task"]) in acima}
+    falta = sorted(grupos, key=lambda g: (g.get("ligado_em") or "", g["task"]))
+    ordem, postas = [], set()
+    while falta:
+        g = next((g for g in falta if deps[g["task"]] <= postas), None)
+        if g is None:
+            ordem += [{**x, "espera": sorted(deps[x["task"]]), "ciclo": True} for x in falta]
+            break
+        falta.remove(g)
+        ordem.append({**g, "espera": sorted(deps[g["task"]]), "ciclo": False})
+        postas.add(g["task"])
+    return ordem
+
+
+def _pr_contrato(i):
+    """O PR como o contrato do digest (contratos/digest-v1.md) o pede: estado em caixa alta e o título, ou `PR #N` se o gh nunca o deu."""
+    return {"numero": i.get("numero"), "url": i["url"], "base": i.get("base"), "estado": ESTADO_GH.get(i["estado"], "OPEN"),
+            "titulo": i.get("titulo") or f"PR #{i.get('numero')}"}
+
+
+def _fila_ro():
+    d = _dict(_read_json(_path(FILA)))
+    return {"passos": [p for p in d.get("passos") or [] if isinstance(p, dict) and isinstance(p.get("passo"), int)]}
+
+
+def _mutar_fila(fn):
+    """Lê o fila.json, aplica fn(dados) e grava com tmp + rename, sob o fila.lock. Só o coordenador escreve (`orq fila`)."""
+    with _trava("fila.lock"):
+        d = _fila_ro()
+        out = fn(d)
+        d["passos"].sort(key=lambda p: p["passo"])
+        _write_json(_path(FILA), d, indent=2)
+    return out
+
+
+def fila_add(passo, nome, por, numeros):
+    """Declara (ou troca) o passo `passo` da ordem de merge: nome, por quê e os PRs, que já precisam estar ligados (`orq pr ligar`)."""
+    if passo < 1 or not numeros:
+        raise ValueError("passo pede um número a partir de 1 e ao menos um PR")
+    ligados = {i.get("numero") for i in _prs_ro()["itens"]}
+    faltam = [n for n in numeros if n not in ligados]
+    if faltam:
+        raise ValueError(f"PR {', '.join('#' + str(n) for n in faltam)} não está ligado a nenhuma task (orq pr ligar <task> <url>)")
+
+    def grava(d):
+        d["passos"] = [p for p in d["passos"] if p["passo"] != passo] + [{"passo": passo, "nome": nome, "por": por, "prs": list(dict.fromkeys(numeros)), "feito": False}]
+        append_event({"tipo": "fila", "op": "add", "passo": passo, "nome": nome, "prs": numeros})
+        return d["passos"][-1]
+
+    return _mutar_fila(grava)
+
+
+def fila_marca(passo, op):
+    """`feito` marca o passo como feito à mão (vale mesmo com PR aberto); `rm` tira o passo da fila."""
+    def muda(d):
+        achado = next((p for p in d["passos"] if p["passo"] == passo), None)
+        if not achado:
+            raise ValueError(f"o passo {passo} não existe na fila (orq fila lista)")
+        if op == "rm":
+            d["passos"].remove(achado)
+        else:
+            achado["feito"] = True
+        append_event({"tipo": "fila", "op": op, "passo": passo})
+
+    _mutar_fila(muda)
+
+
+def fila_lista():
+    """Linhas de `orq fila lista`: o passo, o nome, se está feito e cada PR com o estado que o poll guardou."""
+    return [f"{p['passo']}  {p['nome']}  [{'feito' if p['feito'] else 'a fazer'}]  " + ", ".join(f"#{i['numero']} {i['estado'].lower()}" for i in p["prs"]) + (f"  — {p['por']}" if p["por"] else "")
+            for p in _passos_declarados(_fila_ro(), _prs_ro())]
+
+
+def _passos_declarados(fila, prs):
+    """Os passos de `orq fila` no formato do contrato, com o estado de cada PR vindo do prs.json. `feito` = marcado à mão, ou PRs que sobraram
+    todos MERGED ou CLOSED (PR desligado depois some do passo)."""
+    por_num = {i.get("numero"): i for i in prs.get("itens") or []}
+    out = []
+    for p in fila["passos"]:
+        itens = [_pr_contrato(por_num[n]) for n in p.get("prs") or [] if n in por_num]
+        out.append({"passo": p["passo"], "nome": p.get("nome") or "", "por": p.get("por") or "", "prs": itens,
+                    "feito": bool(p.get("feito")) or (bool(itens) and all(i["estado"] != "OPEN" for i in itens))})
+    return out
+
+
+def _estado_de_gente(a):
+    """O estado de um worker vivo em texto de gente: a fase que ele declarou, ou o estado sem o jargão do orq."""
+    if a["estado"] == "rodando":
+        return a.get("fase") or "rodando"
+    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou"}.get(a["estado"], a["estado"])
+
+
+def _linha_do_log(e, titulo):
+    """Uma entrada de `linha` do contrato a partir de um evento do log, ou None se o evento não conta. tipo: ok, sec (falha), info."""
+    tipo = e.get("tipo")
+    if tipo == "worker_done":
+        ok = e.get("outcome") == "succeeded"
+        return {"tipo": "ok" if ok else "sec", "titulo": ("Worker entregou" if ok else "Worker falhou") + f": {_cita(e.get('subject'), 100)}",
+                "detalhe": titulo.get(e.get("task")) or ""}
+    if tipo == "pr" and e.get("op") in ("entrou", "fechou"):
+        entrou = e["op"] == "entrou"
+        return {"tipo": "ok" if entrou else "sec", "titulo": f"PR #{e.get('numero')} " + (f"entrou em {e.get('base')}" if entrou else "fechado sem merge"),
+                "detalhe": titulo.get(e.get("task")) or ""}
+    if tipo == "resposta_coordenador" and e.get("texto"):
+        return {"tipo": "info", "titulo": _cita(e["texto"].strip().splitlines()[0], 90), "detalhe": e["texto"]}
+    if tipo == "resposta_worker" and e.get("texto"):
+        return {"tipo": "info", "titulo": "Coordenador respondeu a um worker", "detalhe": e["texto"]}
+    if tipo in ("resposta", "resposta_lavish") and e.get("resposta"):
+        return {"tipo": "ok", "titulo": f"Decisão: {e.get('header') or e.get('item') or ''}", "detalhe": e["resposta"]}
+    if tipo == "pend" and e.get("op") == "done" and e.get("resposta"):
+        return {"tipo": "ok", "titulo": f"Pendência {e.get('pend')} fechada", "detalhe": e["resposta"]}
+    return None
+
+
+def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None):
+    """O digest como dados no formato do contrato (contratos/digest-v1.md) mais o que só a página usa. Só arquivos do orq: nada de gh nem de Orca.
+
+    fila = a ordem que o coordenador declarou (`orq fila`); sem nenhum passo declarado, sai da ordem pelos `Blocked by` dos tickets, um passo por
+    feature. features = um grupo por task com PR ligado. linha = o que aconteceu desde `desde` (a página a mostra sempre; o arquivo do
+    contrato só a leva com o modo ausente ligado)."""
+    por_task = {t["task"]: t for t in ts if t.get("task")}
+    por_task_prs = {}
+    for i in prs.get("itens") or []:
+        por_task_prs.setdefault(i["task"], []).append(i)
+    grupos = [{"task": task, "ligado_em": min(i.get("ligado_em") or "" for i in itens),
+               "itens": sorted(itens, key=lambda i: (AMBIENTES.index(i["base"]) if i.get("base") in AMBIENTES else len(AMBIENTES), i.get("numero") or 0))}
+              for task, itens in por_task_prs.items() if not _pr_antigo(itens, agora)]
+    titulo = {g["task"]: _dict(por_task.get(g["task"])).get("titulo") or g["task"] for g in grupos}
+    feito = {g["task"]: _passo_feito(g["itens"]) for g in grupos}
+    ordem = ordem_de_merge(grupos, ts)
+    derivada = [{"passo": n, "nome": titulo[g["task"]], "por": (f"Espera: {', '.join(titulo[t] for t in g['espera'] if not feito[t])}." if [t for t in g["espera"] if not feito[t]] else ""),
+                 "prs": [_pr_contrato(i) for i in g["itens"]], "feito": feito[g["task"]], "ticket": _dict(por_task.get(g["task"])).get("num"),
+                 "proximo": None if feito[g["task"]] else pr_proximo(g["itens"]), "ciclo": g["ciclo"]} for n, g in enumerate(ordem, 1)]
+    declarada = _passos_declarados(fila, prs)
+    features = []
+    for g in ordem:
+        ext = [i for i in g["itens"] if i.get("tag") or i.get("nota")]
+        features.append({"tag": next((i["tag"] for i in ext if i.get("tag")), None), "nome": titulo[g["task"]],
+                         "nota": next((i["nota"] for i in ext if i.get("nota")), ""), "prs": [_pr_contrato(i) for i in g["itens"]]})
+    hoje = agora.astimezone().date()
+    pend = [{**i, "depois": bool(pend_depois(i, hoje))} for i in _dict(pendencias).get("itens", []) if isinstance(i, dict)]
+    rodando = [{"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde")}
+               for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA]
+    linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
+    return {"versao": 1, "geradoEm": agora.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(ausente), "desde": _dict(ausente).get("ligada_em")},
+            "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando,
+            "pagina": {"data": agora.astimezone().strftime("%Y-%m-%d"), "gerado": agora.astimezone().strftime("%H:%M"), "desde": desde, "poll": prs.get("ultimo_poll"),
+                       "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada)}}
+
+
+def digest_json(d):
+    """O que vai para o atual.json: as chaves do contrato, cada passo só com as dele, e `linha` vazia com o modo ausente desligado."""
+    return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
+            "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito")} for p in d["fila"]],
+            "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"]}
+
+
+def html_digest(d):
+    """A página do digest (um arquivo só, com o CSS dentro e claro/escuro pelo sistema). Todo texto de fora passa por html.escape."""
+    e, pg = html.escape, d["pagina"]
+
+    def chip(i):
+        cls, nome = DIGEST_ESTADO.get(i["estado"], ("o", i["estado"]))
+        return (f'<a class="pr {cls}" href="{e(i["url"])}" title="{e(i.get("base") or "base ainda desconhecida")}">'
+                f'<span class="dot {DIGEST_BASE.get(i.get("base"), "d")}"></span>#{e(str(i.get("numero")))}<em>{nome}</em></a>')
+
+    passos = []
+    for g in d["fila"]:
+        notas = ([f"Ticket {g['ticket']}."] if g.get("ticket") else []) + ([g["por"]] if g["por"] else []) + ([f"Próximo: {g['proximo']}."] if g.get("proximo") else [])
+        aviso = '<p class="aviso">Dependência circular nos tickets: a ordem é a de ligação.</p>' if g.get("ciclo") else ""
+        passos.append(f'<li class="{"feito" if g["feito"] else ""}"><span class="num">{"✓" if g["feito"] else g["passo"]}</span><div><b>{e(g["nome"])}</b>'
+                      f'<p>{e(" ".join(notas))}</p>{aviso}<div class="prs">{"".join(chip(i) for i in g["prs"])}</div></div></li>')
+    fila = f'<ol class="fila">{"".join(passos)}</ol>' if passos else '<p class="sub">Nenhum PR ligado: nada para mergear.</p>'
+    origem_ = "Ordem declarada com `orq fila`." if pg["declarada"] else "Pelos Blocked by dos tickets, já que nenhum passo foi declarado com `orq fila`."
+    pend = "".join(f'<div class="card dec"><h3>{e(str(p.get("titulo") or p.get("id")))}</h3><p>{e(str(p.get("tipo") or ""))} · <code>{e(str(p.get("id") or ""))}</code>'
+                   f'{" · Depois" if p["depois"] else ""}</p></div>' for p in d["pendencias"])
+    rod = "".join(f'<span>{e(r["titulo"])} [{e(r["estado"])}]</span>' for r in d["rodando"])
+    linha = "".join(f'<li class="{ {"sec": "sec", "info": "fo"}.get(x["tipo"], "ok") }"><b>{e(x["titulo"])}</b><p>{_hora_local(x["ts"])} {e(x["detalhe"])}</p></li>' for x in d["linha"])
+    antes = f'<p class="sub">+{pg["linha_antes"]} antes destes.</p>' if pg["linha_antes"] else ""
+    poll = (f"O estado dos PRs é do poll das {datetime.fromtimestamp(pg['poll']).strftime('%H:%M')}; esta página não consulta o GitHub."
+            if isinstance(pg.get("poll"), (int, float)) else "O estado dos PRs ainda não foi lido por nenhum poll (`orq pr poll`); esta página não consulta o GitHub.")
+    desde = f"Desde as {_hora_local(pg['desde'])}." if pg["desde"] else "Desde o início do log."
+    return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Digest {e(pg["data"])}</title><style>{DIGEST_CSS}</style></head><body><main>'
+            f'<h1>O que espera você</h1><p class="sub">{e(pg["data"])}. {e(desde)} Gerado às {e(pg["gerado"])}. {e(poll)}</p>'
+            '<div class="legend"><span><span class="dot d"></span> development</span><span><span class="dot s"></span> staging</span>'
+            '<span><span class="dot p"></span> main</span></div>'
+            f'<h2>Ordem de merge</h2><p class="sub">{e(origem_)} Dentro de cada passo, development antes de staging.</p>'
+            f'{fila}<h2>Com você</h2>{f"<div class=grid>{pend}</div>" if pend else "<p class=sub>Nada esperando por você.</p>"}'
+            f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}'
+            f'<h1 style="margin-top:36px">O que aconteceu</h1>{antes}'
+            f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}</main></body></html>')
+
+
+def digest_gerar(agora=None, desde=None, com_html=False):
+    """Monta o digest dos arquivos locais e grava ORQ_HOME/digest/atual.json (o contrato que o painel lê) e, com `com_html`, digest/<data>.html.
+    Cada arquivo é trocado de uma vez. Devolve (dados, caminho do json, caminho do html ou None).
+
+    A janela de `linha` e da página: `desde`, senão o momento em que o modo ausente ligou, senão a última mensagem do usuário. Sem rede: o
+    estado dos PRs é o que o poll (`orq pr poll`, o painel do gerente) deixou no prs.json."""
+    agora = agora or datetime.now(timezone.utc)
+    events, ausente = read_events(), _dict(_cursor_ro().get("ausente")) or None
+    janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
+    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente)
+    os.makedirs(_path(DIGEST), exist_ok=True)
+    _write_json(_path(os.path.join(DIGEST, "atual.json")), digest_json(d), indent=2)
+    pagina = None
+    if com_html:
+        pagina = _path(os.path.join(DIGEST, d["pagina"]["data"] + ".html"))
+        _escrever(pagina, html_digest(d))
+    return d, _path(os.path.join(DIGEST, "atual.json")), pagina
+
+
+def digest_abrir(caminho):
+    """Abre a página do digest numa aba do Orca (`orca tab create --url file://…`, na worktree do terminal que chama)."""
+    orca("create", "--url", pathlib.Path(caminho).as_uri(), area="tab", timeout=10)
+
+
+def ausente_ligar():
+    """Liga o modo ausente: o Stop do coordenador atualiza o digest a cada resposta (`hook_stop`). Devolve o estado gravado."""
+    estado_ = {"ligada_em": now()}
+    _cursor_mut(lambda c: c.__setitem__("ausente", estado_))
+    append_event({"tipo": "ausente_ligar"})
+    return estado_
+
+
+def ausente_desligar():
+    """Desliga o modo ausente; devolve se estava ligado."""
+    ligado = bool(_dict(_cursor_ro().get("ausente")))
+    _cursor_mut(lambda c: c.pop("ausente", None))
+    if ligado:
+        append_event({"tipo": "ausente_desligar"})
+    return ligado
+
+
+def linhas_ausente(cur):
+    """O estado do modo ausente para `orq ausente`: uma linha, mais o aviso de que ninguém roda o poll dos PRs sem o gerente."""
+    a = _dict(_dict(cur).get("ausente"))
+    if not a:
+        return ["modo ausente desligado"]
+    return [f"modo ausente ligado desde {_hora_local(a.get('ligada_em'))}: o Stop de cada resposta atualiza {_path(os.path.join(DIGEST, 'atual.json'))}",
+            *([] if _gerente_cfg() else ["aviso: sem agent manager ligado ninguém roda o poll dos PRs; rode `orq pr poll` (o Stop não chama o gh)"])]
+
+
+def _ultima_resposta(ev):
+    """O texto da última resposta do coordenador: `last_assistant_message` do Stop, senão o fim do transcrito (`transcript_path`); "" sem nenhum."""
+    texto = ev.get("last_assistant_message")
+    if isinstance(texto, str) and texto.strip():
+        return texto
+    try:
+        with open(ev["transcript_path"], "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - TRANSCRITO_FIM))
+            linhas = f.read().decode("utf-8", "replace").splitlines()
+    except (KeyError, OSError, TypeError):
+        return ""
+    for linha in reversed(linhas):
+        try:
+            m = json.loads(linha)
+        except ValueError:
+            continue
+        if isinstance(m, dict) and m.get("type") == "assistant":
+            partes = _dict(m.get("message")).get("content")
+            textos = [c.get("text", "") for c in partes if isinstance(c, dict) and c.get("type") == "text"] if isinstance(partes, list) else []
+            if "".join(textos).strip():
+                return "\n".join(textos)
+    return ""
+
+
+def digest_no_stop(ev):
+    """No Stop do coordenador, com o modo ausente ligado: grava a resposta como evento `resposta_coordenador` e atualiza o digest. Fail-open: a
+    falha vai para o log e o Stop segue."""
+    if not _dict(_cursor_ro().get("ausente")):
+        return
+    try:
+        texto = _ultima_resposta(ev)
+        if texto:
+            append_event({"tipo": "resposta_coordenador", "texto": texto[:RESPOSTA_MAX], "sessao": (ev.get("session_id") or "")[:8]})
+        digest_gerar()
+    except TimeoutError:
+        raise  # o teto de 3 s do hook vale para o hook inteiro
+    except Exception as e:  # noqa: BLE001
+        log(f"digest: {type(e).__name__}: {e}")
 
 
 # ---------- modo noite: orçamento e disjuntor ----------
@@ -2362,6 +2731,7 @@ def hook_prompt(ev, run):
 
 def hook_stop(ev, run):
     # modo aviso (fatia 1): nunca bloqueia; a fatia 5 troca o systemMessage por decision=block com stop_hook_active
+    digest_no_stop(ev)
     sem = abertas(read_events())
     if not sem:
         return None
@@ -4038,11 +4408,28 @@ def main(argv=None):
     pl2.add_argument("task")
     pl2.add_argument("url")
     pl2.add_argument("--issue", type=int, help="número da issue do GitHub, quando houver")
+    pl2.add_argument("--tag", help="a etiqueta da feature no digest (segurança, failover, …)")
+    pl2.add_argument("--nota", help="o que o PR faz, em uma ou duas frases, para o digest")
     pr.add_parser("lista").add_argument("--task")
     pd2 = pr.add_parser("desligar")
     pd2.add_argument("task")
     pd2.add_argument("url")
     pr.add_parser("poll", help="pergunta ao gh pelos PRs abertos; merge ou fechamento vira uma entrada, uma vez").add_argument("--forcar", action="store_true", help="ignora o intervalo mínimo")
+    dg = sub.add_parser("digest", help="grava digest/atual.json (o contrato do painel): fila de merge, features, pendências, o que aconteceu e workers vivos")
+    dg.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez do momento em que o modo ausente ligou ou da última mensagem do usuário")
+    dg.add_argument("--html", action="store_true", help="grava também a página digest/<data>.html")
+    dg.add_argument("--abrir", action="store_true", help="grava a página e a abre numa aba do Orca")
+    fi = sub.add_parser("fila", help="a ordem de merge que o coordenador declara: add, feito, rm, lista").add_subparsers(dest="op", required=True)
+    fa = fi.add_parser("add", help="orq fila add --passo N --nome <nome> --por <por quê> <PR>…: declara (ou troca) o passo; os PRs já precisam estar ligados")
+    fa.add_argument("--passo", type=int, required=True)
+    fa.add_argument("--nome", required=True)
+    fa.add_argument("--por", required=True)
+    fa.add_argument("prs", nargs="+", type=int, help="números dos PRs do passo")
+    fi.add_parser("feito", help="marca o passo como feito à mão").add_argument("passo", type=int)
+    fi.add_parser("rm", help="tira o passo da fila").add_argument("passo", type=int)
+    fi.add_parser("lista")
+    au = sub.add_parser("ausente", help="modo ausente: orq ausente ligar | desligar | (sem op: estado); o Stop de cada resposta atualiza o digest")
+    au.add_argument("op", nargs="?", choices=["ligar", "desligar"])
     sub.add_parser("steers", help="reentrega o aviso dos ajustes que o worker parado não leu e grava o alerta na terceira falha (o painel do gerente já faz)")
     rp = sub.add_parser("responder", help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
     rp.add_argument("msg_id")
@@ -4133,7 +4520,7 @@ def main(argv=None):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
         elif a.cmd == "pr":
             if a.op == "ligar":
-                print(json.dumps(pr_ligar(a.task, a.url, a.issue), ensure_ascii=False))
+                print(json.dumps(pr_ligar(a.task, a.url, a.issue, a.tag, a.nota), ensure_ascii=False))
             elif a.op == "desligar":
                 pr_desligar(a.task, a.url)
                 print(f"PR desligado de {a.task}")
@@ -4175,6 +4562,30 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd == "digest":
+            d, arq, pagina = digest_gerar(desde=_dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ") if a.desde else None, com_html=a.html or a.abrir)
+            print("\n".join(x for x in (arq, pagina) if x))
+            print(f"{sum(i['estado'] == 'OPEN' for g in d['fila'] for i in g['prs'])} PR(s) aberto(s), {len(d['pendencias'])} pendência(s), "
+                  f"{len(d['rodando'])} rodando, {len(d['linha']) + d['pagina']['linha_antes']} no que aconteceu")
+            if a.abrir:
+                try:
+                    digest_abrir(pagina)
+                except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
+                    print(f"aviso: a aba não abriu ({e}); abra {pagina}", file=sys.stderr)
+        elif a.cmd == "fila":
+            if a.op == "add":
+                print(json.dumps(fila_add(a.passo, a.nome, a.por, a.prs), ensure_ascii=False))
+            elif a.op in ("feito", "rm"):
+                fila_marca(a.passo, a.op)
+                print(f"passo {a.passo}: {'marcado feito' if a.op == 'feito' else 'tirado da fila'}")
+            else:
+                print("\n".join(fila_lista()) or "nenhum passo declarado")
+        elif a.cmd == "ausente":
+            if a.op == "ligar":
+                ausente_ligar()
+            elif a.op == "desligar":
+                ausente_desligar()
+            print("\n".join(linhas_ausente(_cursor_ro())))
         elif a.cmd == "noite":
             if a.op == "ligar":
                 noite_ligar(a.ate, a.max_despachos, a.max_falhas)
