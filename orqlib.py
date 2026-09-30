@@ -81,6 +81,7 @@ RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do 
 ANDA = ("rodando", "perguntando", "travado", "parado", "nao_comecou")  # estados que aparecem em "Anda" do `orq resumo`
 PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
 PAINEL_PARADO_S = 60
+PAINEL_CHECAGEM = "gerente-checagem.json"  # {ts, terminal, morto}: o que o último `orq gerente checar` (fora do hook) viu no Orca; o hook só o lê
 GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
 RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
 RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
@@ -586,10 +587,37 @@ def aviso_painel(agora=None):
     try:
         idade = (agora or time.time()) - os.path.getmtime(_path(PAINEL_VIVO))
     except OSError:
-        return f"painel do agent manager sem carimbo ({PAINEL_VIVO}): ele não subiu ou roda o script antigo; nenhum aviso de worker chega enquanto isso"
-    if idade <= PAINEL_PARADO_S:
+        idade = None
+    if idade is not None and idade <= PAINEL_PARADO_S:
         return None
+    ck = _dict(_read_json(_path(PAINEL_CHECAGEM)))
+    if ck.get("morto") and ck.get("terminal") == g.get("gerente"):
+        return (f"o terminal do agent manager ({g['gerente']}) sumiu do Orca: nenhum aviso de worker chega e os worker_done ficam na caixa. "
+                "Suba de novo com: orq gerente subir")
+    if idade is None:
+        return f"painel do agent manager sem carimbo ({PAINEL_VIVO}): ele não subiu ou roda o script antigo; nenhum aviso de worker chega enquanto isso"
     return f"painel do agent manager parado há {int(idade // 60)} min: nenhum aviso de worker chega; reinicie painel-agent-manager.sh no terminal dele"
+
+
+def checar_gerente_bg(agora=None):
+    """No prompt do coordenador: carimbo `gerente-vivo` velho (ou ausente) e a última checagem com mais de PAINEL_PARADO_S, pede ao Orca em segundo plano
+    se o terminal do gerente ainda existe (`orq gerente checar`). O hook não espera o Orca: o aviso sai no prompt seguinte, pelo aviso_painel."""
+    g = _gerente_cfg()
+    if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return
+    agora = agora or time.time()
+    try:
+        if agora - os.path.getmtime(_path(PAINEL_VIVO)) <= PAINEL_PARADO_S:
+            return
+    except OSError:
+        pass
+    try:
+        if agora - os.path.getmtime(_path(PAINEL_CHECAGEM)) <= PAINEL_PARADO_S:
+            return
+    except OSError:
+        _write_json(_path(PAINEL_CHECAGEM), {"ts": agora, "terminal": g["gerente"], "morto": False})
+    os.utime(_path(PAINEL_CHECAGEM), (agora, agora))  # marca a checagem já: prompts seguidos não disparam outra
+    _orq_cli("gerente", "checar")
 
 
 def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turnos=None, painel=None):
@@ -3039,6 +3067,7 @@ def hook_prompt(ev, run):
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             **({"com_aviso": True} if com_aviso else {})}, novo_id=True)
+    checar_gerente_bg()
     ctx = estado(entrada)
     refresh_bg()
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
@@ -4772,6 +4801,39 @@ def gerente_ligar(terminal, runs=None, assumir=False):
     return append_event({"tipo": "gerente", "op": "ligar", "terminal": terminal, "run": runs[-1], "runs": todos})
 
 
+def gerente_checar():
+    """Fora do hook: o terminal do gerente do gerente.json ainda está no `orca terminal list`? Grava o achado em PAINEL_CHECAGEM. Sem lista
+    confiável (Orca falhou ou cortou) não prova nada: não está morto."""
+    g = _gerente_cfg()
+    if not g:
+        return None
+    vivos = _terminais_vivos()
+    ck = {"ts": time.time(), "terminal": g["gerente"], "morto": vivos is not None and g["gerente"] not in vivos}
+    _write_json(_path(PAINEL_CHECAGEM), ck)
+    return ck
+
+
+def gerente_subir(forcar=False):
+    """O terminal do agent manager sumiu: cria outro com o painel-agent-manager.sh e religa a ele todos os Runs do gerente.json (este coordenador
+    assume o arquivo). Recusa com o terminal antigo ainda no Orca, a não ser com `forcar`."""
+    g = _gerente_cfg()
+    if not g:
+        raise ValueError("sem gerente.json: nada a subir (use `orq gerente ligar`)")
+    vivos = _terminais_vivos()
+    if not forcar:
+        if vivos is None:
+            raise ValueError("o Orca não listou os terminais: sem prova de que o agent manager morreu, nada foi feito (--forcar sobe assim mesmo)")
+        if g["gerente"] in vivos:
+            raise ValueError(f"o terminal {g['gerente']} ainda existe no Orca: se o painel parou, reinicie painel-agent-manager.sh nele (--forcar sobe outro)")
+    novo = _terminal_novo("agent manager", f"sh {shlex.quote(_path('painel-agent-manager.sh'))}")
+    ev = gerente_ligar(novo, g["runs"], assumir=True)
+    try:
+        os.remove(_path(PAINEL_CHECAGEM))
+    except OSError:
+        pass
+    return {**ev, "terminal": novo, "runs": g["runs"]}
+
+
 def gerente_desligar(run=None, assumir=False):
     """Devolve ao terminal do coordenador (`run-use` com o handle próprio) o Run `run`, ou todos, e tira do gerente.json.
 
@@ -5433,6 +5495,9 @@ def main(argv=None):
     gd = ge.add_parser("desligar", help="no coordenador: devolve um Run (--run) ou todos a este terminal")
     gd.add_argument("--run")
     gd.add_argument("--assumir", action="store_true", help="desliga também o gerente.json de outro coordenador que ainda aparece no Orca")
+    ge.add_parser("checar", help="confere no Orca se o terminal do agent manager ainda existe (o prompt do coordenador chama, em segundo plano)")
+    gs = ge.add_parser("subir", help="no coordenador: o terminal do agent manager sumiu; cria outro com o painel e religa todos os Runs do gerente.json")
+    gs.add_argument("--forcar", action="store_true", help="sobe mesmo com o terminal antigo ainda no Orca")
     ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
     rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
     rt.add_argument("--dry-run", action="store_true", help="só lista")
@@ -5580,6 +5645,10 @@ def main(argv=None):
                 print(json.dumps(gerente_ligar(a.terminal, a.run, a.assumir), ensure_ascii=False))
             elif a.op == "desligar":
                 print(json.dumps(gerente_desligar(a.run, a.assumir), ensure_ascii=False))
+            elif a.op == "checar":
+                print(json.dumps(gerente_checar(), ensure_ascii=False))
+            elif a.op == "subir":
+                print(json.dumps(gerente_subir(a.forcar), ensure_ascii=False))
             else:
                 print(gerente_absorver())
         elif a.cmd == "retomar" and a.pausados:

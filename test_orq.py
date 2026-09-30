@@ -6346,6 +6346,7 @@ def _painel_tocado(a, segundos_atras=None):
 def test_review8_m19_painel_parado_aparece_no_prompt_no_status_e_no_resumo():
     a = Amb(run="run_a")
     _gerente(a)
+    a.set("terminals.json", ["term_coord", "term_ger"])  # o terminal do gerente existe: só o painel parou
     for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
         assert "painel do agent manager sem carimbo" in saida, saida
     _painel_tocado(a, 200)
@@ -7902,6 +7903,74 @@ def test_it_should_take_over_the_manager_of_another_live_coordinator_when_asked_
     assert r.returncode == 0, r.stderr
     assert not os.path.exists(os.path.join(a.home, "gerente.json"))
     assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
+
+
+# ---------- ticket 54: gerente morto avisado no prompt e religado por `orq gerente subir` ----------
+
+def _listas_de_terminais(a):
+    return [c for c in _log(a, "calls.log") if c[:2] == ["list", "--limit"] or c[:1] == ["list"]]
+
+
+def _contexto(a):
+    return json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_it_should_warn_on_the_prompt_when_the_manager_terminal_is_gone_and_say_how_to_raise_it():
+    a = Amb(run="run_a")
+    _gerente(a)
+    a.set("terminals.json", ["term_coord"])  # o terminal do gerente sumiu do Orca
+    _painel_tocado(a, 200)
+    _contexto(a)  # a primeira checagem roda fora do hook
+    ctx = _contexto(a)
+    assert "sumiu" in ctx and "term_ger" in ctx and "orq gerente subir" in ctx, ctx
+
+
+def test_it_should_not_ask_the_orca_while_the_manager_stamp_is_fresh_nor_more_than_once_a_minute():
+    a = Amb(run="run_a")
+    _gerente(a)
+    a.set("terminals.json", ["term_coord"])
+    _painel_tocado(a, 20)
+    for _ in range(3):
+        assert "sumiu" not in _contexto(a)
+    assert not _listas_de_terminais(a), "carimbo fresco: nada de Orca a cada prompt"
+    _painel_tocado(a, 200)
+    for _ in range(3):
+        _contexto(a)
+    assert len(_listas_de_terminais(a)) == 1, _listas_de_terminais(a)
+
+
+def test_it_should_keep_the_old_stopped_message_when_the_terminal_exists_but_the_panel_stopped():
+    a = Amb(run="run_a")
+    _gerente(a)
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _painel_tocado(a, 200)
+    _contexto(a)
+    ctx = _contexto(a)
+    assert "parado há 3 min" in ctx and "sumiu" not in ctx, ctx
+
+
+def test_it_should_raise_a_new_manager_terminal_and_rebind_every_run_of_the_gerente_json():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    os.makedirs(a.home, exist_ok=True)
+    a.set("terminals.json", ["term_coord"])
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    r = a.orq("gerente", "subir")
+    assert r.returncode == 0, r.stderr
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}", c
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a", "run_b"]}
+    assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
+    assert "sumiu" not in _contexto(a), "depois de subir o aviso some"
+
+
+def test_it_should_refuse_to_raise_the_manager_while_its_terminal_still_exists():
+    a = Amb(run="run_a")
+    _gerente(a)
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    r = a.orq("gerente", "subir")
+    assert r.returncode == 1 and "ainda existe" in r.stderr and not _log(a, "create.log"), r
+    assert a.orq("gerente", "subir", "--forcar").returncode == 0
+    assert a.orq("gerente", "subir", "--forcar", ORQ_HOME=os.path.join(a.tmp.name, "vazio")).returncode == 1, "sem gerente.json não há o que subir"
 
 
 # ---------- ticket 54: prligar com PRs de branches diferentes ----------
