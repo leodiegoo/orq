@@ -2622,13 +2622,25 @@ def responder(msg_id, texto):
                          "resposta_id": (res.get("message") or res).get("id")})
 
 
+PEDIDO_TITULO = "## Pedido do usuário"
+
+
+def _texto_da_entrada(entrada):
+    """Texto literal da entrada no events.jsonl (o hook grava até 2000 caracteres), ou None sem `entrada`. ValueError se não existe."""
+    if not entrada:
+        return None
+    x = next((x for x in read_events() if x.get("id") == entrada and x.get("tipo") == "entrada"), None)
+    if not x:
+        raise ValueError(f"entrada {entrada} não existe")
+    return x.get("texto") or ""
+
+
 def steer(task, texto, run=None, entrada=None):
     """Manda `texto` ao dispatch da task (send --to dispatch:<id>) e registra.
 
     Recusa task que não está dispatched, entrada inexistente e Run que não é o ligado ao coordenador (o send daria consumer_fenced).
     """
-    if entrada and not any(x.get("id") == entrada and x.get("tipo") == "entrada" for x in read_events()):
-        raise ValueError(f"entrada {entrada} não existe")
+    pedido = _texto_da_entrada(entrada)
     alvo = run_padrao(run)
     if not alvo:
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
@@ -2641,7 +2653,8 @@ def steer(task, texto, run=None, entrada=None):
     if t.get("status") != "dispatched" or not t.get("dispatch_id"):
         raise ValueError(f"task {task} está {t.get('status')}, não dispatched: sem worker para receber o ajuste")
     try:
-        res = orca("send", "--run", alvo, "--to", f"dispatch:{t['dispatch_id']}", "--subject", "Ajuste", "--body", texto,
+        res = orca("send", "--run", alvo, "--to", f"dispatch:{t['dispatch_id']}", "--subject", "Ajuste",
+                   "--body", texto if pedido is None else f"{texto}\n\n{PEDIDO_TITULO} (acréscimo)\n{pedido}",
                    "--priority", "high", timeout=10)
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
@@ -2652,7 +2665,7 @@ def steer(task, texto, run=None, entrada=None):
     handle = _terminal_do_dispatch(alvo, t["dispatch_id"])
     entrega = "orca" if _orca_avisou(msg.get("id")) else digita(handle, _aviso_worker(handle)) if handle else "sem_terminal"
     ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": alvo, "texto": texto, "msg_id": msg.get("id"),
-                       **({"aviso_terminal": entrega} if entrega != "ocupado" else {})})
+                       **({"pedido": pedido} if pedido is not None else {}), **({"aviso_terminal": entrega} if entrega != "ocupado" else {})})
     if entrada:
         intake(entrada, "steer", task, run=alvo)
     return ev
@@ -3331,13 +3344,16 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 spec = f.read()
         except OSError as e:
             raise ValueError(f"não consegui ler {spec_arquivo}: {e.strerror}")
-    if entrada and not any(x.get("id") == entrada and x.get("tipo") == "entrada" for x in read_events()):
-        raise ValueError(f"entrada {entrada} não existe")
+    pedido = _texto_da_entrada(entrada)
     _adotar(run)
     if not run_do_coordenador(run):
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
     if spec is not None and not spec.lstrip().startswith("#"):
         spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
+    if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
+        cabeca, _, resto = spec.partition("\n")
+        spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
+                f"{resto.lstrip(chr(10))}")
     ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
     args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
             "--agent", "claude", "--model", modelo, "--effort", effort]

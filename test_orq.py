@@ -1141,7 +1141,7 @@ def test_steer_manda_o_send_e_grava_o_evento_e_o_intake():
     r = a.orq("steer", "task_rodando", "use o índice novo", "--entrada", "e1")
     assert r.returncode == 0, r.stderr
     assert _enviados(a) == [["send", "--run", "run_a", "--to", "dispatch:ctx_1", "--subject", "Ajuste",
-                             "--body", "use o índice novo", "--priority", "high", "--json"]]
+                             "--body", "use o índice novo\n\n## Pedido do usuário (acréscimo)\najusta o worker", "--priority", "high", "--json"]]
     ev = [e for e in a.events() if e["tipo"] == "steer"]
     assert len(ev) == 1 and (ev[0]["task"], ev[0]["dispatch"], ev[0]["run"], ev[0]["texto"], ev[0]["msg_id"]) == \
         ("task_rodando", "ctx_1", "run_a", "use o índice novo", "msg_9")
@@ -3479,6 +3479,31 @@ def test_despachar_com_entrada_liga_o_intake_na_task_nova():
     (i,) = [e for e in a.events() if e["tipo"] == "intake"]
     assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "tarefa", "task_novo1", "run_a"), i
     assert json.loads(r.stdout)["entrada"] == "e1"
+
+
+def test_despachar_com_entrada_poe_o_pedido_literal_no_topo_do_spec():
+    a = Amb(run="run_a")
+    a.prompt("cria o ticket 05, com \"aspas\" e acento")
+    _despachar(a, "--entrada", "e1", spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
+    (arg,) = _log(a, "started.log")
+    spec = arg[arg.index("--spec") + 1]
+    assert spec == ('# Ticket 05\n\n## Pedido do usuário\ncria o ticket 05, com "aspas" e acento\n\n'
+                    'O que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\nFaça X.\n'), spec
+
+
+def test_despachar_sem_entrada_nao_muda_o_spec():
+    a = Amb(run="run_a")
+    _despachar(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n"
+
+
+def test_despachar_entrada_com_spec_sem_titulo_poe_o_pedido_depois_do_titulo_que_o_orq_acrescenta():
+    a = Amb(run="run_a")
+    a.prompt("pedido")
+    _despachar(a, "--entrada", "e1", spec=_spec(a, "Faça X.\n"))
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--spec") + 1].startswith("# Ticket 05\n\n## Pedido do usuário\npedido\n"), arg
 
 
 def test_despachar_entrada_inexistente_nao_despacha():
