@@ -6594,6 +6594,202 @@ def test_despachar_fora_da_noite_nao_mexe_no_ambiente():
     assert _log(a, "started-env.log")[0]["GIT_CONFIG_COUNT"] is None
     assert "ambiente" not in [e for e in a.events() if e["tipo"] == "despacho"][0]
 
+
+# ---------- cartão da manhã e motivo de parada por dispatch (ticket 40) ----------
+
+T0 = "2026-09-30T02:00:00Z"
+
+
+def _ev(ts, tipo, **k):
+    return {"ts": f"2026-09-30T{ts}Z", "tipo": tipo, **k}
+
+
+def _noite_log(*extra, desligar="09:00:00", volta="08:58:00"):
+    """Uma noite de 02:00 a 09:00 UTC com um despacho por motivo de parada; `extra` entra no fim do log (o log fica ordenado por ts)."""
+    evs = [_ev("02:00:00", "noite_ligar", ate="2026-09-30T09:00:00Z")]
+    motivos = [("d1", "entregue"), ("d2", "falhou"), ("d3", "parou: orçamento"), ("d4", "parou: decisão pendente"), ("d5", "parou: limite de uso"), ("d6", "sem worker_done")]
+    for i, (d, m) in enumerate(motivos):
+        evs.append(_ev(f"02:1{i}:00", "despacho", dispatch=d, task="t_" + d, run="run_a", titulo="Frente " + d))
+        evs.append(_ev(f"03:1{i}:00", "fim_dispatch", dispatch=d, task="t_" + d, run="run_a", motivo=m, sujo=0, sem_push=0, caminho="/wt/" + d))
+    evs += list(extra)
+    if desligar:
+        evs.append(_ev(desligar, "noite_desligar"))
+    cur = {"noite": {"ate": "2026-09-30T09:00:00Z", "ligada_em": T0}, "gerente_volta": f"2026-09-30T{volta}Z"} if not desligar else {"gerente_volta": f"2026-09-30T{volta}Z"}
+    return sorted(evs, key=lambda e: e["ts"]), cur
+
+
+def _cartao(evs, cur, agora="2026-09-30T09:05:00Z", **k):
+    return orq_mod.cartao_noite(evs, cur, {"itens": []}, orq_mod._dt(agora), **k)
+
+
+def test_cartao_cada_motivo_de_parada_aparece_no_dispatch():
+    evs, cur = _noite_log(_ev("05:00:00", "heartbeat_absorvido"), _ev("06:00:00", "heartbeat_absorvido"), _ev("07:00:00", "heartbeat_absorvido"), _ev("08:00:00", "heartbeat_absorvido"))
+    txt = "\n".join(_cartao(evs, cur))
+    for d, m in (("d1", "entregue"), ("d2", "falhou"), ("d3", "parou: orçamento"), ("d4", "parou: decisão pendente"), ("d5", "parou: limite de uso"), ("d6", "sem worker_done")):
+        assert any(f"Frente {d}" in l and l.rstrip().endswith(m) for l in txt.splitlines()), (d, m, txt)
+
+
+def test_cartao_worktree_suja_e_commit_sem_push_com_os_comandos_para_colar():
+    evs, cur = _noite_log(_ev("08:00:00", "heartbeat_absorvido"))
+    for e in evs:
+        if e.get("dispatch") == "d2" and e["tipo"] == "fim_dispatch":
+            e.update(sujo=3)
+        if e.get("dispatch") == "d3" and e["tipo"] == "fim_dispatch":
+            e.update(sem_push=2)
+    linhas = _cartao(evs, cur)
+    txt = "\n".join(linhas)
+    assert "Worktrees sujas (1)" in txt and "Frente d2: 3 arquivos" in txt, txt
+    assert "Sem push (1)" in txt and "Frente d3: 2 commits" in txt, txt
+    assert "git -C /wt/d2 status --short" in txt and "git -C /wt/d3 log --oneline origin/main..HEAD" in txt, txt
+    assert "/wt/d1" not in txt, "worktree limpa e sem commit pendente não vira comando"
+
+
+def test_cartao_vivo_pega_o_estado_das_worktrees_dos_dispatches_sem_fim():
+    evs, cur = _noite_log()
+    evs.append(_ev("04:00:00", "despacho", dispatch="d7", task="t_d7", run="run_a", titulo="Frente d7"))
+    vivos = {"d7": {"caminho": "/wt/d7", "sujo": 2, "sem_push": 0}}
+    txt = "\n".join(_cartao(sorted(evs, key=lambda e: e["ts"]), cur, vivos=vivos))
+    assert any("Frente d7" in l and l.rstrip().endswith("rodando") for l in txt.splitlines()), txt
+    assert "Frente d7: 2 arquivos" in txt and "git -C /wt/d7 status --short" in txt, txt
+
+
+def test_cartao_lacuna_maior_que_10_min_no_log():
+    evs, cur = _noite_log()
+    txt = "\n".join(_cartao(evs, cur))
+    assert "a máquina pode ter dormido às " + _hora_de("2026-09-30T03:15:00Z") in txt, txt
+    evs2, cur2 = _noite_log(*[_ev(f"{h:02d}:{m:02d}:00", "heartbeat_absorvido") for h in range(2, 9) for m in range(0, 60, 5) if (h, m) >= (2, 20)])
+    assert "dormido" not in "\n".join(_cartao(evs2, cur2)), "passos de 5 min não são lacuna"
+
+
+def test_cartao_gerente_vivo_ou_parado():
+    evs, cur = _noite_log(_ev("08:59:00", "heartbeat_absorvido"))
+    assert "Gerente: vivo" in "\n".join(_cartao(evs, cur))
+    evs, cur = _noite_log(volta="05:30:00")
+    assert f"Gerente: parou às {_hora_de('2026-09-30T05:30:00Z')}" in "\n".join(_cartao(evs, cur))
+    evs, cur = _noite_log()
+    cur.pop("gerente_volta")
+    assert "Gerente: sem rodada" in "\n".join(_cartao(evs, cur))
+
+
+def test_cartao_decisoes_estacionadas_e_parada_do_orcamento():
+    evs, cur = _noite_log(_ev("04:00:00", "pend", op="add", pend="freio-x"), _ev("04:05:00", "pend", op="add", pend="freio-y"), _ev("06:00:00", "pend", op="done", pend="freio-y"),
+                          _ev("07:00:00", "noite_parou", motivo="teto de 6 despachos da noite"))
+    txt = "\n".join(orq_mod.cartao_noite(evs, cur, {"itens": [{"id": "freio-x", "tipo": "decisao", "titulo": "Liberar o freio?"}]}, orq_mod._dt("2026-09-30T09:05:00Z")))
+    assert "Decisões estacionadas (1)" in txt and "freio-x" in txt and "freio-y" not in txt, txt
+    assert "Parou de despachar às " + _hora_de("2026-09-30T07:00:00Z") + ": teto de 6 despachos da noite" in txt, txt
+
+
+def test_cartao_cabe_em_40_linhas_com_muitos_dispatches():
+    evs, cur = _noite_log()
+    for i in range(30):
+        d = f"x{i:02d}"
+        evs.append(_ev("04:00:00", "despacho", dispatch=d, task="t_" + d, run="run_a", titulo="Frente " + d))
+        evs.append(_ev("04:30:00", "fim_dispatch", dispatch=d, task="t_" + d, run="run_a", motivo="entregue", sujo=1, sem_push=1, caminho="/wt/" + d))
+    evs.sort(key=lambda e: e["ts"])
+    linhas = _cartao(evs, cur)
+    assert len(linhas) <= 40, len(linhas)
+    assert "+" in "\n".join(linhas), "o que não coube vira +N"
+
+
+def test_cartao_sem_noite_no_log_diz_que_nao_houve():
+    assert _cartao([_ev("01:00:00", "entrada")], {}) == ["Nenhuma noite no log: rode orq noite ligar --ate HH:MM"]
+
+
+def test_cartao_primeira_linha_no_session_start_so_ate_12_h_depois_do_fim():
+    evs, cur = _noite_log()
+    linha = orq_mod.cartao_primeira_linha(evs, orq_mod._dt("2026-09-30T10:00:00Z"))
+    assert linha and "6 despachos" in linha and "1 entregue" in linha and "orq resumo --noite" in linha, linha
+    assert orq_mod.cartao_primeira_linha(evs, orq_mod._dt("2026-09-30T21:01:00Z")) is None, "12 h depois do fim o cartão sai do SessionStart"
+    assert orq_mod.cartao_primeira_linha([], orq_mod._dt("2026-09-30T10:00:00Z")) is None
+
+
+def _fim(a):
+    return [e for e in a.events() if e["tipo"] == "fim_dispatch"]
+
+
+def test_liberar_grava_fim_dispatch_entregue_e_falhou():
+    a = Amb(run="run_a")
+    _lib_env(a, worktree="/tmp/nao-existe")
+    a.set("inbox.json", {"ok": True, "result": {"messages": [{"id": "m1", "run_id": "run_a", "sequence": 1, "type": "worker_done", "subject": "s", "created_at": "2026-09-30T02:00:00Z",
+                                                            "payload": json.dumps({"dispatchId": "ctx_term_w1", "taskId": "task_w1", "outcome": "succeeded"})}]}})
+    assert a.orq("liberar", "ctx_term_w1").returncode == 0
+    (f,) = _fim(a)
+    assert (f["dispatch"], f["task"], f["run"], f["motivo"]) == ("ctx_term_w1", "task_w1", "run_a", "entregue"), f
+    b = Amb(run="run_a")
+    _lib_env(b)
+    b.set("inbox.json", {"ok": True, "result": {"messages": [{"id": "m1", "run_id": "run_a", "sequence": 1, "type": "worker_done", "subject": "s", "created_at": "2026-09-30T02:00:00Z",
+                                                            "payload": json.dumps({"dispatchId": "ctx_term_w1", "taskId": "task_w1", "outcome": "failed"})}]}})
+    assert b.orq("liberar", "ctx_term_w1").returncode == 0
+    assert _fim(b)[0]["motivo"] == "falhou"
+
+
+def test_liberar_sem_worker_done_grava_sem_worker_done_e_o_estado_da_worktree(tmp_path=None):
+    a = Amb(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt")
+    subprocess.run(["git", "init", "-q", wt], check=True)
+    open(os.path.join(wt, "sujo.txt"), "w").write("x")
+    _lib_env(a, worktree=wt)
+    a.set("inbox.json", {"ok": True, "result": {"messages": []}})
+    assert a.orq("liberar", "ctx_term_w1").returncode == 0
+    (f,) = _fim(a)
+    assert f["motivo"] == "sem worker_done" and f["sujo"] == 1 and f["caminho"] == wt and f["sem_push"] == 0, f
+
+
+def test_liberar_inbox_indisponivel_nao_inventa_motivo():
+    a = Amb(run="run_a")
+    _lib_env(a)
+    r = a.orq("liberar", "ctx_term_w1", FAKE_FAIL="inbox")
+    assert r.returncode == 0, r.stderr
+    (f,) = _fim(a)
+    assert f["motivo"] == "motivo desconhecido", f
+
+
+def test_encerrar_com_parada_marca_o_motivo_no_fim_dispatch():
+    a = Amb(run="run_a")
+    a.set("workers.json", [{"handle": "term_w2", "run": "run_a", "task": "task_w2", "status": "dispatched"}])
+    a.set("terminals.json", ["term_w2", "term_coord"])
+    a.set("inbox.json", {"ok": True, "result": {"messages": []}})
+    r = a.orq("encerrar", "ctx_term_w2", "--motivo", "acabou o orçamento", "--parada", "orcamento")
+    assert r.returncode == 0, r.stderr
+    (f,) = _fim(a)
+    assert f["motivo"] == "parou: orçamento", f
+    assert a.orq("encerrar", "ctx_term_w2", "--motivo", "x", "--parada", "sono").returncode != 0
+
+
+def test_resumo_noite_imprime_o_cartao_e_status_nao_muda():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    evs, cur = _noite_log()
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.writelines(json.dumps(e) + "\n" for e in evs)
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    r = a.orq("resumo", "--noite")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("[orq noite] Cartão da manhã") and "Frente d3" in r.stdout and len(r.stdout.splitlines()) <= 40, r.stdout
+    assert "Cartão da manhã" not in a.orq("resumo").stdout
+
+
+def test_session_start_injeta_so_a_primeira_linha_do_cartao_quando_a_noite_acabou_ha_pouco():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    agora = datetime.now(timezone.utc)
+    fim = (agora - __import__("datetime").timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ini = (agora - __import__("datetime").timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    evs = [{"ts": ini, "tipo": "noite_ligar", "ate": fim}, {"ts": ini, "tipo": "despacho", "dispatch": "d1", "task": "t1", "run": "run_a", "titulo": "Frente"},
+           {"ts": fim, "tipo": "fim_dispatch", "dispatch": "d1", "task": "t1", "run": "run_a", "motivo": "entregue"}, {"ts": fim, "tipo": "noite_desligar"}]
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.writelines(json.dumps(e) + "\n" for e in evs)
+    ctx = json.loads(a.orq("hook", "session", stdin=json.dumps({"session_id": "abcdef123456"})).stdout)["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("Cartão da manhã") == 1 and "orq resumo --noite" in ctx and "Despachos (" not in ctx, ctx
+
+
+def test_gerente_absorver_carimba_a_rodada_no_cursor():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _gerente(a)
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert json.load(open(os.path.join(a.home, "cursor.json")))["gerente_volta"] >= "2026"
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

@@ -1797,6 +1797,125 @@ def noite_desligar():
     return ligado
 
 
+# ---- modo noite: motivo de parada por dispatch e cartão da manhã ----
+
+GERENTE_VIVO_S = 300  # a última rodada do absorver até 5 min antes do fim da noite conta como gerente vivo
+LACUNA_S = 600  # log sem evento por mais que isso: a máquina pode ter dormido
+CARTAO_LINHAS = 40
+CARTAO_SESSAO_H = 12  # o SessionStart injeta a primeira linha do cartão até 12 h depois do fim da noite
+PARADAS = {"orcamento": "parou: orçamento", "decisao": "parou: decisão pendente", "limite": "parou: limite de uso"}  # orq encerrar --parada
+
+
+def fim_motivo(dispatch, events, msgs):
+    """O estado final nomeado do dispatch que o `liberar` grava: entregue, falhou, parou: <orçamento|decisão pendente|limite de uso> (o `encerrar --parada`),
+    sem worker_done. `msgs` é o inbox; None (o Orca não respondeu) dá "motivo desconhecido" em vez de chutar "sem worker_done"."""
+    if msgs is None:
+        return "motivo desconhecido"
+    done = next((_payload(m) for m in msgs if m.get("type") == "worker_done" and _payload(m).get("dispatchId") == dispatch), None)
+    if done:
+        return "entregue" if done.get("outcome") == "succeeded" else "falhou"
+    enc = next((e for e in reversed(events) if e.get("tipo") == "controle" and e.get("acao") == "encerrar" and e.get("dispatch") == dispatch and e.get("parada")), None)
+    return PARADAS.get(enc["parada"], "sem worker_done") if enc else "sem worker_done"
+
+
+def estado_worktree(caminho):
+    """{caminho, sujo (arquivos com mudança não commitada), sem_push (commits fora do origin/main)}; o que o git não disser fica de fora."""
+    if not caminho or not os.path.isdir(caminho):
+        return {"caminho": caminho} if caminho else {}
+    sujo, n = _git(caminho, "status", "--porcelain"), _git(caminho, "rev-list", "--count", "origin/main..HEAD")
+    return {"caminho": caminho, **({"sujo": len(sujo.splitlines())} if sujo is not None else {}), "sem_push": int(n) if n and n.strip().isdigit() else 0}
+
+
+def _janela_noite(events):
+    """(evento noite_ligar mais recente, ts do noite_desligar seguinte ou None). Sem noite no log: (None, None)."""
+    lig = next((e for e in reversed(events) if e.get("tipo") == "noite_ligar"), None)
+    if not lig:
+        return None, None
+    return lig, next((e["ts"] for e in events if e.get("tipo") == "noite_desligar" and (e.get("ts") or "") >= lig["ts"]), None)
+
+
+def _fim_da_noite(lig, des):
+    return _dt(des or lig["ate"])
+
+
+def cartao_noite(events, cur, pend, agora, vivos=None):
+    """O cartão da manhã (até CARTAO_LINHAS linhas): função pura do log da última noite. `vivos` = {dispatch: estado_worktree} dos dispatches ainda sem fim_dispatch."""
+    lig, des = _janela_noite(events)
+    if not lig:
+        return ["Nenhuma noite no log: rode orq noite ligar --ate HH:MM"]
+    vivos = vivos or {}
+    ini, terminou = lig["ts"], bool(des) or _dt(lig["ate"]) <= agora
+    fim = min(_fim_da_noite(lig, des), agora)
+    fim_s = fim.strftime("%Y-%m-%dT%H:%M:%SZ")
+    na = [e for e in events if (e.get("ts") or "") >= ini]
+    fins = {e["dispatch"]: e for e in na if e.get("tipo") == "fim_dispatch"}
+    desp = [e for e in na if e.get("tipo") == "despacho"]
+    ls = [f"[orq noite] Cartão da manhã: {_hora_local(ini)} a {_hora_local(fim_s)}, {len(desp)} despacho{'s' if len(desp) != 1 else ''}."]
+    linha = lambda d: f"{_cita(d.get('titulo') or d['dispatch'], 36)}: {fins[d['dispatch']]['motivo'] if d['dispatch'] in fins else 'rodando'}"
+    ls += [f"Despachos ({len(desp)}):", *("  " + x for x in _lim(desp, 8, linha))] if desp else ["Despachos: nenhum"]
+    parou = next((e for e in reversed(na) if e.get("tipo") == "noite_parou"), None)
+    if parou:
+        ls.append(f"Parou de despachar às {_hora_local(parou['ts'])}: {parou['motivo']}.")
+    estados = [(d, {**vivos.get(d["dispatch"], {}), **fins.get(d["dispatch"], {})}) for d in desp]
+    sujas = [(_cita(d.get("titulo") or d["dispatch"], 30), w) for d, w in estados if (w.get("sujo") or 0) > 0]
+    sem_push = [(_cita(d.get("titulo") or d["dispatch"], 30), w) for d, w in estados if (w.get("sem_push") or 0) > 0]
+    if sujas:
+        ls += [f"Worktrees sujas ({len(sujas)}):", *("  " + x for x in _lim(sujas, 3, lambda t: f"{t[0]}: {t[1]['sujo']} arquivo{'s' if t[1]['sujo'] != 1 else ''} ({t[1].get('caminho') or '?'})"))]
+    if sem_push:
+        ls += [f"Sem push ({len(sem_push)}):", *("  " + x for x in _lim(sem_push, 3, lambda t: f"{t[0]}: {t[1]['sem_push']} commit{'s' if t[1]['sem_push'] != 1 else ''} ({t[1].get('caminho') or '?'})"))]
+    ids = {e["pend"] for e in na if e.get("tipo") == "pend" and e.get("op") == "add"}
+    dec = [i for i in (pend or {}).get("itens", []) if i.get("id") in ids and i.get("tipo") == "decisao"]
+    if dec:
+        ls += [f"Decisões estacionadas ({len(dec)}):", *("  " + x for x in _lim(dec, 3, lambda i: f"{i['id']}  {_cita(i.get('titulo'), 50)}"))]
+    volta = (cur or {}).get("gerente_volta")
+    ls.append("Gerente: sem rodada do absorver na noite" if not volta or volta < ini else
+              f"Gerente: vivo (última rodada {_hora_local(volta)})" if (fim - _dt(volta)).total_seconds() <= GERENTE_VIVO_S else
+              f"Gerente: parou às {_hora_local(volta)} (a noite foi até {_hora_local(fim_s)})")
+    marcas = [ini, *(e["ts"] for e in na if e.get("ts") and e["ts"] <= fim_s), *([fim_s] if terminou else [])]
+    lacunas = sorted(((_dt(b) - _dt(a)).total_seconds(), a, b) for a, b in zip(marcas, marcas[1:]))
+    lacunas = [x for x in lacunas if x[0] > LACUNA_S]
+    if lacunas:
+        seg, a, b = lacunas[-1]
+        ls.append(f"Lacuna: sem evento no log de {_hora_local(a)} a {_hora_local(b)} ({int(seg // 60)} min): a máquina pode ter dormido às {_hora_local(a)}."
+                  + (f" +{len(lacunas) - 1} lacuna{'s' if len(lacunas) > 2 else ''} menor{'es' if len(lacunas) > 2 else ''}." if len(lacunas) > 1 else ""))
+    cmds = [f"git -C {w['caminho']} status --short" for _, w in sujas if w.get("caminho")] + [f"git -C {w['caminho']} log --oneline origin/main..HEAD" for _, w in sem_push if w.get("caminho")]
+    if cmds:
+        ls += ["Para colar:", *("  " + x for x in _lim(cmds, 6, lambda c: c))]
+    return ls[:CARTAO_LINHAS]
+
+
+def cartao_primeira_linha(events, agora):
+    """A linha do cartão que o SessionStart injeta: só com a noite terminada (desligada ou vencida) há menos de CARTAO_SESSAO_H h, senão None."""
+    lig, des = _janela_noite(events)
+    if not lig:
+        return None
+    fim = _fim_da_noite(lig, des)
+    if fim > agora or agora - fim > timedelta(hours=CARTAO_SESSAO_H):
+        return None
+    fins = {e["dispatch"]: e["motivo"] for e in events if e.get("tipo") == "fim_dispatch"}
+    desp = [e["dispatch"] for e in events if e.get("tipo") == "despacho" and (e.get("ts") or "") >= lig["ts"]]
+    cont = {}
+    for d in desp:
+        m = fins.get(d, "rodando")
+        cont[m] = cont.get(m, 0) + 1
+    return (f"[orq noite] Cartão da manhã: a noite acabou às {_hora_local(des or lig['ate'])}, {len(desp)} despacho{'s' if len(desp) != 1 else ''}"
+            f"{' (' + ', '.join(f'{n} {m}' for m, n in cont.items()) + ')' if cont else ''}; orq resumo --noite tem o resto.")
+
+
+def cartao_manha(agora=None):
+    """`orq resumo --noite`: o cartão do log e, para os dispatches ainda sem fim_dispatch, a worktree vista agora (worker-show; o que falhar fica de fora)."""
+    events, agora = read_events(), agora or datetime.now(timezone.utc)
+    lig, _ = _janela_noite(events)
+    fins = {e.get("dispatch") for e in events if e.get("tipo") == "fim_dispatch"}
+    vivos = {}
+    for e in [e for e in events if lig and e.get("tipo") == "despacho" and e["ts"] >= lig["ts"] and e.get("dispatch") not in fins][:10]:
+        try:
+            vivos[e["dispatch"]] = estado_worktree(_checkpoint(e["dispatch"]).get("caminho"))
+        except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as x:
+            log(f"cartão: worker-show {e['dispatch']}: {x}")
+    return "\n".join(cartao_noite(events, _cursor_ro(), _read_json(PEND), agora, vivos))
+
+
 # ---- modo noite: ações externas e ambiente do worker ----
 
 NOITE_GIT_CONFIG = ("commit.gpgsign", "false")  # sem assinatura: o pinentry não tem quem responda de madrugada
@@ -2848,7 +2967,10 @@ def ticket_fechar(numero, answer):
 def contexto_sessao():
     """O que uma sessão nova do coordenador lê ao começar: o `orq status` (até 5 linhas), os tickets abertos e o caminho do mapa, em até
     LINHAS_SESSAO linhas. Tickets que não cabem viram `+N abertos`."""
-    linhas = estado().splitlines()[:LINHAS_SESSAO - 2]
+    cartao = cartao_primeira_linha(read_events(), datetime.now(timezone.utc))
+    linhas = estado().splitlines()[:LINHAS_SESSAO - 2 - bool(cartao)]
+    if cartao:
+        linhas.append(cartao)
     abertos = [t for t in tickets() if t["status"] != STATUS_FECHADO]
     sobra = LINHAS_SESSAO - len(linhas) - 1  # a linha do mapa fica reservada
     if not abertos:
@@ -3125,6 +3247,21 @@ def _pode_fechar(handle, run_id, dispatch):
     return False, f"o Orca o reteve como {motivo or res.get('ownershipState') or 'desconhecido'}, não é só do worker", False
 
 
+def _fim_do_dispatch(dispatch, w):
+    """Os campos do evento `fim_dispatch`: o motivo (inbox e log) e a worktree como está agora (worker-show; sem ela, só o motivo)."""
+    try:
+        msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:
+        log(f"liberar: inbox falhou ({type(e).__name__}: {e}); fim_dispatch sem motivo")
+        msgs = None
+    try:
+        wt = estado_worktree(_checkpoint(dispatch).get("caminho"))
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
+        log(f"liberar: worker-show {dispatch}: {e}")
+        wt = {}
+    return {"motivo": fim_motivo(dispatch, read_events(), msgs), **wt}
+
+
 def liberar(dispatch, run=None):
     """ack pendente do dispatch, worker-release e, se o estado vier `retained`, `orca terminal close` do terminal do worker. Grava um evento.
 
@@ -3142,6 +3279,7 @@ def liberar(dispatch, run=None):
     entregas, aviso = _ack_do_dispatch(run_id, dispatch)
     if aviso:
         avisos.append(aviso)
+    fim = _fim_do_dispatch(dispatch, w)
     try:
         estado = orca("worker-release", "--dispatch", dispatch, timeout=30, run=run_id).get("state")
     except RuntimeError as e:
@@ -3161,6 +3299,8 @@ def liberar(dispatch, run=None):
             avisos.append(f"terminal close de {handle} falhou: {e}")
     elif estado == "release_pending":
         avisos.append("release_pending: o Orca ainda está liberando; repita orq liberar depois")
+    if estado != "release_pending":  # a repetição do release_pending grava o fim de novo; vale o último
+        append_event({"tipo": "fim_dispatch", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, **fim})
     ev = {"tipo": "liberar", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, "terminal": handle, "estado": estado, "fechado": fechado, "ack": entregas,
           **({"interacao": True} if humano else {})}
     append_event({**ev, **({"aviso": "; ".join(avisos)} if avisos else {})})
@@ -3231,18 +3371,20 @@ def _parar(acao, w, base):
         raise
 
 
-def encerrar(dispatch, motivo, run=None):
+def encerrar(dispatch, motivo, run=None, parada=None):
     """worker-stop (se ainda roda) e depois o `liberar`, com o motivo no log. Parar não volta atrás: se o release falha, o worker fica parado, o
     terminal retido e a worktree onde estava (evento `parcial`), e `orq liberar` termina o serviço."""
     if not (motivo or "").strip():
         raise ValueError("encerrar pede --motivo: ele fica no log e no orq agentes")
+    if parada and parada not in PARADAS:
+        raise ValueError(f"--parada espera {'|'.join(PARADAS)} (recebi {parada!r})")
     w = _worker_do_dispatch(dispatch, run)
     try:
         cp = _checkpoint(dispatch)
     except RuntimeError as e:
         log(f"encerrar: worker-show {dispatch}: {e}")
         cp = {}
-    base = {"motivo": motivo.strip(), "terminal": w.get("agentTerminalHandle"), "head": cp.get("head"), "sujo": cp.get("sujo")}
+    base = {"motivo": motivo.strip(), "parada": parada, "terminal": w.get("agentTerminalHandle"), "head": cp.get("head"), "sujo": cp.get("sujo")}
     _controle("encerrar", w, "iniciado", **base)
     _parar("encerrar", w, base)
     try:
@@ -3612,6 +3754,7 @@ def gerente_absorver():
     g = _gerente_cfg()
     if not g or g.get("gerente") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return "agent manager desligado (orq gerente ligar --terminal <este terminal>, no coordenador)"
+    _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # o cartão da manhã lê daqui se o gerente estava vivo
     liga = bool(g["runs"])  # gerente.json do ticket 17 (sem runs): o Run é o ligado ao terminal, sem revezar
     runs = g["runs"] or [r for r in [(orca("run-current")["run"] or {}).get("id")] if r]
     if not runs:
@@ -3700,6 +3843,7 @@ def main(argv=None):
     sub.add_parser("status")
     rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
     rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
+    rs.add_argument("--noite", action="store_true", help="o cartão da manhã da última noite (até 40 linhas)")
     al = sub.add_parser("alerta", help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
     al.add_parser("visto").add_argument("task")
     ag = sub.add_parser("agentes", help="o estado de cada dispatch em todos os Runs")
@@ -3715,6 +3859,7 @@ def main(argv=None):
     en = sub.add_parser("encerrar", help="worker-stop (se ainda roda) e release, com o motivo no log")
     en.add_argument("dispatch")
     en.add_argument("--motivo", required=True)
+    en.add_argument("--parada", choices=list(PARADAS), help="nomeia a parada no cartão da manhã (parou: orçamento|decisão pendente|limite de uso)")
     en.add_argument("--run")
     rl = sub.add_parser("relancar", help="para o worker e sobe outro na mesma worktree e task (--retry-of), com a nota do que mudou")
     rl.add_argument("dispatch")
@@ -3789,6 +3934,8 @@ def main(argv=None):
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
         elif a.cmd == "status":
             print(estado())
+        elif a.cmd == "resumo" and a.noite:
+            print(cartao_manha())
         elif a.cmd == "resumo":
             if a.desde:
                 _dt(a.desde)  # ValueError vira exit 1
@@ -3806,7 +3953,7 @@ def main(argv=None):
             if r["aviso"]:
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
         elif a.cmd in ("interromper", "encerrar", "relancar"):
-            r = interromper(a.dispatch, a.run) if a.cmd == "interromper" else encerrar(a.dispatch, a.motivo, a.run) if a.cmd == "encerrar" \
+            r = interromper(a.dispatch, a.run) if a.cmd == "interromper" else encerrar(a.dispatch, a.motivo, a.run, a.parada) if a.cmd == "encerrar" \
                 else relancar(a.dispatch, a.nota, a.modelo, a.effort, a.run)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
