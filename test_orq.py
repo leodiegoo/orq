@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -7036,6 +7036,36 @@ def test_pr_gerente_com_coordenador_ocupado_tenta_de_novo_sem_duplicar_a_entrada
     assert a.orq("gerente", "absorver").returncode == 0
     assert len([e for e in _log(a, "send.log") if "--text" in e]) == 1
     assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1
+
+
+def _wt(caminho, dias, agora, **extra):
+    return {"path": caminho, "branch": "refs/heads/feat/" + os.path.basename(caminho), "lastActivityAt": int((agora.timestamp() - dias * 86400) * 1000), **extra}
+
+
+def test_worktrees_paradas_lista_so_a_sem_worker_parada_ha_mais_de_3_dias_com_os_commits_fora_da_main():
+    agora = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    wts = [_wt("/w/velha", 5, agora), _wt("/w/recente", 2, agora), _wt("/w/com-worker", 9, agora), _wt("/w/principal", 9, agora, isMainWorktree=True),
+           _wt("/w/arquivada", 9, agora, isArchived=True)]
+    fora = {"/w/velha": 4}
+    r = orq_mod.worktrees_paradas(wts, {"/w/com-worker"}, agora, lambda c: fora.get(c, 0))
+    assert r == [{"caminho": "/w/velha", "branch": "feat/velha", "dias": 5, "fora": 4}], r
+    assert orq_mod.worktrees_paradas(wts, set(), agora, lambda c: 0)[0]["caminho"] == "/w/com-worker"  # sem o worker, ela entra
+
+
+def test_worktrees_paradas_avisa_uma_vez_por_dia_no_status():
+    agora = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as d:
+        orq_mod.HOME, antes = d, orq_mod.HOME
+        try:
+            wts = [_wt("/w/velha", 5, agora)]
+            args = (agora, wts, set(), lambda c: 4)
+            (linha,) = orq_mod.linhas_worktrees(*args)
+            assert "Worktrees paradas (1)" in linha and "velha" in linha and "5 dias" in linha and "4 commits fora da main" in linha, linha
+            assert orq_mod.linhas_worktrees(*args) == []  # o mesmo dia não repete
+            assert len(orq_mod.linhas_worktrees(agora + timedelta(days=1), wts, set(), lambda c: 4)) == 1  # o dia seguinte volta
+            assert orq_mod.linhas_worktrees(agora + timedelta(days=2), [], set(), lambda c: 0) == []  # nada parado: sem linha
+        finally:
+            orq_mod.HOME = antes
 
 
 
