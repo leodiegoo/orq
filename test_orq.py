@@ -10402,6 +10402,20 @@ def test_ticket85_run_isento_sobe_sem_vaga_mas_o_piso_de_memoria_o_segura():
     assert json.loads(_desp79(a, "Ticket 07", 2).stdout)["dispatchId"], "abaixo do mínimo mole, acima do piso: sobe"
 
 
+def test_ticket85_run_isento_respeita_o_max_caros_e_o_opus_enfileira_mesmo_sob_pressao():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)])
+    _runs85(a, "Orquestrador: x")
+    out = json.loads(_desp79(a, "Terceiro opus", 1, OPUS).stdout)
+    assert out["estado"] == "enfileirado" and "2/2 workers caros" in out["motivo"], out
+    a.maquina(carga=40)
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "o barato do mesmo Run sobe com a carga alta e 2/4 workers"
+    assert [i["titulo"] for i in _fila79(a)] == ["Terceiro opus"]
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Ticket 05"] and len(_fila79(a)) == 1, "sob pressão o gerente drena só o que o max_caros deixa: o opus segue na fila"
+
+
 def test_ticket85_fila_do_run_isento_sobe_pelo_gerente_mesmo_sob_pressao():
     a = _painel79()
     _gerente(a)

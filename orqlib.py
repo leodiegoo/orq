@@ -5318,7 +5318,7 @@ MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RA
                   "mem_livre_min_mb": 3072, "livre_pct_min": 15,  # abaixo de qualquer um dos dois a pressão é alta
                   "carga_max": 12,  # loadavg de 1 min acima disto (uma por CPU) é pressão alta
                   "mem_piso_mb": 1024,  # piso de segurança: nem o Run isento sobe com a memória livre abaixo disto
-                  "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem vaga; só max_e2e e mem_piso_mb o seguram
+                  "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem o teto de workers; max_caros, max_e2e e mem_piso_mb o seguram
                   "pausar_sob_pressao": False}  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
 FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
 FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
@@ -5499,11 +5499,11 @@ def maquina_ocupacao():
     return {"vivos": {w["dispatchId"]: modelos.get(w["dispatchId"]) for w in vivos}, "dispatched": {w["dispatchId"] for w in ws}}
 
 
-def maquina_vaga(modelo, ocup=None, cfg=None):
-    """O motivo de não caber mais um worker deste modelo (workers vivos no teto, ou caros no teto), ou None se cabe."""
+def maquina_vaga(modelo, ocup=None, cfg=None, isento=False):
+    """O motivo de não caber mais um worker deste modelo (workers vivos no teto, ou caros no teto), ou None se cabe. `isento`: Run isento, sem o teto de workers."""
     cfg, ocup = cfg or maquina_cfg(), ocup or maquina_ocupacao()
     n = len(ocup["vivos"])
-    if n >= cfg["max_workers"]:
+    if n >= cfg["max_workers"] and not isento:
         return f"{n}/{cfg['max_workers']:g} workers vivos"
     caros = sum(modelo_caro(m, cfg) for m in ocup["vivos"].values())
     if modelo_caro(modelo, cfg) and caros >= cfg["max_caros"]:
@@ -5512,11 +5512,13 @@ def maquina_vaga(modelo, ocup=None, cfg=None):
 
 
 def maquina_barra_item(modelo, run, ocup, cfg, pressao, leitura):
-    """O motivo de o worker deste Run não subir agora, ou None. A pressão da máquina vem antes das vagas; o Run isento (`runs_isentos`) passa pelas duas e
-    só para no piso de memória (max_e2e segue com a fila global do E2E)."""
+    """O motivo de o worker deste Run não subir agora, ou None. A pressão da máquina vem antes das vagas; o Run isento (`runs_isentos`) passa pela pressão e
+    pelo teto de workers, e só para no teto de caros (limite de custo), no piso de memória e no max_e2e (a fila global do E2E)."""
     causa = maquina_causa(leitura, cfg) if pressao[0] == "alta" else (None, None)
     motivo = (f"máquina sob pressão: {pressao[1]}" + (f"; vem de fora do orq ({causa[1]})" if causa[0] == "fora" else "")) if pressao[0] == "alta" else maquina_vaga(modelo, ocup, cfg)
-    return maquina_piso(leitura, cfg) if motivo and run_isento(run, cfg) else motivo
+    if not motivo or not run_isento(run, cfg):
+        return motivo
+    return maquina_vaga(modelo, ocup, cfg, isento=True) or maquina_piso(leitura, cfg)
 
 
 def maquina_barra(modelo, ocup=None, cfg=None, run=None):
@@ -5630,7 +5632,7 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
 
     Item de modelo caro com o teto de caros cheio fica para trás e o barato de prioridade menor sobe. Retomada cujo dispatch já terminou ou voltou sai da
     fila. O que o uso do plano ou o modo noite seguram espera ESPERA_SEGURADO_S; erro de outra causa conta em `falhas` e, na FALHAS_FILA-ésima, o item sai.
-    Item de Run isento (`runs_isentos`) sobe sem vaga, só parado pelo piso de memória; `so_isentos` (pressão alta) tenta só esses."""
+    Item de Run isento (`runs_isentos`) sobe sem o teto de workers, parado só pelo teto de caros e pelo piso de memória; `so_isentos` (pressão alta) tenta só esses."""
     cfg, agora = cfg or maquina_cfg(), agora or time.time()
     itens = fila_despacho_itens()
     if not itens:
@@ -5646,7 +5648,7 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
         isento = (so_isentos or maquina_vaga(it.get("modelo"), ocup, cfg)) and run_isento(it.get("run"), cfg)  # só pergunta ao Orca quando há o que isentar
         if so_isentos and not isento:
             continue
-        if isento and maquina_piso(maquina_ler(), cfg) or not isento and maquina_vaga(it.get("modelo"), ocup, cfg):
+        if isento and (maquina_vaga(it.get("modelo"), ocup, cfg, isento=True) or maquina_piso(maquina_ler(), cfg)) or not isento and maquina_vaga(it.get("modelo"), ocup, cfg):
             continue
         try:
             linhas.append(_sobe_da_fila(it))
