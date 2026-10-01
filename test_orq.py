@@ -5297,7 +5297,7 @@ def _agentes_24(a, turnos):
                            {"handle": "term_t", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
                            {"handle": "term_r", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
                            {"handle": "term_j", "run": "run_a", "status": "dispatched", "desde": _iso(-60), "agente": "claude"},
-                           {"handle": "term_x", "run": "run_a", "status": "dispatched", "desde": _iso(-300), "agente": "codex"},
+                           {"handle": "term_x", "run": "run_a", "status": "dispatched", "desde": _iso(-300), "agente": "cursor"},
                            {"handle": "term_s", "run": "run_a", "status": "dispatched", "desde": _iso(-300)}])
     os.makedirs(a.home, exist_ok=True)
     json.dump(turnos, open(os.path.join(a.home, "turnos.json"), "w"))
@@ -5321,7 +5321,7 @@ def test_ticket24_worker_sem_hook_do_orq_ou_sem_agente_conhecido_fica_unknown_nu
     a = Amb(run="run_a")
     _agentes_24(a, {})
     ag = _agentes(a)
-    for d in ("ctx_term_x", "ctx_term_s"):  # codex não tem o hook; worker-show sem agente não prova nada
+    for d in ("ctx_term_x", "ctx_term_s"):  # cursor não tem o hook do orq; worker-show sem agente não prova nada
         assert ag[d]["turno"] == "unknown" and ag[d]["estado"] == "rodando", ag[d]
     assert ag["ctx_term_n"]["estado"] == "nao_comecou"
 
@@ -5494,8 +5494,8 @@ def test_ticket43_telas_le_so_worker_claude_rodando_e_falha_de_leitura_nao_prova
     orq_mod.orca = falso
     try:
         ws = [{"dispatchId": f"ctx_{h}", "agentTerminalHandle": f"term_{h}", "dispatchStatus": st} for h, st in (("a", "dispatched"), ("f", "dispatched"), ("c", "dispatched"), ("d", "completed"))]
-        det = {"ctx_a": {"agente": "claude"}, "ctx_f": {"agente": "claude"}, "ctx_c": {"agente": "codex"}, "ctx_d": {"agente": "claude"}}
-        assert orq_mod._telas(ws, det) == {"ctx_a": "2 shells still running (tela)"}, "codex e completed nem são lidos; o read que falha fica de fora"
+        det = {"ctx_a": {"agente": "claude"}, "ctx_f": {"agente": "claude"}, "ctx_c": {"agente": "cursor"}, "ctx_d": {"agente": "claude"}}
+        assert orq_mod._telas(ws, det) == {"ctx_a": "2 shells still running (tela)"}, "agente sem adaptador e completed nem são lidos; o read que falha fica de fora"
         assert sorted(lidos) == ["term_a", "term_f"], lidos
     finally:
         orq_mod.orca = orig
@@ -8501,6 +8501,74 @@ def test_ticket73_a_tela_de_cada_harness_usa_os_padroes_dele_e_harness_sem_adapt
     assert set(orq_mod.HARNESS) >= {"claude"} and "claude" in orq_mod.HARNESSES
 
 
+
+def _codex(nome, **campos):
+    """Payload real de hook do Codex (fixtures/codex-hook-<nome>.json, capturado do codex-cli 0.159.2) com os campos trocados."""
+    return {**json.load(open(os.path.join(AQUI, "fixtures", f"codex-hook-{nome}.json"))), **campos}
+
+
+def _hook_codex(a, kind, ev, **env):
+    r = a.orq("hook", kind, "codex", stdin=json.dumps(ev), **env)
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def test_ticket73_hook_do_worker_codex_grava_o_turno_com_o_harness_e_o_transcrito():
+    a = Amb(run=None)
+    ev = _codex("userpromptsubmit", prompt=PREAMBULO_24, session_id="thr_1")
+    _hook_codex(a, "prompt", ev)
+    t = _turnos(a)["ctx_d24"]
+    assert (t["sessao"], t["harness"], t["cwd"]) == ("thr_1", "codex", "/wt/repo-captura") and t["transcrito"].endswith("-01a0f802-a07c-7f81-86a2-f094ee020c7a.jsonl"), t
+    _hook_codex(a, "stop", _codex("stop", session_id="thr_1"))
+    assert _turnos(a)["ctx_d24"]["fim"], "o Stop do Codex fecha o turno"
+    _hook(a, "prompt", prompt=PREAMBULO_24.replace("ctx_d24", "ctx_c24"), session_id="s_claude")
+    assert _turnos(a)["ctx_c24"]["harness"] == "claude", "sem o argumento o hook é do Claude, como os instalados hoje"
+
+
+def test_ticket73_hook_com_harness_desconhecido_recusa_e_o_exemplo_do_codex_instala_cada_hook_com_o_argumento():
+    a = Amb(run=None)
+    assert a.orq("hook", "prompt", "cursor", stdin="{}").returncode != 0
+    cfg = json.load(open(os.path.join(AQUI, "codex.hooks.example.json")))["hooks"]
+    cmds = {h["command"] for g in cfg.values() for x in g for h in x["hooks"]}
+    for k in ("prompt", "stop", "session", "lugar", "externas", "prligar"):
+        assert f"python3 ~/.claude/orq/orq.py hook {k} codex" in cmds, k
+    assert "apply_patch" in next(x["matcher"] for x in cfg["PreToolUse"] if "hook lugar" in json.dumps(x))
+    assert not [c for c in cmds if "hook guard" in c or "hook ask" in c], "o Codex não tem AskUserQuestion"
+
+
+def test_ticket73_lugar_no_codex_le_o_caminho_do_apply_patch_e_a_casa_vem_do_primeiro_prompt():
+    a = Amb(run="run_a")
+    p, w = _repo(a.tmp.name)
+    _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="oi", cwd=p))  # coordenador Codex na casa p
+    patch = "*** Begin Patch\n*** Update File: sub/a.txt\n@@\n-x\n+y\n*** End Patch"
+    os.makedirs(os.path.join(w, "sub"))
+    r = _hook_codex(a, "lugar", _codex("pre-apply-patch", session_id="abcdef123456", cwd=w, tool_input={"command": patch}))
+    msg = _aviso(r)
+    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+    b = Amb(run="run_a")
+    pb, wb = _repo(b.tmp.name)
+    _hook_codex(b, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="oi", cwd=wb))  # coordenador que mora na worktree
+    assert _aviso(_hook_codex(b, "lugar", _codex("pre-apply-patch", session_id="abcdef123456", cwd=wb, tool_input={"command": patch.replace("sub/", "")}))) == ""
+    assert _aviso(_hook_codex(b, "lugar", _codex("pre-bash", session_id="abcdef123456", cwd=wb, tool_input={"command": "git commit -m x"}))) == ""
+
+
+def test_ticket73_prligar_no_codex_le_a_url_da_saida_em_texto():
+    a, p, w = _ambiente_46()
+    ev = _codex("post-bash", session_id="abcdef123456", cwd=w, tool_input={"command": "gh pr create --base development --title x --body y"}, tool_response=PR1 + "\n")
+    r = _hook_codex(a, "prligar", ev)
+    (item,) = _prs_json(a)["itens"]
+    assert item["task"] == "task_feat1" and "#1216" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], item
+
+
+def test_ticket73_worker_codex_com_turno_gravado_tem_estado_e_agente_sem_adaptador_segue_unknown():
+    a = Amb(run="run_a")
+    a.set("workers.json", [{"handle": "term_x", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "codex"},
+                           {"handle": "term_y", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "cursor"}])
+    os.makedirs(a.home, exist_ok=True)
+    fim = now_iso(-300)
+    json.dump({d: {"task": "t", "harness": "codex", "inicio": now_iso(-600), "fim": fim} for d in ("ctx_term_x", "ctx_term_y")}, open(os.path.join(a.home, "turnos.json"), "w"))
+    ag = _agentes(a)
+    assert ag["ctx_term_x"]["turno"] == "parado" and ag["ctx_term_y"]["turno"] == "unknown", ag
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""

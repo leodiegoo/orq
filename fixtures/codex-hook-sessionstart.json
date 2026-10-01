@@ -1,0 +1,9 @@
+{
+ "session_id": "01a0f802-a07c-7f81-86a2-f094ee020c7a",
+ "transcript_path": "/home/u/.codex/sessions/2026/10/01/rollout-2026-10-01T12-08-37-01a0f802-a07c-7f81-86a2-f094ee020c7a.jsonl",
+ "cwd": "/wt/repo-captura",
+ "hook_event_name": "SessionStart",
+ "model": "gpt-6-sol",
+ "permission_mode": "bypassPermissions",
+ "source": "startup"
+}

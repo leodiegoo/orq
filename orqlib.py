@@ -125,7 +125,20 @@ HARNESS = {
         "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
     },
 }
+# o Codex numera as opções com `›` (ou `>`) no cursor; o trust da pasta e o modal dos hooks não confiados são os menus que param um worker dele
+TELA_OPCAO_CODEX = re.compile(r"^\s*([›>])?\s*(\d{1,2})\.\s+(\S.*?)\s*$")
+HARNESS["codex"] = {
+    "resume": lambda sessao, modelo, effort, msg: ["codex", "resume", sessao, *(["-m", modelo] if modelo else []),
+                                                   *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
+                                                   "--dangerously-bypass-approvals-and-sandbox", msg],
+    "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›",
+             "perguntas": (("trust", re.compile(r"Do you trust the contents of this directory", re.I)),
+                           ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
+             "espera": None, "falha": ("command not found",)},
+    "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: o ultra só nos modelos que o têm (o Orca recusa no Luna)
+}
 HARNESSES = tuple(HARNESS)
+PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)  # o caminho de cada arquivo que o apply_patch do Codex mexe
 
 
 # ---------- puras ----------
@@ -1260,7 +1273,7 @@ def _turnos_mut(fn):
             _write_json(_path(TURNOS), turnos)
 
 
-def registra_turno(kind, ev):
+def registra_turno(kind, ev, harness="claude"):
     """Hooks prompt e stop de uma sessão de worker: grava o início ou o fim do turno do dispatch dela em turnos.json. Não chama o Orca.
 
     O preâmbulo de despacho traz o dispatch e a task e abre o registro; os prompts seguintes (steer, aviso) reabrem o mais novo da sessão, e o Stop o fecha.
@@ -1283,8 +1296,9 @@ def registra_turno(kind, ev):
             return False
         if kind == "prompt":
             antigo = _dict(turnos.pop(d, None))  # o pop leva o dispatch reaberto para o fim da ordem
-            turnos[d] = {"task": task or antigo.get("task"), "sessao": sid, "inicio": agora, "fim": None,
-                         **({"cwd": antigo.get("cwd") or ev.get("cwd")} if antigo.get("cwd") or ev.get("cwd") else {})}  # o cwd é o do lançamento: o `claude --resume` só acha a sessão nele (ticket 48)
+            turnos[d] = {"task": task or antigo.get("task"), "sessao": sid, "inicio": agora, "fim": None, "harness": harness,
+                         **({"cwd": antigo.get("cwd") or ev.get("cwd")} if antigo.get("cwd") or ev.get("cwd") else {}),
+                         **({"transcrito": ev["transcript_path"]} if ev.get("transcript_path") else {})}  # o cwd é o do lançamento: o `claude --resume` só acha a sessão nele (ticket 48)
         else:
             turnos[d]["fim"] = agora
         corte = _ts(agora) - timedelta(days=TURNOS_DIAS)
@@ -2934,17 +2948,25 @@ def coordenador(ev):
     run = orca("run-current")["run"]
     if run is None:
         return None
-    lembrar_run(sid, run["id"])
+    lembrar_run(sid, run["id"], ev.get("cwd"))
     return run
 
 
 # ---------- hooks ----------
 
-def lembrar_run(sid, run_id):
-    """Guarda em cursor.json o último Run visto por session_id (só de coordenador); grava só quando muda."""
-    if _dict(_cursor_ro().get("runs")).get(sid) == run_id:
+def lembrar_run(sid, run_id, cwd=None):
+    """Guarda em cursor.json o último Run visto por session_id (só de coordenador) e a casa dele, o cwd do primeiro prompt (o Codex não tem
+    CLAUDE_PROJECT_DIR); grava só quando muda."""
+    cur = _cursor_ro()
+    if _dict(cur.get("runs")).get(sid) == run_id and (not cwd or _dict(cur.get("casas")).get(sid)):
         return
-    _cursor_mut(lambda c: _sub(c, "runs").__setitem__(sid, run_id))
+
+    def grava(c):
+        _sub(c, "runs")[sid] = run_id
+        if cwd:
+            _sub(c, "casas").setdefault(sid, cwd)
+
+    _cursor_mut(grava)
 
 
 def binding_perdido(ev, ultimo):
@@ -3291,8 +3313,9 @@ def hook_lugar(ev, run):
         if c:
             d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
             d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
-    elif ferr in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        d = os.path.dirname(ti.get("file_path") or ti.get("notebook_path") or "")
+    elif ferr in ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"):
+        arq = ti.get("file_path") or ti.get("notebook_path") or next(iter(PATCH_ARQUIVO.findall(ti.get("command") or "")), "")
+        d = os.path.dirname(os.path.join(ev.get("cwd") or os.getcwd(), arq)) if arq else ""
         d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
     else:
         return None
@@ -3301,7 +3324,7 @@ def hook_lugar(ev, run):
         return None
     comum = os.path.realpath(os.path.join(d, comum))
     if os.path.realpath(gd) != comum:  # worktree ligada: só é engano se não é onde o coordenador mora
-        casa = os.environ.get("CLAUDE_PROJECT_DIR")
+        casa = os.environ.get("CLAUDE_PROJECT_DIR") or _dict(_cursor_ro().get("casas")).get(ev.get("session_id") or "")
         if casa and os.path.realpath(casa) == os.path.realpath(topo):
             return None
         aviso = f"o cwd está na worktree {topo}, que parece ser de um worker"
@@ -3398,7 +3421,7 @@ def guard_worker():
 HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_lugar, "externas": hook_externas, "prligar": hook_prligar}
 
 
-def run_hook(kind):
+def run_hook(kind, harness="claude"):
     """Só no coordenador (Run ligado e terminal que não é de worker). Fail-open: qualquer exceção vira exit 0 e uma linha no log."""
     def estouro(*_):
         raise TimeoutError(f"hook {kind} passou de {HOOK_TIMEOUT}s")
@@ -3431,7 +3454,7 @@ def run_hook(kind):
         if run is None:
             sid = ev.get("session_id") or ""
             if kind in ("prompt", "stop") and _papeis().get(sid) == "worker":
-                registra_turno(kind, ev)  # o worker só grava o turno: sem Orca, sem Run
+                registra_turno(kind, ev, harness)  # o worker só grava o turno: sem Orca, sem Run
             if kind == "guard" and ev.get("tool_name") == "AskUserQuestion" and _papeis().get(sid) == "worker":
                 print(json.dumps(guard_worker(), ensure_ascii=False))  # sem Orca: a caixa abre no terminal, onde só quem olha a vê
                 return 0
@@ -5377,7 +5400,9 @@ def gerente_absorver():
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="orq")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("hook").add_argument("kind", choices=list(HOOKS))
+    hk = sub.add_parser("hook")
+    hk.add_argument("kind", choices=list(HOOKS))
+    hk.add_argument("harness", nargs="?", default="claude", choices=HARNESSES, help="de que agente vem o hook (o padrão é o dos hooks instalados no Claude)")
     i = sub.add_parser("intake")
     i.add_argument("entrada")
     i.add_argument("efeito")
@@ -5538,7 +5563,7 @@ def main(argv=None):
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
     a = ap.parse_args(argv)
     if a.cmd == "hook":
-        return run_hook(a.kind)
+        return run_hook(a.kind, a.harness)
     try:
         if a.cmd == "intake":
             print(json.dumps(intake(a.entrada, a.efeito, a.ref, a.run, a.nota), ensure_ascii=False))
