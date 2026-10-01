@@ -3824,6 +3824,7 @@ def lavish_resposta(caminho):
 OCIOSO_MS = int(os.environ.get("ORQ_OCIOSO_MS") or 2000)  # quanto esperar o tui-idle de um terminal antes de dizer que ele está ocupado
 AVISO_GAP_S = float(os.environ.get("ORQ_AVISO_GAP_S") or 3)  # entre a leitura da caixa e a que vem logo antes do send: quem começou a digitar nesse meio-tempo barra o aviso (ticket 82)
 COORD_OCIOSO_MIN = float(os.environ.get("ORQ_COORD_OCIOSO_MIN") or 10)  # prompt do usuário mais novo que isso: o coordenador tem gente e nenhum aviso é digitado nele (ticket 82)
+WAKE_OCIOSO_MIN = float(os.environ.get("ORQ_WAKE_OCIOSO_MIN") or 2)  # o mesmo para o aviso que acorda o coordenador (worker_done): janela curta, a entrega não espera 10 min (ticket 86)
 STEER_ESPERA_S = float(os.environ.get("ORQ_STEER_ESPERA_S") or 2)  # o Orca digita o próprio aviso no worker ocupado: dá-lhe tempo antes de achar que ninguém avisou
 
 
@@ -3900,11 +3901,12 @@ def digita_ocupado(handle, texto):
     return "ocupado_digitado"
 
 
-def coordenador_ativo(agora=None):
-    """True se o último prompt do usuário é mais novo que COORD_OCIOSO_MIN: o coordenador tem gente, e digitar nele cai no meio do que ela escreve."""
+def coordenador_ativo(agora=None, minutos=None):
+    """True se o último prompt do usuário é mais novo que `minutos` (COORD_OCIOSO_MIN): o coordenador tem gente, e digitar nele cai no meio do que ela escreve."""
+    minutos = COORD_OCIOSO_MIN if minutos is None else minutos
     agora = agora or datetime.now(timezone.utc)
     ult = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts")), None)
-    return bool(ult) and (agora - _dt(ult)).total_seconds() < COORD_OCIOSO_MIN * 60
+    return bool(ult) and (agora - _dt(ult)).total_seconds() < minutos * 60
 
 
 def _notifica_mac(texto):
@@ -3916,25 +3918,25 @@ def _notifica_mac(texto):
                        capture_output=True, timeout=3, check=False)
 
 
-def avisa_coordenador(handle, texto, contexto=True):
+def avisa_coordenador(handle, texto, contexto=True, minutos=None):
     """Leva um aviso ao coordenador sem digitar por cima de quem escreve (ticket 82). Devolve `enviado` (coordenador ocioso: digitado), `adiado`
     (coordenador com gente: o aviso espera na fila `avisos` do cursor, sai no contexto do próximo prompt, `contexto` False para o que o resumo já
     mostra, e `avisos_entregar` o digita se o coordenador ficar ocioso) ou o motivo do `digita` (nada saiu: repita depois). `adiado` já é entrega."""
-    if not coordenador_ativo():
+    if not coordenador_ativo(minutos=minutos):
         return digita(handle, texto)
-    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": texto, "ts": now(), "contexto": contexto}))
+    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": texto, "ts": now(), "contexto": contexto, **({"minutos": minutos} if minutos is not None else {})}))
     _notifica_mac(texto)
     return "adiado"
 
 
 def avisos_entregar():
-    """Uma volta do painel: com o coordenador ocioso há mais de COORD_OCIOSO_MIN, digita o aviso mais antigo da fila (um por volta; o seguinte
+    """Uma volta do painel: com o coordenador ocioso há mais de COORD_OCIOSO_MIN (WAKE_OCIOSO_MIN no aviso de acordar), digita o aviso mais antigo da fila (um por volta; o seguinte
     encontra o coordenador ocupado). Devolve as linhas do painel."""
     g, fila = _gerente_cfg(), _cursor_ro().get("avisos")
-    if not g.get("coordenador") or not isinstance(fila, list) or not fila or coordenador_ativo():
+    if not g.get("coordenador") or not isinstance(fila, list) or not fila:
         return []
-    a = fila[0]
-    if digita(g["coordenador"], a["texto"]) != "enviado":
+    a = next((x for x in fila if not coordenador_ativo(minutos=x.get("minutos"))), None)  # o aviso de acordar (2 min) não espera atrás de um de 10
+    if not a or digita(g["coordenador"], a["texto"]) != "enviado":
         return []
     _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))
     return ["aviso adiado digitado no coordenador, ocioso"]
@@ -5604,7 +5606,7 @@ def _maquina_avisar(motivo, na_fila, cfg):
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
         filhos = _filhos_por_task()
     peso = f" Processos em segundo plano: {', '.join(f'{t} {n}' for t, n in filhos.items())}." if filhos else ""
-    if digita(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{peso}{dica}") != "enviado":
+    if avisa_coordenador(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{peso}{dica}") not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": motivo}))
     append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"sugerido": alvo["task"]} if alvo else {}), **({"filhos": filhos} if filhos else {})})
@@ -6578,7 +6580,7 @@ def gerente_absorver():
     for r in novos:
         n = len(pendentes[r])
         texto = f"You have {n} orchestration message{'s' if n > 1 else ''}. Run `orca orchestration check --run {r} --terminal {g['gerente']}`."
-        if digita(g["coordenador"], texto) != "enviado":
+        if avisa_coordenador(g["coordenador"], texto, minutos=WAKE_OCIOSO_MIN) not in ("enviado", "adiado"):  # adiado (coordenador com gente, ticket 86): já é entrega, sai no contexto
             break  # coordenador no meio do turno ou com rascunho (ou o Orca recusou): nada foi digitado, a próxima volta tenta
         vistos = [*(avisos.get(r, {}).get("vistos") or []), *pendentes[r]]
         avisos[r] = {"vistos": vistos[-VISTOS_MAX:], "ts": time.time()}

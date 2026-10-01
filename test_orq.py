@@ -8416,6 +8416,47 @@ def test_it_should_keep_the_queued_notice_when_the_idle_coordinator_is_busy_or_h
             orq_mod.HOME, orq_mod.digita = antes, dig
 
 
+def test_ticket86_aviso_de_pressao_da_maquina_nao_e_digitado_com_o_usuario_no_coordenador():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=40)
+    _usuario_falou(a.home, 1)
+    _desp79(a, "Ticket 05", 1)
+    for _ in range(2):
+        assert a.orq("gerente", "absorver").returncode == 0
+    assert not _log(a, "send.log"), "o coordenador tem gente: nada é digitado"
+    assert [e["tipo"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["maquina_aviso"], "adiado é entrega: um aviso por episódio"
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "não foram digitados" in ctx and "máquina sob pressão" in ctx, ctx
+
+
+def test_ticket86_gerente_absorver_acorda_o_coordenador_parado_ha_mais_de_dois_minutos_e_adia_antes_disso():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.caixa(("worker_done", {"taskId": "task_1", "dispatchId": "ctx_1"}), run="run_b")
+    _usuario_falou(a.home, 5)  # fora da janela de 2 min, dentro dos 10 do aviso comum
+    assert a.orq("gerente", "absorver").returncode == 0
+    (env,) = _log(a, "send.log")
+    assert "--run run_b" in env[env.index("--text") + 1], "worker_done acorda o coordenador sem esperar 10 min"
+
+
+def test_ticket86_gerente_absorver_nao_digita_o_aviso_enquanto_o_usuario_fala_com_o_coordenador():
+    """O texto que cortou a digitação em 01/10 era o aviso do próprio gerente (`--terminal <gerente>`), digitado direto pelo gerente_absorver."""
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.caixa(("worker_done", {"taskId": "task_1", "dispatchId": "ctx_1"}), run="run_b")
+    _usuario_falou(a.home, 1)
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert _log(a, "send.log") == [], "o coordenador tem gente: o aviso do gerente não é digitado"
+    assert "avisado ao coordenador" in r.stdout, r.stdout
+    a.orq("gerente", "absorver")
+    assert _log(a, "send.log") == [], "adiado já é entrega: a volta seguinte não o repete"
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "não foram digitados" in ctx and "check --run run_b" in ctx, ctx
+
+
 def test_it_should_not_type_when_the_second_read_finds_text_in_the_box():
     antes, orca_ = orq_mod.terminal_livre, orq_mod.orca
     chamadas, envios = [], []
