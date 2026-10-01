@@ -10777,8 +10777,9 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert r.returncode == 0, r.stderr
     cria = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
     cmd = cria[0][cria[0].index("--command") + 1]
-    assert cmd.startswith("env ORQ_MATE=orq claude --model claude-sonnet-5-5") and "/h/regras-orq.md" in cmd and "orq mate subir" in cmd, cmd
-    assert f"path:{a.home}" in cria[0]
+    # o Orca só cria terminal em worktree que conhece (o ~/.claude/orq não é uma): abre no checkout atual e entra na pasta do grupo
+    assert cmd.startswith(f"cd {a.home}; env ORQ_MATE=orq claude --model claude-sonnet-5-5") and "/h/regras-orq.md" in cmd and "orq mate subir" in cmd, cmd
+    assert "--worktree" not in cria[0], cria[0]
     assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
     r = a.orq("mate", "abrir", "orq")
     assert r.returncode != 0 and "aberto" in r.stderr  # um mate por grupo
@@ -10790,7 +10791,7 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert a.orq("mate", "abrir", "orq").returncode == 0
     cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
     cmd = cmd[cmd.index("--command") + 1]
-    assert cmd.startswith("env ORQ_MATE=orq claude --resume sess-mate"), cmd
+    assert cmd.startswith(f"cd {a.home}; env ORQ_MATE=orq claude --resume sess-mate"), cmd
 
 
 def test_mate_nao_abre_pergunta_no_terminal():

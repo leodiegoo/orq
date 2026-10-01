@@ -4222,7 +4222,7 @@ def mate_subir(tipo, texto, corr=None, link=None, grupo=None):
                          **({"corr": corr} if corr else {}), **({"link": link} if link else {})}, novo_id=True)
 
 
-def _comando_mate(grupo, cfg, sessao):
+def _comando_mate(grupo, cfg, sessao, cwd=None):
     agente, modelo = cfg.get("harness") or "claude", cfg.get("modelo")
     if agente not in HARNESS:
         raise ValueError(f"harness {agente} do grupo {grupo}: o orq só abre {', '.join(HARNESSES)}")
@@ -4232,7 +4232,10 @@ def _comando_mate(grupo, cfg, sessao):
         regras = f"\nLeia antes as regras do grupo em {cfg['regras']}." if cfg.get("regras") else ""
         charter = CHARTER_MATE.format(grupo=grupo, projetos=", ".join(cfg.get("projetos") or []) or "nenhum", regras=regras)
         cmd = HARNESS[agente]["abrir"](modelo, cfg.get("effort"), charter)
-    return shlex.join(["env", f"ORQ_MATE={grupo}", *cmd])
+    comando = shlex.join(["env", f"ORQ_MATE={grupo}", *cmd])
+    # o Orca só cria terminal numa worktree que conhece, e a pasta do grupo (o ~/.claude/orq) não é uma: o terminal abre no checkout atual e entra nela.
+    # `cd x; y` vale no fish, no zsh e no bash; o resume do claude só acha a sessão no cwd onde ela nasceu
+    return f"cd {shlex.quote(cwd)}; {comando}" if cwd else comando
 
 
 def mate_abrir(grupo):
@@ -4247,7 +4250,7 @@ def mate_abrir(grupo):
         raise ValueError(f"o mate {grupo} já está aberto no terminal {m['terminal']}")
     cwd = m.get("cwd") or cfg.get("cwd") or next(iter(cfg.get("projetos") or []), None)
     cwd = cwd and os.path.expanduser(cwd)
-    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", _comando_mate(grupo, cfg, m.get("sessao")), cwd)
+    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", _comando_mate(grupo, cfg, m.get("sessao"), cwd))
     if m.get("sessao") and not _voltou(novo, cfg.get("harness") or "claude"):
         # sessão que não volta deixa um shell: o gerente digitaria o pedido nele. Fecha, esquece a sessão, e o próximo abrir sobe com o charter
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
