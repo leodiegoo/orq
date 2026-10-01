@@ -127,7 +127,7 @@ ln -s ~/.claude/orq/orq.py ~/.local/bin/orq   # the manager loop calls `orq`
 
 Then merge the `hooks` section of [`settings.hooks.example.json`](settings.hooks.example.json) into `~/.claude/settings.json`, next to any hooks you already have.
 
-For Codex, merge [`codex.hooks.example.json`](codex.hooks.example.json) into `~/.codex/hooks.json`, adding each group at the end of its event: Codex records hook trust by position (`hooks.json:<event>:<group>:<hook>`), so inserting a group in the middle unsets the trust of the ones after it. Review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Then link the skills where Codex reads them:
+For Codex, merge [`codex.hooks.example.json`](codex.hooks.example.json) into `~/.codex/hooks.json`, adding each group at the end of its event: Codex records hook trust by position (`hooks.json:<event>:<group>:<hook>`), so inserting a group in the middle unsets the trust of the ones after it. `orq hooks-codex` does that merge for you: it appends the missing groups at the end of each event and never reorders or removes anything. Review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Until they are trusted the orq does not see that terminal, so `orq status`, `orq agentes` and the coordinator's session preamble start with "⚠ hooks do orq não confiados no Codex: rode /hooks" (position check of the `hooks.json` hooks against `[hooks.state]` in `~/.codex/config.toml`; it cannot see a hook edited after it was trusted, because the hash is not documented). Then link the skills where Codex reads them:
 
 ```sh
 mkdir -p ~/.agents/skills

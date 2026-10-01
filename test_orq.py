@@ -19,7 +19,8 @@ sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # a segunda leitura da caixa não espera nos testes
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
-orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")  # nenhum teste grava no ~/.codex/config.toml de verdade
+orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
+orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")  # idem: o hooks.json de verdade tem hook do orq e pode estar não confiado  # nenhum teste grava no ~/.codex/config.toml de verdade
 
 FAKE = '''#!/usr/bin/env python3
 import base64, json, os, sys, time
@@ -413,7 +414,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.maquina()
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
@@ -11102,6 +11103,57 @@ def test_perguntar_recusa_menos_de_duas_opcoes_e_pendencia_que_nao_e_decisao():
     assert r.returncode != 0 and "duas" in r.stderr
     r = a.orq("perguntar", "--id", "avisar-x", "--pergunta", "p", "--opcao", "a", "--opcao", "b", "--sem-poll")
     assert r.returncode != 0 and "não decisão" in r.stderr
+
+
+def _hooks_codex_fixture(t, confiar):
+    """hooks.json com um hook alheio (grupo 0) e dois do orq (grupos 1 e 2); `confiar` são as chaves `evento:grupo:hook` que o config.toml confia."""
+    hj = os.path.join(t, "hooks.json")
+    json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "graphify hook-check"}]},
+                                  {"hooks": [{"type": "command", "command": "python3 ~/.claude/orq/orq.py hook stop codex"}]}],
+                         "SessionStart": [{"hooks": [{"type": "command", "command": "python3 ~/.claude/orq/precompact.py retomar"}]}]}}, open(hj, "w"))
+    cfg = os.path.join(t, "codex-config.toml")
+    open(cfg, "w").write("[hooks.state]\n" + "".join(f'[hooks.state."{hj}:{k}"]\ntrusted_hash = "sha256:ab"\n' for k in confiar))
+    return hj, cfg
+
+
+def test_ticket77_orq_status_avisa_dos_hooks_do_orq_nao_confiados_no_codex_e_cala_quando_confiados():
+    a = Amb(run=None)
+    hj, cfg = _hooks_codex_fixture(a.tmp.name, ["stop:1:0"])  # falta o session_start:0:0
+    r = a.orq("status")
+    assert "hooks do orq não confiados no Codex: rode /hooks" in r.stdout and "(1 hook;" in r.stdout, r.stdout
+    assert "hooks do orq não confiados" in a.orq("agentes").stdout
+    _hooks_codex_fixture(a.tmp.name, ["stop:1:0", "session_start:0:0"])
+    assert "não confiados no Codex" not in a.orq("status").stdout
+    assert "não confiados no Codex" not in a.orq("agentes").stdout
+    open(cfg, "a").write(f'[hooks.state."{hj}:stop:1:0"]\nenabled = false\n')  # chave repetida: o TOML não lê, o trust some
+    assert "não confiados no Codex" in a.orq("status").stdout, "config que não lê vale não confiado"
+
+
+def test_ticket77_sem_hook_do_orq_no_hooks_json_nao_ha_aviso():
+    a = Amb(run=None)
+    assert "não confiados no Codex" not in a.orq("status").stdout, "sem hooks.json o Codex não está ligado ao orq"
+
+
+def test_ticket77_o_preambulo_do_coordenador_traz_o_aviso_na_primeira_linha():
+    a = Amb(run="run_a")
+    _hooks_codex_fixture(a.tmp.name, [])
+    assert _ctx_session(a).splitlines()[0].startswith("⚠ hooks do orq não confiados no Codex: rode /hooks")
+
+
+def test_ticket77_o_instalador_acrescenta_no_fim_e_nunca_reordena_os_grupos_existentes():
+    exemplo = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 ~/.claude/orq/orq.py hook stop codex"}]}],
+                         "SessionStart": [{"hooks": [{"type": "command", "command": "novo-do-orq"}]}]}}
+    atual = {"hooks": {"SessionStart": [{"hooks": [{"command": "a"}]}, {"hooks": [{"command": "b"}]}],
+                       "Stop": [{"hooks": [{"command": "graphify hook-check"}]}]}}
+    novo, add = orq_mod.mesclar_hooks_codex(atual, exemplo)
+    assert novo["hooks"]["SessionStart"][:2] == atual["hooks"]["SessionStart"], "os grupos existentes ficam nas mesmas posições"
+    assert novo["hooks"]["SessionStart"][2]["hooks"][0]["command"] == "novo-do-orq" and add == [("Stop", 1), ("SessionStart", 2)]
+    assert novo["hooks"]["Stop"][0] == atual["hooks"]["Stop"][0]
+    again, add2 = orq_mod.mesclar_hooks_codex(novo, exemplo)
+    assert add2 == [] and again == novo, "rodar de novo não duplica"
+    vazio, add3 = orq_mod.mesclar_hooks_codex({}, exemplo)
+    assert len(add3) == 2 and vazio["hooks"]["Stop"] == exemplo["hooks"]["Stop"]
+    assert atual["hooks"]["Stop"] == [{"hooks": [{"command": "graphify hook-check"}]}], "a entrada não é mutada"
 
 
 if __name__ == "__main__":

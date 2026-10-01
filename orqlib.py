@@ -149,6 +149,7 @@ HARNESS["codex"] = {
 }
 HARNESSES = tuple(HARNESS)
 CODEX_CONFIG = os.environ.get("ORQ_CODEX_CONFIG") or os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "config.toml")
+CODEX_HOOKS = os.environ.get("ORQ_CODEX_HOOKS") or os.path.join(os.path.dirname(CODEX_CONFIG), "hooks.json")
 PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)  # o caminho de cada arquivo que o apply_patch do Codex mexe
 
 
@@ -2317,7 +2318,7 @@ def telas_avisar():
 def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
     txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
-    return "\n".join([txt, *linhas_noite(cur, events)])
+    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events)])
 
 
 # ---------- digest e modo ausente ----------
@@ -5372,6 +5373,70 @@ def _conferir_inicio(dispatch, terminal, titulo, out):
     return _esperar_prompt(dispatch, terminal, titulo)
 
 
+def mesclar_hooks_codex(atual, exemplo):
+    """Acrescenta ao fim de cada evento de `atual` os grupos de `exemplo` cujo comando ainda não está lá. Nunca reordena nem remove: o trust do Codex
+    é posicional (`hooks.json:<evento>:<grupo>:<hook>`) e inserir no meio desconfia os grupos seguintes. Devolve (hooks novos, [(evento, grupo)] acrescentados)."""
+    novo, add = json.loads(json.dumps(atual)), []
+    ja = {h.get("command") for gs in _dict(novo.get("hooks")).values() for g in gs for h in g.get("hooks", [])}
+    for ev, grupos in _dict(exemplo.get("hooks")).items():
+        for g in grupos:
+            if all(h.get("command") in ja for h in g.get("hooks", [])):
+                continue
+            lista = novo.setdefault("hooks", {}).setdefault(ev, [])
+            lista.append(g)
+            add.append((ev, len(lista) - 1))
+            ja |= {h.get("command") for h in g.get("hooks", [])}
+    return novo, add
+
+
+def instalar_hooks_codex(exemplo):
+    """Mescla o exemplo no CODEX_HOOKS (arquivo ausente vale vazio) e devolve os grupos acrescentados. JSON que não lê levanta: nada é gravado."""
+    try:
+        atual = json.load(open(CODEX_HOOKS, encoding="utf-8"))
+    except FileNotFoundError:
+        atual = {}
+    novo, add = mesclar_hooks_codex(atual, json.load(open(exemplo, encoding="utf-8")))
+    if add:
+        tmp = f"{CODEX_HOOKS}.{os.getpid()}.tmp"
+        os.makedirs(os.path.dirname(CODEX_HOOKS) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(novo, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CODEX_HOOKS)
+    return add
+
+
+def hooks_codex_nao_confiados():
+    """As chaves `<hooks.json>:<evento>:<grupo>:<hook>` dos hooks do orq no CODEX_HOOKS que o `[hooks.state]` do config.toml não confia (sem entrada,
+    sem trusted_hash ou `enabled = false`). Sem hooks.json ou sem hook do orq nele o Codex não está ligado ao orq: lista vazia.
+    ponytail: só a posição; o hash do Codex não é documentado, então um hook editado depois do trust passa por confiado."""
+    import tomllib
+    try:
+        eventos = _dict(json.load(open(CODEX_HOOKS, encoding="utf-8")).get("hooks"))
+    except (OSError, ValueError):
+        return []
+    try:
+        estado_ = _dict(_dict(tomllib.loads(open(CODEX_CONFIG, encoding="utf-8").read()).get("hooks")).get("state"))
+    except (OSError, tomllib.TOMLDecodeError):
+        estado_ = {}
+    caminho, fora = os.path.abspath(CODEX_HOOKS), []
+    for ev, grupos in eventos.items():
+        for g, grupo in enumerate(grupos):
+            for h, x in enumerate(_dict(grupo).get("hooks", [])):
+                if not re.search(r"/orq/(?:orq|precompact)\.py", x.get("command") or ""):
+                    continue
+                chave = f"{caminho}:{re.sub(r'(?<!^)(?=[A-Z])', '_', ev).lower()}:{g}:{h}"
+                reg = _dict(estado_.get(chave))
+                if not reg.get("trusted_hash") or reg.get("enabled") is False:
+                    fora.append(chave)
+    return fora
+
+
+def aviso_hooks_codex():
+    """A linha de aviso do `orq status`, do `orq agentes` e do preâmbulo do coordenador; vazia com tudo confiado."""
+    n = len(hooks_codex_nao_confiados())
+    return f"⚠ hooks do orq não confiados no Codex: rode /hooks ({n} hook{'s' if n > 1 else ''}; até confiar o orq não vê o terminal Codex)" if n else ""
+
+
 def confiar_codex(*caminhos):
     """Marca cada pasta como confiável no Codex (`[projects."<p>"] trust_level = "trusted"` no config.toml) e devolve as que entraram agora. O Codex
     guarda o trust pela raiz do repositório principal, e a worktree herda; o orq grava as duas. Config que não lê como TOML fica como estava."""
@@ -7547,6 +7612,7 @@ def main(argv=None):
     hk = sub.add_parser("hook")
     hk.add_argument("kind", choices=list(HOOKS))
     hk.add_argument("harness", nargs="?", default="claude", choices=HARNESSES, help="de que agente vem o hook (o padrão é o dos hooks instalados no Claude)")
+    sub.add_parser("hooks-codex", help="acrescenta os hooks do orq ao ~/.codex/hooks.json sem reordenar; depois confie em /hooks")
     i = sub.add_parser("intake")
     i.add_argument("entrada")
     i.add_argument("efeito")
@@ -7811,6 +7877,9 @@ def main(argv=None):
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
         elif a.cmd == "ocupadas":
             print("\n".join(sorted(worktrees_ocupadas())))
+        elif a.cmd == "hooks-codex":
+            add = instalar_hooks_codex(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex.hooks.example.json"))
+            print("\n".join([*(f"acrescentado: {ev} grupo {g}" for ev, g in add), aviso_hooks_codex() or "hooks do orq confiados no Codex"]))
         elif a.cmd == "status":
             print("\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])]))
         elif a.cmd == "resumo" and a.noite:
@@ -7822,7 +7891,7 @@ def main(argv=None):
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]
-            print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([texto_agentes(ags), *linhas_hibernacao(), *parada]))
+            print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([*filter(None, [aviso_hooks_codex()]), texto_agentes(ags), *linhas_hibernacao(), *parada]))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))
