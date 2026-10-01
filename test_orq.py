@@ -10636,6 +10636,25 @@ def _estado(evs, mates, seg):
     return {p["corr"]: p["estado"] for p in orq_mod.mate_pendentes(evs, mates, T0 + timedelta(seconds=seg))}
 
 
+def _linhas_mate(a):
+    return [x for x in a.orq("status").stdout.splitlines() if x.startswith("mate ")]
+
+
+def test_orq_status_mostra_uma_linha_por_mate_vivo_caido_e_com_pedido():
+    a = Amb()
+    _grupo(a)
+    _grupo(a, "dados")  # grupo sem mate: sem linha
+    assert _linhas_mate(a) == []
+    _mate_vivo(a)
+    assert _linhas_mate(a) == ["mate orq: vivo (term_mate)"]
+    a.set("terminals.json", ["term_coord"])  # o terminal do mate sumiu
+    assert _linhas_mate(a) == ["mate orq: caiu (term_mate)"]
+    a.set("terminals.json", ["term_mate", "term_coord"])
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "mate_pedido", "corr": "p1", "grupo": "orq", "texto": "x", "prazo": 120, "ts": "2026-10-01T12:00:00Z"}) + "\n")
+    assert _linhas_mate(a) == ["mate orq: vivo (term_mate) | pedidos: p1 a_entregar"]
+
+
 def test_mate_pendentes_conta_o_prazo_do_fim_do_turno_que_recebeu_o_pedido():
     evs = _pedido()
     assert _estado(_pedido(entregue=None), {}, 5) == {"p1": "a_entregar"}

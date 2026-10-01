@@ -4331,16 +4331,35 @@ def mate_volta():
     return linhas
 
 
+def _mate_do_grupo(nome, mates, vivos, eventos, agora):
+    """(estado, terminal, Runs, pedidos sem resposta) do mate de um grupo; estado "sem mate", "vivo" ou "caiu"."""
+    m = _dict(mates.get(nome))
+    estado = "sem mate" if not m.get("terminal") else "vivo" if vivos is None or m["terminal"] in vivos else "caiu"
+    return estado, m.get("terminal"), m.get("runs") or [], [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == nome]
+
+
 def texto_grupos(gs, mates, vivos, eventos, agora):
     linhas = []
     for nome, cfg in gs.items():
-        m = _dict(mates.get(nome))
-        estado = "sem mate" if not m.get("terminal") else "vivo" if vivos is None or m["terminal"] in vivos else "caiu"
-        pend = [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == nome]
+        estado, terminal, runs, pend = _mate_do_grupo(nome, mates, vivos, eventos, agora)
         linhas.append(f"{nome}: {', '.join(cfg.get('projetos') or [])} | prefixos {', '.join(cfg.get('prefixos') or []) or '-'} | mate {estado}"
-                      + (f" ({m['terminal']}, Runs {', '.join(m.get('runs') or []) or '-'})" if m.get("terminal") else "")
+                      + (f" ({terminal}, Runs {', '.join(runs) or '-'})" if terminal else "")
                       + (f" | pedidos: {', '.join(p['corr'] + ' ' + p['estado'] for p in pend)}" if pend else ""))
     return "\n".join(linhas) or f"nenhum grupo em {_path(GRUPOS_DIR)}"
+
+
+def linhas_mates():
+    """As linhas do `orq status`: uma por grupo com mate gravado (vivo ou caiu, terminal, pedidos sem resposta). Sem mate, nada."""
+    mates = _mates()
+    if not mates:
+        return []
+    vivos, eventos, agora = _terminais_vivos(), read_events(), datetime.now(timezone.utc)
+    linhas = []
+    for nome in grupos():
+        estado, terminal, _, pend = _mate_do_grupo(nome, mates, vivos, eventos, agora)
+        if terminal:
+            linhas.append(f"mate {nome}: {estado} ({terminal})" + (f" | pedidos: {', '.join(p['corr'] + ' ' + p['estado'] for p in pend)}" if pend else ""))
+    return linhas
 
 
 def guard_mate():
@@ -6682,7 +6701,7 @@ def linhas_passagens(events, turnos, agora=None):
 
 def texto_status():
     """O que `orq status` imprime: o estado, as passagens abertas, os PRs, as worktrees, a fila de E2E e a máquina."""
-    return "\n".join([estado(), *linhas_passagens(read_events(), _turnos_ro()), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
+    return "\n".join([estado(), *linhas_passagens(read_events(), _turnos_ro()), *linhas_pr(), *linhas_worktrees(), *linhas_mates(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
 
 
 # ---------- orq iniciar: o coordenador que já está aberto, em qualquer harness ----------
