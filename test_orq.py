@@ -6440,7 +6440,7 @@ def test_review9_b49_anda_mostra_travado_parado_e_nao_comecou():
 
     def z(s):
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(agora.timestamp() - s))
-    base = {"agente": orq_mod.AGENTE_COM_HOOK, "estado": "rodando", "titulo": "W"}
+    base = {"agente": "claude", "estado": "rodando", "titulo": "W"}
     ags = [{**base, "dispatch": "ctx_t", "task": "t1", "desde": z(3600), "ultimo_heartbeat": z(3000)},
            {**base, "dispatch": "ctx_p", "task": "t2", "desde": z(3600), "ultimo_heartbeat": z(1200), "turno_inicio": z(1100), "turno_fim": z(900)},
            {**base, "dispatch": "ctx_n", "task": "t3", "desde": z(900)}]
@@ -8483,6 +8483,23 @@ def test_ticket52_retomar_leva_o_jeito_de_escalar_na_mensagem_de_continuacao():
 
 def test_ticket52_tela_tem_15_linhas_de_folga_para_o_prompt_de_permissao():
     assert orq_mod.TELA_LINHAS >= 25 and len(_tela52("tela-permissao.txt")) <= orq_mod.TELA_LINHAS
+
+
+# ---------- ticket 73: adaptador de harness (claude | codex) ----------
+
+def test_ticket73_o_resume_do_claude_sai_igual_ao_de_antes_do_adaptador():
+    r = orq_mod.HARNESS["claude"]["resume"]
+    assert orq_mod.shlex.join(r("sess 1", "claude-opus-5-5", "high", "Continue, it's ok")) == \
+        "claude --resume 'sess 1' --model claude-opus-5-5 --dangerously-skip-permissions 'Continue, it'\"'\"'s ok'"
+    assert orq_mod.shlex.join(r("s", None, None, "m")) == "claude --resume s --dangerously-skip-permissions m", "sem modelo não leva --model"
+
+
+def test_ticket73_a_tela_de_cada_harness_usa_os_padroes_dele_e_harness_sem_adaptador_nao_tem_menu():
+    p = orq_mod.tela_pergunta(_tela52("tela-permissao.txt"), "claude")
+    assert p == orq_mod.tela_pergunta(_tela52("tela-permissao.txt")), "o padrão é o claude"
+    assert orq_mod.tela_pergunta(_tela52("tela-permissao.txt"), "cursor") is None, "sem adaptador o orq não afirma nada da tela"
+    assert set(orq_mod.HARNESS) >= {"claude"} and "claude" in orq_mod.HARNESSES
+
 
 
 if __name__ == "__main__":

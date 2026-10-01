@@ -68,7 +68,6 @@ NAO_COMECOU_S = 120  # dispatch aberto sem nenhum turno registrado tanto tempo d
 PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker parou no prompt (o limiar evita chamar de parado a folga entre dois turnos)
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
-AGENTE_COM_HOOK = "claude"  # só o Claude Code roda os hooks do orq: de outro agente o orq não sabe se parou
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
 ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "encerrado": 6, "liberado": 7}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
@@ -113,6 +112,20 @@ WT_PARADA_D = 3  # worktree sem worker e sem atividade há mais que isto entra n
 PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
 AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
+TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
+
+
+# ---------- harness (claude | codex) ----------
+# O que muda de um agente para o outro, numa tabela: o comando de resume (o launch é do Orca, `worker-start --agent`) e os padrões da tela.
+# Agente fora da tabela não tem hook do orq nem tela lida: o estado dele fica `unknown`. Desenho: ~/.claude/orquestrador-plan/orq-claude-e-codex.md
+HARNESS = {
+    "claude": {
+        "resume": lambda sessao, modelo, effort, msg: ["claude", "--resume", sessao, *(["--model", modelo] if modelo else []),
+                                                       "--dangerously-skip-permissions", msg],
+        "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
+    },
+}
+HARNESSES = tuple(HARNESS)
 
 
 # ---------- puras ----------
@@ -274,7 +287,7 @@ def turno_do_dispatch(t, agente, desde, ultimo_hb, agora):
     heartbeat veio depois; `aberto`: turno em andamento (ou terminado há pouco). `unknown` é o que não dá para afirmar (agente sem o hook do orq,
     agente que o Orca não informou, ainda dentro da janela): nunca vale como ocioso. `t` é {inicio, fim} do turnos.json; `desde` e `ultimo_hb` são datetimes.
     """
-    if agente != AGENTE_COM_HOOK:
+    if agente not in HARNESS:
         return "unknown", None
     inicio, fim = _ts(_dict(t).get("inicio")), _ts(_dict(t).get("fim"))
     if not inicio:
@@ -2204,7 +2217,7 @@ def telas_avisar():
     turnos, ws = _turnos_ro(), []
     for r in g["runs"]:
         ws += [w for w in _workers_todos(r) if w.get("dispatchId") in turnos]
-    lidas = _ler_telas(ws, {w["dispatchId"]: {"agente": AGENTE_COM_HOOK} for w in ws})
+    lidas = _ler_telas(ws, {w["dispatchId"]: {"agente": _dict(turnos[w["dispatchId"]]).get("harness") or "claude"} for w in ws})
     abertas, linhas = _pergunta_aberta(read_events()), []
     for w in ws:
         d, p = w["dispatchId"], (lidas.get(w["dispatchId"]) or {}).get("pergunta")
@@ -4078,26 +4091,29 @@ def _detalhes(ws):
     return {w["dispatchId"]: {"titulo": tits.get(w.get("runId"), {}).get(w.get("taskId")), **vivos.get(w["dispatchId"], {})} for w in ws}
 
 
-def tela_pergunta(linhas):
-    """{tipo, texto, opcoes: [[n, rótulo]]} se o fim da tela é um menu do Claude Code esperando resposta humana, senão None.
+def tela_pergunta(linhas, agente="claude"):
+    """{tipo, texto, opcoes: [[n, rótulo]]} se o fim da tela é um menu do agente esperando resposta humana, senão None (também para agente sem adaptador).
 
     Três tipos: `trust` (confiar na pasta), `permissao` (Do you want to proceed?…) e `pergunta` (AskUserQuestion). Menu aberto = opções numeradas
     1, 2… seguidas, uma com o cursor `❯`, no fim da tela (no máximo TELA_RODAPE_MAX linhas de rodapé depois); um `❯ 1. …` solto no histórico não conta.
     """
+    if agente not in HARNESS:
+        return None
+    padroes = HARNESS[agente]["tela"]
     tela = [re.sub(r"[│╭╮╰╯─]", " ", str(l)).rstrip() for l in linhas or []]
-    ops = [(i, TELA_OPCAO.match(l)) for i, l in enumerate(tela)]
+    ops = [(i, padroes["opcao"].match(l)) for i, l in enumerate(tela)]
     ops = [(i, m) for i, m in ops if m]
     bloco = []
     for i, m in reversed(ops):  # o último bloco de opções consecutivas
         if bloco and (bloco[0][0] - i > 2 or int(m.group(2)) != int(bloco[0][1].group(2)) - 1):
             break
         bloco.insert(0, (i, m))
-    if len(bloco) < 2 or int(bloco[0][1].group(2)) != 1 or not any(m.group(1) == "❯" for _, m in bloco):
+    if len(bloco) < 2 or int(bloco[0][1].group(2)) != 1 or not any(m.group(1) == padroes["cursor"] for _, m in bloco):
         return None
     if sum(bool(l.strip()) for l in tela[bloco[-1][0] + 1:]) > TELA_RODAPE_MAX:
         return None
     texto = "\n".join(tela)
-    tipo = next((t for t, r in TELA_PERGUNTAS if r.search(texto)), None)
+    tipo = next((t for t, r in padroes["perguntas"] if r.search(texto)), None)
     if not tipo:
         return None
     acima = [l.strip() for l in tela[:bloco[0][0]] if l.strip()][-3:]
@@ -4116,10 +4132,12 @@ def _ler_telas(ws, detalhes):
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
             log(f"agentes: tela de {w['dispatchId']}: {type(e).__name__}: {e}")
             return w["dispatchId"], None
-        m = TELA_ESPERA.search("\n".join(map(str, tail[-15:])))
-        achado = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": tela_pergunta(tail)}
+        agente = detalhes[w["dispatchId"]]["agente"]
+        espera = HARNESS[agente]["tela"]["espera"]
+        m = espera and espera.search("\n".join(map(str, tail[-15:])))
+        achado = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": tela_pergunta(tail, agente)}
         return w["dispatchId"], achado if m or achado["pergunta"] else None
-    alvo = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (detalhes.get(w.get("dispatchId")) or {}).get("agente") == AGENTE_COM_HOOK]
+    alvo = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (detalhes.get(w.get("dispatchId")) or {}).get("agente") in HARNESS]
     with ThreadPoolExecutor(8) as ex:
         return {d: a for d, a in ex.map(le, alvo) if a}
 
@@ -4431,7 +4449,8 @@ def responder_tela(task, opcao, run=None):
     if not w or not w.get("agentTerminalHandle"):
         raise ValueError(f"task {task} não tem worker rodando com terminal: nada a responder")
     handle = w["agentTerminalHandle"]
-    p = tela_pergunta(_fundo(orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal", timeout=10), "terminal", "tail") or [])
+    agente = _dict(_turnos_ro().get(w["dispatchId"])).get("harness") or "claude"
+    p = tela_pergunta(_fundo(orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal", timeout=10), "terminal", "tail") or [], agente)
     if not p:
         raise ValueError(f"a tela de {handle} não mostra um menu esperando resposta: nada foi digitado")
     alvo = next((o for o in p["opcoes"] if str(o[0]) == opcao.strip() or o[1].lower().startswith(opcao.strip().lower())), None)
@@ -4881,21 +4900,18 @@ def msg_continuar(coord, task, dispatch, run):
     return f"{MSG_CONTINUE} {MSG_ESCALAR.format(coord=coord or '<coordenador>', run=run or '<run>', task=task or '<task>', dispatch=dispatch)}"
 
 
-TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
-
-
 def _terminal_novo(titulo, comando, cwd=None):
     """`orca terminal create` (na worktree `cwd`, ou na atual) e o handle do terminal novo."""
     args = ["create", "--title", titulo, "--command", comando, *(["--worktree", f"path:{cwd}"] if cwd else [])]
     return orca(*args, area="terminal", timeout=30)["terminal"]["handle"]
 
 
-def _voltou(handle):
-    """A sessão do terminal mostra atividade: `esc to interrupt` na tela, ou a tela mudou entre duas leituras; TELA_FALHA é que não voltou."""
+def _voltou(handle, agente="claude"):
+    """A sessão do terminal mostra atividade: `esc to interrupt` na tela, ou a tela mudou entre duas leituras; a `falha` da tela do agente é que não voltou."""
     antes, fim = None, time.time() + RETOMAR_ESPERA_S
     while True:
         tela = "\n".join(orca("read", "--terminal", handle, "--screen", area="terminal")["terminal"].get("tail") or [])
-        if any(f in tela for f in TELA_FALHA):
+        if any(f in tela for f in HARNESS[agente]["tela"]["falha"]):
             return False
         if "esc to interrupt" in tela or (antes is not None and tela != antes):
             return True
@@ -4913,10 +4929,10 @@ def _gerente_a_religar(g, meu, vivos):
     return (morto, trocado) if morto or trocado else None
 
 
-def _subir_sessao(linha, sessao, modelo, cp, dica, msg=MSG_CONTINUE):
-    """`claude --resume` da `sessao` num terminal novo na worktree `linha["cwd"]`, evento `retomada` e conferência da tela. Devolve `linha` com o estado
-    (retomado, sem_atividade ou falhou)."""
-    comando = f"claude --resume {shlex.quote(sessao)}{f' --model {shlex.quote(modelo)}' if modelo else ''} --dangerously-skip-permissions {shlex.quote(msg)}"
+def _subir_sessao(linha, sessao, modelo, cp, dica, msg=MSG_CONTINUE, agente="claude", effort=None):
+    """O resume do agente (HARNESS) da `sessao` num terminal novo na worktree `linha["cwd"]`, evento `retomada` e conferência da tela. Devolve `linha` com o
+    estado (retomado, sem_atividade ou falhou)."""
+    comando = shlex.join(HARNESS[agente]["resume"](sessao, modelo, effort, msg))
     try:
         novo = _terminal_novo(f"{linha['titulo']} (retomado)", comando, linha["cwd"])
     except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -4924,7 +4940,7 @@ def _subir_sessao(linha, sessao, modelo, cp, dica, msg=MSG_CONTINUE):
     append_event({"tipo": "retomada", "dispatch": linha["dispatch"], "task": linha["task"], "run": linha["run"], "terminal": novo, "anterior": linha["terminal"],
                   "sessao": sessao, "cwd": linha["cwd"], "modelo": modelo, "head": cp["head"], "sujo": cp["sujo"]})
     try:
-        voltou = _voltou(novo)
+        voltou = _voltou(novo, agente)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         voltou, linha = False, {**linha, "aviso": f"não consegui ler a tela ({e})"}
     return {**linha, "novo": novo, "estado": "retomado" if voltou else "sem_atividade",
