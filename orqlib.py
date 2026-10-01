@@ -1241,6 +1241,7 @@ def refresh_aberto():
             ab["agentes"] = agentes()  # sem os liberados; se o Orca falhar, o cache fica sem a chave e o resumo cai nos `andamento`
         except Exception as e:  # noqa: BLE001
             log(f"refresh: agentes: {type(e).__name__}: {e}")
+        ab["maquina"] = maquina_painel(ab.get("agentes"))
         _write_json(_path("aberto.json"), ab)
         return ab
 
@@ -2454,7 +2455,7 @@ def tickets_do_painel(ts, aberto):
     return {"abertos": saida, "resolvidos": sorted(feitos, key=lambda x: (x["em"], x["num"]), reverse=True)[:5]}
 
 
-def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None, e2e=None):
+def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None, e2e=None, maquina=None):
     """O digest como dados no formato do contrato (contratos/digest-v1.md) mais o que só a página usa. Só arquivos do orq: nada de gh nem de Orca.
 
     fila = a ordem que o coordenador declarou (`orq fila`); sem nenhum passo declarado, sai da ordem pelos `Blocked by` dos tickets, um passo por
@@ -2484,11 +2485,13 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
     rodando = sorted(({"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde"),
                        **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
                       for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA), key=lambda r: r.get("prioridade") or 2)  # a mais alta primeiro
+    if maquina:  # as vagas e a fila de despacho (ticket 79): uma chave a mais, `rodando` segue só com workers e a fila do E2E
+        maquina = {**maquina, "ocupadas": len(rodando), "livres": max(maquina["max_workers"] - len(rodando), 0)}
     if e2e:  # a fila do E2E é uma linha a mais em `rodando`: `presa` quando não anda
         rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
     return {"versao": 1, "geradoEm": agora.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(ausente), "desde": _dict(ausente).get("ligada_em")},
-            "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando,
+            "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando, "maquina": maquina,
             "tickets_orq": tickets_do_painel(ts, aberto),
             "pagina": {"data": agora.astimezone().strftime("%Y-%m-%d"), "gerado": agora.astimezone().strftime("%H:%M"), "desde": desde, "poll": prs.get("ultimo_poll"),
                        "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada)}}
@@ -2522,6 +2525,8 @@ def html_digest(d):
     pend = "".join(f'<div class="card dec"><h3>{e(str(p.get("titulo") or p.get("id")))}</h3><p>{e(str(p.get("tipo") or ""))} · <code>{e(str(p.get("id") or ""))}</code>'
                    f'{" · Depois" if p["depois"] else ""}</p></div>' for p in d["pendencias"])
     rod = "".join(f'<span>{e(r["titulo"])} [{e(r["estado"])}]</span>' for r in d["rodando"])
+    m = d.get("maquina")
+    vagas = (f'<p class="sub">Máquina: {m["ocupadas"]}/{m["max_workers"]:g} vagas ocupadas, {m["livres"]:g} livres, {m["fila"]} na fila de despacho.</p>' if m else "")
     linha = "".join(f'<li class="{ {"sec": "sec", "info": "fo"}.get(x["tipo"], "ok") }"><b>{e(x["titulo"])}</b><p>{_hora_local(x["ts"])} {e(x["detalhe"])}</p></li>' for x in d["linha"])
     antes = f'<p class="sub">+{pg["linha_antes"]} antes destes.</p>' if pg["linha_antes"] else ""
     poll = (f"O estado dos PRs é do poll das {datetime.fromtimestamp(pg['poll']).strftime('%H:%M')}; esta página não consulta o GitHub."
@@ -2534,7 +2539,7 @@ def html_digest(d):
             '<span><span class="dot p"></span> main</span></div>'
             f'<h2>Ordem de merge</h2><p class="sub">{e(origem_)} Dentro de cada passo, development antes de staging.</p>'
             f'{fila}<h2>Com você</h2>{f"<div class=grid>{pend}</div>" if pend else "<p class=sub>Nada esperando por você.</p>"}'
-            f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}'
+            f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}{vagas}'
             f'<h1 style="margin-top:36px">O que aconteceu</h1>{antes}'
             f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}</main></body></html>')
 
@@ -2548,7 +2553,8 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     agora = agora or datetime.now(timezone.utc)
     events, ausente = read_events(), _dict(_cursor_ro().get("ausente")) or None
     janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
-    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e())
+    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
+                    {"max_workers": maquina_cfg()["max_workers"], "fila": len(fila_despacho_itens())})
     os.makedirs(_path(DIGEST), exist_ok=True)
     _write_json(_path(os.path.join(DIGEST, "atual.json")), digest_json(d), indent=2)
     pagina = None
@@ -4645,6 +4651,10 @@ def relancar(dispatch, nota, modelo=None, effort=None, run=None):
         raise ValueError("o Orca não informou o modelo e o effort do worker antigo: passe --modelo e --effort")
     if not run_do_coordenador(run_id):
         raise ValueError(f"o worker é do Run {run_id}, que o coordenador não comanda: {dica_ligar(run_id)}")
+    ocup = maquina_ocupacao()  # troca um por um: o worker do próprio dispatch sai da conta (é parado antes de subir o novo), então só o modelo caro a mais ou um dispatch já morto estouram o teto
+    ocup["vivos"].pop(dispatch, None)
+    if motivo := maquina_vaga(pedido[0], ocup):
+        raise ValueError(f"{motivo}: nada foi parado. Relance com um modelo barato, espere abrir vaga ou ajuste orq maquina")
     if not any(t["id"] == task for t in orca("task-list", "--run", run_id, timeout=20)["tasks"]):
         raise ValueError(f"task {task} não existe no Run {run_id}")
     base = {"nota": nota, "terminal": w.get("agentTerminalHandle"), "worktree": cp["caminho"], "head": cp["head"], "sujo": cp["sujo"]}
@@ -4746,7 +4756,7 @@ def _raiz_do_repo(d):
     return os.path.realpath(os.path.dirname(comum)) if comum else None
 
 
-def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente="claude"):
+def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente="claude", _drenando=False):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
@@ -4754,6 +4764,10 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     Com `ticket` (o número de um `orq ticket novo`) o worker sobe na task que o ticket já criou (`worker-start --task`), sem título nem spec: o
     ticket é o conteúdo. Com o modo noite ligado, recusa depois do horário, do teto de despachos ou das falhas seguidas (noite_checar). Recusa também
     com o uso do plano acima do limiar (uso_checar). `prioridade` (1 alta a 3 baixa) fica no evento; sem ela vale a da frente do título (prioridade_padrao).
+
+    Orçamento da máquina (ticket 79): sem vaga (workers vivos ou caros no teto) ou com a máquina sob pressão, o pedido entra na fila de despacho e a resposta é
+    `{estado: "enfileirado", fila, posicao, motivo}` no lugar dos ids do worker; o gerente sobe o item por prioridade quando abrir vaga (`_drenando`: é ele
+    quem chama, e sem vaga levanta SemVaga em vez de enfileirar de novo).
     """
     if prioridade is not None and prioridade not in (1, 2, 3):
         raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
@@ -4787,41 +4801,48 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 spec = f.read()
         except OSError as e:
             raise ValueError(f"não consegui ler {spec_arquivo}: {e.strerror}")
-    uso_checar(prioridade or prioridade_de(read_events(), tk and tk["task"], None, titulo), agente=agente)
+    prio = prioridade or prioridade_de(read_events(), tk and tk["task"], None, titulo)
+    uso_checar(prio, agente=agente)
     pedido = _texto_da_entrada(entrada)
     _adotar(run)
     if not run_do_coordenador(run):
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
-    if spec is not None and not spec.lstrip().startswith("#"):
-        spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
-    if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
-        cabeca, _, resto = spec.partition("\n")
-        spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
-                f"{resto.lstrip(chr(10))}")
-    ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
-    confiadas = confiar_codex(_raiz_do_repo(os.getcwd())) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
-    args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
-            "--agent", agente, "--model", modelo, "--effort", effort]
-    for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
-        if val:
-            args += [flag, val]
-    try:
-        res = orca(*args, timeout=180, env_extra=ambiente)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"worker-start passou de 180 s sem resposta: o worker pode ter subido, confira com orq agentes --run {run}")
-    task, dispatch = res.get("taskId"), res.get("dispatchId")
-    terminal = next((e.get("id") for e in res.get("effects") or [] if e.get("kind") == "terminal" and e.get("role") == "agent"), None)
-    if not (task and dispatch):
-        raise RuntimeError(f"worker-start sem taskId/dispatchId na resposta: {json.dumps(res)[:300]}")
-    if terminal:
+    with _trava("despacho.lock"):  # a vaga conferida e o worker-start formam um passo: despachos paralelos não passam do teto juntos
+        barra, motivo = maquina_barra(modelo)
+        if barra and _drenando:
+            raise SemVaga(motivo)
+        if barra:
+            return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente)
+        if spec is not None and not spec.lstrip().startswith("#"):
+            spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
+        if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
+            cabeca, _, resto = spec.partition("\n")
+            spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
+                    f"{resto.lstrip(chr(10))}")
+        ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
+        confiadas = confiar_codex(_raiz_do_repo(os.getcwd())) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
+        args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
+                "--agent", agente, "--model", modelo, "--effort", effort]
+        for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
+            if val:
+                args += [flag, val]
         try:
-            orca("rename", "--terminal", terminal, "--title", titulo, area="terminal")
-        except Exception as e:  # noqa: BLE001 - o título da aba é conforto: falhar não desfaz o despacho
-            log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
-    ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort, "terminal": terminal,
-          **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
-          **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
-    append_event(ev)
+            res = orca(*args, timeout=180, env_extra=ambiente)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"worker-start passou de 180 s sem resposta: o worker pode ter subido, confira com orq agentes --run {run}")
+        task, dispatch = res.get("taskId"), res.get("dispatchId")
+        terminal = next((e.get("id") for e in res.get("effects") or [] if e.get("kind") == "terminal" and e.get("role") == "agent"), None)
+        if not (task and dispatch):
+            raise RuntimeError(f"worker-start sem taskId/dispatchId na resposta: {json.dumps(res)[:300]}")
+        if terminal:
+            try:
+                orca("rename", "--terminal", terminal, "--title", titulo, area="terminal")
+            except Exception as e:  # noqa: BLE001 - o título da aba é conforto: falhar não desfaz o despacho
+                log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
+        ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort, "terminal": terminal,
+              **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
+              **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
+        append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if agente == "codex":
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError):
@@ -5050,6 +5071,361 @@ def gerente_desligar(run=None, assumir=False):
     return append_event({"tipo": "gerente", "op": "desligar", "terminal": g.get("gerente"), "run": devolvidos[-1] if devolvidos else None, "runs": devolvidos})
 
 
+# ---------- orçamento da máquina e fila de despacho (ticket 79) ----------
+
+MAQUINA = "maquina.json"  # por cima de MAQUINA_PADRAO; `orq maquina set <chave> <valor>` grava
+MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RAM, 12 CPUs: cada um pode subir uma stack de E2E)
+                  "max_e2e": 1,  # só informativo: a fila global do E2E (scripts/e2e-lock.sh) já serializa as stacks
+                  "max_caros": 2, "modelos_caros": ["claude-opus-*", "gpt-6-astra*", "gpt-6-sol*"],  # padrões glob; o modelo caro conta no max_workers também
+                  "mem_livre_min_mb": 3072, "livre_pct_min": 15,  # abaixo de qualquer um dos dois a pressão é alta
+                  "carga_max": 12,  # loadavg de 1 min acima disto (uma por CPU) é pressão alta
+                  "pausar_sob_pressao": False}  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
+FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
+FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
+VIVOS_MAQUINA = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
+PROCESSOS_PESADOS = ("claude", "codex", "node", "docker")  # a soma de RSS que o `orq maquina` mostra
+ESPERA_SEGURADO_S = 300  # item da fila que o uso do plano ou o modo noite segurou só é tentado de novo depois disto
+FALHAS_FILA = 3  # tentativas do gerente com erro antes de o item sair da fila
+
+
+class SemVaga(Exception):
+    """O gerente tentou subir um item da fila e a máquina não tem mais vaga (outro despacho tomou a vaga)."""
+
+
+def _maquina_tipo_ok(padrao, v):
+    if isinstance(padrao, bool):
+        return isinstance(v, bool)
+    if isinstance(padrao, (int, float)):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def maquina_cfg():
+    """MAQUINA_PADRAO por cima de maquina.json; chave de tipo errado ou desconhecida vale como ausente."""
+    lido = _dict(_read_json(_path(MAQUINA)))
+    return {k: lido[k] if k in lido and _maquina_tipo_ok(p, lido[k]) else p for k, p in MAQUINA_PADRAO.items()}
+
+
+def maquina_definir(chave, valor):
+    """`orq maquina set <chave> <valor>`: valor em JSON (4, true, ["claude-opus-*"]); recusa chave desconhecida ou de outro tipo. Devolve a config nova."""
+    if chave not in MAQUINA_PADRAO:
+        raise ValueError(f"chave {chave!r} desconhecida; as que existem: {', '.join(MAQUINA_PADRAO)}")
+    try:
+        v = json.loads(valor)
+    except ValueError:
+        raise ValueError(f"valor {valor!r} não é JSON (use 4, true ou [\"claude-opus-*\"])")
+    if not _maquina_tipo_ok(MAQUINA_PADRAO[chave], v):
+        raise ValueError(f"valor {valor} não serve para {chave} (espera {type(MAQUINA_PADRAO[chave]).__name__})")
+    _write_json(_path(MAQUINA), {**_dict(_read_json(_path(MAQUINA))), chave: v}, indent=2)
+    return maquina_cfg()
+
+
+def maquina_ler():
+    """O que a máquina tem agora, com ferramentas nativas do macOS: {mem_livre_mb, livre_pct, carga, ncpu, rss_mb: {claude, codex, node, docker}}.
+
+    mem_livre_mb = (free + inactive + speculative + purgeable) do `vm_stat`; livre_pct = o `System-wide memory free percentage` do `memory_pressure`;
+    carga = loadavg de 1 min (o mesmo número do `sysctl vm.loadavg`); rss_mb = soma do RSS dos processos de PROCESSOS_PESADOS no `ps`. Fonte que falha
+    fica None/vazia (a pressão que ela mediria vale como desconhecida, nunca como alta). `ORQ_MAQUINA_LEITURA` aponta um JSON no lugar da leitura (testes)."""
+    if os.environ.get("ORQ_MAQUINA_LEITURA"):
+        return _dict(_read_json(os.environ["ORQ_MAQUINA_LEITURA"]))
+
+    def roda(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    leitura = {"mem_livre_mb": None, "livre_pct": None, "carga": None, "ncpu": os.cpu_count(), "rss_mb": {}}
+    vm = roda("vm_stat")
+    pag = re.search(r"page size of (\d+)", vm)
+    pags = {n: re.search(rf"^Pages {n}:\s+(\d+)", vm, re.M) for n in ("free", "inactive", "speculative", "purgeable")}
+    if pag and all(pags.values()):
+        leitura["mem_livre_mb"] = sum(int(m.group(1)) for m in pags.values()) * int(pag.group(1)) // 2**20
+    pct = re.search(r"free percentage:\s*(\d+)%", roda("memory_pressure"))
+    leitura["livre_pct"] = int(pct.group(1)) if pct else None
+    with contextlib.suppress(OSError):
+        leitura["carga"] = round(os.getloadavg()[0], 2)
+    rss = dict.fromkeys(PROCESSOS_PESADOS, 0)
+    for linha in roda("ps", "-axo", "rss=,comm=").splitlines():
+        kb, _, comm = linha.strip().partition(" ")
+        base = os.path.basename(comm.strip()).lower()
+        nome = next((p for p in PROCESSOS_PESADOS if base == p or (p == "docker" and "docker" in comm.lower())), None)
+        if nome and kb.isdigit():
+            rss[nome] += int(kb) // 1024
+    leitura["rss_mb"] = rss
+    return leitura
+
+
+def maquina_nivel(leitura=None, cfg=None):
+    """(`alta` | `ok`, motivo): pressão alta se a memória livre, o percentual livre ou a carga passam do limite de maquina.json. Leitura ausente não conta."""
+    l, c = leitura if leitura is not None else maquina_ler(), cfg or maquina_cfg()
+    motivos = []
+    if isinstance(l.get("mem_livre_mb"), (int, float)) and l["mem_livre_mb"] < c["mem_livre_min_mb"]:
+        motivos.append(f"memória livre {l['mem_livre_mb']:g} MB (mínimo {c['mem_livre_min_mb']:g} MB)")
+    if isinstance(l.get("livre_pct"), (int, float)) and l["livre_pct"] < c["livre_pct_min"]:
+        motivos.append(f"memória livre {l['livre_pct']:g}% (mínimo {c['livre_pct_min']:g}%)")
+    if isinstance(l.get("carga"), (int, float)) and l["carga"] > c["carga_max"]:
+        motivos.append(f"carga {l['carga']:g} (máximo {c['carga_max']:g})")
+    return ("alta", "; ".join(motivos)) if motivos else ("ok", None)
+
+
+def modelo_caro(modelo, cfg=None):
+    """O modelo casa com algum padrão glob de `modelos_caros` (sem diferenciar maiúsculas). Modelo desconhecido não é caro."""
+    import fnmatch  # só aqui: fora do topo para não pesar nos hooks
+    return bool(modelo) and any(fnmatch.fnmatch(str(modelo).lower(), p.lower()) for p in (cfg or maquina_cfg())["modelos_caros"])
+
+
+def maquina_ocupacao():
+    """{vivos: {dispatch: modelo}, dispatched: {dispatch}}: os workers com terminal vivo no Orca (todos os Runs) e os dispatches ainda `dispatched`.
+
+    O modelo vem do evento de despacho ou de retomada e, na falta dele, do worker-show; sem lista de terminais confiável todo `dispatched` conta como vivo."""
+    terminais = _terminais_vivos()
+    ws = [w for w in _workers_todos() if w.get("dispatchStatus") == "dispatched"]
+    vivos = [w for w in ws if terminais is None or w.get("agentTerminalHandle") in terminais]
+    modelos = {e["dispatch"]: e["modelo"] for e in read_events() if e.get("tipo") in ("despacho", "retomada") and e.get("dispatch") and e.get("modelo")}
+    faltam = [w for w in vivos if w["dispatchId"] not in modelos]
+    if faltam:
+        modelos |= {d: x["modelo"] for d, x in _detalhes(faltam).items() if x.get("modelo")}
+    return {"vivos": {w["dispatchId"]: modelos.get(w["dispatchId"]) for w in vivos}, "dispatched": {w["dispatchId"] for w in ws}}
+
+
+def maquina_vaga(modelo, ocup=None, cfg=None):
+    """O motivo de não caber mais um worker deste modelo (workers vivos no teto, ou caros no teto), ou None se cabe."""
+    cfg, ocup = cfg or maquina_cfg(), ocup or maquina_ocupacao()
+    n = len(ocup["vivos"])
+    if n >= cfg["max_workers"]:
+        return f"{n}/{cfg['max_workers']:g} workers vivos"
+    caros = sum(modelo_caro(m, cfg) for m in ocup["vivos"].values())
+    if modelo_caro(modelo, cfg) and caros >= cfg["max_caros"]:
+        return f"{caros}/{cfg['max_caros']:g} workers caros ({modelo} é caro)"
+    return None
+
+
+def maquina_barra(modelo, ocup=None, cfg=None):
+    """(`pressao` | `cheio`, motivo) se o worker não pode subir agora, senão (None, None). A pressão da máquina vem antes das vagas."""
+    cfg = cfg or maquina_cfg()
+    nivel, motivo = maquina_nivel(cfg=cfg)
+    if nivel == "alta":
+        return "pressao", f"máquina sob pressão: {motivo}"
+    motivo = maquina_vaga(modelo, ocup, cfg)
+    return ("cheio", motivo) if motivo else (None, None)
+
+
+def _fila_despacho_mut(fn):
+    """Lê a fila de despacho, aplica fn(itens) e grava, sob o fila-despacho.lock. Devolve o que fn devolveu."""
+    with _trava("fila-despacho.lock"):
+        d = _dict(_read_json(_path(FILA_DESPACHO)))
+        itens = [i for i in d.get("itens") or [] if isinstance(i, dict)]
+        r = fn(itens)
+        _write_json(_path(FILA_DESPACHO), {"itens": itens}, indent=2)
+        return r
+
+
+def fila_despacho_itens():
+    """Os itens da fila na ordem em que sobem: prioridade (1 antes de 3) e, no empate, o mais antigo."""
+    itens = [i for i in _dict(_read_json(_path(FILA_DESPACHO))).get("itens") or [] if isinstance(i, dict)]
+    return sorted(itens, key=lambda i: (i.get("prioridade") or 2, i.get("ts") or ""))
+
+
+def fila_despacho_add(item, motivo):
+    """Põe o pedido na fila e devolve (item, posição, já estava). Despacho do mesmo ticket (ou do mesmo título no mesmo Run) não entra duas vezes."""
+    import uuid
+    novo = {"id": "fd" + uuid.uuid4().hex[:6], "ts": now(), "motivo": motivo, "falhas": 0, **item}
+
+    def poe(itens):
+        igual = next((i for i in itens if i.get("tipo") == novo["tipo"] and (i.get("dispatch") == novo.get("dispatch") if novo["tipo"] == "retomada" else
+                                                                           (i.get("run"), i.get("ticket") or i.get("titulo")) == (novo["run"], novo.get("ticket") or novo.get("titulo")))), None)
+        if igual:
+            return igual, True
+        itens.append(novo)
+        return novo, False
+    it, ja = _fila_despacho_mut(poe)
+    if not ja:
+        append_event({"tipo": "despacho_fila", "op": "entrou", "id": it["id"], "fila_tipo": it["tipo"], "titulo": it.get("titulo"), "prioridade": it.get("prioridade"), "motivo": motivo})
+    ordem = [i["id"] for i in fila_despacho_itens()]
+    return it, ordem.index(it["id"]) + 1, ja
+
+
+def fila_despacho_rm(id_, op="removido", **extra):
+    """Tira o item da fila (e a cópia do spec). False se o id não está lá."""
+    achado = _fila_despacho_mut(lambda itens: next((itens.pop(n) for n, i in enumerate(itens) if i.get("id") == id_), None))
+    if achado:
+        with contextlib.suppress(OSError):
+            os.remove(_path(os.path.join(FILA_DESPACHO_SPECS, id_ + ".md")))
+        append_event({"tipo": "despacho_fila", "op": op, "id": id_, "fila_tipo": achado.get("tipo"), "titulo": achado.get("titulo"), **extra})
+    return achado
+
+
+def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente):
+    """O despacho que não coube: guarda o pedido (o spec numa cópia em ORQ_HOME) e devolve a resposta do `orq despachar` no lugar dos ids do worker."""
+    import uuid
+    id_ = "fd" + uuid.uuid4().hex[:6]
+    item = {"id": id_, "tipo": "despacho", "run": run, "titulo": titulo, "modelo": modelo, "effort": effort, "agente": agente, "prioridade": prio,
+            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"])) if v}}
+    copia = _path(os.path.join(FILA_DESPACHO_SPECS, id_ + ".md"))
+    if spec is not None:
+        os.makedirs(os.path.dirname(copia), exist_ok=True)
+        with open(copia, "w", encoding="utf-8") as f:
+            f.write(spec)
+        item["spec_arquivo"] = copia
+    it, pos, ja = fila_despacho_add(item, motivo)
+    if ja and spec is not None:
+        os.remove(copia)
+    return {"estado": "enfileirado", "fila": it["id"], "posicao": pos, "run": run, "prioridade": prio, "motivo": motivo,
+            "aviso": f"{'já estava' if ja else 'entrou'} na fila de despacho (posição {pos}): {motivo}. O gerente sobe quando abrir vaga; veja com orq fila-despacho lista"}
+
+
+def _ocupar(ocup, dispatch, modelo):
+    """Conta na ocupação o worker que acabou de subir, para o próximo item do mesmo lote ver a vaga já tomada."""
+    ocup["vivos"][dispatch] = modelo
+
+
+@contextlib.contextmanager
+def _como_coordenador():
+    """O painel roda no terminal do agent manager; o despacho precisa do handle do coordenador (é ele que comanda os Runs, e o orca() troca pelo do gerente)."""
+    g, antes = _gerente_cfg(), os.environ.get("ORCA_TERMINAL_HANDLE")
+    if g.get("coordenador"):
+        os.environ["ORCA_TERMINAL_HANDLE"] = g["coordenador"]
+    try:
+        yield
+    finally:
+        if antes is None:
+            os.environ.pop("ORCA_TERMINAL_HANDLE", None)
+        else:
+            os.environ["ORCA_TERMINAL_HANDLE"] = antes
+
+
+def _sobe_da_fila(it):
+    """Sobe um item da fila. Devolve a linha do painel; levanta SemVaga, ValueError ou RuntimeError se não subiu (o item volta)."""
+    if it["tipo"] == "despacho":
+        with _como_coordenador():
+            r = despachar(it["run"], it.get("titulo") if not it.get("ticket") else None, it.get("spec_arquivo"), it["modelo"], it["effort"], it.get("worktree"), it.get("nome"),
+                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", _drenando=True)
+        return f"fila: {it['titulo']} subiu ({r.get('dispatchId')})"
+    d = it["dispatch"]
+    cp = _checkpoint(d)
+    linha = {k: it.get(k) for k in ("task", "run", "titulo", "agente", "modelo", "effort", "sessao", "cwd", "terminal")} | {"dispatch": d}
+    r = _subir_sessao(linha, it["sessao"], it.get("modelo"), cp, f"suba outro worker do spec da task com: orq relancar {d} --nota 'a sessão não pôde ser retomada'",
+                      msg_continuar(it.get("coord"), it["task"], d, it["run"]), it.get("agente") or "claude", it.get("effort"))
+    return f"fila: {it['titulo']} retomado: {r['estado']}" + (f" ({r['aviso']})" if r.get("aviso") else "")
+
+
+def despacho_drenar(cfg=None, agora=None):
+    """Uma volta da fila: sobe, por prioridade, o primeiro item que cabe (um por volta, para a memória mostrar o que o anterior custou antes do próximo).
+
+    Item de modelo caro com o teto de caros cheio fica para trás e o barato de prioridade menor sobe. Retomada cujo dispatch já terminou ou voltou sai da
+    fila. O que o uso do plano ou o modo noite seguram espera ESPERA_SEGURADO_S; erro de outra causa conta em `falhas` e, na FALHAS_FILA-ésima, o item sai."""
+    cfg, agora = cfg or maquina_cfg(), agora or time.time()
+    itens = fila_despacho_itens()
+    if not itens:
+        return []
+    ocup, linhas = maquina_ocupacao(), []
+    for it in itens:
+        if it.get("nao_antes", 0) > agora:
+            continue
+        if it["tipo"] == "retomada" and (it["dispatch"] in ocup["vivos"] or it["dispatch"] not in ocup["dispatched"]):
+            fila_despacho_rm(it["id"], "saiu", motivo="o dispatch já terminou ou já voltou")
+            linhas.append(f"fila: {it['titulo']} saiu (o dispatch já terminou ou já voltou)")
+            continue
+        if maquina_vaga(it.get("modelo"), ocup, cfg):
+            continue
+        try:
+            linhas.append(_sobe_da_fila(it))
+            fila_despacho_rm(it["id"], "subiu")
+            return linhas
+        except SemVaga:
+            continue
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+            segurado = str(e).startswith(("uso do plano", "modo noite"))
+            falhas = it.get("falhas", 0) + (0 if segurado else 1)
+            if falhas >= FALHAS_FILA:
+                fila_despacho_rm(it["id"], "desistiu", erro=str(e))
+                linhas.append(f"fila: {it['titulo']} saiu da fila depois de {falhas} erros ({e}); despache de novo à mão")
+                continue
+            _fila_despacho_mut(lambda xs, it=it, falhas=falhas, segurado=segurado: [x.update(falhas=falhas, nao_antes=agora + ESPERA_SEGURADO_S if segurado else 0)
+                                                                                      for x in xs if x["id"] == it["id"]])
+            linhas.append(f"fila: {it['titulo']} segue esperando ({e})")
+    return linhas
+
+
+def _candidato_a_pausar():
+    """O worker vivo de menor prioridade (prioridade mais alta em número; no empate o primeiro), fora os poupados por estarem em verificação final; ou None."""
+    ags = agentes()
+    escolhidos, _ = _lista_pausa(ags, read_events(), set(), 1, _dict(_cursor_ro().get("pausados")))
+    return max(escolhidos, key=lambda a: a["prioridade"], default=None)
+
+
+def _maquina_avisar(motivo, na_fila, cfg):
+    """Pressão alta: digita no coordenador, uma vez por episódio, que o gerente parou de subir worker e qual pausar. Com `pausar_sob_pressao` o gerente pausa esse
+    worker sozinho (o orq pausar espera até ORQ_PAUSA_ESPERA_S pelo PAUSA.md: a volta do painel demora esse tempo). Coordenador ocupado: a próxima volta tenta."""
+    g = _gerente_cfg()
+    if not g or not g.get("coordenador") or _cursor_ro().get("maquina_aviso"):
+        return []
+    alvo = None
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
+        alvo = _candidato_a_pausar()
+    dica = f" Para abrir folga: orq pausar {alvo['task']} (P{alvo['prioridade']} {alvo.get('titulo') or alvo['task']})." if alvo else ""
+    if digita(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{dica}") != "enviado":
+        return []
+    _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": motivo}))
+    append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"sugerido": alvo["task"]} if alvo else {})})
+    linhas = [f"máquina sob pressão ({motivo}): coordenador avisado, nada sobe"]
+    if cfg["pausar_sob_pressao"] and alvo:
+        r = pausar((alvo["task"],))
+        linhas += [f"pausa automática: {x['task']} {x['estado']}" for x in r["pausados"]]
+    return linhas
+
+
+def maquina_volta():
+    """O trabalho da fila de despacho numa volta do painel do agent manager: pressão alta avisa o coordenador e nada sobe; senão sobe um item que caiba."""
+    cfg = maquina_cfg()
+    nivel, motivo = maquina_nivel(cfg=cfg)
+    if nivel == "alta":
+        return _maquina_avisar(motivo, len(fila_despacho_itens()), cfg)
+    if _cursor_ro().get("maquina_aviso"):
+        _cursor_mut(lambda c: c.pop("maquina_aviso", None))
+    return despacho_drenar(cfg)
+
+
+def texto_maquina(cfg=None, leitura=None, ocup=None):
+    """As linhas do `orq maquina`: o que a máquina tem, o que o orq decidiria agora para um despacho barato e para um caro, as vagas e a fila."""
+    cfg, leitura = cfg or maquina_cfg(), leitura if leitura is not None else maquina_ler()
+    nivel, motivo = maquina_nivel(leitura, cfg)
+    rss = _dict(leitura.get("rss_mb"))
+    ls = [f"memória livre {leitura.get('mem_livre_mb')} MB ({leitura.get('livre_pct')}% livre), carga {leitura.get('carga')} em {leitura.get('ncpu')} CPUs",
+          "RSS: " + ", ".join(f"{k} {rss.get(k, 0)} MB" for k in PROCESSOS_PESADOS)]
+    if ocup is not None:
+        caros = sum(modelo_caro(m, cfg) for m in ocup["vivos"].values())
+        ls.append(f"vagas: {len(ocup['vivos'])}/{cfg['max_workers']:g} ocupadas, {max(cfg['max_workers'] - len(ocup['vivos']), 0):g} livres; caros {caros}/{cfg['max_caros']:g}; E2E máx {cfg['max_e2e']:g} (a fila do E2E serializa); fila de despacho {len(fila_despacho_itens())}")
+
+    def decide(modelo):
+        m = f"pressão alta: {motivo}" if nivel == "alta" else maquina_vaga(modelo, ocup, cfg) if ocup is not None else None
+        return f"fila ({m})" if m else "sobe"
+    ls.append(f"decisão agora: despacho de modelo barato {decide('barato')}; de modelo caro {decide(next(iter(cfg['modelos_caros']), 'caro').replace('*', 'x'))}")
+    return ls
+
+
+def maquina_painel(agentes_=None):
+    """O que o painel e o digest mostram da máquina, só de arquivo: {max_workers, max_caros, ocupadas, livres, caros, fila: [{id, tipo, titulo, prioridade, modelo}]}."""
+    cfg = maquina_cfg()
+    vivos = [a for a in agentes_ or [] if isinstance(a, dict) and a.get("estado") in VIVOS_MAQUINA]
+    return {"max_workers": cfg["max_workers"], "max_caros": cfg["max_caros"], "ocupadas": len(vivos), "livres": max(cfg["max_workers"] - len(vivos), 0),
+            "caros": sum(modelo_caro(a.get("modelo"), cfg) for a in vivos),
+            "fila": [{k: i.get(k) for k in ("id", "tipo", "titulo", "prioridade", "modelo")} for i in fila_despacho_itens()]}
+
+
+def linha_maquina():
+    """A linha do `orq status`: vagas (do aberto.json, sem falar com o Orca), pressão e fila. Vazia sem nada a dizer (sem worker vivo, sem fila, sem pressão)."""
+    p = maquina_painel(_dict(_read_json(_path("aberto.json"))).get("agentes"))
+    nivel, motivo = maquina_nivel()
+    if not p["ocupadas"] and not p["fila"] and nivel == "ok":
+        return ""
+    txt = f"Máquina: {p['ocupadas']}/{p['max_workers']:g} workers ({p['caros']}/{p['max_caros']:g} caros), {p['livres']:g} vagas livres"
+    txt += f"; PRESSÃO ALTA: {motivo}" if nivel == "alta" else ""
+    if p["fila"]:
+        txt += f"; {len(p['fila'])} na fila de despacho: " + ", ".join(f"P{i.get('prioridade') or 2} {_cita(i.get('titulo') or '?', 30)}" for i in p["fila"][:3]) + (f" +{len(p['fila']) - 3}" if len(p["fila"]) > 3 else "")
+    return txt
+
+
 # ---------- retomar depois de uma queda (ticket 48) ----------
 
 RETOMAR_ESPERA_S = float(os.environ.get("ORQ_RETOMAR_ESPERA_S") or 20)  # quanto esperar a sessão retomada mostrar atividade antes de dizer que não voltou
@@ -5152,7 +5528,9 @@ def retomar(dry_run=False, run=None):
             res["gerente"] = {**res["gerente"], "novo": novo, "estado": "religado"}
     pausados = _dict(_cursor_ro().get("pausados"))  # pausados pelo orçamento de uso voltam com `retomar --pausados`, não aqui
     cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and w.get("dispatchId") not in pausados]
-    det, turnos, despachos = _detalhes(cand), _turnos_ro(), {e.get("dispatch"): e for e in read_events() if e.get("tipo") == "despacho"}
+    det, turnos, eventos = _detalhes(cand), _turnos_ro(), read_events()
+    despachos = {e.get("dispatch"): e for e in eventos if e.get("tipo") == "despacho"}
+    por_d, subir = {}, []
     for w in cand:
         d = w["dispatchId"]
         t = _dict(turnos.get(d))
@@ -5168,15 +5546,30 @@ def retomar(dry_run=False, run=None):
                  "sessao": t.get("sessao"), "cwd": cwd, "terminal": w.get("agentTerminalHandle")}
         dica = f"suba outro worker do spec da task com: orq relancar {d} --nota 'a sessão não pôde ser retomada'"  # do firstmate: sem sessão, o brief em disco é a instrução durável
         if not linha["sessao"] or not cwd:
-            res["workers"].append({**linha, "estado": "sem_sessao", "aviso": f"sem session_id ou cwd gravado (o hook de turno não viu este worker): {dica}"})
-            continue
-        if not os.path.isdir(cwd):
-            res["workers"].append({**linha, "estado": "sem_worktree", "aviso": f"a pasta {cwd} não existe: nada foi subido"})
-            continue
-        if dry_run:
-            res["workers"].append({**linha, "estado": "a_retomar"})
-            continue
-        res["workers"].append(_subir_sessao(linha, t["sessao"], modelo, cp, dica, msg_continuar(meu, w.get("taskId"), d, w.get("runId")), agente, effort))
+            por_d[d] = {**linha, "estado": "sem_sessao", "aviso": f"sem session_id ou cwd gravado (o hook de turno não viu este worker): {dica}"}
+        elif not os.path.isdir(cwd):
+            por_d[d] = {**linha, "estado": "sem_worktree", "aviso": f"a pasta {cwd} não existe: nada foi subido"}
+        else:
+            subir.append((prioridade_de(eventos, w.get("taskId"), d, titulo), linha, cp, dica))
+    if subir:  # o orçamento da máquina (ticket 79): sobe por prioridade até o teto, o resto vai para a fila de despacho
+        cfg, ocup = maquina_cfg(), maquina_ocupacao()
+        pressao = maquina_nivel(cfg=cfg)
+        for prio, linha, cp, dica in sorted(subir, key=lambda x: x[0]):  # estável: na mesma prioridade vale a ordem do Orca
+            d = linha["dispatch"]
+            motivo = f"máquina sob pressão: {pressao[1]}" if pressao[0] == "alta" else maquina_vaga(linha["modelo"], ocup, cfg)
+            if motivo:
+                if not dry_run:
+                    fila_despacho_add({"tipo": "retomada", "dispatch": d, "task": linha["task"], "run": linha["run"], "titulo": linha["titulo"], "agente": linha["agente"],
+                                       "modelo": linha["modelo"], "effort": linha["effort"], "sessao": linha["sessao"], "cwd": linha["cwd"], "terminal": linha["terminal"],
+                                       "prioridade": prio, "coord": meu}, motivo)
+                por_d[d] = {**linha, "prioridade": prio, "estado": "a_enfileirar" if dry_run else "enfileirado", "aviso": f"{motivo}; o gerente sobe quando abrir vaga (orq fila-despacho lista)"}
+                continue
+            _ocupar(ocup, d, linha["modelo"])
+            if dry_run:
+                por_d[d] = {**linha, "prioridade": prio, "estado": "a_retomar"}
+            else:
+                por_d[d] = {**_subir_sessao(linha, linha["sessao"], linha["modelo"], cp, dica, msg_continuar(meu, linha["task"], d, linha["run"]), linha["agente"], linha["effort"]), "prioridade": prio}
+    res["workers"] = [por_d[w["dispatchId"]] for w in cand]
     return res
 
 
@@ -5449,8 +5842,13 @@ def retomar_pausados(run=None, forcar=False):
             altos[ag] = motivo
     if pausados and altos and all((p.get("agente") or "claude") in altos for p in pausados.values()):
         raise ValueError(f"uso do plano ainda alto: {'; '.join(f'{m}{_do_harness(ag)}' for ag, m in altos.items())}. Espere a janela virar ou use --forcar")
-    res = []
+    res, cfg = [], maquina_cfg()
+    ocup = maquina_ocupacao() if pausados else None
+    pressao = maquina_nivel(cfg=cfg)
     for d, p in sorted(pausados.items(), key=lambda kv: kv[1].get("prioridade") or 2):
+        if (p.get("agente") or "claude") not in altos and (motivo := f"máquina sob pressão: {pressao[1]}" if pressao[0] == "alta" else maquina_vaga(p.get("modelo"), ocup, cfg)):
+            res.append({"dispatch": d, "task": p["task"], "titulo": p["titulo"], "estado": "sem_vaga", "aviso": f"{motivo}; segue pausado, rode orq retomar --pausados quando abrir vaga"})
+            continue
         if (p.get("agente") or "claude") in altos:
             res.append({"dispatch": d, "task": p["task"], "titulo": p["titulo"], "estado": "uso_alto", "aviso": altos[p.get("agente") or "claude"]})
             continue
@@ -5466,6 +5864,7 @@ def retomar_pausados(run=None, forcar=False):
         r = _subir_sessao(linha, p["sessao"], p.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão pausada não pôde ser retomada'", MSG_VOLTA,
                           p.get("agente") or "claude", p.get("effort"))
         if r["estado"] != "falhou":
+            _ocupar(ocup, d, p.get("modelo"))
             _cursor_mut(lambda c, d=d: c.get("pausados", {}).pop(d, None))
             append_event({"tipo": "pausa_fim", "dispatch": d, "task": p["task"], "terminal": r.get("novo")})
         res.append(r)
@@ -5594,6 +5993,10 @@ def gerente_absorver():
         linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex")]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
+    try:
+        linhas += maquina_volta()
+    except Exception as e:  # noqa: BLE001 - a fila de despacho não derruba o painel; a próxima volta tenta
+        log(f"fila de despacho: {type(e).__name__}: {e}")
     return "\n".join(linhas)
 
 
@@ -5759,6 +6162,14 @@ def main(argv=None):
     uz = sub.add_parser("uso", help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
     uz.add_argument("--json", action="store_true")
     uz.add_argument("--agente", default="claude", choices=HARNESSES, help="de que plano (as cotas do Claude e do Codex são separadas)")
+    mq = sub.add_parser("maquina", help="o orçamento da máquina (ticket 79): o que ela tem agora, o que o orq decide e as vagas. `orq maquina set <chave> <valor>` ajusta o maquina.json")
+    mq.add_argument("op", nargs="?", choices=["set"])
+    mq.add_argument("chave", nargs="?")
+    mq.add_argument("valor", nargs="?", help="em JSON: 4, true, [\"claude-opus-*\"]")
+    mq.add_argument("--json", action="store_true")
+    fd = sub.add_parser("fila-despacho", help="os despachos e retomadas que esperam vaga na máquina: lista | rm <id>").add_subparsers(dest="op", required=True)
+    fd.add_parser("lista").add_argument("--json", action="store_true")
+    fd.add_parser("rm").add_argument("id")
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
@@ -5811,7 +6222,7 @@ def main(argv=None):
         elif a.cmd == "ocupadas":
             print("\n".join(sorted(worktrees_ocupadas())))
         elif a.cmd == "status":
-            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e())])]))
+            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])]))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":
@@ -5914,6 +6325,24 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_pausar(r))
         elif a.cmd == "prioridade":
             print(json.dumps(prioridade_definir(a.task, a.valor), ensure_ascii=False))
+        elif a.cmd == "maquina" and a.op == "set":
+            if not a.chave or a.valor is None:
+                raise ValueError("orq maquina set <chave> <valor>")
+            print(json.dumps(maquina_definir(a.chave, a.valor), ensure_ascii=False))
+        elif a.cmd == "maquina":
+            cfg, leitura = maquina_cfg(), maquina_ler()
+            nivel, motivo = maquina_nivel(leitura, cfg)
+            ocup = maquina_ocupacao()
+            print(json.dumps({"config": cfg, "leitura": leitura, "nivel": nivel, "motivo": motivo, "vivos": ocup["vivos"], "fila": fila_despacho_itens()}, ensure_ascii=False)
+                  if a.json else "\n".join(texto_maquina(cfg, leitura, ocup)))
+        elif a.cmd == "fila-despacho" and a.op == "rm":
+            if not fila_despacho_rm(a.id):
+                raise ValueError(f"{a.id} não está na fila de despacho")
+            print(f"{a.id} saiu da fila de despacho")
+        elif a.cmd == "fila-despacho":
+            itens = fila_despacho_itens()
+            print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(
+                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}) desde {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(itens, 1)) or "fila de despacho vazia")
         elif a.cmd == "uso":
             u = uso_plano(agente=a.agente)
             nivel, motivo, _ = uso_nivel(u)

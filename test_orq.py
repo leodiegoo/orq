@@ -401,13 +401,19 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
+        self.maquina()
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
 
     def set(self, nome, dado):
         with open(os.path.join(self.fake, nome), "w") as f:
             json.dump(dado, f)
+
+    def maquina(self, mem_livre_mb=16000, livre_pct=60, carga=2.0):
+        """A leitura simulada da máquina (ORQ_MAQUINA_LEITURA): o padrão dos testes é uma máquina folgada, para não depender da carga real de quem roda a suíte."""
+        with open(self.env["ORQ_MAQUINA_LEITURA"], "w") as f:
+            json.dump({"mem_livre_mb": mem_livre_mb, "livre_pct": livre_pct, "carga": carga, "ncpu": 12, "rss_mb": {"claude": 900, "codex": 0, "node": 1500, "docker": 2000}}, f)
 
     def orq(self, *args, stdin=None, **env):
         return subprocess.run([sys.executable, ORQ, *args], input=stdin, capture_output=True, text=True,
@@ -8391,6 +8397,7 @@ def test_ticket51_pausar_nao_pausa_worker_sem_sessao_gravada():
 def test_ticket51_retomar_pausados_sobe_com_resume_e_so_os_pausados_e_o_retomar_comum_os_ignora():
     a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2", ORQ_RETOMAR_ESPERA_S="2")
     _pausa51(a)
+    json.dump({"max_caros": 4}, open(os.path.join(a.home, "maquina.json"), "w"))  # os quatro workers da fixture são Opus: aqui a ordem é o que se confere, não o teto de caros
     f = _escreve_pausa51(a, "f", "i")
     assert a.orq("pausar").returncode == 0
     f.result()
@@ -8691,7 +8698,7 @@ def test_ticket73_despachar_recusa_effort_que_o_harness_nao_tem_sem_criar_task()
     assert len(_log(a, "started.log")) == 1
 
 
-def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_e_sem_astra_nem_terra():
+def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_astra_so_em_low_e_medium_e_sem_terra():
     txt = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
     assert "gpt-6-luna" in txt and "gpt-6-sol" in txt and "--agente codex" in txt, "a tabela do Codex e o jeito de despachar"
     assert "learn.chatgpt.com/docs/models" in txt, "a fonte da equivalência"
@@ -8900,6 +8907,393 @@ def test_ticket73_auditar_respostas_de_coordenador_codex_diz_que_nao_ha_o_que_au
     _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="thr_coord", prompt="oi"))
     r = a.orq("auditar-respostas")
     assert r.returncode != 0 and "Codex" in r.stderr and "AskUserQuestion" in r.stderr, r.stderr
+
+
+# ---------- ticket 79: orçamento da máquina e fila de despacho ----------
+
+SONNET, OPUS = "claude-sonnet-5-5", "claude-opus-5-5"
+
+
+def _frota79(a, vivos=(), mortos=()):
+    """No run_a, um worker vivo por (título, modelo) em `vivos` (term_v0…, com terminal) e um caído por (título, modelo) em `mortos` (term_m0…, sem terminal, com sessão e pasta)."""
+    os.makedirs(a.home, exist_ok=True)
+    a.wt = os.path.join(a.tmp.name, "wt")
+    ws, ts, sessoes = [], [], {}
+    for pref, lista in (("v", vivos), ("m", mortos)):
+        for n, (titulo, modelo) in enumerate(lista):
+            h = f"term_{pref}{n}"
+            ws.append(_w48(h, modelo=modelo))
+            ts.append({"id": "task_" + h, "task_title": titulo, "status": "dispatched", "dispatch_id": "ctx_" + h, "created_at": _iso(-900)})
+            if pref == "m":
+                os.makedirs(os.path.join(a.wt, h))
+                sessoes["ctx_" + h] = ("sess-" + h, os.path.join(a.wt, h))
+    a.set("workers.json", ws)
+    a.set("tasks_run_a.json", ts)
+    a.set("terminals.json", ["term_coord", *(f"term_v{n}" for n in range(len(vivos)))])
+    if sessoes:
+        _turno48(a, **sessoes)
+
+
+def _libera79(a, *handles):
+    """Os workers entregaram: o dispatch fecha e o terminal some, a vaga abre."""
+    a.set("workers.json", [{**w, "status": "completed"} if w["handle"] in handles else w for w in json.load(open(os.path.join(a.fake, "workers.json")))])
+    a.set("terminals.json", [h for h in json.load(open(os.path.join(a.fake, "terminals.json"))) if h not in handles])
+
+
+def _desp79(a, titulo, prio, modelo=SONNET):
+    return a.orq("despachar", "--run", "run_a", "--titulo", titulo, "--spec-arquivo", _spec(a), "--modelo", modelo, "--effort", "medium", "--prioridade", str(prio))
+
+
+def _fila79(a):
+    return json.load(open(os.path.join(a.home, "fila-despacho.json")))["itens"] if os.path.exists(os.path.join(a.home, "fila-despacho.json")) else []
+
+
+def _titulos_iniciados79(a):
+    return [c[c.index("--task-title") + 1] for c in _log(a, "started.log")]
+
+
+def _painel79():
+    return Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+
+
+def test_ticket79_maquina_json_ausente_usa_os_padroes_e_o_set_ajusta_e_valida():
+    a = Amb(run="run_a")
+    cfg = json.loads(a.orq("maquina", "--json").stdout)["config"]
+    assert (cfg["max_workers"], cfg["max_e2e"], cfg["max_caros"]) == (4, 1, 2) and cfg["modelos_caros"] == ["claude-opus-*", "gpt-6-astra*", "gpt-6-sol*"], cfg
+    assert not os.path.exists(os.path.join(a.home, "maquina.json")), "ler não grava"
+    assert json.loads(a.orq("maquina", "set", "max_workers", "6").stdout)["max_workers"] == 6
+    assert json.loads(a.orq("maquina", "set", "modelos_caros", '["claude-opus-*"]').stdout)["modelos_caros"] == ["claude-opus-*"]
+    for ruim in (("max_workers", "muitos"), ("max_workers", "true"), ("nada", "1"), ("modelos_caros", "3")):
+        r = a.orq("maquina", "set", *ruim)
+        assert r.returncode == 1 and r.stderr.startswith("orq:"), (ruim, r)
+    assert json.load(open(os.path.join(a.home, "maquina.json"))) == {"max_workers": 6, "modelos_caros": ["claude-opus-*"]}, "o que foi recusado não grava"
+    json.dump({"max_workers": "x", "max_caros": 3}, open(os.path.join(a.home, "maquina.json"), "w"))
+    cfg = json.loads(a.orq("maquina", "--json").stdout)["config"]
+    assert (cfg["max_workers"], cfg["max_caros"]) == (4, 3), "valor de tipo errado vale como ausente"
+
+
+def test_ticket79_despachar_com_o_orcamento_cheio_enfileira_e_nao_sobe_worker():
+    a = Amb(run="run_a")
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    r = _desp79(a, "Ticket 05", 2)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert (out["estado"], out["posicao"], out["prioridade"]) == ("enfileirado", 1, 2) and "4/4 workers vivos" in out["motivo"] and "dispatchId" not in out, out
+    assert "orq fila-despacho lista" in r.stderr, "o aviso diz como ver a fila"
+    assert not _log(a, "started.log"), "nada subiu"
+    (it,) = _fila79(a)
+    assert (it["tipo"], it["run"], it["titulo"], it["modelo"], it["effort"], it["prioridade"]) == ("despacho", "run_a", "Ticket 05", SONNET, "medium", 2), it
+    assert open(it["spec_arquivo"]).read() == open(_spec(a)).read() and it["spec_arquivo"].startswith(a.home), "o spec fica numa cópia em ORQ_HOME"
+    assert _desp79(a, "Ticket 05", 2).returncode == 0 and len(_fila79(a)) == 1, "o mesmo pedido não entra duas vezes"
+    assert "P2 despacho Ticket 05" in a.orq("fila-despacho", "lista").stdout
+    assert [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"] == ["entrou"]
+    assert a.orq("fila-despacho", "rm", "fd_que_nao_existe").returncode == 1
+    assert a.orq("fila-despacho", "rm", it["id"]).returncode == 0 and not _fila79(a) and not os.path.exists(it["spec_arquivo"])
+    assert a.orq("fila-despacho", "lista").stdout.strip() == "fila de despacho vazia"
+
+
+def test_ticket79_vaga_aberta_sobe_o_p1_antes_do_p2_e_um_por_volta_do_painel():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    assert _desp79(a, "Segunda", 2).returncode == 0 and _desp79(a, "Primeira", 1).returncode == 0 and _desp79(a, "Terceira", 2).returncode == 0
+    assert [i["titulo"] for i in sorted(_fila79(a), key=lambda i: (i["prioridade"], i["ts"]))] == ["Primeira", "Segunda", "Terceira"]
+    a.orq("gerente", "absorver")
+    assert not _log(a, "started.log"), "sem vaga o painel não sobe nada"
+    _libera79(a, "term_v0", "term_v1")
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert _titulos_iniciados79(a) == ["Primeira"], "duas vagas, mas o painel sobe um por volta: o P1 antes do P2"
+    assert "Primeira subiu" in r.stdout
+    a.set("terminals.json", [*json.load(open(os.path.join(a.fake, "terminals.json"))), "term_novo5"])  # o terminal do worker novo (o Orca falso não o cria)
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Primeira", "Segunda"], "a segunda vaga leva o próximo da fila; o worker novo já ocupa a primeira"
+    a.set("terminals.json", [*json.load(open(os.path.join(a.fake, "terminals.json"))), "term_novo6"])
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Primeira", "Segunda"] and [i["titulo"] for i in _fila79(a)] == ["Terceira"], "duas vagas ocupadas por eles: a Terceira espera"
+
+
+def test_ticket79_o_painel_sobe_pela_ordem_p1_p2_e_empate_pelo_mais_antigo():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    for t, p in (("Segunda", 2), ("Primeira", 1), ("Terceira", 2)):
+        assert _desp79(a, t, p).returncode == 0
+    _libera79(a, "term_v0", "term_v1", "term_v2", "term_v3")
+    for _ in range(3):
+        assert a.orq("gerente", "absorver").returncode == 0
+    assert _titulos_iniciados79(a) == ["Primeira", "Segunda", "Terceira"] and not _fila79(a)
+    assert [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"].count("subiu") == 3
+
+
+def test_ticket79_retomar_com_10_caidos_e_max_workers_4_sobe_4_por_prioridade_e_enfileira_6():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    mortos = [("Segurança a", SONNET), ("Failover 1", SONNET), ("Ticket 1", SONNET), ("Failover 2", SONNET), ("Ticket 2", SONNET),
+              ("Failover 3", SONNET), ("Segurança b", SONNET), ("Ticket 3", SONNET), ("Failover 4", SONNET), ("Ticket 4", SONNET)]
+    _frota79(a, mortos=mortos)
+    a.set("screens.json", {f"term_ret{n}": ["esc to interrupt"] for n in range(1, 5)})
+    seco = json.loads(a.orq("retomar", "--dry-run", "--json").stdout)["workers"]
+    assert sorted(w["estado"] for w in seco).count("a_retomar") == 4 and sorted(w["estado"] for w in seco).count("a_enfileirar") == 6 and not _fila79(a) and not _log(a, "create.log")
+    r = a.orq("retomar", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)["workers"]
+    assert [w["titulo"] for w in res] == [t for t, _ in mortos], "a resposta segue a ordem do Orca"
+    subiram = [c[c.index("--title") + 1] for c in _log(a, "create.log")]
+    assert subiram == ["Segurança a (retomado)", "Segurança b (retomado)", "Ticket 1 (retomado)", "Ticket 2 (retomado)"], "os dois P1 e os dois primeiros P2"
+    fila = _fila79(a)
+    assert sorted(i["titulo"] for i in fila) == sorted(["Ticket 3", "Ticket 4", "Failover 1", "Failover 2", "Failover 3", "Failover 4"]) and {i["tipo"] for i in fila} == {"retomada"}
+    assert {(i["titulo"], i["prioridade"]) for i in fila} >= {("Ticket 3", 2), ("Failover 1", 3)}
+    assert all("4/4 workers vivos" in w["aviso"] for w in res if w["estado"] == "enfileirado")
+    again = json.loads(a.orq("retomar", "--dry-run", "--json").stdout)["workers"]
+    assert [w["estado"] for w in again].count("a_enfileirar") == 6, "os 4 retomados contam como vivos; os outros seguem esperando"
+
+
+def test_ticket79_a_fila_de_retomada_sobe_por_prioridade_quando_abre_vaga_e_descarta_o_que_ja_voltou():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)] * 4, mortos=[("Failover 1", SONNET), ("Ticket 1", SONNET), ("Ticket 2", SONNET)])
+    a.set("workers.json", json.load(open(os.path.join(a.fake, "workers.json"))))
+    a.set("screens.json", {f"term_ret{n}": ["esc to interrupt"] for n in range(1, 4)})
+    a.set("terminals.json", ["term_coord", "term_v0", "term_v1", "term_v2", "term_v3"])
+    assert [w["estado"] for w in json.loads(a.orq("retomar", "--json").stdout)["workers"]] == ["enfileirado"] * 3
+    _libera79(a, "term_v0")
+    a.orq("gerente", "absorver")
+    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (retomado)"], "o P2 mais antigo antes do P3"
+    assert sorted(i["titulo"] for i in _fila79(a)) == ["Failover 1", "Ticket 2"]
+    _libera79(a, "term_v1", "term_v2")
+    a.set("workers.json", [{**w, "status": "completed"} if w["handle"] == "term_m2" else w for w in json.load(open(os.path.join(a.fake, "workers.json")))])  # Ticket 2 terminou sozinho
+    r = a.orq("gerente", "absorver")
+    assert "Ticket 2 saiu" in r.stdout and "Failover 1 retomado" in r.stdout, r.stdout
+    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (retomado)", "Failover 1 (retomado)"] and not _fila79(a)
+
+
+def test_ticket79_sob_pressao_alta_nada_sobe_e_o_aviso_sai_uma_vez_por_episodio():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=40)
+    r = _desp79(a, "Ticket 05", 1)
+    out = json.loads(r.stdout)
+    assert out["estado"] == "enfileirado" and "carga 40 (máximo 12)" in out["motivo"], out
+    assert not _log(a, "started.log"), "com vaga de sobra, mas a máquina em pressão: enfileira"
+    for _ in range(3):
+        assert a.orq("gerente", "absorver").returncode == 0
+    assert not _log(a, "started.log") and len(_fila79(a)) == 1
+    (env,) = _log(a, "send.log")
+    texto = env[env.index("--text") + 1]
+    assert env[env.index("--terminal") + 1] == "term_coord" and "máquina sob pressão" in texto and "carga 40" in texto and "1 na fila de despacho" in texto, texto
+    assert "orq pausar task_term_v0" in texto, "propõe pausar o único worker vivo"
+    assert not _log(a, "close.log"), "propor não é pausar"
+    assert [e["tipo"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["maquina_aviso"]
+    a.maquina(mem_livre_mb=1000, livre_pct=8)
+    a.orq("gerente", "absorver")
+    assert len(_log(a, "send.log")) == 1, "o mesmo episódio de pressão não avisa de novo, mesmo com outro motivo"
+    a.maquina()
+    r = a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Ticket 05"] and not _fila79(a), "a pressão passou: o item sobe"
+    a.maquina(carga=40)
+    a.orq("gerente", "absorver")
+    assert len(_log(a, "send.log")) == 2, "pressão nova, aviso novo"
+
+
+def test_ticket79_pressao_por_memoria_livre_e_por_percentual_livre():
+    a = Amb(run="run_a")
+    for kw, trecho in (({"mem_livre_mb": 2000}, "memória livre 2000 MB (mínimo 3072 MB)"), ({"livre_pct": 9}, "memória livre 9% (mínimo 15%)")):
+        a.maquina(**kw)
+        out = json.loads(_desp79(a, "Ticket 05", 2).stdout)
+        assert out["estado"] == "enfileirado" and trecho in out["motivo"], out
+        for i in _fila79(a):
+            a.orq("fila-despacho", "rm", i["id"])
+    a.maquina()
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "máquina folgada: sobe"
+
+
+def test_ticket79_pressao_com_pausar_sob_pressao_ligado_o_gerente_pausa_o_de_menor_prioridade_sozinho():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2")
+    _gerente(a)
+    _pausa51(a)
+    a.maquina(carga=40)
+    a.orq("gerente", "absorver")
+    (env,) = _log(a, "send.log")
+    assert "orq pausar task_term_f" in env[env.index("--text") + 1] and not _log(a, "close.log"), "sem a regra, só propõe: o failover P3, e não o P3 em review"
+    a.orq("maquina", "set", "pausar_sob_pressao", "true")
+    a.maquina()
+    a.orq("gerente", "absorver")  # volta a normal: reabre o aviso
+    a.maquina(carga=40)
+    f = _escreve_pausa51(a, "f")
+    r = a.orq("gerente", "absorver")
+    f.result()
+    assert r.returncode == 0, r.stderr
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_f"] and "pausa automática: task_term_f pausado" in r.stdout, r.stdout
+
+
+def test_ticket79_modelo_caro_com_o_teto_cheio_enfileira_e_o_barato_sobe_e_quando_o_opus_libera_o_da_fila_sobe():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)])
+    out = json.loads(_desp79(a, "Terceiro opus", 1, OPUS).stdout)
+    assert out["estado"] == "enfileirado" and "2/2 workers caros" in out["motivo"], out
+    out = json.loads(_desp79(a, "Um sonnet", 2, SONNET).stdout)
+    assert out["dispatchId"] and out["taskId"], "o barato continua subindo com vaga geral"
+    assert _titulos_iniciados79(a) == ["Um sonnet"] and [i["titulo"] for i in _fila79(a)] == ["Terceiro opus"]
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Um sonnet"], "dois Opus ainda rodando"
+    ws = json.load(open(os.path.join(a.fake, "workers.json")))
+    a.set("workers.json", ws)
+    _libera79(a, "term_v0")
+    r = a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Um sonnet", "Terceiro opus"] and not _fila79(a), r.stdout
+    assert [c[c.index("--model") + 1] for c in _log(a, "started.log")] == [SONNET, OPUS]
+
+
+def test_ticket79_nunca_rebaixa_o_modelo_o_opus_espera_na_fila_e_sobe_com_o_mesmo_modelo_e_effort():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)])
+    r = a.orq("despachar", "--run", "run_a", "--titulo", "Opus que espera", "--spec-arquivo", _spec(a), "--modelo", OPUS, "--effort", "xhigh", "--prioridade", "1")
+    assert json.loads(r.stdout)["estado"] == "enfileirado" and not _log(a, "started.log"), r
+    (it,) = _fila79(a)
+    assert (it["modelo"], it["effort"]) == (OPUS, "xhigh"), "a fila guarda o pedido como veio"
+    for _ in range(3):
+        a.orq("gerente", "absorver")
+    assert not _log(a, "started.log"), "o orq não troca por um barato para subir antes: espera"
+    assert (_fila79(a)[0]["modelo"], _fila79(a)[0]["effort"]) == (OPUS, "xhigh")
+    _libera79(a, "term_v1")
+    a.orq("gerente", "absorver")
+    (arg,) = _log(a, "started.log")
+    assert (arg[arg.index("--model") + 1], arg[arg.index("--effort") + 1], arg[arg.index("--task-title") + 1]) == (OPUS, "xhigh", "Opus que espera"), arg
+    assert not _fila79(a)
+
+
+def test_ticket79_o_opus_bloqueado_da_fila_nao_trava_o_barato_de_prioridade_menor_e_o_padrao_do_modelo_e_glob():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS), ("Sonnet 1", SONNET), ("Sonnet 2", SONNET)])
+    assert json.loads(_desp79(a, "Opus P1", 1, OPUS).stdout)["estado"] == "enfileirado"
+    assert json.loads(_desp79(a, "Sonnet P3", 3, SONNET).stdout)["estado"] == "enfileirado"
+    _libera79(a, "term_v2")
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Sonnet P3"] and [i["titulo"] for i in _fila79(a)] == ["Opus P1"], "uma vaga geral, mas os caros estão cheios"
+    m = orq_mod.modelo_caro
+    assert (m("claude-opus-5-5"), m("gpt-6-astra"), m("gpt-6-sol"), m("GPT-6-SOL"), m("claude-sonnet-5-5"), m("gpt-6-luna"), m(None)) == (True, True, True, True, False, False, False)
+    cfg = json.loads(a.orq("maquina", "set", "modelos_caros", '["claude-sonnet-*"]').stdout)
+    assert orq_mod.modelo_caro("claude-sonnet-5-5", cfg) and not orq_mod.modelo_caro("claude-opus-5-5", cfg), "a lista de padrões é configurável"
+
+
+def test_ticket79_max_caros_ajustavel_e_retomar_conta_os_caros_igual():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)], mortos=[("Opus caído", OPUS), ("Sonnet caído", SONNET)])
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    res = {w["titulo"]: w for w in json.loads(a.orq("retomar", "--json").stdout)["workers"]}
+    assert (res["Opus caído"]["estado"], res["Sonnet caído"]["estado"]) == ("enfileirado", "retomado"), res
+    assert "2/2 workers caros" in res["Opus caído"]["aviso"] and [i["titulo"] for i in _fila79(a)] == ["Opus caído"]
+    b = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _frota79(b, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)], mortos=[("Opus caído", OPUS)])
+    b.orq("maquina", "set", "max_caros", "3")
+    b.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    assert json.loads(b.orq("retomar", "--json").stdout)["workers"][0]["estado"] == "retomado", "max_caros ajustado para 3"
+
+
+def test_ticket79_retomar_pausados_respeita_o_teto_e_deixa_o_resto_pausado():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(3)])
+    os.makedirs(os.path.join(a.wt, "p"))
+    json.dump({"pausados": {f"ctx_p{n}": {"task": f"task_p{n}", "run": "run_a", "titulo": f"Pausado {n}", "prioridade": 2, "agente": "claude", "modelo": SONNET, "effort": "medium",
+                                         "sessao": f"s{n}", "cwd": os.path.join(a.wt, "p"), "terminal": f"term_p{n}"} for n in range(2)}}, open(os.path.join(a.home, "cursor.json"), "w"))
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    res = json.loads(a.orq("retomar", "--pausados", "--json").stdout)["workers"]
+    assert [w["estado"] for w in res] == ["retomado", "sem_vaga"] and "3/4" not in res[1]["aviso"] and "4/4 workers vivos" in res[1]["aviso"], res
+    assert list(_cursor(a)["pausados"]) == ["ctx_p1"], "o que não coube continua pausado"
+
+
+def test_ticket79_relancar_conta_igual_o_opus_a_mais_e_recusado_sem_parar_ninguem():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _ctl_env(a, repo)
+        ws = json.load(open(os.path.join(a.fake, "workers.json")))
+        a.set("workers.json", ws + [_w48("term_v0", modelo=OPUS), _w48("term_v1", modelo=OPUS)])
+        a.set("terminals.json", ["term_coord", "term_w1", "term_v0", "term_v1"])
+        r = a.orq("relancar", "ctx_w1", "--nota", "x", "--modelo", OPUS, "--effort", "high")
+        assert r.returncode == 1 and "2/2 workers caros" in r.stderr and "nada foi parado" in r.stderr, r
+        assert not _log(a, "stopped.log") and not _log(a, "started.log")
+        r = a.orq("relancar", "ctx_w1", "--nota", "x")
+        assert r.returncode == 0, r.stderr
+        assert _log(a, "stopped.log") and _log(a, "started.log"), "o mesmo modelo barato troca um por um: o teto não conta o próprio"
+        b = Amb(run="run_a")
+        _ctl_env(b, repo, modelo=OPUS)
+        wb = json.load(open(os.path.join(b.fake, "workers.json")))
+        b.set("workers.json", wb + [_w48("term_v0", modelo=OPUS)])
+        b.set("terminals.json", ["term_coord", "term_w1", "term_v0"])
+        assert b.orq("relancar", "ctx_w1", "--nota", "x", "--modelo", OPUS, "--effort", "high").returncode == 0, "o Opus que sai libera a vaga de caro para o Opus novo"
+
+
+def test_ticket79_status_painel_e_digest_mostram_vagas_ocupadas_livres_e_a_fila():
+    a = Amb(run="run_a")
+    _pausa51(a)
+    out = json.loads(_desp79(a, "Ticket 06", 2).stdout)
+    assert out["estado"] == "enfileirado"
+    a.orq("ingest", "--refresh")
+    ab = json.load(open(os.path.join(a.home, "aberto.json")))["maquina"]
+    assert (ab["max_workers"], ab["ocupadas"], ab["livres"], ab["caros"]) == (4, 4, 0, 4) and [i["titulo"] for i in ab["fila"]] == ["Ticket 06"], ab
+    st = a.orq("status").stdout
+    assert "Máquina: 4/4 workers (4/2 caros), 0 vagas livres; 1 na fila de despacho: P2 Ticket 06" in st, st
+    a.orq("digest", "--html")
+    d = json.load(open(os.path.join(a.home, "digest", "atual.json")))
+    assert "maquina" not in d, "o contrato do digest não muda"
+    pagina = open(os.path.join(a.home, "digest", [f for f in os.listdir(os.path.join(a.home, "digest")) if f.endswith(".html")][0])).read()
+    assert "Máquina: 4/4 vagas ocupadas, 0 livres, 1 na fila de despacho" in pagina
+
+
+def test_ticket79_status_sem_worker_sem_fila_e_sem_pressao_nao_diz_nada_da_maquina():
+    a = Amb(run="run_a")
+    assert "Máquina:" not in a.orq("status").stdout
+    a.maquina(carga=30)
+    assert "PRESSÃO ALTA: carga 30 (máximo 12)" in a.orq("status").stdout
+
+
+def test_ticket79_item_da_fila_que_falha_tres_vezes_sai_e_o_segurado_pelo_uso_espera():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    assert _desp79(a, "Ticket 05", 2).returncode == 0
+    _libera79(a, "term_v0")
+    _uso51(a, semana=95)
+    r = a.orq("gerente", "absorver")
+    assert "segue esperando" in r.stdout and "uso do plano" in r.stdout, r.stdout
+    (it,) = _fila79(a)
+    assert it["falhas"] == 0 and it["nao_antes"] > time.time(), "o uso do plano segura sem contar como falha"
+    n = len([e for e in a.events() if e["tipo"] == "uso_parou"])
+    a.orq("gerente", "absorver")
+    assert len([e for e in a.events() if e["tipo"] == "uso_parou"]) == n, "dentro da espera nem tenta de novo"
+    _uso51(a, semana=10)
+    it["nao_antes"] = 0
+    json.dump({"itens": [it]}, open(os.path.join(a.home, "fila-despacho.json"), "w"))
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Ticket 05"]
+    b = _painel79()
+    _gerente(b)
+    _frota79(b, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    assert _desp79(b, "Ticket 07", 2).returncode == 0
+    _libera79(b, "term_v0")
+    (it,) = _fila79(b)
+    json.dump({"itens": [{**it, "run": "run_que_nao_e_do_gerente"}]}, open(os.path.join(b.home, "fila-despacho.json"), "w"))
+    for _ in range(3):
+        b.orq("gerente", "absorver")
+    assert not _fila79(b) and [e["op"] for e in b.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu" and not _log(b, "started.log")
+
+
+def test_ticket79_leitura_real_do_sistema_tem_as_quatro_medidas_no_macos():
+    if sys.platform != "darwin":
+        return
+    antes = os.environ.pop("ORQ_MAQUINA_LEITURA", None)
+    try:
+        l = orq_mod.maquina_ler()
+    finally:
+        if antes:
+            os.environ["ORQ_MAQUINA_LEITURA"] = antes
+    assert l["mem_livre_mb"] > 0 and 0 <= l["livre_pct"] <= 100 and l["carga"] >= 0 and l["ncpu"] >= 1, l
+    assert set(l["rss_mb"]) == {"claude", "codex", "node", "docker"} and all(v >= 0 for v in l["rss_mb"].values()), l
 
 
 if __name__ == "__main__":
