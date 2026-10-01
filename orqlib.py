@@ -4042,11 +4042,12 @@ GRUPOS_DIR = "groups"
 PRAZO_PEDIDO_S = int(os.environ.get("ORQ_PRAZO_PEDIDO_S") or 120)  # o do firstmate, contado do fim do turno que recebeu o pedido
 TIPOS_SUBIDA = ("resposta", "decisao", "pr", "bloqueio", "resumo")
 TURNOS_MATE = 20  # turnos guardados por mate: o prazo conta do primeiro que começou depois da entrega, não do último
+MATE_ESPERA_S = float(os.environ.get("ORQ_MATE_ESPERA_S") or 90)  # a caixa do claude do mate na tela: o resume levou mais de 20 s com a máquina carregada (01/10)
 TURNO_ABERTO_TETO_S = 1800  # turno sem fim (Esc, erro da API: o Stop não rodou) conta como acabado no começo depois disto
 ENTREGUE = ("enviado", "adiado")  # o avisa_coordenador (ticket 82): adiado já é entrega, sai no contexto do próximo prompt do coordenador
 CHARTER_MATE = """Você é o secondmate do grupo {grupo} no orq. O usuário fala só com o coordenador; você coordena os workers deste grupo e não conversa com o usuário.
 Projetos do grupo: {projetos}.{regras}
-1. Crie o seu Run uma vez: `orca orchestration run-create --objective "{grupo}: secondmate"`. Depois de um resume, o Run já está em `orq grupos`: use `orca orchestration run-use --id <run>`.
+1. Rode `orq grupos`: se o mate {grupo} já tem Run ali, ligue-se a ele com `orca orchestration run-use --id <run>`; senão crie o seu, uma vez: `orca orchestration run-create --objective "{grupo}: secondmate"`.
 2. Despache e acompanhe os workers como o coordenador faz (`orq despachar`, `orq agentes`, `orq steer`, `orq liberar`), com a skill worker-routing.
 3. Pedido do coordenador chega digitado como `orq ▸ pedido pN ...`. Responda sempre com `orq mate subir --corr pN --tipo resposta --texto "<resposta>"`: a resposta no chat ninguém lê.
 4. Suba ao coordenador, com `orq mate subir --tipo <decisao|pr|bloqueio|resumo> --texto "..."`: decisão que só o usuário toma, PR ou branch pronta, bloqueio, e um resumo quando um ticket fecha. O resto fica com você.
@@ -4244,10 +4245,10 @@ def _comando_mate(grupo, cfg, sessao, cwd=None):
     return (f"cd {shlex.quote(cwd)}; {comando}" if cwd else comando), (" ".join(texto.split()) if digitado else None)  # a quebra de linha submeteria no meio
 
 
-def _agente_pronto(handle, agente):
-    """Espera, até RETOMAR_ESPERA_S, a caixa do agente aparecer no terminal novo (HARNESS tela pronto). False com a tela de falha (sessão que não existe) ou sem
+def _agente_pronto(handle, agente, espera=None):
+    """Espera, até `espera` (RETOMAR_ESPERA_S), a caixa do agente aparecer no terminal novo (HARNESS tela pronto). False com a tela de falha (sessão que não existe) ou sem
     a caixa no prazo: digitar antes cairia no shell."""
-    fim, tela_ = time.time() + RETOMAR_ESPERA_S, HARNESS[agente]["tela"]
+    fim, tela_ = time.time() + (RETOMAR_ESPERA_S if espera is None else espera), HARNESS[agente]["tela"]
     while True:
         tela = "\n".join(orca("read", "--terminal", handle, "--screen", area="terminal")["terminal"].get("tail") or [])
         if any(f in tela for f in tela_["falha"]):
@@ -4274,7 +4275,7 @@ def mate_abrir(grupo):
     agente = cfg.get("harness") or "claude"
     comando, texto = _comando_mate(grupo, cfg, m.get("sessao"), cwd)
     novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", comando)
-    ok = _agente_pronto(novo, agente) and digita(novo, texto) == "enviado" if texto else not m.get("sessao") or _voltou(novo, agente)
+    ok = _agente_pronto(novo, agente, MATE_ESPERA_S) and digita(novo, texto) == "enviado" if texto else not m.get("sessao") or _voltou(novo, agente)
     if not ok:
         # sessão que não volta, ou agente que não subiu, deixa um shell: o gerente digitaria o pedido nele. Fecha e, se era resume, esquece a sessão
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
@@ -4282,7 +4283,7 @@ def mate_abrir(grupo):
         _mate_mut(grupo, terminal=None, **({"sessao": None} if m.get("sessao") else {}))
         motivo = "a sessão não voltou" if m.get("sessao") else "o agente não chegou ao prompt"
         append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": False, "falhou": motivo})
-        raise ValueError(f"mate {grupo}: {motivo} em {RETOMAR_ESPERA_S:.0f} s; terminal fechado. Rode orq mate abrir {grupo} de novo"
+        raise ValueError(f"mate {grupo}: {motivo} em {MATE_ESPERA_S:.0f} s; terminal fechado. Rode orq mate abrir {grupo} de novo"
                          + (" para abrir com o charter" if m.get("sessao") else ""))
     _mate_mut(grupo, terminal=novo, morto=None, **({"cwd": cwd} if cwd else {}))
     append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao")), "anterior": m.get("terminal")})

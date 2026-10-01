@@ -10864,7 +10864,7 @@ def test_subida_do_mate_com_o_usuario_no_coordenador_espera_o_proximo_prompt():
 
 
 def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
-    a = Amb(ORQ_RETOMAR_ESPERA_S="0.5")
+    a = Amb(ORQ_RETOMAR_ESPERA_S="0.5", ORQ_MATE_ESPERA_S="0.5")
     _grupo(a)
     _mate_vivo(a)
     a.set("terminals.json", ["term_coord"])
