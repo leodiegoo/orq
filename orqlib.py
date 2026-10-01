@@ -138,7 +138,8 @@ HARNESS = {
         "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA,
                  "pronto": re.compile(r"bypass permissions|\? for shortcuts|esc to interrupt")},  # a caixa do claude está na tela: dá para digitar
         "abrir": lambda modelo, effort, msg: ["claude", *(["--model", modelo] if modelo else []), "--dangerously-skip-permissions", msg],  # o mate (ticket 80)
-        "digita_prompt": True,  # o mate abre sem prompt e o texto é digitado com a caixa na tela: um prompt longo de várias linhas não passa pelo shell
+        # o mate abre sem prompt e o texto é digitado (ticket 80). O que tornava o claude não interativo era o `env ORQ_MATE=…` na frente, não o prompt na linha (ticket 106)
+        "digita_prompt": True,
         "efforts": ("low", "medium", "high", "xhigh", "max"),
         "filho": re.compile(r"/shell-snapshots/"),  # o comando do Bash tool (E2E, teste, build, shell em segundo plano) sobe como `zsh -c source ~/.claude/shell-snapshots/…`, filho do claude
     },
@@ -4238,8 +4239,8 @@ def _comando_mate(grupo, cfg, sessao, cwd=None):
     digitado = HARNESS[agente].get("digita_prompt")
     msg = None if digitado else texto
     cmd = HARNESS[agente]["resume"](sessao, modelo, cfg.get("effort"), msg) if sessao else HARNESS[agente]["abrir"](modelo, cfg.get("effort"), msg)
-    # `VAR=x cmd`, não `env VAR=x cmd`: no fish do usuário `env` é uma função do grc que passa a saída por um colorizador, e o claude sem TTY no stdout
-    # roda não interativo (sdk-cli) e sai depois do turno (visto em 01/10). `VAR=x cmd` vale no fish 3.1+, no zsh e no bash
+    # `ORQ_MATE=x claude` e não `env ORQ_MATE=x claude`: num terminal do Orca (fish) o claude lançado pelo `env` roda não interativo (sdk-cli, ou o erro de --print
+    # sem prompt), com ou sem prompt na linha. A atribuição direta vale no fish, no zsh e no bash e deixa o claude interativo (ticket 106)
     comando = f"ORQ_MATE={shlex.quote(grupo)} " + shlex.join([x for x in cmd if x is not None])
     # o Orca só cria terminal numa worktree que conhece, e a pasta do grupo (o ~/.claude/orq) não é uma: o terminal abre no checkout atual e entra nela.
     # `cd x; y` vale no fish, no zsh e no bash; o resume do claude só acha a sessão no cwd onde ela nasceu

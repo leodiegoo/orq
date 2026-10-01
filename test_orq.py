@@ -10778,10 +10778,11 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert r.returncode == 0, r.stderr
     cria = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
     cmd = cria[0][cria[0].index("--command") + 1]
-    # o Orca só cria terminal em worktree que conhece (o ~/.claude/orq não é uma): abre no checkout atual e entra na pasta do grupo. O `env`
-    # do fish é uma função do grc, e o claude sem TTY roda não interativo (visto em 01/10): `VAR=x cmd`. O charter é digitado com a caixa do claude na tela
+    # o Orca só cria terminal em worktree que conhece (o ~/.claude/orq não é uma): abre no checkout atual e entra na pasta do grupo. O `claude '<prompt>'`
+    # num terminal do Orca roda não interativo e sai depois do turno (sdk-cli, visto em 01/10): o claude abre sem prompt e o charter é digitado
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     assert "--worktree" not in cria[0], cria[0]
+    assert not _env_claude(cria), "env VAR=x claude roda não interativo num terminal do Orca (ticket 106)"
     texto = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
     assert "secondmate do grupo orq" in texto and "/h/regras-orq.md" in texto and "orq mate subir" in texto and "\n" not in texto, texto
     assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
@@ -10798,6 +10799,28 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
     assert len(textos) == 2 and "terminal caiu" in textos[1], textos
+
+
+def _env_claude(criados):
+    """Os comandos de `orca terminal create` que lançam o claude ou o codex atrás de `env VAR=…`."""
+    return [c[c.index("--command") + 1] for c in criados if re.search(r"\benv\s+\S+=\S*\s.*\b(?:claude|codex)\b", c[c.index("--command") + 1])]
+
+
+def test_ticket106_nenhum_comando_do_orq_lanca_o_agente_atras_de_env():
+    # num terminal do Orca (fish), `env VAR=x claude …` roda não interativo (sdk-cli; sem prompt, o erro de --print), com ou sem prompt na linha. Conferido em
+    # 01/10 (Claude Code 2.1.287): `claude 'p'`, `VAR=x claude 'p'` e `claude --resume <sessão> 'p'` ficam interativos depois do primeiro turno
+    assert _env_claude([["--command", "cd /x; env ORQ_MATE=orq claude --model m"]]) and not _env_claude([["--command", "cd /x; ORQ_MATE=orq claude --model m"]])
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "orqlib.py")).read()
+    assert not re.search(r'\[\s*"env"\s*,', src), "um comando montado como [\"env\", …] sobe o agente atrás de env"
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    a.set("workers.json", [])
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    assert a.orq("retomar").returncode == 0
+    cria = _log(a, "create.log")
+    assert cria and not _env_claude(cria), cria
 
 
 def test_mate_nao_abre_pergunta_no_terminal():
