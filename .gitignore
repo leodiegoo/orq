@@ -38,3 +38,7 @@ e2e-aviso.json
 worktrees-aviso.json
 gerente.json.antes-*
 *.py-e
+fila-despacho.json
+maquina.json
+.omc/
+suite_integra.py
