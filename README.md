@@ -241,9 +241,23 @@ Editing orq: hooks and the manager panel execute `~/.claude/orq/orq.py` while it
 
 Audience check: `git config core.hooksPath githooks` runs `scripts/audiencia-check.py` before each commit. It scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, default `~/.claude/orquestrador-plan/termos-proibidos.txt`: one term per line, `re:` prefix for a regex) and prints `file:line`. Without the list it skips with a warning.
 
+## Projects
+
+One file per project in `~/.claude/orq/projects/<name>.json` (under `ORQ_HOME`, gitignored), read on every call, no cache and no daemon:
+
+```json
+{"repo": "path:/Users/me/code/my-app", "harness": "codex", "grupo": "work"}
+```
+
+- `repo` is the only required key: the Orca repository selector (`path:`, `id:` or `name:`). `harness` is the default of `orq despachar` for that project's workers (`claude` when absent). `grupo` is free text that only groups the listing. Other keys are ignored for now.
+- `orq projetos [--json]` lists them. A file that is not JSON, has no `repo` or names a harness orq does not dispatch shows as `inválido: <why>` and is never picked on its own.
+- `orq despachar` takes the harness from `--agente`, then from the project, then `claude`. The project is `--projeto <name>` (refuses a name that does not exist or is invalid, before any task is created) or, without it, the project whose `repo: path:` contains the current directory (or its main checkout), the longest path winning. With no project file the behavior is the old one. There is still one coordinator for all projects.
+
+Not done yet: a Run remembering its project, `--repo` on `worker-start`, per-project environments, E2E queue and transcripts, the quota policy and `orq iniciar`. See `docs/design.md`, "Projects".
+
 ## Claude Code and Codex
 
-The coordinator can be a Claude Code or a Codex session, and each worker can be either: `orq despachar --agente codex --modelo gpt-6-sol --effort low ...` (the default is `claude`). What changes per agent sits in one table, `HARNESS` in `orqlib.py`: the resume command, the screen patterns and the accepted efforts. Orca builds the launch command itself from `worker-start --agent`. The rest goes through Orca for both:
+The coordinator can be a Claude Code or a Codex session, and each worker can be either: `orq despachar --agente codex --modelo gpt-6-sol --effort low ...` (the default is `claude`, or the harness of the project, below). What changes per agent sits in one table, `HARNESS` in `orqlib.py`: the resume command, the screen patterns and the accepted efforts. Orca builds the launch command itself from `worker-start --agent`. The rest goes through Orca for both:
 
 - `orq retomar` finds a session the hooks never recorded through Orca's session index (`orca search <dispatch id>`);
 - `orq uso [--agente codex]` reads each plan from `orca account list`, because the quotas are separate (Claude reads the HUD frame first);

@@ -5301,7 +5301,57 @@ def _raiz_do_repo(d):
     return os.path.realpath(os.path.dirname(comum)) if comum else None
 
 
-def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente="claude", _drenando=False):
+def projetos():
+    """Os arquivos ORQ_HOME/projects/<nome>.json, lidos a cada chamada (sem cache): {nome: {"repo", "harness", "grupo", "erro"}}.
+
+    Só `repo` é obrigatório; `harness` ausente vale claude e `grupo` só agrupa a listagem. Arquivo ilegível, sem `repo` ou com harness que o orq não
+    despacha fica na lista com `erro` (o `orq projetos` mostra o motivo) e nunca é escolhido sozinho."""
+    pasta, achados = _path("projects"), {}
+    for f in sorted(os.listdir(pasta)) if os.path.isdir(pasta) else []:
+        if not f.endswith(".json"):
+            continue
+        nome = f[:-5]
+        try:
+            with open(os.path.join(pasta, f)) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError) as e:
+            achados[nome] = {"repo": None, "harness": None, "grupo": None, "erro": f"json ilegível ({type(e).__name__})"}
+            continue
+        d = _dict(d)
+        harness = d.get("harness") or "claude"
+        erro = ("sem repo (o seletor do Orca: path:, id: ou name:)" if not isinstance(d.get("repo"), str) or not d["repo"] else
+                f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else None)
+        achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "erro": erro}
+    return achados
+
+
+def projeto_por_pasta(ps, pasta):
+    """O projeto cujo `repo: path:<dir>` contém `pasta` (o de caminho mais longo ganha), ou None. Seletor id:/name: não tem pasta para comparar."""
+    melhor = None
+    for nome, d in ps.items():
+        repo = d.get("repo") or ""
+        if d.get("erro") or not repo.startswith("path:"):
+            continue
+        raiz = os.path.realpath(os.path.expanduser(repo[5:]))
+        if os.path.commonpath([raiz, pasta]) == raiz and (melhor is None or len(raiz) > melhor[0]):
+            melhor = (len(raiz), nome)
+    return melhor and melhor[1]
+
+
+def projeto_do_despacho(nome=None):
+    """O projeto de um despacho: `--projeto` (recusa nome que não existe ou está inválido), senão o que contém o cwd (ou o checkout principal dele), senão None."""
+    ps = projetos()
+    if nome:
+        if nome not in ps:
+            raise ValueError(f"--projeto {nome}: não existe {_path('projects')}/{nome}.json (orq projetos lista os que há)")
+        if ps[nome]["erro"]:
+            raise ValueError(f"--projeto {nome}: arquivo inválido, {ps[nome]['erro']}")
+        return nome
+    cwd = os.path.realpath(os.getcwd())
+    return projeto_por_pasta(ps, cwd) or (projeto_por_pasta(ps, _raiz_do_repo(cwd) or cwd) if ps else None)
+
+
+def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
@@ -5316,6 +5366,9 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     """
     if prioridade is not None and prioridade not in (1, 2, 3):
         raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
+    if not agente:  # --agente ganha; sem ele vale o harness do projeto (--projeto ou o do cwd), e sem projeto o claude de sempre
+        p = projeto_do_despacho(projeto)
+        agente = projetos()[p]["harness"] if p else "claude"
     if agente not in HARNESS:
         raise ValueError(f"--agente {agente}: o orq só despacha {', '.join(HARNESSES)}")
     if effort not in HARNESS[agente]["efforts"]:
@@ -7453,7 +7506,8 @@ def main(argv=None):
     de.add_argument("--titulo")
     de.add_argument("--spec-arquivo")
     de.add_argument("--ticket", help="número de um ticket criado por orq ticket novo: o worker sobe na task dele (no lugar de --titulo e --spec-arquivo)")
-    de.add_argument("--agente", default="claude", help=f"o harness do worker ({', '.join(HARNESSES)}; o padrão é claude)")
+    de.add_argument("--agente", help=f"o harness do worker ({', '.join(HARNESSES)}); sem ele vale o do projeto e, sem projeto, claude")
+    de.add_argument("--projeto", help="um arquivo de ORQ_HOME/projects (orq projetos); sem ele vale o projeto cujo repo contém o cwd")
     de.add_argument("--modelo", required=True)
     de.add_argument("--effort", required=True)
     de.add_argument("--worktree", choices=["current", "new-top-level"])
@@ -7461,6 +7515,8 @@ def main(argv=None):
     de.add_argument("--base-branch")
     de.add_argument("--entrada")
     de.add_argument("--prioridade", type=int, choices=[1, 2, 3], help="1 alta a 3 baixa; sem ela vale a da frente do título (segurança e produção 1, failover, diagnóstico e painel 3)")
+    pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo)")
+    pj.add_argument("--json", action="store_true")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
     tn = tk.add_parser("novo", help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
     tn.add_argument("--titulo", required=True)
@@ -7661,10 +7717,17 @@ def main(argv=None):
                 return 0
             print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
         elif a.cmd == "despachar":
-            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente)
+            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente, a.projeto)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd == "projetos":
+            ps = projetos()
+            if a.json:
+                print(json.dumps([{"nome": n, **d} for n, d in ps.items()], ensure_ascii=False))
+            else:
+                print("\n".join(f"{n}  {d['repo'] or '-'}  {d['harness'] or '-'}" + (f"  grupo {d['grupo']}" if d["grupo"] else "") +
+                                (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
         elif a.cmd == "ticket":
             if a.op == "novo":
                 print(json.dumps(ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run), ensure_ascii=False))

@@ -569,6 +569,16 @@ orq runs with either harness as coordinator and dispatches workers of either. Th
 - No `/away` slash command: the `away` skill (`$away on`) or `orq away on`.
 - A Codex coordinator or worker whose orq hooks are untrusted is invisible to the turn tracking, like any agent without hooks.
 
+## Projects (ticket 94)
+
+First slice of per-project settings: the files and the harness. The plan notes hold the whole design (`firstmate-licoes-2.md`, section 4); this is what the code does.
+
+- `projects()` reads `ORQ_HOME/projects/*.json` on every call. A project is `{repo, harness, grupo, erro}`; `erro` is set for a file that is not JSON, has no `repo`, or whose `harness` is not in `HARNESS`. Those stay in the listing with the reason and are never resolved.
+- `projeto_do_despacho(nome)`: `--projeto` wins and raises on an unknown or invalid name; otherwise `projeto_por_pasta` takes the project whose `repo: path:<dir>` contains the cwd (then the cwd's main checkout, for linked worktrees), longest path first. `id:` and `name:` selectors have no folder to compare, so only `--projeto` reaches them.
+- `despachar(agente=None)` resolves the harness as `--agente`, project harness, `claude`. The `despacho` event already stores `agente`, so resume, relaunch and hibernate read it as before. A queued dispatch (ticket 79) is queued with the harness already resolved.
+- Divergences from the plan notes: the order has no "task harness" step because tasks carry no harness; and the Run's project (`run_projeto`) is left to the next slice, so the order is `--projeto`, cwd, none.
+- Not in this slice: `run_projeto`, `worker-start --repo`, `confiar_codex` on the project root, `AMBIENTES`/`fila_e2e`/`TRANSCRITOS` from the file, `modelos`, `sem_cota`, `orq iniciar`.
+
 ## Design decisions
 
 Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.

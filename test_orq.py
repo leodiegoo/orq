@@ -10808,6 +10808,91 @@ def test_fila_do_mate_drena_com_o_terminal_atual_do_mate():
     assert visto["h"] == "term_mate_novo", visto
 
 
+# ---- ticket 94: arquivos de projeto (ORQ_HOME/projects/<nome>.json) ----
+
+def _projeto(a, nome, dado):
+    os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
+    with open(os.path.join(a.home, "projects", f"{nome}.json"), "w") as f:
+        f.write(dado if isinstance(dado, str) else json.dumps(dado))
+
+
+def test_ticket94_projetos_lista_cada_arquivo_com_repo_harness_e_grupo():
+    a = Amb(run="run_a")
+    _projeto(a, "meu-app", {"repo": "path:/r/meu-app", "harness": "codex", "grupo": "confi"})
+    _projeto(a, "neo-api", {"repo": "name:neo-api"})
+    r = a.orq("projetos")
+    assert r.returncode == 0, r.stderr
+    linhas = r.stdout.splitlines()
+    assert any(l.startswith("meu-app") and "path:/r/meu-app" in l and "codex" in l and "confi" in l for l in linhas), r.stdout
+    assert any(l.startswith("neo-api") and "name:neo-api" in l and "claude" in l for l in linhas), "sem harness no arquivo vale claude: " + r.stdout
+    js = json.loads(a.orq("projetos", "--json").stdout)
+    assert {p["nome"] for p in js} == {"meu-app", "neo-api"} and next(p for p in js if p["nome"] == "neo-api")["harness"] == "claude", js
+
+
+def test_ticket94_projetos_sem_pasta_diz_que_nao_ha_projeto_e_sai_0():
+    a = Amb(run="run_a")
+    r = a.orq("projetos")
+    assert r.returncode == 0 and "nenhum projeto" in r.stdout, r
+    assert json.loads(a.orq("projetos", "--json").stdout) == []
+
+
+def test_ticket94_projetos_mostra_o_arquivo_invalido_com_o_motivo_sem_derrubar_a_lista():
+    a = Amb(run="run_a")
+    _projeto(a, "bom", {"repo": "path:/r/bom"})
+    _projeto(a, "quebrado", "{nao e json")
+    _projeto(a, "sem-repo", {"harness": "claude"})
+    _projeto(a, "harness-ruim", {"repo": "path:/r/x", "harness": "gemini"})
+    r = a.orq("projetos")
+    assert r.returncode == 0, r.stderr
+    for nome, motivo in (("quebrado", "json"), ("sem-repo", "repo"), ("harness-ruim", "gemini")):
+        assert any(l.startswith(nome) and "inválido" in l and motivo in l for l in r.stdout.splitlines()), (nome, r.stdout)
+    assert any(l.startswith("bom") and "inválido" not in l for l in r.stdout.splitlines()), r.stdout
+
+
+def test_ticket94_despachar_sem_agente_usa_o_harness_do_projeto():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p", "harness": "codex"})
+    r = _despachar(a, "--projeto", "p", "--modelo", "gpt-6-sol")
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--agent") + 1] == "codex", arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["agente"] == "codex", ev
+
+
+def test_ticket94_despachar_com_agente_ganha_do_harness_do_projeto():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p", "harness": "codex"})
+    assert _despachar(a, "--projeto", "p", "--agente", "claude").returncode == 0
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--agent") + 1] == "claude", arg
+
+
+def test_ticket94_despachar_projeto_sem_harness_ou_sem_projeto_segue_claude():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p"})
+    assert _despachar(a, "--projeto", "p").returncode == 0
+    assert _despachar(a).returncode == 0  # nenhum projeto contém o cwd dos testes
+    assert [x[x.index("--agent") + 1] for x in _log(a, "started.log")] == ["claude", "claude"]
+
+
+def test_ticket94_despachar_projeto_inexistente_ou_invalido_recusa_sem_criar_task():
+    a = Amb(run="run_a")
+    _projeto(a, "ruim", {"harness": "codex"})
+    for nome in ("nao-existe", "ruim"):
+        r = _despachar(a, "--projeto", nome)
+        assert r.returncode != 0 and nome in r.stderr, (nome, r.stderr)
+    assert not _log(a, "started.log"), "nada subiu"
+
+
+def test_ticket94_projeto_por_pasta_pega_o_repo_que_contem_o_cwd_e_o_mais_especifico_ganha():
+    ps = {"geral": {"repo": "path:/r/mono"}, "web": {"repo": "path:/r/mono/web", "harness": "codex"}, "outro": {"repo": "name:x"}}
+    assert orq_mod.projeto_por_pasta(ps, "/r/mono/web/app") == "web"
+    assert orq_mod.projeto_por_pasta(ps, "/r/mono/api") == "geral"
+    assert orq_mod.projeto_por_pasta(ps, "/r/monolito") is None, "prefixo de texto não é pasta contida"
+    assert orq_mod.projeto_por_pasta(ps, "/fora") is None
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

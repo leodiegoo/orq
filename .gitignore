@@ -12,6 +12,7 @@ ask-guard.off
 *.lock
 handoff/
 groups/
+projects/
 
 # decision pages and answers
 .lavish/
