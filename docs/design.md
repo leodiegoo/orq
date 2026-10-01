@@ -69,6 +69,8 @@ The model does the classifying. The code only checks that a classification was r
 | `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
 
+`orq retro` reads all of these (see "Retro"); a new failure event should get a signal there.
+
 Current state is always computed from the whole log by pure functions:
 
 ```mermaid
@@ -552,6 +554,45 @@ Do not trust a signal that cannot bear weight. `user_takeover` fires without a p
 The ticket file is the only copy of its content. Orca's task only points at the file, so there is one place to edit and nothing to keep in sync.
 
 A visible mark instead of colour. Messages orq shows the user start with a fixed emoji prefix, because ANSI colour in hook messages could not be shown to render and would show up as escape codes if it did not.
+
+## Retro: learning from its own failures (ticket 78)
+
+orq already leaves the trace of everything that goes wrong; nothing read it. `orq retro` reads it, and a weekly analysis step turns it into proposals. Two parts:
+
+- **Collector** (`orq retro`, deterministic, no LLM, about 5 s for three days of log). `orq retro [--desde D] [--ate D] [--projeto TRECHO] [--json] [--sem-gh] [--sem-transcritos] [--gravar]`; the window defaults to the last 7 days. It counts failure signals and prints a table, one pointer per case, and a model/effort table. Every signal is listed even at zero (`falhas no período: 0`); `n/d` means "not consulted" (no `gh`, no transcripts), never zero.
+- **Analysis** (the `skills/orq-retro` skill, a Sonnet worker). It reads the collector, follows the pointers, drops noise, and proposes at most 5 changes, each in exactly one class: **checagem** (hook, test or guard in orq, for a mechanical error), **texto** (AGENTS.md, standard worker spec or memory, for a judgement error) or **calibragem** (the `worker-routing` table). The classes are the ones of the user's `retro` skill: this skill feeds it with the collector instead of a single session. **Nothing is applied without the user's ok** on a Lavish page; approved proposals become orq tickets or document edits.
+
+Signals (`tipo` of the event, or other source, in parentheses). Counts and cases are per window:
+
+| Signal | Source |
+|---|---|
+| `nao_iniciou`, with the reason from the `relancar` note | `nao_iniciou` |
+| `steer_sem_leitura`, flagged when the worker delivered afterwards; `steer_reentregue` | `steer` without a `steer_fim` `lido`; `steer_reentrega` |
+| `retry`, `controle_falhou`, `intervencao` | `controle` |
+| `pergunta_de_worker` (question or escalation answered) | `resposta_worker` |
+| `worker_falhou`, `sem_entrega` | `worker_done` not `succeeded`; `fim_dispatch` `sem worker_done`, `falhou`, `motivo desconhecido` |
+| `liberado_sujo`, `liberado_sem_push`, `entrega_com_aviso`, `checkout_em_uso` | `fim_dispatch`, `entrega` (`checkout_em_uso`: the live `~/.claude/orq` named in the warning or the released path) |
+| `entrada_sem_tratamento` (distinct entries), `intake_descartado` | `gate_aviso`, `intake` |
+| `alerta`, `binding_perdido` | the matching events |
+| `correcao_do_usuario` | a user entry whose first word is `não`, `ops`, `ajust*` or `errad*`, within 30 min of a delivery |
+| `regra_violada` | the worker transcripts (`turnos.json` gives the session): `push_de_worker`, `trailer`, `agents_global` (write under `~/.agents`), `producao` (`gh workflow run`, `gh pr merge`), `checkout_em_uso_do_orq` (git merge, rebase, commit... or an edit inside the live checkout) |
+| `pr_ci_vermelho`, `pr_pediu_mudanca` | `gh pr view` for each PR linked in the window |
+
+Each case carries title, model, effort and a pointer: `events.jsonl:<line>` (`sed -n <line>p`), `<transcript>:<line>` or the PR URL. `--projeto` keeps the cases whose path, title or task contains the text.
+
+The rule scan looks only at the command that runs: heredoc bodies and quoted text are dropped first, so a `git push` inside `python3 - <<EOF` or an `echo` is not a push. The trailer rule also reads the commit message, but only when `git commit` or `gh pr create` is in the real command. New rules go in `_retro_viola`; the patterns are narrow on purpose.
+
+Week over week. `--gravar` writes only the numbers to `ORQ_HOME/retro/<end>.json`. The next run prints them in an `antes` column, and `orq digest` adds a `retro` key to `atual.json` (the last 4 rounds: `ate`, `falhas`, `metricas`) plus a line per round on the HTML page. The key is additive and absent until a round is saved, so a v1 reader keeps working. `falhas` is the plain sum of all signals, a thermometer: compare signal by signal.
+
+Limits: `pr_ci_vermelho` is the state of the checks now, not at delivery time. `liberado_sujo` counts the dirt the main checkout already had; the analysis step discounts a constant baseline. Windows start where `events.jsonl` does, so the first saved round is a baseline. `intake_descartado` and `entrada_sem_tratamento` measure the coordinator's habits, not bugs. The collector never writes anything besides the saved round.
+
+### Weekly trigger (proposed, not created)
+
+Friday 16:00 local, an Orca automation in the project workspace, so it only runs while Orca is open and the machine awake, like the other automations. Cron `0 16 * * 5`, one Sonnet session (`claude-sonnet-5-5`, effort high), prompt:
+
+> Rode a skill `orq-retro` com a janela padrão de 7 dias e `--gravar`. Não aplique nada: a saída é a página no Lavish e o relatório em `~/.claude/orquestrador-plan/relatorios/retro-AAAA-MM-DD.md`.
+
+Cost: the collector is local and free (log read, transcripts read, one `gh pr view` per PR of the week); the analysis is one Sonnet turn of a few minutes, once a week. On demand it is the same skill, without `--gravar`.
 
 ## Non-goals and known limits
 

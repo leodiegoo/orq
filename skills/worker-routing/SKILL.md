@@ -101,4 +101,4 @@ O spec do retry cita o id da tarefa antiga. Quando o retry termina bem, feche a 
 
 ## Calibrar
 
-A meta aproximada é 15% Haiku, 70% Sonnet e 15% Opus, sem virar regra. Quem calibra são os traces: tarefa concluída sem retry, escalations, testes quebrando depois do "pronto" e correções no review.
+A meta aproximada é 15% Haiku, 70% Sonnet e 15% Opus, sem virar regra. Quem calibra são os traces: tarefa concluída sem retry, escalations, testes quebrando depois do "pronto" e correções no review. `orq retro` conta isso por modelo e effort (o quadro `por_modelo`), e a skill `orq-retro` propõe a mudança nesta tabela, que só vale com o ok do usuário.
