@@ -5046,10 +5046,10 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     if not run_do_coordenador(run):
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
     with _trava("despacho.lock"):  # a vaga conferida e o worker-start formam um passo: despachos paralelos não passam do teto juntos
-        barra, motivo = maquina_barra(modelo)
-        if barra and _drenando:
+        motivo = maquina_barra(modelo, run=run)
+        if motivo and _drenando:
             raise SemVaga(motivo)
-        if barra:
+        if motivo:
             return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente)
         if spec is not None and not spec.lstrip().startswith("#"):
             spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
@@ -5317,6 +5317,8 @@ MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RA
                   "max_caros": 2, "modelos_caros": ["claude-opus-*", "gpt-6-astra*", "gpt-6-sol*"],  # padrões glob; o modelo caro conta no max_workers também
                   "mem_livre_min_mb": 3072, "livre_pct_min": 15,  # abaixo de qualquer um dos dois a pressão é alta
                   "carga_max": 12,  # loadavg de 1 min acima disto (uma por CPU) é pressão alta
+                  "mem_piso_mb": 1024,  # piso de segurança: nem o Run isento sobe com a memória livre abaixo disto
+                  "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem vaga; só max_e2e e mem_piso_mb o seguram
                   "pausar_sob_pressao": False}  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
 FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
 FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
@@ -5365,7 +5367,9 @@ def maquina_ler():
     carga = loadavg de 1 min (o mesmo número do `sysctl vm.loadavg`); rss_mb = soma do RSS dos processos de PROCESSOS_PESADOS no `ps`. Fonte que falha
     fica None/vazia (a pressão que ela mediria vale como desconhecida, nunca como alta). `ORQ_MAQUINA_LEITURA` aponta um JSON no lugar da leitura (testes)."""
     if os.environ.get("ORQ_MAQUINA_LEITURA"):
-        return _dict(_read_json(os.environ["ORQ_MAQUINA_LEITURA"]))
+        simulada = _dict(_read_json(os.environ["ORQ_MAQUINA_LEITURA"]))
+        procs = simulada.pop("processos", None)  # a amostra de processos simulada (a lista do _processos); sem ela a origem fica desconhecida
+        return {**simulada, "origem": maquina_origem(procs)}
 
     def roda(*cmd):
         try:
@@ -5390,7 +5394,36 @@ def maquina_ler():
         if nome and kb.isdigit():
             rss[nome] += int(kb) // 1024
     leitura["rss_mb"] = rss
+    leitura["origem"] = maquina_origem(_processos(com_cwd=False))
     return leitura
+
+
+def _nome_processo(args):
+    """Como o processo aparece na lista de culpados: o app (`OrbStack` de .../OrbStack.app/...) ou o nome do executável."""
+    app = re.search(r"/([^/]+)\.app/", args)
+    return app.group(1) if app else os.path.basename((args.split(None, 1) or [""])[0])
+
+
+def maquina_origem(procs):
+    """De quem é a carga, a partir da lista do `_processos`: {orq_cpu, fora_cpu, orq_rss_mb, fora_rss_mb, fora_por_cpu, fora_por_mem} ou None sem a lista.
+
+    São do orq os processos de agente (claude, codex: workers, gerente e coordenador) e tudo o que sobe abaixo deles, mais os do E2E (`e2e` no comando e o que
+    sobe abaixo). O resto é de fora. `fora_por_cpu` e `fora_por_mem` são os três maiores de fora, somados por nome ([{nome, valor}], %CPU e MB). Limite: o %CPU do
+    `ps` do macOS é uma média que decai em cerca de um minuto, e os containers do OrbStack contam como um processo só, de fora."""
+    if not procs:
+        return None
+    orq = _descendentes(procs, [p["pid"] for p in procs if _agente_do(p) or re.search(r"e2e", p["args"], re.I)])
+    dentro, fora = [p for p in procs if p["pid"] in orq], [p for p in procs if p["pid"] not in orq]
+
+    def maiores(chave, escala):
+        por_nome = {}
+        for p in fora:
+            n = _nome_processo(p["args"])
+            por_nome[n] = por_nome.get(n, 0) + (p.get(chave) or 0) / escala
+        return [{"nome": n, "valor": round(v)} for n, v in sorted(por_nome.items(), key=lambda kv: -kv[1])[:3] if round(v) > 0]
+    soma = lambda ps, k, escala=1: round(sum(p.get(k) or 0 for p in ps) / escala)
+    return {"orq_cpu": soma(dentro, "cpu"), "fora_cpu": soma(fora, "cpu"), "orq_rss_mb": soma(dentro, "rss", 1024), "fora_rss_mb": soma(fora, "rss", 1024),
+            "fora_por_cpu": maiores("cpu", 1), "fora_por_mem": maiores("rss", 1024)}
 
 
 def maquina_nivel(leitura=None, cfg=None):
@@ -5404,6 +5437,46 @@ def maquina_nivel(leitura=None, cfg=None):
     if isinstance(l.get("carga"), (int, float)) and l["carga"] > c["carga_max"]:
         motivos.append(f"carga {l['carga']:g} (máximo {c['carga_max']:g})")
     return ("alta", "; ".join(motivos)) if motivos else ("ok", None)
+
+
+def maquina_causa(leitura=None, cfg=None):
+    """(`orq` | `fora` | None, culpados): de quem é a pressão alta. `orq` se a maior parte (metade ou mais) da CPU, no motivo de carga, ou da RSS, no de memória,
+    é dos processos do orq; `fora` se não, com os maiores de fora ("mds_stores 146%, OrbStack 77%"). None sem pressão ou sem a amostra de processos
+    (origem desconhecida vale como do orq: o aviso segue sugerindo pausar)."""
+    l, c = leitura if leitura is not None else maquina_ler(), cfg or maquina_cfg()
+    o = l.get("origem")
+    if not o:
+        return None, None
+    cpu_alta = isinstance(l.get("carga"), (int, float)) and l["carga"] > c["carga_max"]
+    mem_alta = (isinstance(l.get("mem_livre_mb"), (int, float)) and l["mem_livre_mb"] < c["mem_livre_min_mb"]) or (isinstance(l.get("livre_pct"), (int, float)) and l["livre_pct"] < c["livre_pct_min"])
+    if not (cpu_alta or mem_alta):
+        return None, None
+    if (cpu_alta and o["orq_cpu"] >= o["fora_cpu"]) or (mem_alta and o["orq_rss_mb"] >= o["fora_rss_mb"]):
+        return "orq", None
+    culpados = [f"{x['nome']} {x['valor']}%" for x in o["fora_por_cpu"]] if cpu_alta else []
+    culpados += [f"{x['nome']} {x['valor']} MB" for x in o["fora_por_mem"]] if mem_alta else []
+    return "fora", ", ".join(culpados) or "processos de fora do orq"
+
+
+def maquina_piso(leitura, cfg):
+    """O motivo de a memória livre estar abaixo do piso de segurança (`mem_piso_mb`), o limite duro que vale até para o Run isento; ou None."""
+    livre = leitura.get("mem_livre_mb")
+    if isinstance(livre, (int, float)) and livre < cfg["mem_piso_mb"]:
+        return f"memória livre {livre:g} MB abaixo do piso de segurança ({cfg['mem_piso_mb']:g} MB), que vale até para o Run isento"
+    return None
+
+
+def run_isento(run, cfg=None):
+    """O Run casa com um padrão de `runs_isentos` (glob, sem diferenciar maiúsculas, contra o id ou o objetivo)? Run que o Orca não mostra não é isento."""
+    import fnmatch  # só aqui: fora do topo para não pesar nos hooks
+    padroes = (cfg or maquina_cfg())["runs_isentos"]
+    if not run or not padroes:
+        return False
+    try:
+        objetivo = (orca("run-show", "--id", run).get("run") or {}).get("objective") or ""
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        objetivo = ""
+    return any(fnmatch.fnmatch(x.lower(), p.lower()) for p in padroes for x in (run, objetivo) if x)
 
 
 def modelo_caro(modelo, cfg=None):
@@ -5438,14 +5511,19 @@ def maquina_vaga(modelo, ocup=None, cfg=None):
     return None
 
 
-def maquina_barra(modelo, ocup=None, cfg=None):
-    """(`pressao` | `cheio`, motivo) se o worker não pode subir agora, senão (None, None). A pressão da máquina vem antes das vagas."""
+def maquina_barra_item(modelo, run, ocup, cfg, pressao, leitura):
+    """O motivo de o worker deste Run não subir agora, ou None. A pressão da máquina vem antes das vagas; o Run isento (`runs_isentos`) passa pelas duas e
+    só para no piso de memória (max_e2e segue com a fila global do E2E)."""
+    causa = maquina_causa(leitura, cfg) if pressao[0] == "alta" else (None, None)
+    motivo = (f"máquina sob pressão: {pressao[1]}" + (f"; vem de fora do orq ({causa[1]})" if causa[0] == "fora" else "")) if pressao[0] == "alta" else maquina_vaga(modelo, ocup, cfg)
+    return maquina_piso(leitura, cfg) if motivo and run_isento(run, cfg) else motivo
+
+
+def maquina_barra(modelo, ocup=None, cfg=None, run=None):
+    """O motivo de o worker não poder subir agora, ou None. A pressão da máquina vem antes das vagas; Run isento: ver maquina_barra_item."""
     cfg = cfg or maquina_cfg()
-    nivel, motivo = maquina_nivel(cfg=cfg)
-    if nivel == "alta":
-        return "pressao", f"máquina sob pressão: {motivo}"
-    motivo = maquina_vaga(modelo, ocup, cfg)
-    return ("cheio", motivo) if motivo else (None, None)
+    leitura = maquina_ler()
+    return maquina_barra_item(modelo, run, ocup, cfg, maquina_nivel(leitura, cfg), leitura)
 
 
 def _fila_despacho_mut(fn):
@@ -5547,11 +5625,12 @@ def _sobe_da_fila(it):
     return f"fila: {it['titulo']} retomado: {r['estado']}" + (f" ({r['aviso']})" if r.get("aviso") else "")
 
 
-def despacho_drenar(cfg=None, agora=None):
+def despacho_drenar(cfg=None, agora=None, so_isentos=False):
     """Uma volta da fila: sobe, por prioridade, o primeiro item que cabe (um por volta, para a memória mostrar o que o anterior custou antes do próximo).
 
     Item de modelo caro com o teto de caros cheio fica para trás e o barato de prioridade menor sobe. Retomada cujo dispatch já terminou ou voltou sai da
-    fila. O que o uso do plano ou o modo noite seguram espera ESPERA_SEGURADO_S; erro de outra causa conta em `falhas` e, na FALHAS_FILA-ésima, o item sai."""
+    fila. O que o uso do plano ou o modo noite seguram espera ESPERA_SEGURADO_S; erro de outra causa conta em `falhas` e, na FALHAS_FILA-ésima, o item sai.
+    Item de Run isento (`runs_isentos`) sobe sem vaga, só parado pelo piso de memória; `so_isentos` (pressão alta) tenta só esses."""
     cfg, agora = cfg or maquina_cfg(), agora or time.time()
     itens = fila_despacho_itens()
     if not itens:
@@ -5564,7 +5643,10 @@ def despacho_drenar(cfg=None, agora=None):
             fila_despacho_rm(it["id"], "saiu", motivo="o dispatch já terminou ou já voltou")
             linhas.append(f"fila: {it['titulo']} saiu (o dispatch já terminou ou já voltou)")
             continue
-        if maquina_vaga(it.get("modelo"), ocup, cfg):
+        isento = (so_isentos or maquina_vaga(it.get("modelo"), ocup, cfg)) and run_isento(it.get("run"), cfg)  # só pergunta ao Orca quando há o que isentar
+        if so_isentos and not isento:
+            continue
+        if isento and maquina_piso(maquina_ler(), cfg) or not isento and maquina_vaga(it.get("modelo"), ocup, cfg):
             continue
         try:
             linhas.append(_sobe_da_fila(it))
@@ -5592,24 +5674,29 @@ def _candidato_a_pausar():
     return max(escolhidos, key=lambda a: a["prioridade"], default=None)
 
 
-def _maquina_avisar(motivo, na_fila, cfg):
+def _maquina_avisar(motivo, na_fila, cfg, causa=(None, None)):
     """Pressão alta: digita no coordenador, uma vez por episódio, que o gerente parou de subir worker e qual pausar. Com `pausar_sob_pressao` o gerente pausa esse
-    worker sozinho (o orq pausar espera até ORQ_PAUSA_ESPERA_S pelo PAUSA.md: a volta do painel demora esse tempo). Coordenador ocupado: a próxima volta tenta."""
+    worker sozinho (o orq pausar espera até ORQ_PAUSA_ESPERA_S pelo PAUSA.md: a volta do painel demora esse tempo). Coordenador ocupado: a próxima volta tenta.
+    Carga que vem de fora do orq (`causa` fora): o aviso lista os maiores de fora, segura o despacho e não sugere nem faz pausa, que não aliviaria nada."""
     g = _gerente_cfg()
     if not g or not g.get("coordenador") or _cursor_ro().get("maquina_aviso"):
         return []
+    fora = causa[0] == "fora"
     alvo = None
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
-        alvo = _candidato_a_pausar()
+        alvo = None if fora else _candidato_a_pausar()
     dica = f" Para abrir folga: orq pausar {alvo['task']} (P{alvo['prioridade']} {alvo.get('titulo') or alvo['task']})." if alvo else ""
     filhos = {}
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
         filhos = _filhos_por_task()
     peso = f" Processos em segundo plano: {', '.join(f'{t} {n}' for t, n in filhos.items())}." if filhos else ""
-    if avisa_coordenador(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{peso}{dica}") not in ("enviado", "adiado"):
+    texto = (f"orq: máquina sob pressão ({motivo}). A carga vem de fora do orq ({causa[1]}): pausar worker não alivia. O gerente segura despacho novo ({na_fila} na fila de despacho)."
+             if fora else f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{peso}{dica}")
+    if avisa_coordenador(g["coordenador"], texto) not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": motivo}))
-    append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"sugerido": alvo["task"]} if alvo else {}), **({"filhos": filhos} if filhos else {})})
+    append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"causa": causa[0]} if causa[0] else {}), **({"sugerido": alvo["task"]} if alvo else {}),
+                  **({"filhos": filhos} if filhos else {})})
     linhas = [f"máquina sob pressão ({motivo}): coordenador avisado, nada sobe"]
     if cfg["pausar_sob_pressao"] and alvo:
         r = pausar((alvo["task"],))
@@ -5618,11 +5705,12 @@ def _maquina_avisar(motivo, na_fila, cfg):
 
 
 def maquina_volta():
-    """O trabalho da fila de despacho numa volta do painel do agent manager: pressão alta avisa o coordenador e nada sobe; senão sobe um item que caiba."""
+    """O trabalho da fila de despacho numa volta do painel do agent manager: pressão alta avisa o coordenador e só o Run isento sobe; senão sobe um item que caiba."""
     cfg = maquina_cfg()
-    nivel, motivo = maquina_nivel(cfg=cfg)
+    leitura = maquina_ler()
+    nivel, motivo = maquina_nivel(leitura, cfg)
     if nivel == "alta":
-        return _maquina_avisar(motivo, len(fila_despacho_itens()), cfg)
+        return _maquina_avisar(motivo, len(fila_despacho_itens()), cfg, maquina_causa(leitura, cfg)) + despacho_drenar(cfg, so_isentos=True)
     if _cursor_ro().get("maquina_aviso"):
         _cursor_mut(lambda c: c.pop("maquina_aviso", None))
     return despacho_drenar(cfg)
@@ -5635,6 +5723,9 @@ def texto_maquina(cfg=None, leitura=None, ocup=None):
     rss = _dict(leitura.get("rss_mb"))
     ls = [f"memória livre {leitura.get('mem_livre_mb')} MB ({leitura.get('livre_pct')}% livre), carga {leitura.get('carga')} em {leitura.get('ncpu')} CPUs",
           "RSS: " + ", ".join(f"{k} {rss.get(k, 0)} MB" for k in PROCESSOS_PESADOS)]
+    if o := leitura.get("origem"):
+        ls.append(f"carga por dono: orq {o['orq_cpu']}% de CPU e {o['orq_rss_mb']} MB, fora do orq {o['fora_cpu']}% e {o['fora_rss_mb']} MB"
+                  + (f" (maiores de fora: {', '.join(f'{x['nome']} {x['valor']}%' for x in o['fora_por_cpu'])})" if o["fora_por_cpu"] else ""))
     if ocup is not None:
         caros = sum(modelo_caro(m, cfg) for m in ocup["vivos"].values())
         ls.append(f"vagas: {len(ocup['vivos'])}/{cfg['max_workers']:g} ocupadas, {max(cfg['max_workers'] - len(ocup['vivos']), 0):g} livres; caros {caros}/{cfg['max_caros']:g}; E2E máx {cfg['max_e2e']:g} (a fila do E2E serializa); fila de despacho {len(fila_despacho_itens())}")
@@ -5796,11 +5887,11 @@ def retomar(dry_run=False, run=None):
         else:
             subir.append((prioridade_de(eventos, w.get("taskId"), d, titulo), linha, cp, dica))
     if subir:  # o orçamento da máquina (ticket 79): sobe por prioridade até o teto, o resto vai para a fila de despacho
-        cfg, ocup = maquina_cfg(), maquina_ocupacao()
-        pressao = maquina_nivel(cfg=cfg)
+        cfg, ocup, leitura = maquina_cfg(), maquina_ocupacao(), maquina_ler()
+        pressao = maquina_nivel(leitura, cfg)
         for prio, linha, cp, dica in sorted(subir, key=lambda x: x[0]):  # estável: na mesma prioridade vale a ordem do Orca
             d = linha["dispatch"]
-            motivo = f"máquina sob pressão: {pressao[1]}" if pressao[0] == "alta" else maquina_vaga(linha["modelo"], ocup, cfg)
+            motivo = maquina_barra_item(linha["modelo"], linha["run"], ocup, cfg, pressao, leitura)
             if motivo:
                 if not dry_run:
                     fila_despacho_add({"tipo": "retomada", "dispatch": d, "task": linha["task"], "run": linha["run"], "titulo": linha["titulo"], "agente": linha["agente"],
@@ -6089,9 +6180,10 @@ def retomar_pausados(run=None, forcar=False):
         raise ValueError(f"uso do plano ainda alto: {'; '.join(f'{m}{_do_harness(ag)}' for ag, m in altos.items())}. Espere a janela virar ou use --forcar")
     res, cfg = [], maquina_cfg()
     ocup = maquina_ocupacao() if pausados else None
-    pressao = maquina_nivel(cfg=cfg)
+    leitura = maquina_ler()
+    pressao = maquina_nivel(leitura, cfg)
     for d, p in sorted(pausados.items(), key=lambda kv: kv[1].get("prioridade") or 2):
-        if (p.get("agente") or "claude") not in altos and (motivo := f"máquina sob pressão: {pressao[1]}" if pressao[0] == "alta" else maquina_vaga(p.get("modelo"), ocup, cfg)):
+        if (p.get("agente") or "claude") not in altos and (motivo := maquina_barra_item(p.get("modelo"), p["run"], ocup, cfg, pressao, leitura)):
             res.append({"dispatch": d, "task": p["task"], "titulo": p["titulo"], "estado": "sem_vaga", "aviso": f"{motivo}; segue pausado, rode orq retomar --pausados quando abrir vaga"})
             continue
         if (p.get("agente") or "claude") in altos:
@@ -6166,23 +6258,23 @@ def _agente_do(p):
     return nome if nome in HARNESS else None
 
 
-def _processos():
-    """[{pid, ppid, rss (KB), args, cwd}] do `ps`, com o cwd (lsof) só dos processos de agente; None se o ps falhar. `cwd` None: o lsof não o disse.
+def _processos(com_cwd=True):
+    """[{pid, ppid, rss (KB), cpu (%), args, cwd}] do `ps`, com o cwd (lsof) só dos processos de agente (`com_cwd`); None se o ps falhar. `cwd` None: o lsof não o disse.
 
     ORQ_PROCESSOS: caminho de um JSON com essa lista, no lugar do ps e do lsof (testes)."""
     if os.environ.get("ORQ_PROCESSOS"):
         return _read_json(os.environ["ORQ_PROCESSOS"])
     try:
-        saida = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,command="], capture_output=True, text=True, timeout=10, check=True).stdout
+        saida = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,pcpu=,command="], capture_output=True, text=True, timeout=10, check=True).stdout
     except (subprocess.SubprocessError, OSError) as e:
         log(f"hibernar: ps: {type(e).__name__}: {e}")
         return None
     ps = []
     for l in saida.splitlines():
-        c = l.split(None, 3)
-        if len(c) == 4 and all(x.isdigit() for x in c[:3]):
-            ps.append({"pid": int(c[0]), "ppid": int(c[1]), "rss": int(c[2]), "args": c[3], "cwd": None})
-    donos = [p for p in ps if _agente_do(p)]
+        c = l.split(None, 4)
+        if len(c) == 5 and all(x.isdigit() for x in c[:3]) and re.fullmatch(r"\d+(\.\d+)?", c[3]):
+            ps.append({"pid": int(c[0]), "ppid": int(c[1]), "rss": int(c[2]), "cpu": float(c[3]), "args": c[4], "cwd": None})
+    donos = [p for p in ps if _agente_do(p)] if com_cwd else []
     if donos:
         try:
             lsof = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(str(p["pid"]) for p in donos)], capture_output=True, text=True, timeout=10).stdout

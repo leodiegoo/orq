@@ -420,10 +420,12 @@ class Amb:
         with open(os.path.join(self.fake, nome), "w") as f:
             json.dump(dado, f)
 
-    def maquina(self, mem_livre_mb=16000, livre_pct=60, carga=2.0):
-        """A leitura simulada da máquina (ORQ_MAQUINA_LEITURA): o padrão dos testes é uma máquina folgada, para não depender da carga real de quem roda a suíte."""
+    def maquina(self, mem_livre_mb=16000, livre_pct=60, carga=2.0, processos=None):
+        """A leitura simulada da máquina (ORQ_MAQUINA_LEITURA): o padrão dos testes é uma máquina folgada, para não depender da carga real de quem roda a suíte.
+        `processos`: a amostra de processos simulada ([{pid, ppid, cpu, rss (KB), args}]); sem ela a origem da carga fica desconhecida."""
         with open(self.env["ORQ_MAQUINA_LEITURA"], "w") as f:
-            json.dump({"mem_livre_mb": mem_livre_mb, "livre_pct": livre_pct, "carga": carga, "ncpu": 12, "rss_mb": {"claude": 900, "codex": 0, "node": 1500, "docker": 2000}}, f)
+            json.dump({"mem_livre_mb": mem_livre_mb, "livre_pct": livre_pct, "carga": carga, "ncpu": 12, "rss_mb": {"claude": 900, "codex": 0, "node": 1500, "docker": 2000},
+                       **({"processos": processos} if processos else {})}, f)
 
     def orq(self, *args, stdin=None, **env):
         return subprocess.run([sys.executable, ORQ, *args], input=stdin, capture_output=True, text=True,
@@ -10302,6 +10304,114 @@ def test_ticket55_hook_com_import_falho_sai_0_sem_saida_e_grava_o_log():
     # fora de um hook o erro continua alto: quem digita `orq status` precisa ver a causa
     r = subprocess.run([sys.executable, os.path.join(t, "orq.py"), "status"], env=env, capture_output=True, text=True)
     assert r.returncode != 0 and "SyntaxError" in r.stderr, r.stderr
+
+
+# ---------- ticket 85: a pressão separa o que é do orq do que não é, e o Run do orq é isento ----------
+
+def _p85(pid, ppid, cpu, args, rss=100_000):
+    return {"pid": pid, "ppid": ppid, "cpu": cpu, "rss": rss, "args": args}
+
+
+# o worker (claude e o node dele) e o que roda na máquina fora do orq
+_WORKER85 = lambda cpu: [_p85(100, 1, 3, "/opt/homebrew/bin/claude --model x"), _p85(101, 100, cpu, "node /x/vitest.js")]
+_FORA85 = [_p85(200, 1, 146, "/System/Library/Frameworks/CoreServices.framework/Metadata.framework/Support/mds_stores"),
+           _p85(201, 1, 50, "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper"),
+           _p85(202, 1, 27, "/Applications/OrbStack.app/Contents/MacOS/OrbStack"), _p85(203, 1, 4, "/usr/bin/ssh")]
+
+
+def _texto_aviso85(a):
+    (env,) = _log(a, "send.log")
+    return env[env.index("--text") + 1]
+
+
+def test_ticket85_carga_vinda_de_fora_segura_o_despacho_lista_os_culpados_e_nao_sugere_pausa():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.orq("maquina", "set", "pausar_sob_pressao", "true")
+    a.maquina(carga=14.2, processos=[*_WORKER85(13), *_FORA85])
+    out = json.loads(_desp79(a, "Ticket 05", 2).stdout)
+    assert out["estado"] == "enfileirado" and "carga 14.2 (máximo 12)" in out["motivo"] and "mds_stores 146%, OrbStack 77%" in out["motivo"], out
+    a.orq("gerente", "absorver")
+    texto = _texto_aviso85(a)
+    assert "mds_stores 146%, OrbStack 77%" in texto and "fora do orq" in texto and "não alivia" in texto, texto
+    assert "orq pausar" not in texto and not _log(a, "close.log"), "nem sugere nem pausa sozinho, mesmo com pausar_sob_pressao ligado"
+    assert not _log(a, "started.log") and len(_fila79(a)) == 1, "o despacho novo segue seguro"
+    assert [(e["tipo"], e["causa"]) for e in a.events() if e["tipo"] == "maquina_aviso"] == [("maquina_aviso", "fora")]
+    assert "carga por dono: orq 16% de CPU" in a.orq("maquina").stdout and "fora do orq 227%" in a.orq("maquina").stdout
+
+
+def test_ticket85_carga_vinda_dos_workers_sugere_pausar_o_de_menor_prioridade():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=14.2, processos=[*_WORKER85(600), *_FORA85])
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["estado"] == "enfileirado"
+    a.orq("gerente", "absorver")
+    texto = _texto_aviso85(a)
+    assert "orq pausar task_term_v0" in texto and "fora do orq" not in texto, texto
+    assert [e["causa"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["orq"]
+
+
+def test_ticket85_abaixo_do_limite_nada_acontece_mesmo_com_processo_de_fora_pesado():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=3.0, processos=[*_WORKER85(13), *_FORA85])
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "sobe"
+    a.orq("gerente", "absorver")
+    assert not _log(a, "send.log") and not [e for e in a.events() if e["tipo"] == "maquina_aviso"]
+
+
+def test_ticket85_o_total_conta_o_e2e_e_o_que_sobe_abaixo_dos_agentes_como_do_orq():
+    o = orq_mod.maquina_origem([_p85(100, 1, 3, "/opt/homebrew/bin/codex"), _p85(101, 100, 40, "node mcp"), _p85(300, 1, 90, "bash scripts/e2e-infra.sh start"),
+                                _p85(301, 300, 10, "mongod"), *_FORA85])
+    assert (o["orq_cpu"], o["fora_cpu"]) == (143, 227) and [x["nome"] for x in o["fora_por_cpu"]] == ["mds_stores", "OrbStack", "ssh"], o
+    assert orq_mod.maquina_origem(None) is None and orq_mod.maquina_origem([]) is None
+
+
+def _runs85(a, objetivo):
+    a.set("runs.json", [{"id": "run_a", "objective": objetivo}])
+
+
+def test_ticket85_run_isento_sobe_sob_pressao_e_o_de_outro_run_enfileira():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=40)
+    _runs85(a, "Neo-jobs: insert diário")
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["estado"] == "enfileirado", "Run de outra frente enfileira"
+    _runs85(a, "Orquestrador: registro de tarefas")
+    assert json.loads(_desp79(a, "Ticket 06", 2).stdout)["dispatchId"], "Run do orq sobe com a carga alta"
+    assert _titulos_iniciados79(a) == ["Ticket 06"]
+    a.orq("maquina", "set", "runs_isentos", '["run_a"]')
+    _runs85(a, "Neo-jobs: insert diário")
+    assert json.loads(_desp79(a, "Ticket 07", 2).stdout)["dispatchId"], "o id do Run também vale como padrão"
+
+
+def test_ticket85_run_isento_sobe_sem_vaga_mas_o_piso_de_memoria_o_segura():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("V", SONNET)] * 4)
+    _runs85(a, "Orquestrador: x")
+    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "4/4 workers vivos e o Run isento sobe"
+    a.maquina(mem_livre_mb=800, livre_pct=5)
+    out = json.loads(_desp79(a, "Ticket 06", 2).stdout)
+    assert out["estado"] == "enfileirado" and "piso de segurança (1024 MB)" in out["motivo"], out
+    a.maquina(mem_livre_mb=2000, livre_pct=60)
+    assert json.loads(_desp79(a, "Ticket 07", 2).stdout)["dispatchId"], "abaixo do mínimo mole, acima do piso: sobe"
+
+
+def test_ticket85_fila_do_run_isento_sobe_pelo_gerente_mesmo_sob_pressao():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("Vivo", SONNET)])
+    a.maquina(carga=40)
+    _runs85(a, "Neo-jobs")
+    _desp79(a, "Ticket 05", 2)
+    _runs85(a, "Orquestrador: x")
+    a.orq("gerente", "absorver")
+    assert _titulos_iniciados79(a) == ["Ticket 05"] and not _fila79(a), "o item do Run isento sai da fila com a pressão alta"
 
 
 if __name__ == "__main__":
