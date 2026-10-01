@@ -140,6 +140,7 @@ HARNESS["codex"] = {
     "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: o ultra só nos modelos que o têm (o Orca recusa no Luna)
 }
 HARNESSES = tuple(HARNESS)
+CODEX_CONFIG = os.environ.get("ORQ_CODEX_CONFIG") or os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "config.toml")
 PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)  # o caminho de cada arquivo que o apply_patch do Codex mexe
 
 
@@ -2950,23 +2951,25 @@ def coordenador(ev):
     run = orca("run-current")["run"]
     if run is None:
         return None
-    lembrar_run(sid, run["id"], ev.get("cwd"))
+    lembrar_run(sid, run["id"], ev.get("cwd"), ev.get("_harness_orq") or "claude")
     return run
 
 
 # ---------- hooks ----------
 
-def lembrar_run(sid, run_id, cwd=None):
+def lembrar_run(sid, run_id, cwd=None, harness="claude"):
     """Guarda em cursor.json o último Run visto por session_id (só de coordenador) e a casa dele, o cwd do primeiro prompt (o Codex não tem
     CLAUDE_PROJECT_DIR); grava só quando muda."""
     cur = _cursor_ro()
-    if _dict(cur.get("runs")).get(sid) == run_id and (not cwd or _dict(cur.get("casas")).get(sid)):
+    if _dict(cur.get("runs")).get(sid) == run_id and (not cwd or _dict(cur.get("casas")).get(sid)) and (harness == "claude" or _dict(cur.get("harnesses")).get(sid)):
         return
 
     def grava(c):
         _sub(c, "runs")[sid] = run_id
         if cwd:
             _sub(c, "casas").setdefault(sid, cwd)
+        if harness != "claude":
+            _sub(c, "harnesses")[sid] = harness
 
     _cursor_mut(grava)
 
@@ -3433,6 +3436,7 @@ def run_hook(kind, harness="claude"):
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             return 0  # fora do Orca não há Run nem terminal: nem chama o Orca nem enche o log
         ev = json.load(sys.stdin)
+        ev["_harness_orq"] = harness  # de que agente veio o hook: o coordenador guarda o dele
         if kind == "externas":  # todo Bash, de qualquer sessão: só lê o cursor, sem Orca
             out = hook_externas(ev, None)
             if out:
@@ -4648,6 +4652,37 @@ def _conferir_inicio(dispatch, terminal, titulo, out):
     return _esperar_prompt(dispatch, terminal, titulo)
 
 
+def confiar_codex(*caminhos):
+    """Marca cada pasta como confiável no Codex (`[projects."<p>"] trust_level = "trusted"` no config.toml) e devolve as que entraram agora. O Codex
+    guarda o trust pela raiz do repositório principal, e a worktree herda; o orq grava as duas. Config que não lê como TOML fica como estava."""
+    import tomllib  # import tardio: só o despacho de um worker Codex usa
+    try:
+        txt = open(CODEX_CONFIG, encoding="utf-8").read()
+    except FileNotFoundError:
+        txt = ""
+    try:
+        proj = _dict(tomllib.loads(txt).get("projects"))
+    except tomllib.TOMLDecodeError as e:
+        log(f"confiar_codex: {CODEX_CONFIG} não é TOML ({e}): nada gravado")
+        return []
+    novos = [p for p in dict.fromkeys(c for c in caminhos if c) if _dict(proj.get(p)).get("trust_level") != "trusted"]
+    if not novos:
+        return []
+    txt += "".join(f'\n[projects.{json.dumps(p, ensure_ascii=False)}]\ntrust_level = "trusted"\n' for p in novos)
+    os.makedirs(os.path.dirname(CODEX_CONFIG) or ".", exist_ok=True)
+    tmp = f"{CODEX_CONFIG}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(txt)
+    os.replace(tmp, CODEX_CONFIG)
+    return novos
+
+
+def _raiz_do_repo(d):
+    """A pasta do checkout principal do repositório de `d` (o pai do git common dir), ou None fora de um repositório."""
+    comum = (_git(d, "rev-parse", "--path-format=absolute", "--git-common-dir") or "").strip()
+    return os.path.realpath(os.path.dirname(comum)) if comum else None
+
+
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente="claude"):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
@@ -4701,6 +4736,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
                 f"{resto.lstrip(chr(10))}")
     ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
+    confiadas = confiar_codex(_raiz_do_repo(os.getcwd())) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
     args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
             "--agent", agente, "--model", modelo, "--effort", effort]
     for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
@@ -4724,6 +4760,11 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
           **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
     append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
+    if agente == "codex":
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError):
+            confiadas += confiar_codex(_checkpoint(dispatch)["caminho"])  # a worktree que o Orca criou
+        if confiadas:
+            out["confiadas"] = confiadas
     if tk:  # B24: o ticket despachado deixa de ser "pronto para agente", senão uma sessão nova o despacharia de novo
         try:
             with open(tk["arquivo"], encoding="utf-8") as f:
@@ -4750,6 +4791,8 @@ def _sessao_do_coordenador(sessao):
         if not runs:
             raise ValueError("nenhuma sessão de coordenador registrada em cursor.json: passe --sessao <id>")
         sessao = list(runs)[-1]
+    if _dict(_cursor_ro().get("harnesses")).get(sessao) == "codex":
+        raise ValueError(f"a sessão {sessao[:8]} é de um coordenador no Codex, que não tem AskUserQuestion: não há resposta de caixa para auditar")
     achados = sorted(f for f in os.listdir(TRANSCRITOS) if f.endswith(".jsonl") and f.startswith(sessao)) if os.path.isdir(TRANSCRITOS) else []
     if len(achados) != 1:
         raise ValueError(f"transcrito de {sessao!r} em {TRANSCRITOS}: {'nenhum' if not achados else 'mais de um'}")
@@ -5657,7 +5700,16 @@ def main(argv=None):
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
-    a = ap.parse_args(argv)
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["hook"]:
+        try:
+            a = ap.parse_args(args)
+        except SystemExit as e:  # fail-open: no Codex a saída 2 do argparse bloquearia o prompt do usuário
+            if e.code:
+                log(f"hook com argumentos inválidos: {args}")
+            return 0
+    else:
+        a = ap.parse_args(args)
     if a.cmd == "hook":
         return run_hook(a.kind, a.harness)
     try:

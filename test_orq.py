@@ -16,6 +16,7 @@ LIMPAR = os.path.join(AQUI, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
+orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")  # nenhum teste grava no ~/.codex/config.toml de verdade
 
 FAKE = '''#!/usr/bin/env python3
 import base64, json, os, sys, time
@@ -399,7 +400,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
 
@@ -8532,9 +8533,10 @@ def test_ticket73_hook_do_worker_codex_grava_o_turno_com_o_harness_e_o_transcrit
     assert _turnos(a)["ctx_c24"]["harness"] == "claude", "sem o argumento o hook é do Claude, como os instalados hoje"
 
 
-def test_ticket73_hook_com_harness_desconhecido_recusa_e_o_exemplo_do_codex_instala_cada_hook_com_o_argumento():
+def test_ticket73_hook_com_harness_desconhecido_sai_0_e_o_exemplo_do_codex_instala_cada_hook_com_o_argumento():
     a = Amb(run=None)
-    assert a.orq("hook", "prompt", "cursor", stdin="{}").returncode != 0
+    r = a.orq("hook", "prompt", "cursor", stdin="{}")
+    assert r.returncode == 0 and not r.stdout and "argumentos inválidos" in a.log(), "fail-open: no Codex a saída 2 bloquearia o prompt"
     cfg = json.load(open(os.path.join(AQUI, "codex.hooks.example.json")))["hooks"]
     cmds = {h["command"] for g in cfg.values() for x in g for h in x["hooks"]}
     for k in ("prompt", "stop", "session", "lugar", "externas", "prligar"):
@@ -8765,6 +8767,48 @@ def test_ticket73_telas_le_o_worker_codex_rodando_com_os_padroes_dele():
         assert orq_mod._telas(ws, {"ctx_c": {"agente": "codex"}}) == {"ctx_c": "1 background terminal running (tela)"}
     finally:
         orq_mod.orca = orig
+
+
+
+def test_ticket73_despachar_codex_confia_a_raiz_do_repositorio_no_config_do_codex_sem_estragar_o_que_ja_tem():
+    a = Amb(run="run_a")
+    cfg = os.path.join(a.tmp.name, "config.toml")
+    open(cfg, "w").write('model = "gpt-6-luna"\n\n[projects."/ja/confiada"]\ntrust_level = "trusted"\n')
+    r = _despachar(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "low", ORQ_CODEX_CONFIG=cfg)
+    assert r.returncode == 0, r.stderr
+    raiz = os.path.dirname(subprocess.run(["git", "-C", AQUI, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True).stdout.strip())
+    import tomllib
+    d = tomllib.loads(open(cfg).read())
+    assert d["model"] == "gpt-6-luna" and d["projects"]["/ja/confiada"]["trust_level"] == "trusted", d
+    assert d["projects"][os.path.realpath(raiz)]["trust_level"] == "trusted", d
+    antes = open(cfg).read()
+    assert _despachar(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "low", ORQ_CODEX_CONFIG=cfg).returncode == 0
+    assert open(cfg).read() == antes, "pasta já confiada não é gravada de novo"
+    b = Amb(run="run_a")
+    cfg_b = os.path.join(b.tmp.name, "config.toml")
+    assert _despachar(b, ORQ_CODEX_CONFIG=cfg_b).returncode == 0 and not os.path.exists(cfg_b), "worker Claude não mexe no Codex"
+
+
+def test_ticket73_confiar_codex_grava_a_worktree_e_recusa_config_que_nao_e_toml():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config.toml")
+        antes = orq_mod.CODEX_CONFIG
+        orq_mod.CODEX_CONFIG = cfg
+        try:
+            assert orq_mod.confiar_codex(d + '/wt "x"') == [d + '/wt "x"']
+            import tomllib
+            assert tomllib.loads(open(cfg).read())["projects"][d + '/wt "x"']["trust_level"] == "trusted"
+            open(cfg, "w").write("isto = não é toml [")
+            assert orq_mod.confiar_codex(d + "/outra") == [] and open(cfg).read() == "isto = não é toml [", "config quebrado fica como estava"
+        finally:
+            orq_mod.CODEX_CONFIG = antes
+
+
+def test_ticket73_auditar_respostas_de_coordenador_codex_diz_que_nao_ha_o_que_auditar():
+    a = Amb(run="run_a")
+    _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="thr_coord", prompt="oi"))
+    r = a.orq("auditar-respostas")
+    assert r.returncode != 0 and "Codex" in r.stderr and "AskUserQuestion" in r.stderr, r.stderr
 
 
 if __name__ == "__main__":
