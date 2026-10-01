@@ -43,12 +43,12 @@ Planejamento trivial ("campo `phone` com migration, endpoint e formulário") é 
 | Sonnet medium | `gpt-6-luna` medium ou high |
 | Sonnet high | `gpt-6-luna` xhigh ou max, ou `gpt-6-sol` low, que sai barato para o que entrega |
 | Opus high | `gpt-6-sol` medium ou high |
-| Opus xhigh | `gpt-6-sol` xhigh |
-| Opus max | `gpt-6-sol` max; se falhar, suba para o Claude Opus |
+| Opus xhigh | `gpt-6-astra` low |
+| Opus max | `gpt-6-astra` medium; se falhar, suba para o Claude Opus max |
 
 - O `max` do Luna fica acima do high e abaixo do Sol.
-- Para escalar no Codex, suba um degrau por vez: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Claude Opus xhigh.
-- Não use `gpt-6-astra` nem `gpt-5.6-terra`: decisão do usuário, 01/10.
+- Para escalar no Codex, suba um degrau por vez: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Astra low → Astra medium → Claude Opus max.
+- Astra só em low e medium, no lugar do Opus xhigh e max (decisão do usuário, 01/10). Não use `gpt-5.6-terra`.
 - Não use `ultra` em worker: ele delega para subagentes por conta própria.
 
 De onde vem a tabela:
