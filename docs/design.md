@@ -8,9 +8,9 @@ Names in code and in the event log are Portuguese (see the glossary in the READM
 
 Three kinds of terminal take part.
 
-The coordinator is the Claude Code session the user talks to. It creates Runs and tasks in Orca and dispatches workers.
+The coordinator is the Claude Code or Codex session the user talks to. It creates Runs and tasks in Orca and dispatches workers.
 
-Workers are Claude Code sessions Orca starts for a task. Their first prompt is always Orca's dispatch preamble.
+Workers are Claude Code or Codex sessions Orca starts for a task (`orq despachar --agente claude|codex`). Their first prompt is always Orca's dispatch preamble.
 
 The agent manager (`gerente`) is a plain shell running `painel-agent-manager.sh`. It has no model and costs no tokens.
 
@@ -444,6 +444,34 @@ Everything is read from orq's own files (`events.jsonl`, `prs.json`, `fila.json`
 
 Limits: the file is only as fresh as the last PR poll (the manager loop or `orq pr poll`). PR numbers are taken as unique (one repository). Delivery warnings (`entrega`) are not in the digest. A feature with no ticket shows its task id. A reply of the coordinator that has no text (only tool calls) leaves no entry. `linha` turns empty the moment away mode is turned off, although the events stay in the log.
 
+## Harnesses: Claude Code and Codex (ticket 73)
+
+orq runs with either harness as coordinator and dispatches workers of either. The inventory and the design behind this live outside the repo, in the plan notes; this section is what the code does.
+
+**The table.** `HARNESS` in `orqlib.py` holds, per agent, what changes from one to the other: the resume command, the screen patterns (menu cursor, question types, background-process line, resume failure text) and the efforts the agent accepts. An agent missing from the table has no orq hooks and no screen reading, so its turn state stays `unknown`. The launch command is not in the table: Orca builds it from `worker-start --agent <id> --model --effort`.
+
+**Hooks.** Codex fires the same events with nearly the same JSON (`session_id`, `transcript_path`, `cwd`, `prompt`, `tool_name`, `tool_input`, `tool_response`, `last_assistant_message`) and accepts the same outputs (`hookSpecificOutput.additionalContext`, `permissionDecision: deny`, `decision: block`). The hook command takes the harness as its last argument (`orq.py hook prompt codex`); without it the hook is Claude's, so the hooks already installed stay valid. Three differences are handled in the hooks themselves:
+
+- the edit tool is `apply_patch`, and the file is read from the patch (`*** Update File: <path>`);
+- Codex has no `CLAUDE_PROJECT_DIR`, so the place check uses the coordinator's home, the cwd of its first prompt kept in `cursor.json` (`casas`);
+- Codex has no AskUserQuestion, so the ask guard and the answer hook have nothing to catch there, and `orq auditar-respostas` refuses a Codex coordinator session.
+
+`codex.hooks.example.json` lists the hooks for `~/.codex/hooks.json`. Codex trusts each hook by its position (`hooks.json:<event>:<group>:<hook>` in `[hooks.state]` of `config.toml`), so new groups go at the end of each event, and the hooks are reviewed once in `/hooks` (or the session runs with `--dangerously-bypass-hook-trust`). An untrusted hook does not run and gives no sign to orq: the Codex TUI only shows `⚠ N warnings`. In the interactive TUI (codex-cli 0.159.2) SessionStart fires with the first prompt, right before UserPromptSubmit, not when the window opens; the open-tickets context still reaches the first turn.
+
+**Sessions.** The worker's prompt hook records `harness` and `transcrito` (the hook's `transcript_path`) in `turnos.json`. A worker the hooks never saw is found in Orca's session index: `orca search <dispatchId> --agent <a> --scope conversation`, first hit whose evidence is a user prompt (the coordinator cites the dispatch too, in tool output). The Codex resume is `codex resume <session> -m <model> -c model_reasoning_effort="<effort>" --dangerously-bypass-approvals-and-sandbox '<message>'`; flags after `resume` do not clash with an alias that puts `--yolo` before it.
+
+**Plan usage.** The quotas are separate. Claude reads the HUD frame first and falls back to `orca account list`; Codex reads `orca account list` (`rateLimits.codex.weekly` and `.session`, `resetsAt` in milliseconds). `orq despachar` checks the quota of the chosen harness, the manager warns once per harness, and `orq retomar --pausados` leaves a worker whose harness is still over the limit (`uso_alto`).
+
+**Trust.** Codex keeps folder trust by the main repository root, and a linked worktree of a trusted repo does not ask again (checked with codex-cli 0.159.2). For a Codex worker, `orq despachar` writes `trust_level = "trusted"` into `~/.codex/config.toml` (`ORQ_CODEX_CONFIG`) for the coordinator's repository root before `worker-start`, and for the worktree Orca created after it. A config that does not parse as TOML is left alone.
+
+**Screen.** The Codex TUI uses `›` as the menu cursor, asks "Trust this folder?", and shows `N background terminal running` on the working line while a background command runs. Unknown session ids print "No saved session found". The fixtures `tela-codex-*.txt` are screens read from a real Codex terminal in Orca.
+
+**What is weaker on Codex.**
+
+- No AskUserQuestion: the coordinator asks in text or through the Lavish page, and a pending decision answered in text stays open until `orq pend done`.
+- No `/away` slash command: the `away` skill (`$away on`) or `orq away on`.
+- A Codex coordinator or worker whose orq hooks are untrusted is invisible to the turn tracking, like any agent without hooks.
+
 ## Design decisions
 
 Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.
@@ -486,7 +514,7 @@ Known limits:
 - A worker is recognized only if its first prompt passed through an orq hook.
 - `orq ticket novo`, `orq steer` and `orq intake ... tarefa` only work on the Run bound to the coordinator or its manager, because Orca refuses task writes from other terminals.
 - The worker's tab title set by `orq despachar` does not stick; Claude Code rewrites it.
-- `orq liberar` reads the worker's whole transcript and needs it under `~/.claude/projects`, so non-Claude workers keep their terminals open.
+- `orq liberar` reads the worker's whole transcript: a Claude one under `~/.claude/projects`, a Codex rollout from the path its hooks recorded. Workers of any other agent keep their terminals open.
 - Some constants are tuned to the author's setup: the ingest start date, reports living under `.scratch/`, the Portuguese action headings, and the default protected branch names in the cleanup script (overridable with `ORQ_PROTECTED_BRANCHES` and `ORQ_FINAL_BASE`).
 - macOS and Linux only, single user, one machine.
 

@@ -5,7 +5,7 @@
 
 # orq
 
-A task register and noise filter for a Claude Code session that coordinates coding agents in [Orca](https://www.onorca.dev).
+A task register and noise filter for a Claude Code or Codex session that coordinates coding agents in [Orca](https://www.onorca.dev).
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python 3, stdlib only](https://img.shields.io/badge/python-3%20stdlib%20only-3776AB.svg)
@@ -75,7 +75,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - Delivery proof: when a `worker_done` cites commit shas, ingest checks them with `git` (worker worktree, then `ORQ_REPOS`, default this repo) and, for a cited PR URL, with `gh` when available. A missing commit or a dirty tree logs an `entrega` event, shown as "entrega sem commit" in `orq resumo` and `orq agentes`. It never blocks the worker.
 - `orq liberar` acknowledges a finished worker's messages, releases it and closes its terminal when that is safe.
 - Worker control. `orq interromper <dispatch>` sends Orca's interrupt to a running worker's terminal. `orq encerrar <dispatch> --motivo <why>` stops it (`worker-stop`) and releases it. `orq relancar <dispatch> --nota <what changed>` stops it and starts another in the same worktree and task (`worker-start --task --retry-of`), keeping the old model and effort unless `--modelo` and `--effort` say otherwise. Each step is an event, and `orq agentes` prints the control history under the dispatch. If the model you asked for does not start, the old one does; if nothing starts, the worktree stays and the error prints the command to repeat.
-- `orq retomar [--dry-run]` after a crash: reopens the agent manager and resumes, with `claude --resume`, each worker that has no `worker_done` and lost its terminal (session id and cwd come from the worker's hooks).
+- `orq retomar [--dry-run]` after a crash: reopens the agent manager and resumes, with `claude --resume` or `codex resume`, each worker that has no `worker_done` and lost its terminal (session id and cwd come from the worker's hooks).
 - `orq steer` sends a correction to a running worker and, if Orca did not notify it and it sits idle at its prompt, types the notice into its terminal. The manager loop (or `orq steers`) then checks that the worker read it: with no read after 90 s and the worker idle it types the notice again, up to 3 times, and then records a "steer não lido" alert in the summary and in `orq agentes`. A read is the message's `read` flag in Orca's inbox or its id in the worker's transcript, because Orca only sets `read` on `check --ack`.
 - `orq responder <msg_id> "<text>"` answers a worker's question through the manager's handle, binding the manager to the message's Run first (a bare `orca orchestration reply` fails with `consumer_fenced` from another Run).
 - Pull requests linked to a task. `orq pr ligar <task> <url> [--issue N]` registers the requests of a feature (development, staging, main). A light poll outside the hooks (`orq pr poll`, and every manager lap, at most every 2 minutes) wakes the coordinator only when a linked request is merged or closed, with a line such as "PR #1216 entrou em development", and `orq status` shows where each feature stands and what comes next. The next request is only suggested, never opened. The `orq hook prligar` PostToolUse hook links the request by itself when the coordinator runs `gh pr create` (by the branch's worktree or dispatch name); a branch with no known task is listed as "PR sem tarefa" in `orq status`, and the wake-up says when development and staging both went in and only main is left. See `docs/design.md`, "Pull requests linked to a task".
@@ -89,7 +89,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 ## Requirements
 
 - macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3 with the standard library only (developed and tested on 3.14)
-- [Claude Code](https://docs.claude.com/en/docs/claude-code) for the coordinator and workers
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://developers.openai.com/codex) for the coordinator and workers (either one, or both)
 - [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
 - git
 
@@ -114,7 +114,15 @@ ln -s ~/.claude/orq/commands/away.md ~/.claude/commands/away.md   # /away slash 
 ln -s ~/.claude/orq/orq.py ~/.local/bin/orq   # the manager loop calls `orq`
 ```
 
-Then merge the `hooks` section of [`settings.hooks.example.json`](settings.hooks.example.json) into `~/.claude/settings.json`, next to any hooks you already have. The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
+Then merge the `hooks` section of [`settings.hooks.example.json`](settings.hooks.example.json) into `~/.claude/settings.json`, next to any hooks you already have.
+
+For Codex, merge [`codex.hooks.example.json`](codex.hooks.example.json) into `~/.codex/hooks.json`, adding each group at the end of its event: Codex records hook trust by position (`hooks.json:<event>:<group>:<hook>`), so inserting a group in the middle unsets the trust of the ones after it. Review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Then link the skills where Codex reads them:
+
+```sh
+mkdir -p ~/.agents/skills
+ln -s ~/.claude/orq/skills/worker-routing ~/.agents/skills/worker-routing
+ln -s ~/.claude/orq/skills/away ~/.agents/skills/away   # $away, the Codex side of /away
+``` The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
 
 The branch cleanup reads branch patterns to keep from `~/.claude/scripts/limpar-mergeados.keep` (one glob per line; a missing file means none). Write your own. It treats `main`, `development` and `staging` as protected branches (override with `ORQ_PROTECTED_BRANCHES`, comma-separated) and counts a branch as finished only when a PR into `main` merges it (`ORQ_FINAL_BASE`).
 
@@ -128,6 +136,7 @@ The branch cleanup reads branch patterns to keep from `~/.claude/scripts/limpar-
 | `~/.claude/dashboard/data/pendencias.json` | the user's pending list | `ORQ_PENDENCIAS` |
 | `~/.claude/logs/orq.log` | errors from hooks that failed open | `ORQ_LOG` |
 | `~/.claude/projects/` | Claude Code transcripts, read by `orq liberar` | `ORQ_PROJETOS` |
+| `~/.codex/config.toml` | `orq despachar --agente codex` adds `trust_level = "trusted"` for the repository root and the new worktree | `ORQ_CODEX_CONFIG` (or `CODEX_HOME`) |
 
 `orq auditar-respostas` reads the coordinator's transcripts from `ORQ_TRANSCRITOS`. By default that is the Claude Code project folder for the current directory (`~/.claude/projects/` plus the cwd with every character outside `[A-Za-z0-9]` turned into `-`), so run it from the coordinator's working directory or set the variable. Other knobs: `ORQ_ORCA` (path to the Orca binary), `ORQ_ORCA_TIMEOUT` (seconds per Orca call, default 2.5), `ORQ_NO_BG=1` (no background refresh), `ORQ_GERENTE_PRESO_S`, `ORQ_OCIOSO_MS`, `ORQ_STEER_ESPERA_S`, `ORQ_WAIT_POLL`, `ORQ_WAIT_MAX`.
 
@@ -219,17 +228,29 @@ Editing orq: hooks and the manager panel execute `~/.claude/orq/orq.py` while it
 
 Audience check: `git config core.hooksPath githooks` runs `scripts/audiencia-check.py` before each commit. It scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, default `~/.claude/orquestrador-plan/termos-proibidos.txt`: one term per line, `re:` prefix for a regex) and prints `file:line`. Without the list it skips with a warning.
 
+## Claude Code and Codex
+
+The coordinator can be a Claude Code or a Codex session, and each worker can be either: `orq despachar --agente codex --modelo gpt-6-sol --effort low ...` (the default is `claude`). What changes per agent sits in one table, `HARNESS` in `orqlib.py`: the resume command, the screen patterns and the accepted efforts. Orca builds the launch command itself from `worker-start --agent`. The rest goes through Orca for both:
+
+- `orq retomar` finds a session the hooks never recorded through Orca's session index (`orca search <dispatch id>`);
+- `orq uso [--agente codex]` reads each plan from `orca account list`, because the quotas are separate (Claude reads the HUD frame first);
+- `orq despachar` refuses a dispatch when the quota of the chosen harness is over the limit.
+
+The `worker-routing` skill maps the Claude roles to Codex models (Luna for clear, repeatable work, Sol for ambiguous or hard work, no Astra or Terra). OpenAI publishes no equivalence with Claude models; the table follows OpenAI's own model guidance (<https://learn.chatgpt.com/docs/models>) and independent benchmarks cited in the skill.
+
+Weaker on Codex: there is no AskUserQuestion, so decisions go through text or the Lavish page and stay open until `orq pend done`; `/away` becomes the `away` skill; and an untrusted Codex hook does not run, which leaves that session invisible to orq's turn tracking. The details are in [`docs/design.md`](docs/design.md#harnesses-claude-code-and-codex-ticket-73).
+
 ## Portability and lock-in
 
-orq is a personal tool tuned for Claude Code plus Orca. It works, it has a large test suite, and it is shaped by one person's workflow.
+orq is a personal tool tuned for Claude Code or Codex plus Orca. It works, it has a large test suite, and it is shaped by one person's workflow.
 
-Tied to Claude Code: the hook events and their JSON formats (UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, SessionStart, Stop), the AskUserQuestion tool and its `questions`/`answers`/`annotations` payload, the transcript files under `~/.claude/projects`, the skill file format and `~/.claude/settings.json`.
+Tied to the harness: the hook events and their JSON formats (UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, SessionStart, Stop), which Claude Code and Codex share almost field for field; the AskUserQuestion tool and its `questions`/`answers`/`annotations` payload (Claude Code only); the transcript formats (`~/.claude/projects`, Codex rollouts); the skill file format.
 
-Tied to Orca: the `orca orchestration` CLI and its JSON (Runs, tasks, gates, dispatches, the mailbox with `check --peek`/`--ack`, the inbox), `orca terminal` (send, wait, read, rename, close), `orca automations runs`, the notice text Orca types into terminals, and the dispatch preamble that identifies a worker session.
+Tied to Orca: the `orca orchestration` CLI and its JSON (Runs, tasks, gates, dispatches, the mailbox with `check --peek`/`--ack`, the inbox), `orca terminal` (send, wait, read, rename, close), `orca search`, `orca account list`, `orca automations runs`, the notice text Orca types into terminals, and the dispatch preamble that identifies a worker session.
 
 Generic: the Python core, the append-only `events.jsonl` and the functions that derive state from it, the markdown tickets, and the entry/effect state machine.
 
-Running it with Codex or pi would mean replacing the hook adapters (`orq hook *`, `precompact.py`) with that agent's lifecycle events, rewriting the transcript reader used by `orq liberar`, mapping the ask guard to whatever that agent uses to ask the user questions, and porting `skills/worker-routing/SKILL.md` to its instruction format. The log, the tickets and the core commands would stay as they are.
+A third agent would mean one more `HARNESS` entry (resume command, screen patterns, efforts), its hook config, and a transcript reader for `orq liberar`.
 
 ## Language
 
