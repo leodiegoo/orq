@@ -2633,7 +2633,8 @@ def digest_json(d):
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
             "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
-            "tickets_orq": d["tickets_orq"]}
+            "tickets_orq": d["tickets_orq"],
+            **({"retro": d["retro"]} if d.get("retro") else {})}  # aditivo: sem rodada gravada o contrato v1 fica como era
 
 
 def html_digest(d):
@@ -2663,6 +2664,7 @@ def html_digest(d):
     poll = (f"O estado dos PRs é do poll das {datetime.fromtimestamp(pg['poll']).strftime('%H:%M')}; esta página não consulta o GitHub."
             if isinstance(pg.get("poll"), (int, float)) else "O estado dos PRs ainda não foi lido por nenhum poll (`orq pr poll`); esta página não consulta o GitHub.")
     desde = f"Desde as {_hora_local(pg['desde'])}." if pg["desde"] else "Desde o início do log."
+    retro = ('<h2>Falhas por rodada do retro</h2><ul class="sub">' + "".join(f'<li>até {e(r["ate"][:10])}: {r["falhas"]} falha(s)</li>' for r in d["retro"]) + "</ul>") if d.get("retro") else ""
     return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Digest {e(pg["data"])}</title><style>{DIGEST_CSS}</style></head><body><main>'
             f'<h1>O que espera você</h1><p class="sub">{e(pg["data"])}. {e(desde)} Gerado às {e(pg["gerado"])}. {e(poll)}</p>'
@@ -2672,7 +2674,7 @@ def html_digest(d):
             f'{fila}<h2>Com você</h2>{f"<div class=grid>{pend}</div>" if pend else "<p class=sub>Nada esperando por você.</p>"}'
             f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}{vagas}'
             f'<h1 style="margin-top:36px">O que aconteceu</h1>{antes}'
-            f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}</main></body></html>')
+            f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}{retro}</main></body></html>')
 
 
 def digest_gerar(agora=None, desde=None, com_html=False):
@@ -2686,6 +2688,7 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
     d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
                     {"max_workers": maquina_cfg()["max_workers"], "fila": len(fila_despacho_itens())})
+    d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rodadas()[-4:]]  # as últimas rodadas do `orq retro --gravar`
     os.makedirs(_path(DIGEST), exist_ok=True)
     _write_json(_path(os.path.join(DIGEST, "atual.json")), digest_json(d), indent=2)
     pagina = None
@@ -6534,6 +6537,307 @@ def gerente_absorver():
     return "\n".join(linhas)
 
 
+# ---------- retro: o coletor de sinais de falha (ticket 78) ----------
+
+ORQ_INSTALL = os.path.realpath(os.environ.get("ORQ_INSTALL") or os.path.expanduser("~/.claude/orq"))  # o checkout que roda (hooks, painel): ninguém trabalha nele
+RETRO_DIR = "retro"  # ORQ_HOME/retro/<AAAA-MM-DDTHHMM>.json: as métricas de cada rodada gravada, para comparar semana a semana
+RETRO_DIAS = 7
+RETRO_CORRECAO_S = 1800  # a reação do usuário a uma entrega vem logo depois dela
+RETRO_CORRECAO = re.compile(r"^\W*(n[ãa]o|ops|ajust\w*|errad\w*)\b", re.I)
+RETRO_VERMELHO = ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE")
+RETRO_SINAIS = {
+    "nao_iniciou": "despacho que não começou",
+    "steer_sem_leitura": "steer sem leitura provada",
+    "steer_reentregue": "steer reentregue (aviso digitado de novo)",
+    "retry": "worker relançado",
+    "controle_falhou": "interromper, encerrar ou relançar que falhou",
+    "intervencao": "worker interrompido ou encerrado",
+    "pergunta_de_worker": "pergunta ou escalation respondida",
+    "worker_falhou": "worker_done que não foi succeeded",
+    "sem_entrega": "worker liberado sem entrega",
+    "liberado_sujo": "worker liberado com árvore suja",
+    "liberado_sem_push": "worker liberado com commits fora do origin/main",
+    "entrega_com_aviso": "entrega sem prova (commit ausente ou árvore suja)",
+    "checkout_em_uso": "trabalho no checkout em uso do orq",
+    "entrada_sem_tratamento": "entrada que o Stop achou sem efeito",
+    "intake_descartado": "entrada descartada",
+    "alerta": "alerta do orq",
+    "binding_perdido": "coordenador sem Run ligado",
+    "correcao_do_usuario": "correção do usuário logo depois de uma entrega",
+    "regra_violada": "regra do usuário violada por um worker (transcrito)",
+    "pr_ci_vermelho": "PR com check vermelho (gh)",
+    "pr_pediu_mudanca": "PR com mudança pedida no review (gh)",
+}
+RETRO_POR_MODELO = ("nao_iniciou", "retry", "pergunta_de_worker", "worker_falhou", "sem_entrega", "intervencao", "liberado_sujo")
+RETRO_ESCRITA_AGENTS = re.compile(r"(?:>>?|\btee\b|\bsed\s+-i|\bmv\b|\bcp\b|\brm\b|\bln\b)[^\n|;&]*/\.agents/")
+RETRO_GIT_NO_CHECKOUT = re.compile(r"\bgit\s+(?:-C\s+(\S+)\s+)?(?:merge|rebase|reset|checkout|switch|pull|cherry-pick|commit)\b")
+
+
+RETRO_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+RETRO_ASPAS = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+
+
+def _retro_viola(ferramenta, texto, cwd):
+    """Os nomes das regras do usuário que uma chamada de ferramenta do worker quebra. Padrões estreitos e conhecidos; regra nova entra aqui.
+
+    O comando que vale é o que sobra sem os corpos de heredoc e sem o texto entre aspas: um `git push` dentro de um `python3 - <<EOF` ou de um
+    `echo` não é push. Só o trailer olha o texto inteiro (ele mora na mensagem do commit), e só quando o `git commit` está no comando de verdade.
+    ponytail: regex, sem parser de shell. `bash -c "git push"` passa; `$(git push)` dentro de aspas também."""
+    if ferramenta in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        return (["agents_global"] if "/.agents/" in texto else []) + (["checkout_em_uso_do_orq"] if os.path.realpath(texto).startswith(ORQ_INSTALL + os.sep) else [])
+    v = RETRO_ASPAS.sub('""', RETRO_HEREDOC.sub("", texto))
+    regras = []
+    if re.search(r"\bgit\s+(?:-C\s+\S+\s+)?push\b", v):
+        regras.append("push_de_worker")
+    if re.search(r"\bgh\s+(?:workflow\s+run|pr\s+merge)\b", v):
+        regras.append("producao")
+    if ("git commit" in v or "gh pr create" in v) and re.search(r"Co-Authored-By|Generated with", texto, re.I):
+        regras.append("trailer")
+    if RETRO_ESCRITA_AGENTS.search(v):
+        regras.append("agents_global")
+    m = RETRO_GIT_NO_CHECKOUT.search(v)
+    if m:
+        cds = re.findall(r"\bcd\s+(\S+)", v[:m.start()])
+        if os.path.realpath(os.path.expanduser(m.group(1) or (cds[-1] if cds else None) or cwd or "/")) == ORQ_INSTALL:
+            regras.append("checkout_em_uso_do_orq")
+    return regras
+
+
+def _retro_chamadas(obj):
+    """(ferramenta, texto, cwd) de cada chamada de ferramenta de uma linha de transcrito: `tool_use` no Claude Code, `function_call` no Codex."""
+    out = []
+    conteudo = _dict(obj.get("message")).get("content")
+    for b in conteudo if isinstance(conteudo, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            i = _dict(b.get("input"))
+            out.append((str(b.get("name")), str(i.get("command") or i.get("file_path") or i.get("path") or ""), obj.get("cwd")))
+    p = _dict(obj.get("payload"))
+    if p.get("type") == "function_call":
+        try:
+            a = _dict(json.loads(p.get("arguments") or "{}"))
+        except ValueError:
+            a = {}
+        c = a.get("cmd") or a.get("command") or ""
+        out.append(("Bash", " ".join(map(str, c)) if isinstance(c, list) else str(c), None))
+    return out
+
+
+def _retro_regras(despachos, turnos, projetos):
+    """Casos de regra violada: o transcrito de cada dispatch (turnos.json dá a sessão) lido uma vez, um caso por dispatch e regra.
+
+    ponytail: lê o arquivo inteiro de cada worker da janela; transcrito de dezenas de MB custa alguns segundos. Codex: só o comando, sem cwd."""
+    casos = []
+    for d in despachos:
+        t = _dict(turnos.get(d.get("dispatch")))
+        arqs = [t["transcrito"]] if t.get("transcrito") else glob.glob(os.path.join(projetos, "*", f"{glob.escape(t['sessao'])}.jsonl")) if t.get("sessao") else []
+        achados = {}
+        for arq in arqs:
+            try:
+                with open(arq, "rb") as f:
+                    for n, linha in enumerate(f, 1):
+                        if b'"tool_use"' not in linha and b'"function_call"' not in linha:
+                            continue
+                        try:
+                            obj = json.loads(linha)
+                        except ValueError:
+                            continue
+                        for ferr, texto, cwd in _retro_chamadas(_dict(obj)):
+                            for regra in _retro_viola(ferr, texto, cwd):
+                                a = achados.setdefault(regra, {"n": 0, "ponteiro": f"{arq}:{n}", "ts": _dict(obj).get("timestamp"), "texto": texto})
+                                a["n"] += 1
+            except OSError as e:
+                log(f"retro: transcrito {arq}: {type(e).__name__}: {e}")
+        for regra, a in achados.items():
+            casos.append({"regra": regra, "ts": a["ts"] or d.get("ts"), "task": d.get("task"), "dispatch": d.get("dispatch"), "titulo": d.get("titulo"), "modelo": d.get("modelo"),
+                          "effort": d.get("effort"), "onde": d.get("worktree"), "ponteiro": a["ponteiro"],
+                          "detalhe": f"{regra}: {_cita(' '.join(a['texto'].split()), 100)}" + (f" (+{a['n'] - 1} vezes)" if a["n"] > 1 else "")})
+    return casos
+
+
+def _retro_pr_checks(url):
+    """{falhos: [nome dos checks vermelhos], revisao} do PR pelo gh, ou None sem gh, sem rede ou sem resposta. É o estado de agora, não o da entrega."""
+    try:
+        r = subprocess.run([GH, "pr", "view", url, "--json", "statusCheckRollup,reviewDecision"], capture_output=True, text=True, timeout=PR_GH_S)
+        d = json.loads(r.stdout) if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return {"falhos": [c.get("name") or c.get("context") or "?" for c in d.get("statusCheckRollup") or []
+                       if isinstance(c, dict) and (c.get("conclusion") in RETRO_VERMELHO or c.get("state") in RETRO_VERMELHO)],
+            "revisao": d.get("reviewDecision") or ""}
+
+
+def retro_coleta(events, desde, ate, turnos=None, projetos=None, pr_checks=None, projeto=None):
+    """Os sinais de falha de [desde, ate) (carimbos `AAAA-MM-DDTHH:MM:SSZ`), sem LLM: {desde, ate, sinais {nome: {rotulo, n, casos}}, falhas, por_modelo}.
+
+    Cada caso leva título, modelo, effort e um ponteiro (linha do events.jsonl quando o evento traz `_l`, arquivo:linha do transcrito, URL do PR).
+    `n` None quer dizer "não consultado": sem `turnos` e `projetos` os transcritos não são lidos, sem `pr_checks` o gh não é chamado, e isso não vira zero.
+    `projeto` guarda só os casos cujo caminho, título ou task contém o trecho."""
+    ev = [e for e in events if desde <= (e.get("ts") or "") < ate]
+    por_disp, por_task = {}, {}
+    for d in events:
+        if d.get("tipo") == "despacho":
+            por_disp[d.get("dispatch")], por_task[d.get("task")] = d, d
+    casos = {k: [] for k in RETRO_SINAIS}
+    lidos = {e.get("msg_id") for e in events if e.get("tipo") == "steer_fim" and e.get("motivo") == "lido"}
+    fins = [(e.get("dispatch"), e["ts"]) for e in events if e.get("tipo") in ("worker_done", "fim_dispatch") and e.get("ts")]
+    entregas = sorted(_dt(e["ts"]).timestamp() for e in events if e.get("ts") and (e.get("tipo") == "worker_done" or e.get("origem") == "relatorio_worker"))
+    install = re.compile(re.escape(ORQ_INSTALL) + r"(?![\w-])")
+
+    def add(nome, e, detalhe, ponteiro=None):
+        d = por_disp.get(e.get("dispatch")) or por_task.get(e.get("task")) or {}
+        onde = next((x for x in (e.get("caminho"), e.get("worktree"), d.get("worktree")) if x and x != "current"), None)
+        casos[nome].append({"ts": e.get("ts"), "task": e.get("task") or d.get("task"), "dispatch": e.get("dispatch") or d.get("dispatch"), "titulo": d.get("titulo"),
+                            "modelo": d.get("modelo"), "effort": d.get("effort"), "onde": onde, "detalhe": detalhe,
+                            "ponteiro": ponteiro or (f"events.jsonl:{e['_l']}" if e.get("_l") else f"events.jsonl@{e.get('ts')}")})
+
+    avisos_gate, prs = {}, {}
+    for e in ev:
+        t = e.get("tipo")
+        if t == "nao_iniciou":
+            nota = next((x.get("nota") for x in events if x.get("tipo") == "controle" and x.get("acao") == "relancar" and x.get("dispatch") == e.get("dispatch") and x.get("nota")), None)
+            add("nao_iniciou", e, nota or "o prompt do spec não entrou, nem depois do Enter")
+        elif t == "controle":
+            if e.get("resultado") == "falhou":
+                add("controle_falhou", e, f"{e.get('acao')}: {_cita(str(e.get('erro') or e.get('passo') or ''), 100)}")
+            elif e.get("acao") == "relancar" and e.get("resultado") == "iniciado":
+                add("retry", e, e.get("nota") or "relançado sem nota")
+            elif e.get("acao") in ("interromper", "encerrar"):
+                add("intervencao", e, f"{e.get('acao')}: {_cita(str(e.get('motivo') or e.get('aviso') or ''), 100)}")
+        elif t == "steer" and e.get("msg_id") and e["msg_id"] not in lidos:
+            depois = any(d == e.get("dispatch") and ts > e["ts"] for d, ts in fins)
+            add("steer_sem_leitura", e, ("o worker entregou depois, sem leitura provada do ajuste: " if depois else "sem steer_fim lido: ") + _cita(str(e.get("texto") or ""), 80))
+        elif t == "steer_reentrega":
+            add("steer_reentregue", e, f"tentativa {e.get('tentativa')}")
+        elif t == "resposta_worker":
+            add("pergunta_de_worker", e, _cita(str(e.get("texto") or ""), 100))
+        elif t == "worker_done" and e.get("outcome") != "succeeded":
+            add("worker_falhou", e, f"{e.get('outcome')}: {_cita(str(e.get('subject') or ''), 100)}")
+        elif t == "fim_dispatch":
+            if e.get("motivo") in ("sem worker_done", "falhou", "motivo desconhecido"):
+                add("sem_entrega", e, str(e.get("motivo")))
+            if (e.get("sujo") or 0) > 0:
+                add("liberado_sujo", e, f"{e['sujo']} arquivo(s) em {e.get('caminho')}")
+            if (e.get("sem_push") or 0) > 0:
+                add("liberado_sem_push", e, f"{e['sem_push']} commit(s) em {e.get('caminho')} (o ticket pede 'sem push': conferir)")
+            if e.get("caminho") and os.path.realpath(e["caminho"]) == ORQ_INSTALL and ((e.get("sujo") or 0) or (e.get("sem_push") or 0)):
+                add("checkout_em_uso", e, f"worker liberado em {e['caminho']}")
+        elif t == "entrega" and e.get("avisos"):
+            add("entrega_com_aviso", e, "; ".join(map(str, e["avisos"])))
+            if any(install.search(str(a)) for a in e["avisos"]):
+                add("checkout_em_uso", e, "o aviso da entrega cita o checkout em uso")
+        elif t == "gate_aviso":
+            for i in e.get("abertas") or []:
+                avisos_gate.setdefault(i, e)
+        elif t == "intake" and e.get("efeito") == "descartado":
+            add("intake_descartado", e, f"{e.get('entrada')}: {_cita(str(e.get('nota') or ''), 100)}")
+        elif t == "alerta":
+            add("alerta", e, str(e.get("alerta")))
+        elif t == "binding_perdido":
+            add("binding_perdido", e, f"sessão {e.get('sessao')}")
+        elif t == "entrada" and e.get("origem") == "usuario" and RETRO_CORRECAO.match(str(e.get("texto") or "")) and entregas:
+            agora = _dt(e["ts"]).timestamp()
+            antes = [x for x in entregas if x <= agora]
+            if antes and agora - antes[-1] <= RETRO_CORRECAO_S:
+                add("correcao_do_usuario", e, _cita(" ".join(str(e["texto"]).split()), 100))
+        elif t == "pr" and e.get("op") == "ligar" and e.get("url"):
+            prs.setdefault(e["url"], e)
+    for i, e in avisos_gate.items():
+        add("entrada_sem_tratamento", e, f"entrada {i} ficou sem efeito no fim de um turno")
+    if turnos is not None and projetos is not None:
+        casos["regra_violada"] = _retro_regras([d for d in events if d.get("tipo") == "despacho" and desde <= (d.get("ts") or "") < ate], turnos, projetos)
+    else:
+        casos["regra_violada"] = None
+    if pr_checks is None:
+        casos["pr_ci_vermelho"] = casos["pr_pediu_mudanca"] = None
+    else:
+        with ThreadPoolExecutor(4) as ex:
+            for (url, e), c in zip(prs.items(), ex.map(pr_checks, prs)):
+                if not c:
+                    continue
+                if c.get("falhos"):
+                    add("pr_ci_vermelho", e, f"PR #{e.get('numero')}: {', '.join(c['falhos'])}", url)
+                if c.get("revisao") == "CHANGES_REQUESTED":
+                    add("pr_pediu_mudanca", e, f"PR #{e.get('numero')}: review pediu mudança", url)
+    if projeto:
+        achar = projeto.lower()
+        for k, v in casos.items():
+            if v is not None:
+                casos[k] = [c for c in v if achar in " ".join(str(c.get(x) or "") for x in ("onde", "titulo", "task")).lower()]
+    por_modelo = {}
+    for e in ev:
+        if e.get("tipo") == "despacho":
+            por_modelo.setdefault(f"{e.get('modelo')}/{e.get('effort')}", {"despachos": 0, **dict.fromkeys(RETRO_POR_MODELO, 0)})["despachos"] += 1
+    for k in RETRO_POR_MODELO:
+        for c in casos[k]:
+            if c.get("modelo"):
+                por_modelo.setdefault(f"{c['modelo']}/{c['effort']}", {"despachos": 0, **dict.fromkeys(RETRO_POR_MODELO, 0)})[k] += 1
+    sinais = {k: {"rotulo": RETRO_SINAIS[k], "n": None if v is None else len(v), "casos": v or []} for k, v in casos.items()}
+    return {"desde": desde, "ate": ate, "sinais": sinais, "falhas": sum(s["n"] or 0 for s in sinais.values()), "por_modelo": por_modelo}
+
+
+def _retro_eventos():
+    """O events.jsonl com a linha de cada evento em `_l` (o ponteiro de cada caso)."""
+    out = []
+    try:
+        with open(_path("events.jsonl")) as f:
+            for n, linha in enumerate(f, 1):
+                try:
+                    e = json.loads(linha)
+                except ValueError:
+                    continue
+                if isinstance(e, dict):
+                    out.append({**e, "_l": n})
+    except OSError:
+        pass
+    return out
+
+
+def _retro_rodadas():
+    """As rodadas gravadas em ORQ_HOME/retro, da mais antiga para a mais nova: {desde, ate, falhas, metricas}."""
+    rs = [_read_json(p) for p in sorted(glob.glob(_path(os.path.join(RETRO_DIR, "*.json"))))]
+    return sorted((r for r in rs if isinstance(r, dict) and r.get("ate")), key=lambda r: r["ate"])
+
+
+def retro_gravar(r):
+    """Grava as métricas da rodada (só os números, nunca os casos) em ORQ_HOME/retro/<ate>.json. Devolve o caminho."""
+    os.makedirs(_path(RETRO_DIR), exist_ok=True)
+    caminho = _path(os.path.join(RETRO_DIR, _dt(r["ate"]).strftime("%Y-%m-%dT%H%M") + ".json"))
+    _write_json(caminho, {"desde": r["desde"], "ate": r["ate"], "falhas": r["falhas"], "metricas": {k: v["n"] for k, v in r["sinais"].items()}}, indent=2)
+    return caminho
+
+
+def retro_texto(r, anterior=None, por_caso=5):
+    """A rodada em texto curto: a tabela de sinais (com a rodada gravada ao lado), os casos com ponteiro e o quadro por modelo e effort."""
+    ant = _dict(_dict(anterior).get("metricas"))
+    ls = [f"retro {r['desde'][:10]} a {r['ate'][:10]}", f"falhas no período: {r['falhas']}" + (f" (rodada gravada até {anterior['ate'][:10]}: {anterior['falhas']})" if anterior else "")]
+    ls.append(f"{'sinal':<24}{'n':>5}" + ("  antes" if anterior else ""))
+    for k, s in r["sinais"].items():
+        ls.append(f"{k:<24}{'n/d' if s['n'] is None else s['n']:>5}" + (f"  {'n/d' if ant.get(k, '-') is None else ant.get(k, '-')}" if anterior else ""))
+    for k, s in r["sinais"].items():
+        if s["n"]:
+            ls += ["", f"{k} ({s['n']}): {s['rotulo']}"]
+            ls += [f"  {(c['ts'] or '')[:16]} {c.get('titulo') or c.get('task') or ''} [{c.get('modelo') or '?'}/{c.get('effort') or '?'}] {c['detalhe']} -> {c['ponteiro']}" for c in s["casos"][:por_caso]]
+            ls += [f"  +{s['n'] - por_caso} a mais (--json)"] if s["n"] > por_caso else []
+    if r["por_modelo"]:
+        ls += ["", f"{'modelo/effort':<28}{'desp':>5}" + "".join(f"{k[:9]:>10}" for k in RETRO_POR_MODELO)]
+        ls += [f"{m:<28}{v['despachos']:>5}" + "".join(f"{v[k]:>10}" for k in RETRO_POR_MODELO) for m, v in sorted(r["por_modelo"].items())]
+    return "\n".join(ls)
+
+
+def cmd_retro(a):
+    """`orq retro`: coleta a janela (padrão: os últimos 7 dias), imprime e, com --gravar, guarda as métricas para a rodada seguinte comparar."""
+    ate = _dt(a.ate).strftime("%Y-%m-%dT%H:%M:%SZ") if a.ate else now()
+    desde = _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ") if a.desde else (_dt(ate) - timedelta(days=RETRO_DIAS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = retro_coleta(_retro_eventos(), desde, ate, None if a.sem_transcritos else _turnos_ro(), None if a.sem_transcritos else PROJETOS,
+                     None if a.sem_gh else _retro_pr_checks, a.projeto)
+    anterior = next((x for x in reversed(_retro_rodadas()) if x["ate"] < ate), None)
+    if a.gravar:
+        retro_gravar(r)
+    return json.dumps(r, ensure_ascii=False) if a.json else retro_texto(r, anterior)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="orq")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -6717,6 +7021,14 @@ def main(argv=None):
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
+    rr = sub.add_parser("retro", help="os sinais de falha dos eventos, transcritos e PRs de uma janela (padrão 7 dias), sem LLM: quantos, quais casos, em que modelo")
+    rr.add_argument("--desde", help="início da janela (data ou ISO)")
+    rr.add_argument("--ate", help="fim da janela (padrão: agora)")
+    rr.add_argument("--projeto", help="só os casos cujo caminho, título ou task contém o trecho")
+    rr.add_argument("--json", action="store_true")
+    rr.add_argument("--sem-gh", action="store_true", help="não pergunta ao gh pelo CI e pelo review dos PRs")
+    rr.add_argument("--sem-transcritos", action="store_true", help="não lê os transcritos dos workers (regras violadas)")
+    rr.add_argument("--gravar", action="store_true", help="guarda as métricas em ORQ_HOME/retro para a próxima rodada comparar")
     args = sys.argv[1:] if argv is None else argv
     if args[:1] == ["hook"]:
         try:
@@ -6901,6 +7213,8 @@ def main(argv=None):
                   f"{nivel}" + (f": {motivo}" if motivo else "") + (f" (semana {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (sem quadro fresco do HUD)"))
         elif a.cmd == "auditar-respostas":
             print(auditar_respostas(a.sessao), end="")
+        elif a.cmd == "retro":
+            print(cmd_retro(a))
         else:
             n = ingest()
             print("ingest em andamento por outro processo" if n is None else

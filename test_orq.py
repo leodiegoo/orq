@@ -9861,6 +9861,202 @@ def test_ticket60_rss_e_processo_filho_sobre_a_lista_de_processos():
     assert orq_mod._processo_do_worker(None, "/wt/a", "claude") == ([], None)
 
 
+# ---------- ticket 78: orq retro (coletor determinístico de sinais de falha) ----------
+
+def _ev78(tipo, ts, **kw):
+    return {"ts": ts, "tipo": tipo, **kw}
+
+
+def _eventos78():
+    """Uma semana de fixture com pelo menos um caso de cada sinal de eventos; os de transcrito e de PR vêm de outros testes."""
+    d = {"run": "run_x", "task": "task_a", "dispatch": "ctx_a"}
+    return [
+        _ev78("despacho", "2026-09-29T10:00:00Z", **d, titulo="orq: coisa A", modelo="claude-sonnet-5-5", effort="high", worktree="/wt/a"),
+        _ev78("despacho", "2026-09-29T10:05:00Z", run="run_x", task="task_b", dispatch="ctx_b", titulo="orq: coisa B", modelo="claude-opus-5-5", effort="xhigh", worktree="/wt/b"),
+        _ev78("nao_iniciou", "2026-09-29T10:06:00Z", run="run_x", task="task_b", dispatch="ctx_b", terminal="term_b"),
+        _ev78("controle", "2026-09-29T10:07:00Z", acao="relancar", resultado="iniciado", run="run_x", task="task_b", dispatch="ctx_b", nota="a sessão abriu mas nunca recebeu o spec"),
+        _ev78("controle", "2026-09-29T10:08:00Z", acao="relancar", resultado="falhou", run="run_x", task="task_b", dispatch="ctx_b", erro="cannot retry"),
+        _ev78("controle", "2026-09-29T10:09:00Z", acao="interromper", resultado="ok", run="run_x", task="task_a", dispatch="ctx_a"),
+        _ev78("steer", "2026-09-29T11:00:00Z", **d, texto="use outra chave", msg_id="msg_1"),
+        _ev78("steer", "2026-09-29T11:10:00Z", **d, texto="outro ajuste", msg_id="msg_2"),
+        _ev78("steer_fim", "2026-09-29T11:20:00Z", **d, msg_id="msg_2", motivo="lido", fonte="transcrito"),
+        _ev78("steer_reentrega", "2026-09-29T11:05:00Z", **d, msg_id="msg_1", tentativa=1),
+        _ev78("resposta_worker", "2026-09-29T12:00:00Z", **d, msg_id="msg_9", texto="serve a leitura padrão"),
+        _ev78("worker_done", "2026-09-29T13:00:00Z", **d, msg="msg_d1", outcome="failed", subject="não deu"),
+        _ev78("worker_done", "2026-09-29T13:01:00Z", run="run_x", task="task_b", dispatch="ctx_b", msg="msg_d2", outcome="succeeded", subject="pronto"),
+        _ev78("entrega", "2026-09-29T13:02:00Z", run="run_x", task="task_b", dispatch="ctx_b", msg="msg_d2", avisos=[f"entrega sem commit: árvore suja em {orq_mod.ORQ_INSTALL}"]),
+        _ev78("fim_dispatch", "2026-09-29T13:10:00Z", run="run_x", task="task_a", dispatch="ctx_a", motivo="sem worker_done", caminho="/wt/a", sujo=3, sem_push=0),
+        _ev78("fim_dispatch", "2026-09-29T13:11:00Z", run="run_x", task="task_b", dispatch="ctx_b", motivo="entregue", caminho="/wt/b", sujo=0, sem_push=2),
+        _ev78("gate_aviso", "2026-09-29T14:00:00Z", abertas=["e1", "e2"], sessao="s1"),
+        _ev78("gate_aviso", "2026-09-29T14:05:00Z", abertas=["e2"], sessao="s1"),
+        _ev78("intake", "2026-09-29T14:10:00Z", entrada="e1", efeito="descartado", nota="já tratado"),
+        _ev78("intake", "2026-09-29T14:11:00Z", entrada="e2", efeito="tarefa", ref="task_a"),
+        _ev78("alerta", "2026-09-29T15:00:00Z", alerta="steer_nao_lido", **d),
+        _ev78("binding_perdido", "2026-09-29T15:30:00Z", run="run_x", sessao="s1"),
+        _ev78("entrada", "2026-09-29T13:20:00Z", origem="usuario", texto="não, era o outro arquivo", id="e7"),
+        _ev78("entrada", "2026-09-29T20:00:00Z", origem="usuario", texto="não sei se vale, o que acha?", id="e8"),  # longe de qualquer entrega: não é correção
+    ]
+
+
+def _sinais78(r):
+    return {k: v["n"] for k, v in r["sinais"].items()}
+
+
+def test_ticket78_retro_conta_e_agrupa_cada_sinal_dos_eventos():
+    r = orq_mod.retro_coleta(_eventos78(), "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")
+    n = _sinais78(r)
+    assert n["nao_iniciou"] == 1 and n["retry"] == 1 and n["controle_falhou"] == 1 and n["intervencao"] == 1, n
+    assert n["steer_sem_leitura"] == 1 and n["steer_reentregue"] == 1, n  # msg_2 foi lido; msg_1 não
+    assert n["pergunta_de_worker"] == 1 and n["worker_falhou"] == 1 and n["sem_entrega"] == 1, n
+    assert n["liberado_sujo"] == 1 and n["liberado_sem_push"] == 1 and n["entrega_com_aviso"] == 1 and n["checkout_em_uso"] == 1, n
+    assert n["entrada_sem_tratamento"] == 2 and n["intake_descartado"] == 1 and n["alerta"] == 1 and n["binding_perdido"] == 1, n  # e2 duas vezes conta uma
+    assert n["correcao_do_usuario"] == 1, n
+    por = r["sinais"]["nao_iniciou"]["casos"][0]
+    assert por["titulo"] == "orq: coisa B" and por["modelo"] == "claude-opus-5-5" and por["effort"] == "xhigh", por
+    assert "nunca recebeu o spec" in por["detalhe"], por  # o porquê vem da nota do relançamento
+    assert por["ponteiro"].startswith("events.jsonl"), por
+    assert r["falhas"] == sum(v for v in n.values() if v is not None) and r["falhas"] > 10, r["falhas"]
+    m = r["por_modelo"]
+    assert m["claude-opus-5-5/xhigh"]["despachos"] == 1 and m["claude-opus-5-5/xhigh"]["retry"] == 1, m
+    assert m["claude-sonnet-5-5/high"]["worker_falhou"] == 1 and m["claude-sonnet-5-5/high"]["pergunta_de_worker"] == 1, m
+
+
+def test_ticket78_retro_steer_depois_da_entrega_diz_que_o_worker_entregou_sem_o_ajuste():
+    ev = [_ev78("steer", "2026-09-29T11:00:00Z", task="t", dispatch="ctx_z", texto="x", msg_id="msg_z"),
+          _ev78("worker_done", "2026-09-29T11:09:00Z", task="t", dispatch="ctx_z", outcome="succeeded")]
+    caso = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")["sinais"]["steer_sem_leitura"]["casos"][0]
+    assert "entregou" in caso["detalhe"], caso
+
+
+def test_ticket78_retro_respeita_a_janela_e_o_filtro_de_projeto():
+    r = orq_mod.retro_coleta(_eventos78(), "2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z")
+    assert r["falhas"] == 0 and all(v["n"] == 0 for k, v in r["sinais"].items() if v["n"] is not None), r
+    p = orq_mod.retro_coleta(_eventos78(), "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z", projeto="/wt/b")
+    assert _sinais78(p)["nao_iniciou"] == 1 and _sinais78(p)["sem_entrega"] == 0 and _sinais78(p)["liberado_sujo"] == 0, _sinais78(p)
+
+
+def test_ticket78_retro_correcao_so_conta_logo_depois_de_uma_entrega_e_com_a_palavra_certa():
+    base = [_ev78("worker_done", "2026-09-29T10:00:00Z", task="t", dispatch="ctx_c", outcome="succeeded")]
+    def n(texto, ts):
+        ev = base + [_ev78("entrada", ts, origem="usuario", texto=texto, id="e1")]
+        return orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")["sinais"]["correcao_do_usuario"]["n"]
+    assert n("Ops, errei o nome", "2026-09-29T10:10:00Z") == 1
+    assert n("ajuste: troque o título", "2026-09-29T10:10:00Z") == 1
+    assert n("Não era isso", "2026-09-29T10:10:00Z") == 1
+    assert n("ótimo, siga", "2026-09-29T10:10:00Z") == 0
+    assert n("não era isso", "2026-09-29T12:00:00Z") == 0, "duas horas depois já não é reação à entrega"
+    assert n("nota: o ajuste ficou bom", "2026-09-29T10:10:00Z") == 0, "só a primeira palavra conta"
+
+
+def _transcrito78(d, sessao, chamadas, cwd="/wt/a"):
+    """Um transcrito do Claude Code com uma linha de assistente por chamada de ferramenta, mais uma fala que só cita os comandos."""
+    os.makedirs(os.path.join(d, "proj"), exist_ok=True)
+    with open(os.path.join(d, "proj", sessao + ".jsonl"), "w") as f:
+        f.write(json.dumps({"type": "assistant", "cwd": cwd, "message": {"content": [{"type": "text", "text": "não vou rodar git push nem editar ~/.agents/skills/x"}]}}) + "\n")
+        for nome, entrada in chamadas:
+            f.write(json.dumps({"type": "assistant", "cwd": cwd, "timestamp": "2026-09-29T10:30:00Z", "message": {"content": [{"type": "tool_use", "name": nome, "input": entrada}]}}) + "\n")
+
+
+def test_ticket78_retro_acha_as_regras_do_usuario_violadas_no_transcrito_do_worker():
+    with tempfile.TemporaryDirectory() as d:
+        _transcrito78(d, "sess1", [
+            ("Bash", {"command": "git push origin feat/x"}),
+            ("Bash", {"command": 'git commit -m "feat: x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"'}),
+            ("Edit", {"file_path": "/Users/leo/.agents/skills/retro/SKILL.md", "old_string": "a", "new_string": "b"}),
+            ("Bash", {"command": "gh pr merge 12 --squash"}),
+            ("Bash", {"command": "git merge feat/outra", "cwd": "x"}),
+            ("Bash", {"command": "git status && git commit -m 'fix: ok'"}),
+            ("Read", {"file_path": "/Users/leo/.agents/AGENTS.md"}),
+        ], cwd=orq_mod.ORQ_INSTALL)
+        ev = [_ev78("despacho", "2026-09-29T10:00:00Z", run="r", task="task_a", dispatch="ctx_a", titulo="orq: A", modelo="m", effort="high", worktree="/wt/a")]
+        turnos = {"ctx_a": {"task": "task_a", "sessao": "sess1", "inicio": "2026-09-29T10:00:00Z"}}
+        r = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z", turnos=turnos, projetos=d)
+        casos = r["sinais"]["regra_violada"]["casos"]
+        regras = sorted(c["regra"] for c in casos)
+        assert regras == ["agents_global", "checkout_em_uso_do_orq", "producao", "push_de_worker", "trailer"], regras
+        assert all("sess1.jsonl" in c["ponteiro"] and c["dispatch"] == "ctx_a" for c in casos), casos
+        sem = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")
+        assert sem["sinais"]["regra_violada"]["n"] is None, "sem transcritos o sinal é 'não consultado', não zero"
+
+
+def test_ticket78_retro_regra_so_vale_no_comando_de_verdade_nao_em_heredoc_nem_em_texto_entre_aspas():
+    with tempfile.TemporaryDirectory() as d:
+        _transcrito78(d, "sess2", [
+            ("Bash", {"command": "python3 - <<'E'\ns = 'git push origin x; gh pr merge 1'\nE"}),
+            ("Bash", {"command": 'echo "git push" && grep -n \'gh workflow run\' README.md'}),
+            ("Bash", {"command": "cat > /tmp/x <<'E'\ngit commit -m y Co-Authored-By: z\nE"}),
+        ])
+        _transcrito78(d, "sess3", [
+            ("Bash", {"command": "cd " + orq_mod.ORQ_INSTALL + " && git merge feat/x"}),
+            ("Bash", {"command": "git commit -m \"$(cat <<'EOF'\nfeat: x\n\nCo-Authored-By: Claude <n@a.com>\nEOF\n)\""}),
+            ("Bash", {"command": "ln -s ~/.claude/orq/skills/x ~/.agents/skills/x"}),
+        ], cwd="/wt/a")
+        ev = [_ev78("despacho", "2026-09-29T10:00:00Z", run="r", task="ta", dispatch="ctx_1", titulo="A", modelo="m", effort="high"),
+              _ev78("despacho", "2026-09-29T10:01:00Z", run="r", task="tb", dispatch="ctx_2", titulo="B", modelo="m", effort="high")]
+        turnos = {"ctx_1": {"sessao": "sess2"}, "ctx_2": {"sessao": "sess3"}}
+        casos = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z", turnos=turnos, projetos=d)["sinais"]["regra_violada"]["casos"]
+        assert [(c["dispatch"], c["regra"]) for c in casos if c["dispatch"] == "ctx_1"] == [], casos
+        assert sorted(c["regra"] for c in casos if c["dispatch"] == "ctx_2") == ["agents_global", "checkout_em_uso_do_orq", "trailer"], casos
+
+
+def test_ticket78_retro_pr_com_check_vermelho_e_review_pedindo_mudanca():
+    ev = [_ev78("pr", "2026-09-30T10:00:00Z", op="ligar", task="task_a", url="https://github.com/o/r/pull/7", numero=7, base="development", estado="aberto"),
+          _ev78("pr", "2026-09-30T10:01:00Z", op="ligar", task="task_a", url="https://github.com/o/r/pull/8", numero=8, base="staging", estado="aberto")]
+    def checks(url):
+        return {"falhos": ["MCP typecheck"], "revisao": ""} if url.endswith("/7") else {"falhos": [], "revisao": "CHANGES_REQUESTED"}
+    r = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z", pr_checks=checks)
+    assert r["sinais"]["pr_ci_vermelho"]["n"] == 1 and "MCP typecheck" in r["sinais"]["pr_ci_vermelho"]["casos"][0]["detalhe"], r["sinais"]["pr_ci_vermelho"]
+    assert r["sinais"]["pr_ci_vermelho"]["casos"][0]["ponteiro"] == "https://github.com/o/r/pull/7"
+    assert r["sinais"]["pr_pediu_mudanca"]["n"] == 1
+    assert orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")["sinais"]["pr_ci_vermelho"]["n"] is None, "sem gh: não consultado"
+    sem_resposta = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z", pr_checks=lambda u: None)
+    assert sem_resposta["sinais"]["pr_ci_vermelho"]["n"] == 0, "gh sem resposta num PR não inventa falha"
+
+
+def test_ticket78_orq_retro_periodo_sem_falhas_diz_zero_por_extenso():
+    a = Amb()
+    r = a.orq("retro", "--desde", "2026-09-29", "--ate", "2026-10-01", "--sem-gh", "--sem-transcritos")
+    assert r.returncode == 0, r.stderr
+    assert "falhas no período: 0" in r.stdout, r.stdout
+    assert "nao_iniciou" in r.stdout and "correcao_do_usuario" in r.stdout, "cada sinal aparece, mesmo com zero"
+    linha = next(l for l in r.stdout.splitlines() if l.startswith("nao_iniciou"))
+    assert linha.split()[1] == "0", linha
+    assert "n/d" in next(l for l in r.stdout.splitlines() if l.startswith("regra_violada")), "o que não foi consultado não vira zero"
+
+
+def test_ticket78_orq_retro_com_eventos_imprime_ponteiros_json_e_compara_com_a_rodada_gravada():
+    a = Amb()
+    os.makedirs(a.home)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        for e in _eventos78():
+            f.write(json.dumps(e) + "\n")
+    args = ("retro", "--desde", "2026-09-29", "--ate", "2026-10-01", "--sem-gh", "--sem-transcritos")
+    r = a.orq(*args)
+    assert r.returncode == 0, r.stderr
+    assert "events.jsonl:" in r.stdout and "orq: coisa B" in r.stdout and "claude-opus-5-5/xhigh" in r.stdout, r.stdout
+    j = json.loads(a.orq(*args, "--json").stdout)
+    assert j["sinais"]["nao_iniciou"]["n"] == 1 and j["falhas"] > 10, j["falhas"]
+    linha_ponteiro = int(j["sinais"]["nao_iniciou"]["casos"][0]["ponteiro"].split(":")[1])
+    assert json.loads(open(os.path.join(a.home, "events.jsonl")).read().splitlines()[linha_ponteiro - 1])["tipo"] == "nao_iniciou", "o ponteiro é a linha do log"
+    assert a.orq(*args, "--gravar").returncode == 0
+    snaps = os.listdir(os.path.join(a.home, "retro"))
+    assert len(snaps) == 1, snaps
+    r2 = a.orq("retro", "--desde", "2026-10-01", "--ate", "2026-10-08", "--sem-gh", "--sem-transcritos")
+    assert "antes" in r2.stdout and "nao_iniciou" in r2.stdout, r2.stdout
+    assert next(l for l in r2.stdout.splitlines() if l.startswith("nao_iniciou")).split()[1:3] == ["0", "1"], "esta rodada 0, a gravada 1"
+    assert a.orq("retro", "--desde", "isto-nao-e-data").returncode != 0
+
+
+def test_ticket78_digest_mostra_as_ultimas_rodadas_do_retro_so_quando_existem():
+    a = Amb()
+    d0 = json.load(open(a.orq("digest").stdout.splitlines()[0]))
+    assert "retro" not in d0, "sem rodada gravada o contrato v1 fica como estava"
+    os.makedirs(os.path.join(a.home, "retro"))
+    json.dump({"desde": "2026-09-22T00:00:00Z", "ate": "2026-09-29T00:00:00Z", "falhas": 4, "metricas": {"nao_iniciou": 1, "regra_violada": None}}, open(os.path.join(a.home, "retro", "2026-09-29T0000.json"), "w"))
+    d1 = json.load(open(a.orq("digest").stdout.splitlines()[0]))
+    assert d1["retro"] == [{"ate": "2026-09-29T00:00:00Z", "falhas": 4, "metricas": {"nao_iniciou": 1, "regra_violada": None}}], d1.get("retro")
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
