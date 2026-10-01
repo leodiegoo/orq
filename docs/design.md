@@ -566,7 +566,7 @@ orq runs with either harness as coordinator and dispatches workers of either. Th
 **What is weaker on Codex.**
 
 - No AskUserQuestion: the coordinator asks in text or through the Lavish page, and a pending decision answered in text stays open until `orq pend done`.
-- No `/away` slash command: the `away` skill (`$away on`) or `orq away on`.
+- No `/away` slash command, and none to install. Checked against codex-cli 0.159.3 and the open-source tree: slash commands are a fixed enum of built-ins (`/skills` only opens the skills menu), `~/.codex/prompts/` is not read, and a user skill is invoked as `$name`. The `away` skill (`$away on|off|status`) is the Codex form; `$away status` was run in a real `codex exec` and printed the same line as `/away`. `/away` is the only orq-provided command in `~/.claude/commands`, so nothing else needs a twin. Revisit if Codex adds user commands.
 - A Codex coordinator or worker whose orq hooks are untrusted is invisible to the turn tracking, like any agent without hooks.
 
 ## Projects (tickets 94 and 95)

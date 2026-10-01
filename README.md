@@ -132,7 +132,7 @@ For Codex, merge [`codex.hooks.example.json`](codex.hooks.example.json) into `~/
 ```sh
 mkdir -p ~/.agents/skills
 ln -s ~/.claude/orq/skills/worker-routing ~/.agents/skills/worker-routing
-ln -s ~/.claude/orq/skills/away ~/.agents/skills/away   # $away, the Codex side of /away
+ln -s ~/.claude/orq/skills/away ~/.agents/skills/away   # $away, the Codex side of /away (Codex has no user slash commands, so `$away on|off|status` is the form)
 ``` The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
 
 The branch cleanup reads branch patterns to keep from `~/.claude/scripts/limpar-mergeados.keep` (one glob per line; a missing file means none). Write your own. It treats `main`, `development` and `staging` as protected branches (override with `ORQ_PROTECTED_BRANCHES`, comma-separated) and counts a branch as finished only when a PR into `main` merges it (`ORQ_FINAL_BASE`).
