@@ -820,7 +820,9 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
         lista = [grupo(f, es) for f, es in list(grupos.items())[:3]]
         partes.append("Relatórios sem triar: " + "; ".join(lista) + (f" +{len(grupos) - 3} fontes" if len(grupos) > 3 else "") + ".")
     linha = " ".join(partes)
-    return linha if len(linha) <= 560 else linha[:559] + "…"
+    linha = linha if len(linha) <= 560 else linha[:559] + "…"
+    ob = linha_obrigacoes(events)  # fora do teto de 560: não corta os avisos de antes nem é cortada por eles
+    return " ".join(filter(None, [linha, ob]))
 
 
 def _linha_runs(aberto):
@@ -2345,6 +2347,11 @@ def _aplica_prs(d, vistos, agora):
             continue
         ent = append_event({"tipo": "entrada", "origem": "pr", "texto": texto, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"]}, novo_id=True)
         i.update(entrada=ent["id"], texto=texto, avisado=False)
+        if novo == "mergeado":
+            tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_FECHADO), None)
+            for chave, txt in obrigacoes_do_merge(i, prox, tk):
+                append_event({"tipo": "obrigacao", "op": "nova", "entrada": ent["id"], "chave": chave, "texto": txt, "task": i["task"],
+                              **({"ticket": tk["num"]} if chave == "ticket" else {})})
         linhas.append(f"{i['task']}: {texto}")
     return linhas
 
@@ -2398,6 +2405,101 @@ def pr_avisar():
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
         linhas.append(f"{i['task']}: aviso do PR #{i['numero']} digitado no coordenador")
     return linhas
+
+
+# ---------- obrigações dos avisos (ticket 114) ----------
+
+OBRIGACAO_MIN = float(os.environ.get("ORQ_OBRIGACAO_MIN") or 10)  # obrigação aberta há mais que isto: o Stop do coordenador avisa, uma vez
+# o que o merge de um PR pede ao coordenador, pela base (README, "Obrigações dos avisos"). Obrigação que cita um campo sem valor não nasce:
+# sem issue não há comentário, sem ticket aberto da task não há o que fechar, sem próximo ambiente sugerido não há PR a abrir.
+_PROXIMO = ("proximo", "abrir o PR de {proximo}, ou adiar com o motivo de segurar")
+OBRIGACOES = {
+    "main": (("deploy", "conferir o deploy de produção (quave-one)"), ("comentario", "atualizar o comentário da #{issue}"),
+             ("limpeza", "conferir que a branch e a worktree saíram"), ("ticket", "fechar o ticket {ticket}")),
+    "staging": (("deploy", "conferir o deploy de staging"), _PROXIMO),
+    "development": (("deploy", "conferir o deploy de development"), _PROXIMO),
+}
+
+
+def obrigacoes_do_merge(i, prox, tk=None):
+    """[(chave, texto)] do que o merge do PR `i` pede (OBRIGACOES). A issue vem do `orq pr ligar --issue` ou da `issue:` do ticket `tk` da task."""
+    issue = i.get("issue") or (tk or {}).get("issue")
+    m = re.match(r"pronto para (\w+)", prox or "")
+    vals = {"issue": issue, "ticket": (tk or {}).get("num"), "proximo": m.group(1) if m else None}
+    return [(k, t.format(**vals)) for k, t in OBRIGACOES.get(i.get("base"), ())
+            if all(vals.get(c) for c in re.findall(r"\{(\w+)\}", t))]
+
+
+def obrigacoes_abertas(events, entrada=None):
+    """Os eventos `obrigacao nova` sem `feito` nem `adiada` depois, na ordem em que nasceram (de uma entrada só, com `entrada`)."""
+    fechadas = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") in ("feito", "adiada")}
+    return [e for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "nova" and (e.get("entrada"), e.get("chave")) not in fechadas
+            and entrada in (None, e.get("entrada"))]
+
+
+def _por_entrada(obs):
+    por = {}
+    for o in obs:
+        por.setdefault(o["entrada"], []).append(o)
+    return por
+
+
+def linha_obrigacoes(events):
+    """"A fazer por você: e484 → comentario (…), deploy (…)." do preâmbulo do coordenador, ou vazio. O mate não carrega as do coordenador.
+    ponytail: sem teto próprio; dezenas de obrigações abertas fazem uma linha longa, que é o sinal de que elas estão sendo esquecidas."""
+    obs = [] if os.environ.get("ORQ_MATE") else obrigacoes_abertas(events)
+    if not obs:
+        return ""
+    return ("A fazer por você: " + "; ".join(f"{e} → " + ", ".join(f"{o['chave']} ({o['texto']})" for o in os_) for e, os_ in _por_entrada(obs).items())
+            + '. Feche: orq feito <e> <obrigação> --prova "<url, versão, hash>" | orq adiar <e> <obrigação> --motivo "…".')
+
+
+def _obrigacao(e, chave):
+    obs = obrigacoes_abertas(read_events(), e)
+    o = next((o for o in obs if o["chave"] == chave), None)
+    if not o:
+        raise ValueError(f"entrada {e} não tem a obrigação {chave!r} aberta" + (f" (abertas: {', '.join(o['chave'] for o in obs)})" if obs else ""))
+    return o
+
+
+def _fechar_obrigacao(o, op, **campos):
+    """Grava o fechamento; a última obrigação da entrada fecha também a entrada, se ela ainda não tinha efeito."""
+    ev = append_event({"tipo": "obrigacao", "op": op, "entrada": o["entrada"], "chave": o["chave"], **campos})
+    eventos = read_events()
+    if not obrigacoes_abertas(eventos, o["entrada"]) and not any(x.get("tipo") == "intake" and x.get("entrada") == o["entrada"] for x in eventos):
+        append_event({"tipo": "intake", "entrada": o["entrada"], "efeito": "conversa", "nota": "obrigações cumpridas"})
+    return ev
+
+
+def obrigacao_feito(e, chave, prova):
+    if not (prova or "").strip():
+        raise ValueError("--prova vazia: a URL do comentário, a versão do deploy ou o hash")
+    return _fechar_obrigacao(_obrigacao(e, chave), "feito", prova=prova.strip())
+
+
+def obrigacao_adiar(e, chave, motivo, run=None):
+    """Adia com um ticket "a fazer depois" que leva o motivo: nada se perde. Sem o ticket (sem Run, Orca fora) a obrigação continua aberta."""
+    if not (motivo or "").strip():
+        raise ValueError("--motivo vazio: diga por que fica para depois")
+    o = _obrigacao(e, chave)
+    ent = next((x for x in read_events() if x.get("tipo") == "entrada" and x.get("id") == e), {})
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(f"## What to build\n\nObrigação `{chave}` da entrada {e} ({ent.get('texto') or '?'}), adiada: {o['texto']}.\n\n"
+                f"Motivo: {motivo.strip()}\n\n## Acceptance criteria\n\n- [ ] {o['texto']}, com a prova (URL, versão ou hash)\n")
+    try:
+        tk = ticket_novo(f"a fazer depois: {o['texto']} ({ent.get('fonte') or e})", f.name, run=run)
+    finally:
+        os.remove(f.name)
+    _fechar_obrigacao(o, "adiada", motivo=motivo.strip(), ticket=tk["ticket"])
+    return {"entrada": e, "chave": chave, **tk}
+
+
+def obrigacoes_a_cobrar(events, agora, minutos=None):
+    """As obrigações abertas há pelo menos `minutos` (OBRIGACAO_MIN) que o Stop ainda não cobrou: cada uma é cobrada uma vez só."""
+    minutos = OBRIGACAO_MIN if minutos is None else minutos
+    cobradas = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "cobrada"}
+    return [o for o in obrigacoes_abertas(events) if (o["entrada"], o["chave"]) not in cobradas and (agora - _dt(o["ts"])).total_seconds() >= minutos * 60]
 
 
 def _pergunta_aberta(events):
@@ -3419,6 +3521,8 @@ def hook_prompt(ev, run):
         refresh_bg(refresh=False)  # o aviso do Orca é o sinal de mensagem nova: ingere o inbox já, sem refazer o aberto.json (um heartbeat por 100 s)
     if org != "usuario":
         ln = linhas_noite(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # a noite acorda o coordenador por aviso, não por usuário
+        if org == "aviso_orq" and texto.lstrip().startswith("orq: PR ") and (ob := linha_obrigacoes(read_events())):
+            ln = [*ln, ob]  # o aviso do merge chega já com o que ele pede
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             **({"com_aviso": True} if com_aviso else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, novo_id=True)
@@ -3434,15 +3538,24 @@ def hook_stop(ev, run):
     # modo aviso (fatia 1): nunca bloqueia; a fatia 5 troca o systemMessage por decision=block com stop_hook_active
     if not os.environ.get("ORQ_MATE"):  # o fim de turno do mate não é resposta do coordenador ao usuário ausente
         digest_no_stop(ev)
-    sem = abertas(read_events())
-    if not sem:
+    events, agora = read_events(), datetime.now(timezone.utc)
+    sem = abertas(events)
+    velhas = [] if os.environ.get("ORQ_MATE") else obrigacoes_a_cobrar(events, agora)
+    if not sem and not velhas:
         return None
-    ids = [e["id"] for e in sem]
-    append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
-    rec = cursor_recuperado(_cursor_ro(), datetime.now(timezone.utc))
-    citadas = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
-    return {"systemMessage": f"{MARCA} {len(ids)} entrada(s) sem efeito: {citadas}. Use: orq intake <e> <efeito> [ref]"
-                             + (f" [aviso] {aviso_recuperado(rec)}" if rec else "")}
+    msg = MARCA
+    if sem:
+        ids = [e["id"] for e in sem]
+        append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
+        rec = cursor_recuperado(_cursor_ro(), agora)
+        citadas = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
+        msg += f" {len(ids)} entrada(s) sem efeito: {citadas}. Use: orq intake <e> <efeito> [ref]" + (f" [aviso] {aviso_recuperado(rec)}" if rec else "")
+    if velhas:
+        for o in velhas[:4]:  # cobrada uma vez, só a que foi citada: o Stop avisa, não bloqueia em loop; as outras vêm no Stop seguinte
+            append_event({"tipo": "obrigacao", "op": "cobrada", "entrada": o["entrada"], "chave": o["chave"]})
+        msg += (f" Obrigação aberta há mais de {OBRIGACAO_MIN:g} min: " + ", ".join(f"{o['entrada']} {o['chave']} ({o['texto']})" for o in velhas[:4])
+                + (f" +{len(velhas) - 4} no próximo Stop" if len(velhas) > 4 else "") + ': orq feito <e> <obrigação> --prova "…" ou orq adiar <e> <obrigação> --motivo "…".')
+    return {"systemMessage": msg}
 
 
 def _ask_dados(ev):
@@ -4107,6 +4220,9 @@ def intake(e, efeito, ref=None, run=None, nota=None):
     if efeito == "conversa" and alvo_e.get("origem") in ("relatorio", "relatorio_worker"):
         raise ValueError(f"entrada {e} é item de relatório ({_cita(alvo_e.get('texto'))!r}, {alvo_e.get('fonte')}): conversa não a trata; "
                          "use tarefa, steer, pend, decisao ou descartado --nota <motivo>")
+    if efeito in ("conversa", "descartado") and (obs := obrigacoes_abertas(eventos, e)):
+        raise ValueError(f"entrada {e} tem obrigação aberta: " + ", ".join(f"{o['chave']} ({o['texto']})" for o in obs)
+                         + f'; feche cada uma com orq feito {e} <obrigação> --prova "<url, versão, hash>" ou orq adiar {e} <obrigação> --motivo "…"')
     ev = {"tipo": "intake", "entrada": e, "efeito": efeito}
     if efeito in ("tarefa", "steer"):
         if not ref:
@@ -4712,7 +4828,8 @@ def le_ticket(caminho):
         raise ValueError(f"{caminho} não começa com o título (# NN: Título)")
     return {"num": os.path.basename(caminho).split("-")[0].zfill(2), "arquivo": caminho, "titulo": titulo.group(1).strip(),
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
-            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None}
+            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
+            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
 
 
 def tickets():
@@ -4838,6 +4955,8 @@ def ticket_fechar(numero, answer):
     aviso = "; ".join(x for x in (aviso, *avisos) if x)
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": fechada, **({"aviso": aviso} if aviso else {}),
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in liberados]})
+    for o in [o for o in obrigacoes_abertas(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
+        _fechar_obrigacao(o, "feito", prova=f"ticket {n} {STATUS_FECHADO}")  # o orq cumpre sozinho e só registra
     return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso, "liberados": liberados}
 
 
@@ -8282,6 +8401,15 @@ def main(argv=None):
     i.add_argument("ref", nargs="?")
     i.add_argument("--run")
     i.add_argument("--nota")
+    fe = sub.add_parser("feito", help='orq feito <e> <obrigação> --prova "<url, versão, hash>": fecha uma obrigação do aviso')
+    fe.add_argument("entrada")
+    fe.add_argument("obrigacao")
+    fe.add_argument("--prova", required=True)
+    ad = sub.add_parser("adiar", help='orq adiar <e> <obrigação> --motivo "…": adia a obrigação com um ticket "a fazer depois"')
+    ad.add_argument("entrada")
+    ad.add_argument("obrigacao")
+    ad.add_argument("--motivo", required=True)
+    ad.add_argument("--run")
     p = sub.add_parser("pend").add_subparsers(dest="op", required=True)
     pa = p.add_parser("add")
     pa.add_argument("--id", required=True)
@@ -8540,6 +8668,10 @@ def main(argv=None):
     try:
         if a.cmd == "intake":
             print(json.dumps(intake(a.entrada, a.efeito, a.ref, a.run, a.nota), ensure_ascii=False))
+        elif a.cmd == "feito":
+            print(json.dumps(obrigacao_feito(a.entrada, a.obrigacao, a.prova), ensure_ascii=False))
+        elif a.cmd == "adiar":
+            print(json.dumps(obrigacao_adiar(a.entrada, a.obrigacao, a.motivo, a.run), ensure_ascii=False))
         elif a.cmd == "pend":
             if a.op == "add":
                 print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate, a.run), ensure_ascii=False))

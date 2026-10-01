@@ -7236,7 +7236,9 @@ def test_pr_entrada_aparece_no_prompt_e_fecha_com_intake():
     assert "PR #1216 entrou em development" in ctx, ctx
     assert len(ctx.splitlines()) <= 5
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
-    assert a.orq("intake", ent["id"], "conversa").returncode == 0
+    assert a.orq("intake", ent["id"], "conversa").returncode == 1, "com obrigação aberta o intake conversa é recusado (ticket 114)"
+    for chave in ("deploy", "proximo"):
+        assert a.orq("feito", ent["id"], chave, "--prova", "ok").returncode == 0
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
     assert "PR #1216" not in ctx, ctx
 
@@ -11909,6 +11911,150 @@ def test_ticket105_com_o_gerente_ligado_o_run_solto_continua_pedindo_o_gerente_l
     r = a.orq("steer", "t2", "ajuste", "--run", "run_b")
     assert r.returncode == 1 and "orq gerente ligar --terminal term_ger --run run_b" in r.stderr, "religar o terminal do coordenador o tiraria do gerente"
     assert not [c for c in _log(a, "calls.log") if c[0] == "run-use"]
+
+
+# ---------- ticket 114: cada aviso gera as obrigações que implica ----------
+
+PR_MAIN = PR1.replace("1216", "1282")
+
+
+def _merge_main(a, issue="2045"):
+    """Liga o PR de main à task_feat1 (com --issue, se houver), o gh o vê mergeado e o poll cria a entrada. Devolve o id dela."""
+    _pr(a, PR_MAIN, "OPEN", "main")
+    assert a.orq("pr", "ligar", "task_feat1", PR_MAIN, *(["--issue", issue] if issue else [])).returncode == 0
+    _pr(a, PR_MAIN, "MERGED", "main")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (ent,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    return ent["id"]
+
+
+def _obrig(a, e=None):
+    return {o["chave"]: o["texto"] for o in orq_mod.obrigacoes_abertas(a.events(), e)}
+
+
+def _ctx(r):
+    return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ticket114_merge_em_main_com_issue_gera_as_obrigacoes_e_elas_aparecem_no_preambulo():
+    a = _prs_env()
+    e = _merge_main(a)
+    ob = _obrig(a, e)
+    assert set(ob) == {"deploy", "comentario", "limpeza"}, ob
+    assert "#2045" in ob["comentario"] and "produção" in ob["deploy"], ob
+    ctx = _ctx(a.prompt("e agora?"))
+    assert f"A fazer por você: {e} →" in ctx and "#2045" in ctx and "orq feito" in ctx, ctx
+    assert len(ctx.splitlines()) <= 5, ctx
+    aviso = a.prompt(f"orq: PR #1282 entrou em main (task_feat1, issue #2045): em main. Entrada {e}.")
+    assert f"A fazer por você: {e} →" in _ctx(aviso), "o aviso digitado pelo painel já traz o que ele pede"
+    outro = a.prompt("orq: Fila do E2E parada há 40 min.")
+    assert "A fazer por você" not in (outro.stdout or ""), "só o aviso de PR carrega as obrigações"
+    for k in range(4):  # avisos antigos não somem com obrigações abertas: elas ficam fora do teto da linha extra
+        with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "obrigacao", "op": "nova", "entrada": f"e9{k}", "chave": "deploy", "texto": "x" * 150}) + "\n")
+    linha = next(l for l in _ctx(a.prompt("e agora?")).splitlines() if "A fazer por você" in l)
+    assert linha.index("PR: ") < linha.index("A fazer por você") and "e93 → deploy" in linha, linha
+
+
+def test_ticket114_pr_sem_issue_nao_gera_a_obrigacao_de_comentar():
+    a = _prs_env()
+    ob = _obrig(a, _merge_main(a, issue=None))
+    assert "comentario" not in ob and "deploy" in ob, ob
+
+
+def test_ticket114_issue_e_ticket_vem_do_cabecalho_do_ticket_da_task_e_fechar_o_ticket_cumpre_a_obrigacao():
+    a = _prs_env()
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "07-feature.md"), "w") as f:
+        f.write("# 07: Feature\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: task_feat1\nissue: #2045\n\n## What to build\n\nX\n")
+    e = _merge_main(a, issue=None)
+    ob = _obrig(a, e)
+    assert "#2045" in ob.get("comentario", "") and "07" in ob.get("ticket", ""), ob
+    assert a.orq("ticket", "fechar", "07", "--answer", "entregue").returncode == 0
+    assert "ticket" not in _obrig(a, e), "o orq cumpre sozinho o que consegue e só registra"
+    (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito"]
+    assert f["chave"] == "ticket" and "07" in f["prova"], f
+
+
+def test_ticket114_merge_em_development_pede_o_proximo_pr_e_o_deploy():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    ob = _obrig(a)
+    assert set(ob) == {"deploy", "proximo"} and "staging" in ob["proximo"], ob
+
+
+def test_ticket114_intake_conversa_ou_descartado_e_recusado_com_obrigacao_aberta():
+    a = _prs_env()
+    e = _merge_main(a)
+    for efeito in ("conversa", "descartado"):
+        r = a.orq("intake", e, efeito, "--nota", "visto")
+        assert r.returncode == 1 and "obrigação" in r.stderr and "orq feito" in r.stderr and "comentario" in r.stderr, r
+    assert not [x for x in a.events() if x["tipo"] == "intake"]
+
+
+def test_ticket114_feito_com_prova_fecha_a_obrigacao_e_a_ultima_fecha_a_entrada():
+    a = _prs_env()
+    e = _merge_main(a)
+    assert a.orq("feito", e, "comentario").returncode == 2, "sem --prova não fecha"
+    r = a.orq("feito", e, "nao-existe", "--prova", "x")
+    assert r.returncode == 1 and "deploy" in r.stderr, r
+    r = a.orq("feito", e, "comentario", "--prova", "https://github.com/acme/app/issues/2045#issuecomment-1")
+    assert r.returncode == 0, r.stderr
+    assert "comentario" not in _obrig(a, e) and e in {x["id"] for x in orq_mod.abertas(a.events())}
+    assert a.orq("feito", e, "comentario", "--prova", "de novo").returncode == 1, "já fechada"
+    a.orq("feito", e, "deploy", "--prova", "v776")
+    a.orq("feito", e, "limpeza", "--prova", "branch e worktree removidas")
+    assert not _obrig(a, e) and e not in {x["id"] for x in orq_mod.abertas(a.events())}, "sem obrigação aberta a entrada se fecha"
+    assert "A fazer por você" not in _ctx(a.prompt("e agora?"))
+
+
+def test_ticket114_adiar_cria_um_ticket_com_o_motivo():
+    a = _prs_env()
+    e = _merge_main(a)
+    r = a.orq("adiar", e, "deploy", "--motivo", "deploy de produção só amanhã")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    txt = _lido(a, out["ticket"])
+    assert "deploy de produção só amanhã" in txt and e in txt and "## Acceptance criteria" in txt, txt
+    assert "deploy" not in _obrig(a, e)
+    (ad,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "adiada"]
+    assert ad["ticket"] == out["ticket"] and ad["motivo"] == "deploy de produção só amanhã", ad
+    assert a.orq("adiar", e, "limpeza").returncode == 2, "sem --motivo não adia"
+
+
+def test_ticket114_o_stop_avisa_uma_vez_da_obrigacao_velha():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    e = _merge_main(a)
+    m1 = json.loads(_stop(a).stdout)["systemMessage"]
+    assert "Obrigação aberta" in m1 and f"{e} comentario" in m1 and "orq feito" in m1, m1
+    m2 = json.loads(_stop(a).stdout or "{}").get("systemMessage", "")
+    assert "Obrigação aberta" not in m2, "uma vez só: não bloqueia em loop"
+    for chave in ("deploy", "comentario", "limpeza"):
+        a.orq("feito", e, chave, "--prova", "ok")
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        for n in range(6):  # seis obrigações velhas: o Stop cita quatro e só essas contam como cobradas
+            f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "obrigacao", "op": "nova", "entrada": "e90", "chave": f"k{n}", "texto": f"t{n}"}) + "\n")
+    m3 = json.loads(_stop(a).stdout)["systemMessage"]
+    assert "e90 k3" in m3 and "e90 k4" not in m3 and "+2 no próximo Stop" in m3, m3
+    m4 = json.loads(_stop(a).stdout)["systemMessage"]
+    assert "e90 k4" in m4 and "e90 k5" in m4 and "e90 k0" not in m4, "a que não foi citada não se perde"
+    b = _prs_env(ORQ_OBRIGACAO_MIN="10")
+    _merge_main(b)
+    assert "Obrigação aberta" not in json.loads(_stop(b).stdout or "{}").get("systemMessage", ""), "a obrigação nova ainda não é cobrada"
+
+
+def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    e = _merge_main(a)
+    r = _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?"))
+    assert f"A fazer por você: {e} →" in _ctx(r), r.stdout
+    m = json.loads(_hook_codex(a, "stop", _codex("stop", session_id="abcdef123456")).stdout)["systemMessage"]
+    assert "Obrigação aberta" in m and f"{e} deploy" in m, m
+    for chave in ("deploy", "comentario", "limpeza"):
+        assert a.orq("feito", e, chave, "--prova", "ok").returncode == 0
+    assert "A fazer por você" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
 
 
 if __name__ == "__main__":

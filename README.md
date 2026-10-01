@@ -62,7 +62,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 ## Features
 
 - Deterministic intake. `orq hook prompt` classifies each prompt by its origin (user, Orca notice, task notification, slash command, compaction summary, worker dispatch preamble) and records only user prompts as entries, then injects a status summary of at most five lines.
-- Effects. `orq intake <entry> <effect> [ref]` closes an entry as `tarefa` (task), `steer`, `pend`, `decisao` (decision), `conversa` (nothing to do) or `descartado` (discarded, with a note). It refuses a task or pending id that does not exist.
+- Effects. `orq intake <entry> <effect> [ref]` closes an entry as `tarefa` (task), `steer`, `pend`, `decisao` (decision), `conversa` (nothing to do) or `descartado` (discarded, with a note). An entry that still has obligations (see "Obrigações dos avisos") refuses `conversa` and `descartado`. It refuses a task or pending id that does not exist.
 - Stop reminder. `orq hook stop` lists the entries still without an effect. It only warns for now; blocking the end of the turn is planned but not built.
 - Report ingestion. `orq ingest` turns completed Orca automation runs and `worker_done` messages carrying a `reportPath` into entries, one per numbered action item in the report.
 - Heartbeat absorption. Orca notices whose mailbox holds only heartbeats are acknowledged and blocked before they reach the model, both in the prompt hook and in the manager loop.
@@ -239,6 +239,32 @@ Efeito: orq intake <e> tarefa <task>|steer <task>|pend <id>|decisao <id>|convers
 Ask the user a decision on a page, the same way on Claude Code and Codex: `orq perguntar --id <pend> --pergunta "..." --opcao "A" --opcao "B" [--recomendada N] [--espera-min M]`. It creates the decision if the id is new, builds a Lavish page (one radio per option, the recommended one only labelled, never preselected; free text, "decide later" and "let's talk"), opens it in Orca's browser, waits on `lavish-axi poll` and records the answer like `orq lavish-resposta`: only an explicit choice closes the decision. No answer (timeout, session ended, empty choice) leaves it open with a warning. It blocks until the answer, so run it as the harness's background job.
 
 Also available: `orq ingest [--refresh]`, `orq alerta visto <task>`, `orq lavish-resposta <file|->` and `orq auditar-respostas [--sessao id]`.
+
+## Obrigações dos avisos
+
+A notice often implies work that has nothing to do with the notice being "seen". A merged `main` request means checking the production deploy, updating the issue comment and cleaning the branch. orq writes that work down when the notice arrives, so it does not depend on the coordinator remembering it (ticket 114). The same hooks run it on Claude Code and Codex (`UserPromptSubmit` and `Stop`).
+
+| Notice | Obligations (key: text) |
+|---|---|
+| request merged into `main` | `deploy`: check the production deploy (quave-one); `comentario`: update the comment on the linked issue; `limpeza`: check that the branch and worktree are gone; `ticket`: close the task's ticket |
+| request merged into `development` or `staging` | `deploy`: check that environment's deploy; `proximo`: open the next request, or postpone with the reason to hold |
+| `worker_done`, a worker question, an automation report | none created: the worker list, `orq responder` and the existing report triage already hold them |
+| machine pressure from outside | none |
+
+An obligation that needs a value it does not have is not created. The issue comes from `orq pr ligar --issue N` or from an `issue: #N` line in the header of the task's ticket; with neither, there is no `comentario`. With no open ticket for the task there is no `ticket`, and with no next environment suggested (another request of the feature still open) there is no `proximo`. The table is `OBRIGACOES` in `orqlib.py`.
+
+The obligations are tied to the notice's entry (`eN`) and show in the prompt's extra line, also on the line the manager types for the merge, until each is closed:
+
+```text
+A fazer por você: e484 → deploy (conferir o deploy de produção (quave-one)), comentario (atualizar o comentário da #2045), limpeza (…).
+```
+
+```sh
+orq feito e484 comentario --prova "https://github.com/<org>/<repo>/issues/2045#issuecomment-1"
+orq adiar e484 deploy --motivo "the deploy runs tomorrow"   # creates an "a fazer depois" ticket with the reason
+```
+
+While an entry has an open obligation, `orq intake eN conversa` and `descartado` are refused. Closing the last obligation closes the entry too. Whatever orq can confirm by itself it closes and only records: `orq ticket fechar NN` closes the `ticket` obligation. The coordinator's Stop hook warns once about each obligation open for more than 10 minutes (`ORQ_OBRIGACAO_MIN`); it never blocks.
 
 ## Tests
 
