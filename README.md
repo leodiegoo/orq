@@ -103,7 +103,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
 - git
 
-Optional: `gh` (open PRs in the handoff, branch cleanup), `engram` (the handoff is also saved there), and `lavish-axi` if you want to use the decision page the guard points to. orq never runs `lavish-axi` itself; it only parses its `poll` output in `orq lavish-resposta`.
+Optional: `gh` (open PRs in the handoff, branch cleanup), `engram` (the handoff is also saved there), and `lavish-axi` if you want to use the decision page the guard points to. `orq perguntar` runs `lavish-axi` itself; the rest only parses its `poll` output in `orq lavish-resposta`.
 
 ## Install
 
@@ -227,6 +227,8 @@ Com você: 2 (1 decisões).
 Efeito: orq intake <e> tarefa <task>|steer <task>|pend <id>|decisao <id>|conversa|descartado --nota <motivo>
 ```
 
+Ask the user a decision on a page, the same way on Claude Code and Codex: `orq perguntar --id <pend> --pergunta "..." --opcao "A" --opcao "B" [--recomendada N] [--espera-min M]`. It creates the decision if the id is new, builds a Lavish page (one radio per option, the recommended one only labelled, never preselected; free text, "decide later" and "let's talk"), opens it in Orca's browser, waits on `lavish-axi poll` and records the answer like `orq lavish-resposta`: only an explicit choice closes the decision. No answer (timeout, session ended, empty choice) leaves it open with a warning. It blocks until the answer, so run it as the harness's background job.
+
 Also available: `orq ingest [--refresh]`, `orq alerta visto <task>`, `orq lavish-resposta <file|->` and `orq auditar-respostas [--sessao id]`.
 
 ## Tests
@@ -268,7 +270,7 @@ The coordinator can be a Claude Code or a Codex session, and each worker can be 
 
 The `worker-routing` skill maps the Claude roles to Codex models (Luna for clear, repeatable work, Sol for ambiguous or hard work, Astra low and medium only in place of Opus xhigh and max, no Terra). OpenAI publishes no equivalence with Claude models; the table follows OpenAI's own model guidance (<https://learn.chatgpt.com/docs/models>) and independent benchmarks cited in the skill.
 
-Weaker on Codex: there is no AskUserQuestion, so decisions go through text or the Lavish page and stay open until `orq pend done`; `/away` becomes the `away` skill; and an untrusted Codex hook does not run, which leaves that session invisible to orq's turn tracking. The details are in [`docs/design.md`](docs/design.md#harnesses-claude-code-and-codex-ticket-73).
+Weaker on Codex: there is no AskUserQuestion, so decisions go through `orq perguntar` (Codex's own `request_user_input` only works in Plan mode and is refused in Default mode, codex-cli 0.159.3); `/away` becomes the `away` skill; and an untrusted Codex hook does not run, which leaves that session invisible to orq's turn tracking. The details are in [`docs/design.md`](docs/design.md#harnesses-claude-code-and-codex-ticket-73).
 
 ## Portability and lock-in
 

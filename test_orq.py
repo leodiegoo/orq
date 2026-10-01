@@ -11033,6 +11033,77 @@ def test_ticket95_pedido_enfileirado_leva_o_projeto_e_o_worktree_para_o_gerente_
     assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
 
 
+# ---------- orq perguntar: decisão pelo Lavish nos dois harnesses (ticket 75) ----------
+
+LAVISH_FALSO = """#!/usr/bin/env python3
+import os, sys
+if sys.argv[1] == "poll":
+    sys.stdout.write(open(os.environ["FAKE_POLL"]).read() if os.environ.get("FAKE_POLL") else "session:\\n  status: ended\\n")
+    sys.exit(0)
+print('session:\\n  url: "http://127.0.0.1:4387/session/abc"\\n  status: opened')
+"""
+
+
+def _perguntar(a, poll=None, *args, **env):
+    bin_ = os.path.join(a.tmp.name, "lavish")
+    with open(bin_, "w") as f:
+        f.write(LAVISH_FALSO)
+    os.chmod(bin_, 0o755)
+    if poll is not None:
+        env["FAKE_POLL"] = _lote(a, poll, "poll-perg.json")
+    return a.orq("perguntar", "--id", "badge", "--pergunta", "Qual badge?", "--opcao", "A: ponto", "--opcao", "B: texto", *args, ORQ_LAVISH=bin_, **env)
+
+
+def _todas_chamadas(a):
+    return [json.loads(x) for x in open(os.path.join(a.fake, "calls.log"))]
+
+
+def test_perguntar_monta_a_pagina_com_as_opcoes_e_a_recomendada_e_abre_no_orca():
+    a = Amb()
+    r = _perguntar(a, None, "--recomendada", "2", "--sem-poll")
+    assert r.returncode == 0, r.stderr
+    saida = json.loads(r.stdout)
+    pagina = open(saida["pagina"]).read()
+    assert 'value="A: ponto"' in pagina and 'value="B: texto"' in pagina and "Qual badge?" in pagina
+    assert pagina.count('class="rec"') == 1 and pagina.index("B: texto") < pagina.index('class="rec"'), "só a recomendada leva a marca"
+    assert " checked" not in pagina, "nenhuma opção pré-selecionada: Enter solto não decide pelo usuário"
+    assert saida["url"] == "http://127.0.0.1:4387/session/abc" and saida["efeito"] == "aberta"
+    assert "badge" in _ids_pend(a), "a decisão nasce como pendência"
+    assert any("http://127.0.0.1:4387/session/abc" in " ".join(c) for c in _todas_chamadas(a)), "a aba abre no browser do Orca"
+
+
+def test_perguntar_com_escolha_fecha_a_pendencia_e_grava_o_evento():
+    a = Amb()
+    r = _perguntar(a, [{"id": "perg-badge", "header": "badge", "resposta": "A: ponto", "disposicao": "escolha"}])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["efeito"] == "fechou"
+    assert "badge" not in _ids_pend(a)
+    (ev,) = [e for e in a.events() if e["tipo"] == "resposta_lavish"]
+    assert ev["header"] == "badge" and ev["resposta"] == "A: ponto" and ev["fechou"] == ["badge"]
+
+
+def test_perguntar_com_resposta_vazia_ou_sessao_encerrada_deixa_a_pendencia_aberta_com_aviso():
+    a = Amb()
+    r = _perguntar(a, [{"id": "perg-badge", "header": "badge", "resposta": "", "disposicao": "escolha"}])
+    assert "badge" in _ids_pend(a) and json.loads(r.stdout)["efeito"] == "aberta"
+    assert "orq pend done badge" in r.stderr, r.stderr
+    b = Amb()
+    r = _perguntar(b)  # o poll volta com a sessão encerrada, sem lote
+    assert r.returncode == 0 and "badge" in _ids_pend(b) and json.loads(r.stdout)["efeito"] == "aberta"
+    assert "terminou sem resposta" in r.stderr, r.stderr
+    c = Amb()
+    r = _perguntar(c, None, "--espera-min", "0.0005", FAKE_POLL="/nao/existe")  # poll quebrado não fecha nada
+    assert "badge" in _ids_pend(c)
+
+
+def test_perguntar_recusa_menos_de_duas_opcoes_e_pendencia_que_nao_e_decisao():
+    a = Amb()
+    r = a.orq("perguntar", "--id", "x", "--pergunta", "p", "--opcao", "só uma")
+    assert r.returncode != 0 and "duas" in r.stderr
+    r = a.orq("perguntar", "--id", "avisar-x", "--pergunta", "p", "--opcao", "a", "--opcao", "b", "--sem-poll")
+    assert r.returncode != 0 and "não decisão" in r.stderr
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
@@ -11046,4 +11117,3 @@ if __name__ == "__main__":
             print(f"FALHOU  {nome}: {type(e).__name__}: {str(e)[-400:]!r}")
     print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
     sys.exit(1 if falhas else 0)
-

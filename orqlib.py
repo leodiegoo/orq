@@ -28,6 +28,8 @@ def ThreadPoolExecutor(n):  # import tardio: concurrent.futures custa ~11 ms e s
 HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
+LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
+PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
@@ -3484,7 +3486,7 @@ def hook_guard(ev, run):
         return None
     lista = ", ".join(f"{(a.get('task') or '?')[:18]} ({a.get('run')}, {a.get('dispatch')})" for a in ativos[:3]) + (f" +{len(ativos) - 3}" if len(ativos) > 3 else "")
     motivo = (f"{MARCA} {len(ativos)} despacho{'s' if len(ativos) > 1 else ''} ativo{'s' if len(ativos) > 1 else ''} ({lista}). Com worker rodando, a decisão do "
-              "usuário vai pelo Lavish, não pelo AskUserQuestion: monte a página com lavish-axi (lote com itens id, header igual ao id da pendência, "
+              "usuário vai pelo Lavish, não pelo AskUserQuestion: use `orq perguntar --id <pend> --pergunta ... --opcao ... --opcao ...` (monta a página, abre no Orca, espera e fecha a pendência; rode-o em segundo plano) ou monte a página à mão com lavish-axi (lote com itens id, header igual ao id da pendência, "
               'resposta e disposicao; só a disposicao "escolha" (ou "manter"/"trocar") com resposta fecha a decisão, "livre", "adiar" e "conversar" '
               "a deixam aberta), rode `lavish-axi poll <arquivo.html>` e grave a saída do poll, crua, com `orq lavish-resposta <arquivo>` "
               "(`-` lê da entrada padrão). O AskUserQuestion só vale sem worker ativo. Despacho preso? "
@@ -4126,6 +4128,106 @@ def lavish_resposta(caminho):
         else:
             saida.append({"item": id_, "efeito": "so registrada"})
     return {"lote": lote, "itens": saida, "avisos": avisos}
+
+
+_PAGINA_PERGUNTA = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITULO__</title><style>
+:root{color-scheme:light dark;--bg:#fafafa;--fg:#1a1a1a;--card:#fff;--bd:#d4d4d8;--ac:#6d28d9}
+@media(prefers-color-scheme:dark){:root{--bg:#18181b;--fg:#f4f4f5;--card:#27272a;--bd:#3f3f46;--ac:#a78bfa}}
+html,body{background:var(--bg);color:var(--fg);margin:0;font:16px/1.5 system-ui,sans-serif}
+main{max-width:42rem;margin:0 auto;padding:24px 16px}
+label.op{display:block;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px;margin:8px 0;cursor:pointer}
+label.op:has(input:checked){border-color:var(--ac)}.rec{color:var(--ac);font-size:.85em;margin-left:.5em}
+textarea{width:100%;box-sizing:border-box;min-height:5rem;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:8px}
+button{margin:12px 8px 0 0;padding:8px 16px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);cursor:pointer}
+button.ok{background:var(--ac);color:#fff;border-color:var(--ac)}#erro{color:#dc2626;min-height:1.5em}
+</style></head><body><main>
+<h1>__PERGUNTA__</h1>__DETALHE__
+<form data-lavish-question="__ID__" id="f">__OPCOES__
+<p><label for="nota">Nota ou resposta livre (opcional)</label><textarea id="nota"></textarea></p>
+<div id="erro"></div>
+<button type="submit" class="ok">Enviar resposta</button>
+<button type="button" data-d="adiar">Decidir depois</button>
+<button type="button" data-d="conversar">Quero conversar</button>
+</form></main><script>
+const H=__HEADER__,F=document.getElementById("f");
+function envia(disp){
+  const r=F.querySelector("input[name=op]:checked"),nota=document.getElementById("nota").value.trim();
+  let resposta="",d=disp;
+  if(!disp){
+    if(!r&&!nota){document.getElementById("erro").textContent="Escolha uma opção ou escreva a resposta.";return}
+    resposta=r?(nota?r.value+": "+nota:r.value):nota;
+    d=r&&!nota?"escolha":"livre";
+  }
+  window.lavish.queuePrompt("Resposta à decisão "+H,{tag:"tracked-batch",text:"Decisão "+H+": "+(resposta||d),element:F,data:{items:[{id:"perg-"+H,header:H,resposta:resposta,disposicao:d}]}});
+  window.lavish.sendQueuedPrompts&&window.lavish.sendQueuedPrompts();
+}
+F.addEventListener("submit",e=>{e.preventDefault();envia("")});
+F.querySelectorAll("button[data-d]").forEach(b=>b.addEventListener("click",()=>envia(b.dataset.d)));
+</script></body></html>"""
+
+
+def pagina_pergunta(id_, pergunta, opcoes, recomendada=1, detalhe=None):
+    """HTML da página de decisão: uma opção por rádio (a recomendada marcada no texto, nunca pré-selecionada), campo livre, adiar e conversar.
+
+    Envia um lote `data.items` com id, header (o id da pendência), resposta e disposicao, o formato que `orq lavish-resposta` lê."""
+    ops = "".join(f'<label class="op"><input type="radio" name="op" value="{html.escape(o, quote=True)}"> {html.escape(o)}'
+                  + ('<span class="rec">recomendada</span>' if n == recomendada else "") + "</label>" for n, o in enumerate(opcoes, 1))
+    det = f"<p>{html.escape(detalhe)}</p>" if detalhe else ""
+    return (_PAGINA_PERGUNTA.replace("__TITULO__", html.escape(id_)).replace("__PERGUNTA__", html.escape(pergunta)).replace("__DETALHE__", det)
+            .replace("__ID__", html.escape(id_, quote=True)).replace("__OPCOES__", ops)
+            .replace("__HEADER__", json.dumps(id_).replace("</", "<\\/")))
+
+
+def perguntar(id_, pergunta, opcoes, recomendada=1, detalhe=None, espera_min=None, poll=True):
+    """Decisão do usuário que vale nos dois harnesses (o Codex não tem AskUserQuestion): monta a página, abre no browser do Orca, espera a
+    resposta com `lavish-axi poll` e a grava como `orq lavish-resposta`, que fecha a pendência (só uma escolha explícita fecha).
+
+    A pendência `id_` nasce como decisão se não existir. Sem resposta (tempo esgotado, sessão encerrada, resposta vazia) ela fica aberta e o
+    resultado traz o aviso. Com `poll=False` só monta e abre; a saída do poll vai depois para `orq lavish-resposta`. Bloqueia até a resposta:
+    rode-o como job em segundo plano do harness. Devolve {"pagina", "url", "efeito", "avisos", ...}."""
+    id_, pergunta = (id_ or "").strip(), (pergunta or "").strip()
+    opcoes = [o.strip() for o in opcoes or [] if o.strip()]
+    if not id_ or not pergunta or len(opcoes) < 2:
+        raise ValueError("perguntar pede --id, --pergunta e ao menos duas --opcao")
+    if not 1 <= recomendada <= len(opcoes):
+        raise ValueError(f"--recomendada vai de 1 a {len(opcoes)}")
+    atual = {i.get("id"): i for i in _load_pend()["itens"]}.get(id_)
+    if atual is None:
+        pend_add(id_, "decisao", pergunta, detalhe=detalhe)
+    elif atual.get("tipo") != "decisao":
+        raise ValueError(f"pendência {id_} é {atual.get('tipo')}, não decisão")
+    os.makedirs(_path("perguntar"), exist_ok=True)
+    pagina = os.path.join(_path("perguntar"), f"{id_}.html")
+    with open(pagina, "w") as f:
+        f.write(pagina_pergunta(id_, pergunta, opcoes, recomendada, detalhe))
+    abre = subprocess.run([LAVISH, pagina], capture_output=True, text=True, timeout=30)
+    url = (re.search(r'url:\s*"?(http\S+?)"?\s*$', abre.stdout, re.M) or [None, None])[1]
+    res = {"pagina": pagina, "url": url, "avisos": []}
+    if url:
+        try:
+            orca("create", "--url", url, area="tab", timeout=10)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            res["avisos"].append(f"não abriu a aba no Orca ({e}); abra {url}")
+    else:
+        res["avisos"].append(f"lavish-axi não devolveu a url da sessão: {(abre.stderr or abre.stdout).strip()[:200]}")
+    if not poll:
+        return {**res, "efeito": "aberta"}
+    espera = (espera_min or PERGUNTAR_MIN) * 60
+    saida = os.path.join(_path("perguntar"), f"{id_}.poll")
+    try:
+        r = subprocess.run([LAVISH, "poll", pagina], capture_output=True, text=True, timeout=espera)
+        with open(saida, "w") as f:
+            f.write(r.stdout)
+        out = lavish_resposta(saida)
+    except subprocess.TimeoutExpired:
+        res["avisos"].append(f"sem resposta em {espera / 60:g} min: a pendência {id_} segue aberta")
+        return {**res, "efeito": "aberta"}
+    except ValueError:  # sessão encerrada sem enviar: o poll não traz lote
+        res["avisos"].append(f"a sessão terminou sem resposta: a pendência {id_} segue aberta")
+        return {**res, "efeito": "aberta"}
+    efeito = out["itens"][0]["efeito"] if out["itens"] else "aberta"
+    return {**res, "efeito": efeito, "lote": out["lote"], "avisos": res["avisos"] + out["avisos"]}
 
 
 OCIOSO_MS = int(os.environ.get("ORQ_OCIOSO_MS") or 2000)  # quanto esperar o tui-idle de um terminal antes de dizer que ele está ocupado
@@ -5517,7 +5619,7 @@ def _sessao_do_coordenador(sessao):
             raise ValueError("nenhuma sessão de coordenador registrada em cursor.json: passe --sessao <id>")
         sessao = list(runs)[-1]
     if _dict(_cursor_ro().get("harnesses")).get(sessao) == "codex":
-        raise ValueError(f"a sessão {sessao[:8]} é de um coordenador no Codex, que não tem AskUserQuestion: não há resposta de caixa para auditar")
+        raise ValueError(f"a sessão {sessao[:8]} é de um coordenador no Codex, que não tem AskUserQuestion: não há resposta de caixa para auditar (as de `orq perguntar` ficam em resposta_lavish)")
     achados = sorted(f for f in os.listdir(TRANSCRITOS) if f.endswith(".jsonl") and f.startswith(sessao)) if os.path.isdir(TRANSCRITOS) else []
     if len(achados) != 1:
         raise ValueError(f"transcrito de {sessao!r} em {TRANSCRITOS}: {'nenhum' if not achados else 'mais de um'}")
@@ -7576,6 +7678,14 @@ def main(argv=None):
     tl.add_argument("--todos", action="store_true")
     tl.add_argument("--json", action="store_true")
     sub.add_parser("lavish-resposta").add_argument("arquivo", help="saída do `lavish-axi poll` (crua, ou o JSON dela); `-` lê a entrada padrão")
+    pg = sub.add_parser("perguntar", help="decisão pelo Lavish (vale no Claude e no Codex): página com as opções, espera a resposta e fecha a pendência")
+    pg.add_argument("--id", required=True, help="id da pendência de decisão (até 12 caracteres; nasce se não existir)")
+    pg.add_argument("--pergunta", required=True)
+    pg.add_argument("--opcao", action="append", default=[], help="uma opção; repita (mínimo 2)")
+    pg.add_argument("--recomendada", type=int, default=1, help="número (1..N) da opção recomendada; só marca, não pré-seleciona")
+    pg.add_argument("--detalhe")
+    pg.add_argument("--espera-min", type=float, help=f"minutos até desistir (padrão {PERGUNTAR_MIN:g}); a pendência fica aberta")
+    pg.add_argument("--sem-poll", action="store_true", help="só monta e abre a página; grave o poll depois com orq lavish-resposta")
     sub.add_parser("auditar-respostas").add_argument("--sessao", help="id (ou prefixo) da sessão; sem ele, a última sessão de coordenador do cursor.json")
     ge = sub.add_parser("gerente", help="agent manager em terminal próprio: os avisos do Orca vão para ele, não para o coordenador").add_subparsers(dest="op", required=True)
     gl = ge.add_parser("ligar", help="no coordenador: liga Runs ao terminal do agent manager (soma aos que ele já tem)")
@@ -7790,6 +7900,11 @@ def main(argv=None):
             else:
                 ts = [t for t in tickets() if a.todos or t["status"] != STATUS_FECHADO]
                 print(json.dumps(ts, ensure_ascii=False) if a.json else "\n".join(linha_ticket(t) for t in ts) or "nenhum ticket aberto")
+        elif a.cmd == "perguntar":
+            r = perguntar(a.id, a.pergunta, a.opcao, a.recomendada, a.detalhe, a.espera_min, not a.sem_poll)
+            print(json.dumps(r, ensure_ascii=False))
+            for x in r["avisos"]:
+                print(f"aviso: {x}", file=sys.stderr)
         elif a.cmd == "lavish-resposta":
             r = lavish_resposta(a.arquivo)
             print(json.dumps(r, ensure_ascii=False))

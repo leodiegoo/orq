@@ -437,6 +437,19 @@ Two defenses follow.
 
 Without active workers the widget is allowed, and `orq hook ask` still checks each answer. It is marked suspicious (recorded, but closing nothing) if the prompt hook saw an Orca notice in the previous 3 s, if the answer text is itself a notice, or if Orca delivered a message within 5 s and the answer is just the recommended option. `orq auditar-respostas` scans a past transcript for answers that picked only the recommended option within 2 s of an Orca delivery and lists them for the user to check.
 
+## `orq perguntar`: the decision page on either harness
+
+Codex has no `AskUserQuestion`. Its `request_user_input` exists but is available only in Plan mode; in Default mode the call is refused (checked in codex-cli 0.159.3 and in the openai/codex issues asking to lift the limit). The official command reference, https://learn.chatgpt.com/docs/developer-commands?surface=cli, lists no question tool or slash command; the only pause it documents is the approval gate (`--ask-for-approval`), which asks about commands, not decisions. So the decision channel cannot depend on a harness tool.
+
+`orq perguntar --id <pend> --pergunta ... --opcao ... --opcao ...` does the whole loop in one blocking command:
+
+1. Creates the decision pending item if the id is new (a pending item of another type is refused).
+2. Writes `perguntar/<id>.html` under `ORQ_HOME`: one radio per option, the recommended one labelled and never preselected (a stray Enter must not decide for the user), a free-text box, "decide later" and "let's talk". The page queues one `data.items` batch with `id`, `header` (the pending id), `resposta` and `disposicao`, the format `orq lavish-resposta` reads.
+3. Opens it with `lavish-axi` and in an Orca browser tab (`orca tab create --url <session url>`; a failure only adds a warning with the URL).
+4. Waits on `lavish-axi poll` (`--espera-min`, 30 by default, `ORQ_PERGUNTAR_MIN`) and feeds the output to `lavish_resposta`, so the rules are the same as the widget's: an explicit choice closes the decision and resolves its gate, free text keeps it open.
+
+A timeout, a session ended without sending, or an empty choice leave the pending item open and print a warning. On Claude Code it coexists with `AskUserQuestion`, which the guard still refuses while a worker runs (and the refusal now names this command); on Codex it is the default path. Because it blocks, the coordinator runs it as the harness's tracked background job and the finished job wakes it.
+
 ## Prompts stuck on a worker's screen
 
 Claude Code asks for a human in three ways that never reach the coordinator: a permission prompt ("Dangerous rm operation on possibly-empty variable path… Do you want to proceed?", shown even with permissions bypassed), an open `AskUserQuestion`, and "trust this folder". Only someone looking at the terminal sees them, so the worker sits there.
@@ -565,7 +578,7 @@ orq runs with either harness as coordinator and dispatches workers of either. Th
 
 **What is weaker on Codex.**
 
-- No AskUserQuestion: the coordinator asks in text or through the Lavish page, and a pending decision answered in text stays open until `orq pend done`.
+- No AskUserQuestion: the coordinator asks with `orq perguntar`, and a decision answered in text stays open until `orq pend done`.
 - No `/away` slash command, and none to install. Checked against codex-cli 0.159.3 and the open-source tree: slash commands are a fixed enum of built-ins (`/skills` only opens the skills menu), `~/.codex/prompts/` is not read, and a user skill is invoked as `$name`. The `away` skill (`$away on|off|status`) is the Codex form; `$away status` was run in a real `codex exec` and printed the same line as `/away`. `/away` is the only orq-provided command in `~/.claude/commands`, so nothing else needs a twin. Revisit if Codex adds user commands.
 - A Codex coordinator or worker whose orq hooks are untrusted is invisible to the turn tracking, like any agent without hooks.
 
