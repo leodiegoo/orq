@@ -19,25 +19,42 @@ from datetime import datetime, timezone
 HOME = os.path.expanduser("~")
 KEEP_FILE = os.path.join(HOME, ".claude/scripts/limpar-mergeados.keep")
 LAST = os.path.join(HOME, ".claude/logs/limpar-mergeados.last.json")
-# Fluxo em que a mesma branch é promovida por PR para cada ambiente (development, staging, main): só o merge na base final a encerra.
-PROTECTED = set((os.environ.get("ORQ_PROTECTED_BRANCHES") or "main,development,staging").split(","))
+PROTECTED = set()  # as branches que nunca se apagam: o main() preenche com os ambientes do projeto (`fluxo_do_repo`), o self-test com os do exemplo
 ORFA_OCIOSA_H = 24  # worktree órfã só sai depois deste tempo sem atividade
 ORQ = os.path.join(HOME, ".claude/orq/orq.py")
 ORQ_DIR = os.path.dirname(ORQ)
 RELATORIOS = os.environ.get("ORQ_RELATORIOS") or os.path.join(HOME, ".claude/orquestrador-plan/relatorios")
 # Escritos pelo próprio worker a pedido do orq: não são trabalho do worker (caminhos relativos à raiz da worktree).
 ARTEFATOS_ORQ = ("PAUSA.md", "PASSAGEM.md", "relatorio*.md", ".scratch/*/relatorio-final.md")
-FINAL_BASE = os.environ.get("ORQ_FINAL_BASE") or "main"
 
 
-def is_final(pr, branch):
-    """O merge que encerra a branch: em main, ou o de uma merge/<feature>-<ambiente> no próprio ambiente."""
-    return pr["baseRefName"] == FINAL_BASE or (branch.startswith("merge/") and pr["baseRefName"] in PROTECTED)
+def fluxo_do_repo(repo):
+    """{producao, ambientes} do projeto desse repositório, lido do orq (`orq fluxo --repo`): em um fluxo de promoção a mesma branch vai por PR a cada ambiente e só
+    o merge na produção a encerra. ORQ_FINAL_BASE e ORQ_PROTECTED_BRANCHES (lista separada por vírgula) forçam um dos dois. Sem o orq, a branch padrão do remoto."""
+    fx = None
+    try:
+        r = run([sys.executable, ORQ, "fluxo", "--repo", repo, "--json"])
+        fx = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    if not fx:
+        ref = run(["git", "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo).stdout.strip().removeprefix("origin/")
+        fx = {"producao": ref, "ambientes": [ref] if ref else []}
+    if os.environ.get("ORQ_FINAL_BASE"):
+        fx["producao"] = os.environ["ORQ_FINAL_BASE"]
+    if os.environ.get("ORQ_PROTECTED_BRANCHES"):
+        fx["ambientes"] = os.environ["ORQ_PROTECTED_BRANCHES"].split(",")
+    return fx
 
 
-def pr_final(prs, branch):
+def is_final(pr, branch, fx):
+    """O merge que encerra a branch: na produção do projeto, ou o de uma merge/<feature>-<ambiente> no próprio ambiente."""
+    return pr["baseRefName"] == fx["producao"] or (branch.startswith("merge/") and pr["baseRefName"] in fx["ambientes"])
+
+
+def pr_final(prs, branch, fx):
     """O PR mergeado mais novo que encerra a branch, ou None."""
-    finais = [p for p in prs if is_final(p, branch)]
+    finais = [p for p in prs if is_final(p, branch, fx)]
     return max(finais, key=lambda p: p["number"]) if finais else None
 
 
@@ -162,8 +179,10 @@ def self_test_git():
         # squash: patch-id não casa; só HEAD == headRefOid do PR prova que nada ficou de fora
         tip = g("rev-parse", "feat/x")
         prs = [{"number": 5, "baseRefName": "development"}, {"number": 3, "baseRefName": "main"}, {"number": 4, "baseRefName": "main"}]
-        assert pr_final(prs, "feat/x")["number"] == 4 and pr_final(prs[:1], "feat/x") is None  # development não encerra; o maior em main vence
-        assert pr_final(prs[:1], "merge/feat-development")["number"] == 5 and pr_final(prs[:1], "feat/merge/x") is None
+        fx = {"producao": "main", "ambientes": ["development", "staging", "main"]}
+        assert pr_final(prs, "feat/x", fx)["number"] == 4 and pr_final(prs[:1], "feat/x", fx) is None  # development não encerra; o maior em main vence
+        assert pr_final(prs[:1], "merge/feat-development", fx)["number"] == 5 and pr_final(prs[:1], "feat/merge/x", fx) is None
+        assert pr_final(prs, "feat/x", {"producao": "trunk", "ambientes": ["trunk"]}) is None  # a produção vem do projeto, não de um nome fixo
         assert not is_ahead("origin/nope", "feat/x", d, tip)  # HEAD == headRefOid do PR
         assert is_ahead("origin/nope", "feat/x", d, "0" * 40)
         # cherry-pick: sha novo, mesmo patch-id; o cherry não vê commit "+" e a branch é órfã
@@ -208,6 +227,7 @@ def self_test_sujeira():
 
 
 def self_test():
+    PROTECTED.update({"main", "development", "staging"})  # os ambientes do exemplo; no uso real vêm do projeto
     self_test_git()
     self_test_sujeira()
     orfa = dict(branch="feat/o", kept=False, open_head=False, dirty=False, ahead=False, busy=False, recente=False)
@@ -264,6 +284,8 @@ def main():
     cwd = top.stdout.strip()
     # o cwd pode ser uma worktree; o checkout principal é o primeiro de `git worktree list`
     main_path = run(["git", "worktree", "list", "--porcelain"], cwd).stdout.split("\n")[0].removeprefix("worktree ")
+    fx = fluxo_do_repo(main_path)
+    PROTECTED.update(fx["ambientes"], [fx["producao"]])
     items = []
 
     def add(kind, name, action, reason):
@@ -303,7 +325,7 @@ def main():
             try:
                 prs = gh_json(["pr", "list", "--head", b, "--state", "merged", "--json",
                                "number,baseRefName,headRefOid,author"], main_path)
-                merged_cache[b] = pr_final(prs, b)
+                merged_cache[b] = pr_final(prs, b, fx)
             except Exception as e:
                 merged_cache[b] = e
         return merged_cache[b]
@@ -389,7 +411,7 @@ def main():
     seen = set()
     for pr in sorted(mine_merged, key=lambda p: -p["number"]):
         b = pr["headRefName"]
-        if (a.branch and b != a.branch) or not is_final(pr, b):
+        if (a.branch and b != a.branch) or not is_final(pr, b, fx):
             continue
         if b in seen or b not in tips:
             continue

@@ -31,7 +31,7 @@ ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
 LIMPAR = os.environ.get("ORQ_LIMPAR") or os.path.expanduser("~/.claude/scripts/limpar-mergeados.py")
 LIMPAR_ATRASO_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # o mesmo atraso do hook "merged"
-FINAL_BASE = os.environ.get("ORQ_FINAL_BASE") or "main"  # o merge que encerra a branch (o mesmo do limpar-mergeados.py)
+FINAL_BASE = os.environ.get("ORQ_FINAL_BASE")  # força a base que encerra a branch; sem ela vale a produção do projeto (o mesmo do limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
@@ -122,8 +122,8 @@ LEITURA_VELHA_MIN = float(os.environ.get("ORQ_LEITURA_VELHA_MIN") or 10)  # minu
 CHECK_FALHO = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
 WT_PARADA_D = 3  # worktree sem worker e sem atividade há mais que isto entra na linha do `orq status`
 PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
-AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
-WORKFLOW_AMBIENTE = {"development": "development", "staging": "staging", "production": "main"}  # palavra no nome do workflow de deploy -> base a que ele vale
+FLUXOS = ("promocao", "direto")  # promocao: a mesma feature branch abre um PR por ambiente, na ordem; direto: um PR só, para a branch de produção
+BRANCH_SEM_REMOTO = "main"  # a branch padrão quando o remoto não diz qual é (sem origin/HEAD) e o projeto não declara ambientes
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
 TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
 
@@ -2054,15 +2054,17 @@ def _pr_lista_gh(urls):
     return vistos
 
 
-def _workflow_de_outro_ambiente(workflow, base):
-    """True se o nome do workflow é de deploy de um ambiente que não é a base do PR. O GitHub liga o check ao commit, e a mesma branch abre um PR por ambiente."""
-    ambientes = {a for palavra, a in WORKFLOW_AMBIENTE.items() if palavra in (workflow or "").lower()}
-    return bool(base and ambientes and base not in ambientes)
+def _workflow_de_outro_ambiente(workflow, base, fx):
+    """True se o nome do workflow é de deploy de um ambiente do projeto (`fx`, de `fluxo_do_projeto`) que não é a base do PR. O GitHub liga o check ao commit,
+    e a mesma branch abre um PR por ambiente. O nome do ambiente no workflow vale pelo ambiente; "production" vale pela branch de produção do projeto."""
+    nome = (workflow or "").lower()
+    alvos = {a for a in fx["ambientes"] if a.lower() in nome} | ({fx["producao"]} if "production" in nome else set())
+    return bool(base and alvos and base not in alvos)
 
 
-def _ci_do_gh(visto, agora):
+def _ci_do_gh(visto, agora, fx):
     """{mergeable, falhas, rodando, outro_ambiente, lido_em} do que o gh viu de um PR, ou None se a resposta não traz CI nem mergeable (gh sem resposta, `pr view`).
-    Check de workflow de outro ambiente (ex.: o de staging num PR para main) não entra em falhas nem em rodando: o workflow vira `outro_ambiente`, só se falhou."""
+    Check de workflow de outro ambiente (ex.: o do ambiente de teste num PR para a produção) não entra em falhas nem em rodando: o workflow vira `outro_ambiente`, só se falhou."""
     if "mergeable" not in visto and "statusCheckRollup" not in visto:
         return None
     falhas, rodando, outro = [], [], []
@@ -2070,7 +2072,7 @@ def _ci_do_gh(visto, agora):
         if not isinstance(c, dict):
             continue
         nome = c.get("name") or c.get("context") or "?"
-        if _workflow_de_outro_ambiente(c.get("workflowName"), visto.get("baseRefName")):
+        if _workflow_de_outro_ambiente(c.get("workflowName"), visto.get("baseRefName"), fx):
             if c.get("conclusion") in CHECK_FALHO and c["workflowName"] not in outro:
                 outro.append(c["workflowName"])
             continue
@@ -2104,22 +2106,26 @@ def _mutar_prs(fn):
     return out
 
 
-def pr_proximo(itens):
-    """O próximo ambiente da feature, só como sugestão (`pronto para staging`, ou `em main` no fim), ou None.
+def pr_proximo(itens, fx):
+    """O próximo ambiente da feature, só como sugestão (`pronto para <ambiente>`, ou `em <produção>` no fim), ou None.
 
-    Vem do PR mergeado mais adiante em development, staging e main. Com um PR da feature ainda aberto o próximo já está a caminho: None.
-    Com development e staging mergeados e nenhum PR aberto ou em main, o aviso diz que falta só o de main. Nunca abre o PR.
+    `fx` é o fluxo do projeto da feature (`fluxo_do_projeto`). Vem do PR mergeado mais adiante nos ambientes até a produção. Com um PR da feature
+    ainda aberto o próximo já está a caminho: None. Com todos os ambientes antes da produção mergeados e nenhum PR aberto ou na produção, o aviso diz
+    que falta só o da produção. Fluxo direto só conta a produção: nunca pede PR de outro ambiente. Nunca abre o PR.
     O PR `merge/<feature>-<ambiente>` tem o ambiente como base e conta como entrada nele."""
     if any(i["estado"] == "aberto" for i in itens):
         return None
-    indices = [AMBIENTES.index(i["base"]) for i in itens if i["estado"] == "mergeado" and i.get("base") in AMBIENTES]
-    if not indices:
+    prod = fx["producao"]
+    amb = [prod] if fx["fluxo"] == "direto" else fx["ambientes"][:fx["ambientes"].index(prod) + 1]
+    entrou = {i["base"] for i in itens if i["estado"] == "mergeado" and i.get("base") in amb}
+    if not entrou:
         return None
-    if max(indices) == len(AMBIENTES) - 1:
-        return "em main"
-    if max(indices) == len(AMBIENTES) - 2 and AMBIENTES[0] in {i["base"] for i in itens if i["estado"] == "mergeado"}:
-        return f"pronto para {AMBIENTES[-1]} ({' e '.join(AMBIENTES[:-1])} entraram: abrir o de {AMBIENTES[-1]})"
-    return f"pronto para {AMBIENTES[max(indices) + 1]}"
+    if prod in entrou:
+        return f"em {prod}"
+    ultimo = max(amb.index(b) for b in entrou)
+    if ultimo == len(amb) - 2 and amb[0] in entrou:
+        return f"pronto para {prod} ({' e '.join(amb[:-1])} {'entrou' if len(amb) == 2 else 'entraram'}: abrir o de {prod})"
+    return f"pronto para {amb[ultimo + 1]}"
 
 
 def _seg_pr(i):
@@ -2161,11 +2167,13 @@ def _primeiro_paragrafo(texto, limite=120):
 
 
 def fila_auto(item):
-    """Põe o PR recém-ligado na fila de merge. Task com passo aberto (algum PR dela ainda aberto, do mesmo grupo: main ou development/staging):
-    o PR entra nele. Sem passo, abre um: nome do despacho (ou título do PR), e o "por" é o corpo do PR ou, em main, quem já entrou."""
-    task, main = item["task"], item.get("base") == "main"
+    """Põe o PR recém-ligado na fila de merge. Task com passo aberto (algum PR dela ainda aberto, do mesmo grupo: a produção do projeto ou os outros ambientes):
+    o PR entra nele. Sem passo, abre um: nome do despacho (ou título do PR), e o "por" é o corpo do PR ou, na produção, quem já entrou."""
+    task = item["task"]
+    fx = fluxo_da_task(task)
+    main = item.get("base") == fx["producao"]
     desp = [e for e in read_events() if e.get("tipo") == "despacho" and e.get("task") == task and e.get("titulo")]
-    irmaos = [i for i in _prs_ro()["itens"] if i["task"] == task and i["url"] != item["url"] and (i.get("base") == "main") == main]
+    irmaos = [i for i in _prs_ro()["itens"] if i["task"] == task and i["url"] != item["url"] and (i.get("base") == fx["producao"]) == main]
 
     def poe(d):
         meus = {i["numero"] for i in irmaos}
@@ -2175,9 +2183,10 @@ def fila_auto(item):
             append_event({"tipo": "fila", "op": "auto", "passo": achado["passo"], "prs": achado["prs"]})
             return achado
         nome = desp[-1]["titulo"] if desp else item.get("titulo") or f"PR #{item['numero']}"
-        antes = [f"#{i['numero']}" for i in _prs_ro()["itens"] if i["task"] == task and i.get("base") in ("development", "staging") and i["estado"] != "aberto"]
-        por = f"development e staging já entraram ({', '.join(antes)})" if main and antes else item.get("por", "")
-        novo = {"passo": max([p["passo"] for p in d["passos"]], default=0) + 1, "nome": f"{nome} para main" if main else nome, "por": por, "prs": [item["numero"]], "feito": False}
+        anteriores = [i for i in _prs_ro()["itens"] if i["task"] == task and i.get("base") in fx["ambientes"] and i.get("base") != fx["producao"] and i["estado"] != "aberto"]
+        entraram = [a for a in fx["ambientes"] if a in {i["base"] for i in anteriores}]
+        por = f"{' e '.join(entraram)} já entraram ({', '.join('#' + str(i['numero']) for i in anteriores)})" if main and anteriores else item.get("por", "")
+        novo = {"passo": max([p["passo"] for p in d["passos"]], default=0) + 1, "nome": f"{nome} para {fx['producao']}" if main else nome, "por": por, "prs": [item["numero"]], "feito": False}
         d["passos"].append(novo)
         append_event({"tipo": "fila", "op": "auto", "passo": novo["passo"], "nome": novo["nome"], "prs": novo["prs"]})
         return novo
@@ -2250,7 +2259,7 @@ def pr_auto(url, head=None, wt=None, cwd=None):
         wt = wt or (_worktrees_por_ramo(cwd).get(head) if head and cwd else None)
     task = task_do_ramo(head, wt, read_events())
     if not task and head and head.startswith("merge/"):  # branch de conflito: merge/<feature>-<ambiente> é da task da feature
-        task = task_do_ramo(re.sub(r"-(development|staging|main)$", "", head[len("merge/"):]), wt, read_events())
+        task = task_do_ramo(re.sub(rf"-({'|'.join(map(re.escape, _ambientes_conhecidos()))})$", "", head[len("merge/"):]), wt, read_events())
     item = pr_ligar(task, url) if task else pr_orfao(url, head)
     if task:
         fila_auto(item)
@@ -2283,6 +2292,7 @@ def linhas_pr(agora=None):
     """Uma linha por feature para o `orq status`: os PRs com o ambiente de cada um e a sugestão do próximo. Feature com tudo resolvido há
     mais de PR_VISIVEL_D dias sai. Só lê o prs.json."""
     agora = agora or datetime.now(timezone.utc)
+    eventos = read_events()
     por_task = {}
     for i in _prs_ro()["itens"]:
         por_task.setdefault(i["task"], []).append(i)
@@ -2290,7 +2300,7 @@ def linhas_pr(agora=None):
     for task, itens in por_task.items():
         if _pr_antigo(itens, agora):
             continue
-        prox = pr_proximo(itens)
+        prox = pr_proximo(itens, fluxo_da_task(task, eventos))
         linhas.append(f"PR {task}: " + " · ".join(_seg_pr(i) for i in itens) + (f" → {prox}" if prox else ""))
     linhas += [f"PR sem tarefa: #{x.get('numero')} ({x.get('head') or '?'}) {x['url']}: `orq pr ligar <task> {x['url']}`"
                for x in _prs_ro().get("sem_task") or [] if isinstance(x, dict) and x.get("url")]
@@ -2435,25 +2445,26 @@ def _aplica_prs(d, vistos, agora):
     """Passa ao estado novo cada PR aberto que o gh viu mergeado ou fechado: um evento `pr` e uma entrada `pr` por PR, uma vez só (o `ref` da
     entrada é a URL, então repetir a passagem não a duplica). Devolve as linhas do que mudou."""
     d["ultimo_poll"] = agora
-    ja = {e.get("ref") for e in read_events() if e.get("origem") == "pr"}
+    eventos = read_events()
+    ja = {e.get("ref") for e in eventos if e.get("origem") == "pr"}
     linhas = []
     for i in d["itens"]:
         visto = _dict(vistos.get(i["url"]))
         novo = _estado_do_gh(visto)
         if i["estado"] == "aberto" and not novo:
-            ci = _ci_do_gh(visto, agora)
+            ci = _ci_do_gh(visto, agora, fluxo_da_task(i["task"], eventos))
             i.update(**({"ci": ci} if ci else {}), **({"head": visto["headRefName"]} if visto.get("headRefName") else {}))
         if i["estado"] != "aberto" or not novo:
             i["base"] = visto.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
         i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now())
-        prox = pr_proximo([x for x in d["itens"] if x["task"] == i["task"]])
+        prox = pr_proximo([x for x in d["itens"] if x["task"] == i["task"]], fluxo_da_task(i["task"]))
         onde = f"{i['task']}" + (f", issue #{i['issue']}" if i.get("issue") else "")
         texto = f"PR #{i['numero']} entrou em {i['base']} ({onde})" + (f": {prox}" if prox else "") if novo == "mergeado" \
             else f"PR #{i['numero']} fechado sem merge (base {i['base']}, {onde})"
         append_event({"tipo": "pr", "op": "entrou" if novo == "mergeado" else "fechou", "task": i["task"], "url": i["url"], "numero": i["numero"],
                       "base": i["base"], **({"proximo": prox} if prox else {})})
-        if novo == "mergeado" and i["base"] == FINAL_BASE:
+        if novo == "mergeado" and i["base"] == (FINAL_BASE or fluxo_da_task(i["task"], eventos)["producao"]):
             _limpar_pos_merge(i, visto.get("headRefName") or i.get("head"))
         if i["url"] in ja:
             i["avisado"] = True
@@ -2462,7 +2473,7 @@ def _aplica_prs(d, vistos, agora):
         i.update(entrada=ent["id"], texto=texto, avisado=False)
         if novo == "mergeado":
             tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_FECHADO), None)
-            for chave, txt in obrigacoes_do_merge(i, prox, tk):
+            for chave, txt in obrigacoes_do_merge(i, prox, tk, fluxo_da_task(i['task'], eventos)):
                 append_event({"tipo": "obrigacao", "op": "nova", "entrada": ent["id"], "chave": chave, "texto": txt, "task": i["task"],
                               **({"ticket": tk["num"]} if chave == "ticket" else {})})
         linhas.append(f"{i['task']}: {texto}")
@@ -2526,20 +2537,21 @@ OBRIGACAO_MIN = float(os.environ.get("ORQ_OBRIGACAO_MIN") or 10)  # obrigação 
 # o que o merge de um PR pede ao coordenador, pela base (README, "Obrigações dos avisos"). Obrigação que cita um campo sem valor não nasce:
 # sem issue não há comentário, sem ticket aberto da task não há o que fechar, sem próximo ambiente sugerido não há PR a abrir.
 _PROXIMO = ("proximo", "abrir o PR de {proximo}, ou adiar com o motivo de segurar")
-OBRIGACOES = {
-    "main": (("deploy", "conferir o deploy de produção (quave-one)"), ("comentario", "atualizar o comentário da #{issue}"),
-             ("limpeza", "conferir que a branch e a worktree saíram"), ("ticket", "fechar o ticket {ticket}")),
-    "staging": (("deploy", "conferir o deploy de staging"), _PROXIMO),
-    "development": (("deploy", "conferir o deploy de development"), _PROXIMO),
-}
+OBRIGACOES_PRODUCAO = (("deploy", "conferir o deploy de produção (quave-one)"), ("comentario", "atualizar o comentário da #{issue}"),
+                       ("limpeza", "conferir que a branch e a worktree saíram"), ("ticket", "fechar o ticket {ticket}"))
+OBRIGACOES_AMBIENTE = (("deploy", "conferir o deploy de {base}"), _PROXIMO)  # os ambientes antes da produção
 
 
-def obrigacoes_do_merge(i, prox, tk=None):
-    """[(chave, texto)] do que o merge do PR `i` pede (OBRIGACOES). A issue vem do `orq pr ligar --issue` ou da `issue:` do ticket `tk` da task."""
+def obrigacoes_do_merge(i, prox, tk=None, fx=None):
+    """[(chave, texto)] do que o merge do PR `i` pede: a lista da produção quando a base é a produção do projeto (`fx`, de `fluxo_da_task`), a dos outros
+    ambientes quando é um deles, nada para outra base. A issue vem do `orq pr ligar --issue` ou da `issue:` do ticket `tk` da task."""
+    fx = fx or fluxo_da_task(i.get("task"))
+    base = i.get("base")
+    tabela = OBRIGACOES_PRODUCAO if base == fx["producao"] else OBRIGACOES_AMBIENTE if base in fx["ambientes"] else ()
     issue = i.get("issue") or (tk or {}).get("issue")
-    m = re.match(r"pronto para (\w+)", prox or "")
-    vals = {"issue": issue, "ticket": (tk or {}).get("num"), "proximo": m.group(1) if m else None}
-    return [(k, t.format(**vals)) for k, t in OBRIGACOES.get(i.get("base"), ())
+    m = re.match(r"pronto para (\S+)", prox or "")
+    vals = {"issue": issue, "ticket": (tk or {}).get("num"), "proximo": m.group(1) if m else None, "base": base}
+    return [(k, t.format(**vals)) for k, t in tabela
             if all(vals.get(c) for c in re.findall(r"\{(\w+)\}", t))]
 
 
@@ -2668,7 +2680,6 @@ FILA = "fila.json"  # {passos: [{passo, nome, por, prs: [números], feito}]}: a 
 ESTADO_GH = {"aberto": "OPEN", "mergeado": "MERGED", "fechado": "CLOSED"}  # o estado do PR no contrato do digest
 TRANSCRITO_FIM = 400_000  # bytes do fim do transcrito onde o Stop procura a última resposta do coordenador
 RESPOSTA_MAX = 4000  # caracteres da resposta do coordenador que vão para o log
-DIGEST_BASE = {"development": "d", "staging": "s", "main": "p"}  # a cor do ponto de cada ambiente
 DIGEST_ESTADO = {"MERGED": ("m", "merged"), "CLOSED": ("x", "fechado"), "OPEN": ("o", "aberto")}
 DIGEST_CSS = """:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e4e4e0;--dev:#2f6fdb;--stg:#b7791f;--ok:#2e8b57;--warn:#c2410c;--sec:#b91c1c;--chip:#f0efeb}
 @media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1d1d20;--ink:#ededed;--mute:#9a9aa2;--line:#2c2c31;--chip:#26262b}}
@@ -2694,9 +2705,23 @@ ol.tl b{font-weight:600}ol.tl p{margin:2px 0 0;color:var(--mute);font-size:13.5p
 code{font-size:12.5px;background:var(--chip);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}"""
 
 
-def _passo_feito(itens):
-    """A feature acabou: tem PR, nenhum está aberto e não falta promover (entrou em main, ou só restam PRs fechados)."""
-    return bool(itens) and all(i["estado"] != "aberto" for i in itens) and pr_proximo(itens) in (None, "em main")
+def _amb_pos(fx, base):
+    """A posição da base entre os ambientes do fluxo (o ordem da promoção); base desconhecida vai para o fim."""
+    return fx["ambientes"].index(base) if base in fx["ambientes"] else len(fx["ambientes"])
+
+
+def _pontos(fluxos):
+    """{branch: classe do ponto} dos ambientes dos fluxos, na ordem em que aparecem: produção `p`, o primeiro ambiente `d`, os do meio `s`."""
+    pontos = {}
+    for fx in fluxos:
+        for b in fx["ambientes"]:
+            pontos.setdefault(b, "p" if b == fx["producao"] else "d" if b == fx["ambientes"][0] else "s")
+    return pontos
+
+
+def _passo_feito(itens, fx):
+    """A feature acabou: tem PR, nenhum está aberto e não falta promover (entrou na produção, ou só restam PRs fechados)."""
+    return bool(itens) and all(i["estado"] != "aberto" for i in itens) and pr_proximo(itens, fx) in (None, f"em {fx['producao']}")
 
 
 def ordem_de_merge(grupos, ts):
@@ -2943,15 +2968,16 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
     por_task_prs = {}
     for i in prs.get("itens") or []:
         por_task_prs.setdefault(i["task"], []).append(i)
+    fx = {task: fluxo_da_task(task, events) for task in por_task_prs}
     grupos = [{"task": task, "ligado_em": min(i.get("ligado_em") or "" for i in itens),
-               "itens": sorted(itens, key=lambda i: (AMBIENTES.index(i["base"]) if i.get("base") in AMBIENTES else len(AMBIENTES), i.get("numero") or 0))}
+               "itens": sorted(itens, key=lambda i: (_amb_pos(fx[task], i.get("base")), i.get("numero") or 0))}
               for task, itens in por_task_prs.items() if not _pr_antigo(itens, agora)]
     titulo = {g["task"]: _dict(por_task.get(g["task"])).get("titulo") or g["task"] for g in grupos}
-    feito = {g["task"]: _passo_feito(g["itens"]) for g in grupos}
+    feito = {g["task"]: _passo_feito(g["itens"], fx[g["task"]]) for g in grupos}
     ordem = ordem_de_merge(grupos, ts)
     derivada = [{"passo": n, "nome": titulo[g["task"]], "por": (f"Espera: {', '.join(titulo[t] for t in g['espera'] if not feito[t])}." if [t for t in g["espera"] if not feito[t]] else ""),
                  "prs": [_pr_contrato(i) for i in g["itens"]], "feito": feito[g["task"]], "ticket": _dict(por_task.get(g["task"])).get("num"),
-                 "proximo": None if feito[g["task"]] else pr_proximo(g["itens"]), "ciclo": g["ciclo"]} for n, g in enumerate(ordem, 1)]
+                 "proximo": None if feito[g["task"]] else pr_proximo(g["itens"], fx[g["task"]]), "ciclo": g["ciclo"]} for n, g in enumerate(ordem, 1)]
     declarada = _passos_declarados(fila, prs)
     proximo_passo = _marca_passos(declarada or derivada, prs)
     features = []
@@ -2973,7 +2999,8 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
             "fila": declarada or derivada, "proximoPasso": proximo_passo, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando, "maquina": maquina,
             "tickets_orq": tickets_do_painel(ts, aberto),
             "pagina": {"data": agora.astimezone().strftime("%Y-%m-%d"), "gerado": agora.astimezone().strftime("%H:%M"), "desde": desde, "poll": prs.get("ultimo_poll"),
-                       "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada)}}
+                       "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada),
+                       "pontos": _pontos(list(fx.values()) or [fluxo_da_task(None, events)])}}
 
 
 def digest_json(d):
@@ -2992,7 +3019,7 @@ def html_digest(d):
     def chip(i):
         cls, nome = DIGEST_ESTADO.get(i["estado"], ("o", i["estado"]))
         return (f'<a class="pr {cls}" href="{e(i["url"])}" title="{e(i.get("base") or "base ainda desconhecida")}">'
-                f'<span class="dot {DIGEST_BASE.get(i.get("base"), "d")}"></span>#{e(str(i.get("numero")))}<em>{nome}</em></a>')
+                f'<span class="dot {pg["pontos"].get(i.get("base"), "d")}"></span>#{e(str(i.get("numero")))}<em>{nome}</em></a>')
 
     passos = []
     for g in d["fila"]:
@@ -3013,12 +3040,14 @@ def html_digest(d):
             if isinstance(pg.get("poll"), (int, float)) else "O estado dos PRs ainda não foi lido por nenhum poll (`orq pr poll`); esta página não consulta o GitHub.")
     desde = f"Desde as {_hora_local(pg['desde'])}." if pg["desde"] else "Desde o início do log."
     retro = ('<h2>Falhas por rodada do retro</h2><ul class="sub">' + "".join(f'<li>até {e(r["ate"][:10])}: {r["falhas"]} falha(s)</li>' for r in d["retro"]) + "</ul>") if d.get("retro") else ""
+    legenda = "".join(f'<span><span class="dot {c}"></span> {e(n)}</span>' for n, c in pg["pontos"].items())
+    antes_de = [n for n, c in pg["pontos"].items() if c != "p"]  # a ordem dos ambientes antes da produção, dentro de cada passo
+    depois = f" Dentro de cada passo, {' antes de '.join(antes_de)}." if len(antes_de) > 1 else ""
     return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Digest {e(pg["data"])}</title><style>{DIGEST_CSS}</style></head><body><main>'
             f'<h1>O que espera você</h1><p class="sub">{e(pg["data"])}. {e(desde)} Gerado às {e(pg["gerado"])}. {e(poll)}</p>'
-            '<div class="legend"><span><span class="dot d"></span> development</span><span><span class="dot s"></span> staging</span>'
-            '<span><span class="dot p"></span> main</span></div>'
-            f'<h2>Ordem de merge</h2><p class="sub">{e(origem_)} Dentro de cada passo, development antes de staging.</p>'
+            f'<div class="legend">{legenda}</div>'
+            f'<h2>Ordem de merge</h2><p class="sub">{e(origem_)}{depois}</p>'
             f'{fila}<h2>Com você</h2>{f"<div class=grid>{pend}</div>" if pend else "<p class=sub>Nada esperando por você.</p>"}'
             f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}{vagas}'
             f'<h1 style="margin-top:36px">O que aconteceu</h1>{antes}'
@@ -3880,8 +3909,8 @@ def hook_lugar(ev, run):
         aviso = f"o cwd está na worktree {topo}, que parece ser de um worker"
     else:
         ramo = (_git(d, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
-        padrao = (_git(d, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "main").strip().split("/", 1)[-1]
-        if ramo in (padrao, "main", "master"):
+        padrao = branch_padrao(d)
+        if ramo in (padrao, BRANCH_SEM_REMOTO, "master"):
             return None
         aviso = f"o checkout principal está em {ramo}, não em {padrao}"
     msg = f"{MARCA} lugar errado? {aviso}. Confira `git status --short --branch` e o cwd antes de escrever (aviso, nada foi bloqueado)."
@@ -6297,11 +6326,29 @@ def _raiz_do_repo(d):
     return os.path.realpath(os.path.dirname(comum)) if comum else None
 
 
-def projetos():
-    """Os arquivos ORQ_HOME/projects/<nome>.json, lidos a cada chamada (sem cache): {nome: {"repo", "harness", "grupo", "erro"}}.
+def _ambientes_do_arquivo(d):
+    """(branches, produção, fluxo, erro) do bloco `ambientes` e do `fluxo` de um arquivo de projeto. Sem o bloco: (None, None, None, None) ou só o erro do fluxo."""
+    bloco, fluxo = d.get("ambientes"), d.get("fluxo")
+    if fluxo is not None and fluxo not in FLUXOS:
+        return None, None, None, f"fluxo {fluxo!r} não existe ({', '.join(FLUXOS)})"
+    if bloco is None:
+        return None, None, None, "fluxo sem ambientes: declare o bloco `ambientes`" if fluxo == "promocao" else None
+    if not isinstance(bloco, list) or not bloco or not all(isinstance(b, dict) and isinstance(b.get("branch"), str) and b["branch"] for b in bloco):
+        return None, None, None, 'ambientes malformado (esperado uma lista não vazia de {"branch": "<nome>", "producao": true?})'
+    branches = [b["branch"] for b in bloco]
+    marcadas = [b["branch"] for b in bloco if b.get("producao")]
+    if len(set(branches)) != len(branches) or len(marcadas) > 1:
+        return None, None, None, "ambientes repete uma branch ou marca mais de uma como produção"
+    return branches, (marcadas or branches[-1:])[0], fluxo or ("promocao" if len(branches) > 1 else "direto"), None
 
-    Só `repo` é obrigatório; `harness` ausente vale claude e `grupo` só agrupa a listagem. Arquivo ilegível, sem `repo` ou com harness que o orq não
-    despacha fica na lista com `erro` (o `orq projetos` mostra o motivo) e nunca é escolhido sozinho."""
+
+def projetos():
+    """Os arquivos ORQ_HOME/projects/<nome>.json, lidos a cada chamada (sem cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "erro"}}.
+
+    Só `repo` é obrigatório; `harness` ausente vale claude e `grupo` só agrupa a listagem. `ambientes` é a lista ordenada `[{"branch", "producao"?}]` do
+    projeto (a de produção é a marcada, senão a última) e `fluxo` é `promocao` ou `direto`; sem o bloco `ambientes` vem None e vale o padrão do remoto
+    (`fluxo_do_projeto`). Arquivo ilegível, sem `repo`, com harness que o orq não despacha ou com ambientes malformados fica na lista com `erro`
+    (o `orq projetos` mostra o motivo) e nunca é escolhido sozinho."""
     pasta, achados = _path("projects"), {}
     for f in sorted(os.listdir(pasta)) if os.path.isdir(pasta) else []:
         if not f.endswith(".json"):
@@ -6311,13 +6358,14 @@ def projetos():
             with open(os.path.join(pasta, f)) as fh:
                 d = json.load(fh)
         except (OSError, ValueError) as e:
-            achados[nome] = {"repo": None, "harness": None, "grupo": None, "erro": f"json ilegível ({type(e).__name__})"}
+            achados[nome] = {"repo": None, "harness": None, "grupo": None, "ambientes": None, "producao": None, "fluxo": None, "erro": f"json ilegível ({type(e).__name__})"}
             continue
         d = _dict(d)
         harness = d.get("harness") or "claude"
+        amb, producao, fluxo, erro_amb = _ambientes_do_arquivo(d)
         erro = ("sem repo (o seletor do Orca: path:, id: ou name:)" if not isinstance(d.get("repo"), str) or not d["repo"] else
-                f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else None)
-        achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "erro": erro}
+                f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else erro_amb)
+        achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": amb, "producao": producao, "fluxo": fluxo, "erro": erro}
     return achados
 
 
@@ -6366,6 +6414,47 @@ def projeto_do_despacho(nome=None, run=None):
     return projeto_por_pasta(ps, cwd) or (projeto_por_pasta(ps, _raiz_do_repo(cwd) or cwd) if ps else None)
 
 
+def branch_padrao(pasta):
+    """A branch padrão do remoto de `pasta` (`origin/HEAD`); sem ela, BRANCH_SEM_REMOTO."""
+    ref = (_git(pasta, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "").strip()
+    return ref.split("/", 1)[-1] if ref else BRANCH_SEM_REMOTO
+
+
+def fluxo_do_projeto(nome):
+    """{ambientes: [branch...], producao, fluxo, declarado}: o que o arquivo do projeto declara. Sem projeto, ou sem o bloco `ambientes`, o padrão é um
+    ambiente só, a branch padrão do remoto do repo (a pasta do projeto, ou o cwd), com fluxo direto; `declarado` diz qual dos dois."""
+    d = projetos().get(nome) or {}
+    if d.get("ambientes") and not d.get("erro"):
+        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True}
+    padrao = branch_padrao((d.get("repo") and pasta_do_repo(d["repo"])) or os.getcwd())
+    return {"ambientes": [padrao], "producao": padrao, "fluxo": "direto", "declarado": False}
+
+
+def _ambientes_conhecidos():
+    """Todo nome de ambiente que algum projeto declara, mais a branch padrão do cwd: o sufixo de uma branch merge/<feature>-<ambiente> é um deles."""
+    nomes = {a for p in projetos().values() for a in p.get("ambientes") or ()} | set(fluxo_do_projeto(None)["ambientes"])
+    return sorted(nomes, key=len, reverse=True)
+
+
+def fluxo_do_repo(pasta):
+    """O fluxo do projeto cujo repositório contém `pasta`; sem projeto, o padrão da `pasta` (a branch padrão do remoto dela, um ambiente só)."""
+    pasta, ps = os.path.realpath(pasta), projetos()
+    nome = projeto_por_pasta(ps, pasta) or (projeto_por_pasta(ps, _raiz_do_repo(pasta) or pasta) if ps else None)
+    if nome:
+        return fluxo_do_projeto(nome)
+    padrao = branch_padrao(pasta)
+    return {"ambientes": [padrao], "producao": padrao, "fluxo": "direto", "declarado": False}
+
+
+def fluxo_da_task(task, eventos=None):
+    """O fluxo do projeto da feature (task): o do Run que a despachou (`orq run projeto`), senão o do projeto que contém o cwd, senão o padrão."""
+    run = next((e.get("run") for e in reversed(read_events() if eventos is None else eventos) if e.get("tipo") == "despacho" and e.get("task") == task), None)
+    try:
+        return fluxo_do_projeto(projeto_do_despacho(None, run))
+    except ValueError:  # o Run aponta para um arquivo que sumiu ou ficou inválido: o padrão, sem derrubar o status
+        return fluxo_do_projeto(None)
+
+
 def pasta_do_repo(seletor):
     """A pasta do repositório que um seletor do Orca aponta: `path:` direto; `id:` e `name:` pelo `orca repo list`. None se não achar."""
     tipo, _, valor = seletor.partition(":")
@@ -6409,6 +6498,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         repo = None  # projeto achado só pelo cwd: o worktree current já é do mesmo repo
     elif repo:
         worktree = "new-top-level"
+    if projeto and worktree == "new-top-level" and not base_branch and fluxo_do_projeto(projeto)["declarado"]:
+        base_branch = f"origin/{fluxo_do_projeto(projeto)['producao']}"  # o projeto que declara ambientes nasce da produção (a branch de trabalho só recebe código dela)
     if agente not in HARNESS:
         raise ValueError(f"--agente {agente}: o orq só despacha {', '.join(HARNESSES)}")
     if effort not in HARNESS[agente]["efforts"]:
@@ -8610,7 +8701,7 @@ def main(argv=None):
     st.add_argument("--run")
     st.add_argument("--entrada")
     pr = sub.add_parser("pr", help="PRs de cada feature ligados à task: ligar, lista, desligar, poll (o poll roda fora dos hooks)").add_subparsers(dest="op", required=True)
-    pl2 = pr.add_parser("ligar", help="orq pr ligar <task> <url> [--issue N]: registra o PR da feature (development, staging, main ou merge/)")
+    pl2 = pr.add_parser("ligar", help="orq pr ligar <task> <url> [--issue N]: registra o PR da feature (um por ambiente do projeto, ou merge/<feature>-<ambiente>)")
     pl2.add_argument("task")
     pl2.add_argument("url")
     pl2.add_argument("--issue", type=int, help="número da issue do GitHub, quando houver")
@@ -8716,8 +8807,11 @@ def main(argv=None):
     rp = sub.add_parser("run", help="o que o orq guarda de um Run").add_subparsers(dest="op", required=True).add_parser("projeto", help="liga o Run a um projeto de ORQ_HOME/projects: os despachos dele sobem no repo do projeto")
     rp.add_argument("nome")
     rp.add_argument("--run")
-    pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo)")
+    pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo, ambientes)")
     pj.add_argument("--json", action="store_true")
+    fl = sub.add_parser("fluxo", help="os ambientes e a produção do projeto que contém --repo (o limpar-mergeados.py lê daqui)")
+    fl.add_argument("--repo", default=".")
+    fl.add_argument("--json", action="store_true")
     de.add_argument("--servico", action="store_true", help="worker de serviço (integrador, secondmate): segue vivo depois do worker_done e reporta cada ciclo com orq ciclo feito")
     cc = sub.add_parser("ciclo", help="worker de serviço: reporta um ciclo terminado (sem capability do Orca)").add_subparsers(dest="op", required=True)
     cf = cc.add_parser("feito", help="orq ciclo feito --dispatch <id> --hash <commit> [--nota <texto>]")
@@ -8961,12 +9055,16 @@ def main(argv=None):
             if not run:
                 raise ValueError("sem Run ligado: passe --run")
             print(json.dumps(run_guardar_projeto(run, a.nome), ensure_ascii=False))
+        elif a.cmd == "fluxo":
+            fx = fluxo_do_repo(a.repo)
+            print(json.dumps(fx, ensure_ascii=False) if a.json else f"produção {fx['producao']}; ambientes {', '.join(fx['ambientes'])}; fluxo {fx['fluxo']}" + ("" if fx["declarado"] else " (padrão: sem bloco ambientes)"))
         elif a.cmd == "projetos":
             ps = projetos()
             if a.json:
                 print(json.dumps([{"nome": n, **d} for n, d in ps.items()], ensure_ascii=False))
             else:
                 print("\n".join(f"{n}  {d['repo'] or '-'}  {d['harness'] or '-'}" + (f"  grupo {d['grupo']}" if d["grupo"] else "") +
+                                (f"  ambientes {' > '.join(d['ambientes'])} ({d['fluxo']}, produção {d['producao']})" if d["ambientes"] else "") +
                                 (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
         elif a.cmd == "ciclo":
             print(json.dumps(ciclo_feito(a.dispatch, a.hash, a.nota), ensure_ascii=False))

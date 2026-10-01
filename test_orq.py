@@ -435,8 +435,8 @@ class Amb:
             json.dump({"mem_livre_mb": mem_livre_mb, "livre_pct": livre_pct, "carga": carga, "ncpu": 12, "rss_mb": {"claude": 900, "codex": 0, "node": 1500, "docker": 2000},
                        **({"processos": processos} if processos else {})}, f)
 
-    def orq(self, *args, stdin=None, **env):
-        return subprocess.run([sys.executable, ORQ, *args], input=stdin, capture_output=True, text=True,
+    def orq(self, *args, stdin=None, cwd=None, **env):
+        return subprocess.run([sys.executable, ORQ, *args], input=stdin, capture_output=True, text=True, cwd=cwd,
                               env={**self.env, **env}, timeout=30)
 
     def prompt(self, texto, **env):
@@ -7084,8 +7084,16 @@ def _gh_chamadas(a):
     return _log(a, "gh.log")
 
 
+def _neo(a):
+    """O arquivo de projeto de três ambientes (development, staging, main), achado pelo cwd: o git flow que os testes de PR sempre supuseram."""
+    os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
+        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao"}, f)
+
+
 def _prs_env(**env):
     a = Amb(run="run_a", **env)
+    _neo(a)
     _gh(a)
     _pr(a, PR1)
     return a
@@ -7377,6 +7385,7 @@ def _prs_json(a):
 def _ambiente_46(**env):
     """Coordenador com gh falso e um worker cuja worktree é a `wt` (branch feat/w) do repo de teste; devolve (a, principal, worktree)."""
     a = Amb(run="run_a", **env)
+    _neo(a)
     _gh(a)
     _pr(a, PR1)
     a.prompt("oi")
@@ -7544,6 +7553,7 @@ PR3 = "https://github.com/acme/app/pull/1230"
 def _digest_env(**env):
     """Dois tickets (02 depende do 01), PRs ligados fora de ordem, uma pendência, um worker rodando e um log com uma janela."""
     a = Amb(run="run_a", **env)
+    _neo(a)
     _gh(a)
     _tk_arq(a, "01", "Base de auth", "task_a")
     _tk_arq(a, "02", "Tela nova", "task_b", "01")
@@ -7788,6 +7798,7 @@ def _ck(nome, conclusao="SUCCESS", status="COMPLETED"):
 def _fila_ci(**por_pr):
     """Dois PRs (1216 e 1220) em dois passos; cada PR lê o `mergeable` e os checks dados e o poll roda uma vez."""
     a = Amb(run="run_a")
+    _neo(a)
     _gh(a)
     for url, k in ((PR1, "pr1"), (PR2, "pr2")):
         _pr(a, url, "OPEN", "development", **{"mergeable": "MERGEABLE", "statusCheckRollup": [_ck("lint")], "headRefName": "feat/" + k, **por_pr.get(k, {})})
@@ -12346,6 +12357,216 @@ def test_ticket107_with_away_mode_the_notice_is_typed_keeping_the_old_guards():
             assert orq_mod.avisa_coordenador("term_c", "orq: b") == "enviado" and enviados == ["orq: b"]
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+# ---- ticket 115: ambientes (branches) declarados por projeto ----
+
+def _repo_remoto(a, padrao):
+    """Um repo git com origin/HEAD apontando para `padrao`; devolve a pasta."""
+    d = os.path.join(a.tmp.name, "repo-" + padrao)
+    os.makedirs(d)
+    g = lambda *x: subprocess.run(["git", "-C", d, *x], check=True, capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                                                                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    g("init", "-q", "-b", padrao)
+    g("commit", "-q", "--allow-empty", "-m", "x")
+    g("update-ref", f"refs/remotes/origin/{padrao}", "HEAD")
+    g("symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{padrao}")
+    return d
+
+
+def _status_pr(a, cwd=None):
+    (linha,) = [x for x in a.orq("status", cwd=cwd).stdout.splitlines() if x.startswith("PR task_")]
+    return linha
+
+
+def _entrou(a, url, base, cwd=None):
+    _pr(a, url, "MERGED", base)
+    assert a.orq("pr", "ligar", "task_feat1", url, cwd=cwd).returncode == 0
+    assert a.orq("pr", "poll", "--forcar", cwd=cwd).returncode == 0
+
+
+def test_ticket115_projeto_com_dev_e_main_diz_pronto_para_main_depois_do_pr_de_dev():
+    a = Amb(run="run_a")
+    _gh(a)
+    _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "dev"}, {"branch": "main", "producao": True}], "fluxo": "promocao"})
+    _entrou(a, PR1, "dev")
+    linha = _status_pr(a)
+    assert "pronto para main (dev entrou: abrir o de main)" in linha and "staging" not in linha, linha
+    _entrou(a, PR2, "main")
+    assert "em main" in _status_pr(a) and "pronto para" not in _status_pr(a)
+
+
+def test_ticket115_projeto_so_com_main_e_fluxo_direto_nao_pede_pr_de_outro_ambiente():
+    a = Amb(run="run_a")
+    _gh(a)
+    _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "main", "producao": True}], "fluxo": "direto"})
+    _entrou(a, PR1, "release")  # um PR para outra base não promove nada
+    assert "pronto para" not in _status_pr(a), _status_pr(a)
+    _entrou(a, PR2, "main")
+    assert "em main" in _status_pr(a) and "pronto para" not in _status_pr(a)
+
+
+def test_ticket115_fluxo_direto_com_ambientes_declarados_so_conta_a_producao():
+    a = Amb(run="run_a")
+    _gh(a)
+    _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "main", "producao": True}], "fluxo": "direto"})
+    _entrou(a, PR1, "development")
+    assert "pronto para" not in _status_pr(a), _status_pr(a)
+
+
+def test_ticket115_projeto_sem_bloco_usa_a_branch_padrao_do_remoto_com_fluxo_direto():
+    a = Amb(run="run_a")
+    _gh(a)
+    d = _repo_remoto(a, "trunk")
+    _projeto(a, "app", {"repo": f"path:{d}"})
+    _entrou(a, PR1, "development", cwd=d)
+    assert "pronto para" not in _status_pr(a, d), "sem bloco só a branch padrão do remoto conta: " + _status_pr(a, d)
+    _entrou(a, PR2, "trunk", cwd=d)
+    assert "em trunk" in _status_pr(a, d), _status_pr(a, d)
+
+
+def test_ticket115_projeto_de_tres_ambientes_segue_com_os_textos_de_hoje():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    assert "#1216 development ✓ → pronto para staging" in _linha_pr(a), _linha_pr(a)
+    _entrou(a, PR2, "staging")
+    assert "pronto para main (development e staging entraram: abrir o de main)" in _linha_pr(a), _linha_pr(a)
+    _, h = _html_com_pr(a)
+    assert '<span><span class="dot d"></span> development</span><span><span class="dot s"></span> staging</span><span><span class="dot p"></span> main</span>' in h
+    assert "Dentro de cada passo, development antes de staging." in h
+
+
+def _html_com_pr(a):
+    r = a.orq("digest", "--html")
+    assert r.returncode == 0, r.stderr
+    (caminho,) = [l for l in r.stdout.splitlines() if l.endswith(".html")]
+    return r, open(caminho).read()
+
+
+def test_ticket115_digest_de_projeto_dev_main_leva_a_legenda_do_projeto():
+    a = Amb(run="run_a")
+    _gh(a)
+    _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "dev"}, {"branch": "main", "producao": True}]})
+    _entrou(a, PR1, "dev")
+    _, h = _html_com_pr(a)
+    assert '<span class="dot d"></span> dev</span><span><span class="dot p"></span> main</span>' in h and "staging" not in h and "Dentro de cada passo" not in h, h[h.index("legend"):][:300]
+
+
+def test_ticket115_projetos_valida_os_ambientes_e_lista_o_fluxo():
+    a = Amb(run="run_a")
+    _projeto(a, "bom", {"repo": "path:/r/bom", "ambientes": [{"branch": "dev"}, {"branch": "main", "producao": True}]})
+    _projeto(a, "malformado", {"repo": "path:/r/m", "ambientes": ["dev"]})
+    _projeto(a, "duas-producoes", {"repo": "path:/r/d", "ambientes": [{"branch": "a", "producao": True}, {"branch": "b", "producao": True}]})
+    _projeto(a, "fluxo-ruim", {"repo": "path:/r/f", "fluxo": "cascata"})
+    out = a.orq("projetos").stdout.splitlines()
+    assert any(l.startswith("bom") and "ambientes dev > main (promocao, produção main)" in l and "inválido" not in l for l in out), out
+    for nome, motivo in (("malformado", "ambientes"), ("duas-producoes", "produção"), ("fluxo-ruim", "cascata")):
+        assert any(l.startswith(nome) and "inválido" in l and motivo in l for l in out), (nome, out)
+    js = {p["nome"]: p for p in json.loads(a.orq("projetos", "--json").stdout)}
+    assert js["bom"]["ambientes"] == ["dev", "main"] and js["bom"]["producao"] == "main" and js["bom"]["fluxo"] == "promocao", js["bom"]
+
+
+def test_ticket115_worktree_nova_nasce_da_producao_do_projeto_que_declara_ambientes():
+    a = Amb(run="run_a")
+    _projeto(a, "app", {"repo": "path:/r/app", "ambientes": [{"branch": "dev"}, {"branch": "release", "producao": True}]})
+    _projeto(a, "sem-bloco", {"repo": "path:/r/sem"})
+    assert _despachar(a, "--projeto", "app").returncode == 0
+    assert _despachar(a, "--projeto", "app", "--base-branch", "origin/dev").returncode == 0
+    assert _despachar(a, "--projeto", "sem-bloco").returncode == 0
+    base = lambda arg: arg[arg.index("--base-branch") + 1] if "--base-branch" in arg else None
+    assert [base(x) for x in _log(a, "started.log")] == ["origin/release", "origin/dev", None]
+
+
+def _vira_mergeado(a, url, base):
+    """Liga o PR aberto e só depois o dá como mergeado: a entrada e as obrigações nascem na passagem do poll."""
+    _pr(a, url, "OPEN", base, headRefName="fix/x")
+    assert a.orq("pr", "ligar", "task_feat1", url).returncode == 0
+    _pr(a, url, "MERGED", base, headRefName="fix/x")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+
+
+def _projeto_dev_trunk(a):
+    _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "dev"}, {"branch": "trunk", "producao": True}], "fluxo": "promocao"})
+
+
+def test_ticket115_obrigacoes_do_merge_leem_a_producao_e_os_ambientes_do_projeto_e_nao_main():
+    a = Amb(run="run_a")
+    _gh(a)
+    _limpar_falso(a)
+    _projeto_dev_trunk(a)
+    _vira_mergeado(a, PR1, "dev")
+    textos = [o["texto"] for o in orq_mod.obrigacoes_abertas(a.events())]
+    assert "conferir o deploy de dev" in textos and any("trunk" in t for t in textos), textos
+    assert not any("produção" in t for t in textos), "dev não é a produção do projeto"
+    _vira_mergeado(a, PR2, "trunk")
+    textos = [o["texto"] for o in orq_mod.obrigacoes_abertas(a.events())]
+    assert "conferir o deploy de produção (quave-one)" in textos and "conferir que a branch e a worktree saíram" in textos, textos
+
+
+def test_ticket115_um_projeto_cuja_producao_e_main_em_tres_ambientes_pede_o_deploy_de_producao_so_em_main():
+    a = _prs_env()
+    _limpar_falso(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "main", headRefName="fix/x")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert "deploy" in _obrig(a) and "produção" in _obrig(a)["deploy"] and "ticket" not in _obrig(a), _obrig(a)
+
+
+def test_ticket115_o_merge_na_producao_do_projeto_dispara_a_limpeza_e_o_merge_em_outro_ambiente_nao():
+    a = Amb(run="run_a")
+    _gh(a)
+    args = _limpar_falso(a)
+    _projeto_dev_trunk(a)
+    _vira_mergeado(a, PR1, "dev")
+    time.sleep(0.5)
+    assert not os.path.exists(args), "dev não encerra a branch"
+    _vira_mergeado(a, PR2, "trunk")
+    assert _espera_arquivo(args), "o merge em trunk (a produção do projeto) tem de chamar a limpeza"
+
+
+def test_ticket115_fluxo_diz_a_producao_e_os_ambientes_do_projeto_que_contem_o_repo():
+    a = Amb(run="run_a")
+    _projeto_dev_trunk(a)
+    fx = json.loads(a.orq("fluxo", "--repo", os.getcwd(), "--json").stdout)
+    assert (fx["producao"], fx["ambientes"], fx["declarado"]) == ("trunk", ["dev", "trunk"], True), fx
+    d = _repo_remoto(a, "padrao-x")
+    fx = json.loads(a.orq("fluxo", "--repo", d, "--json").stdout)
+    assert (fx["producao"], fx["ambientes"], fx["declarado"]) == ("padrao-x", ["padrao-x"], False), fx
+
+
+def test_ticket115_o_limpar_mergeados_le_a_producao_do_projeto_e_nao_fixa_main():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("limpar_mergeados", os.path.join(AQUI, "scripts", "limpar-mergeados.py"))
+    lm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lm)
+    a = Amb(run="run_a")
+    _projeto_dev_trunk(a)
+    antes = {k: os.environ.get(k) for k in ("ORQ_HOME", "ORQ_FINAL_BASE", "ORQ_PROTECTED_BRANCHES")}
+    os.environ["ORQ_HOME"] = a.home
+    os.environ.pop("ORQ_FINAL_BASE", None)
+    os.environ.pop("ORQ_PROTECTED_BRANCHES", None)
+    lm.ORQ = os.path.join(AQUI, "orq.py")
+    try:
+        fx = lm.fluxo_do_repo(os.getcwd())
+        assert (fx["producao"], fx["ambientes"]) == ("trunk", ["dev", "trunk"]), fx
+        assert lm.is_final({"baseRefName": "trunk"}, "feat/x", fx) and not lm.is_final({"baseRefName": "main"}, "feat/x", fx)
+        assert lm.is_final({"baseRefName": "dev"}, "merge/feat-dev", fx) and not lm.is_final({"baseRefName": "dev"}, "feat/x", fx)
+        os.environ["ORQ_FINAL_BASE"] = "release"
+        assert lm.fluxo_do_repo(os.getcwd())["producao"] == "release", "a variável força a base final"
+    finally:
+        for k, v in antes.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    codigo = open(os.path.join(AQUI, "scripts", "limpar-mergeados.py")).read().split("def self_test():")[0]
+    assert not re.search(r"""["'](?:main|development|staging)["']""", codigo.split("def self_test_git")[0]), "o script lê os ambientes do projeto"
+
+
+def test_ticket115_nenhum_nome_de_ambiente_fica_fixo_no_codigo():
+    codigo = open(os.path.join(AQUI, "orqlib.py")).read()
+    assert not re.search(r"development|staging|AMBIENTES|DIGEST_BASE", codigo), re.findall(r".*(?:development|staging|AMBIENTES|DIGEST_BASE).*", codigo)
+    fixos = [l for l in codigo.splitlines() if re.search(r"""["']main["']""", l) and not l.startswith("BRANCH_SEM_REMOTO")]
+    assert not fixos, fixos  # a branch padrão sem remoto é uma constante só
 
 
 if __name__ == "__main__":
