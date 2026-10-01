@@ -32,6 +32,34 @@ Planejamento trivial ("campo `phone` com migration, endpoint e formulário") é 
 - Segurança, pagamento ou decisão de arquitetura: Opus high.
 - Worker falhou duas vezes na mesma tarefa: Opus xhigh.
 
+## Worker no Codex
+
+`orq despachar --agente codex --modelo <slug> --effort <nível>` sobe o worker no Codex (o Orca lança com `worker-start --agent codex`). Sem `--agente`, o worker é Claude. O papel continua vindo da ambiguidade. Para chegar ao modelo do Codex, parta do papel que você daria no Claude:
+
+| No Claude | No Codex |
+|---|---|
+| Haiku | sem equivalente: busca simples e mudança mecânica seguem no Claude Haiku |
+| Sonnet low | `gpt-6-luna` low |
+| Sonnet medium | `gpt-6-luna` medium ou high |
+| Sonnet high | `gpt-6-luna` xhigh ou max, ou `gpt-6-sol` low, que sai barato para o que entrega |
+| Opus high | `gpt-6-sol` medium ou high |
+| Opus xhigh | `gpt-6-sol` xhigh |
+| Opus max | `gpt-6-sol` max; se falhar, suba para o Claude Opus |
+
+- O `max` do Luna fica acima do high e abaixo do Sol.
+- Para escalar no Codex, suba um degrau por vez: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Claude Opus xhigh.
+- Não use `gpt-6-astra` nem `gpt-5.6-terra`: decisão do usuário, 01/10.
+- Não use `ultra` em worker: ele delega para subagentes por conta própria.
+
+De onde vem a tabela:
+- A OpenAI não publica uma equivalência com o Claude. Ela avisa que os efforts não se correspondem nem entre gerações dos próprios modelos ("Reasoning efforts don't map exactly between model generations", https://learn.chatgpt.com/docs/models).
+- A divisão Luna e Sol segue os papéis que a mesma página dá:
+  - Luna para tarefas claras e repetíveis, em que se sabe como é um bom resultado;
+  - Sol para tarefas ambíguas, difíceis ou de alto valor.
+- O Sol fica no degrau do Opus, mas abaixo dele, por dois resultados:
+  - no Intelligence Index da Artificial Analysis, o GPT-6 Sol em max marca 47,5, contra 51,2 do Opus 5.5 em medium e 57,6 em max (https://kingy.ai/blog/gpt-6-sol-vs-claude-opus-5-5/);
+  - a Anthropic mostra o Sonnet 5.5 em high empatando com o melhor GPT-6 Sol no FrontierCode (https://www.anthropic.com/claude-sonnet-5-5).
+
 ## Onde despachar
 
 Toda tarefa do usuário vira task no Run do Orca da sua **frente** (o assunto). O objetivo do Run é o título do card no painel do tablet, que só lê o Orca.

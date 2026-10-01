@@ -123,6 +123,7 @@ HARNESS = {
         "resume": lambda sessao, modelo, effort, msg: ["claude", "--resume", sessao, *(["--model", modelo] if modelo else []),
                                                        "--dangerously-skip-permissions", msg],
         "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
+        "efforts": ("low", "medium", "high", "xhigh", "max"),
     },
 }
 # o Codex numera as opções com `›` (ou `>`) no cursor; o trust da pasta e o modal dos hooks não confiados são os menus que param um worker dele
@@ -4615,7 +4616,7 @@ def _conferir_inicio(dispatch, terminal, titulo, out):
     return _esperar_prompt(dispatch, terminal, titulo)
 
 
-def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None):
+def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente="claude"):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
@@ -4626,6 +4627,10 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     """
     if prioridade is not None and prioridade not in (1, 2, 3):
         raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
+    if agente not in HARNESS:
+        raise ValueError(f"--agente {agente}: o orq só despacha {', '.join(HARNESSES)}")
+    if effort not in HARNESS[agente]["efforts"]:
+        raise ValueError(f"--effort {effort} não existe no {agente} ({', '.join(HARNESS[agente]['efforts'])})")
     noite_checar()
     if (name or base_branch) and worktree != "new-top-level":
         raise ValueError("--name e --base-branch só valem com --worktree new-top-level (o Orca recusa criar worktree em current)")
@@ -4665,7 +4670,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 f"{resto.lstrip(chr(10))}")
     ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
     args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
-            "--agent", "claude", "--model", modelo, "--effort", effort]
+            "--agent", agente, "--model", modelo, "--effort", effort]
     for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
         if val:
             args += [flag, val]
@@ -4682,7 +4687,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             orca("rename", "--terminal", terminal, "--title", titulo, area="terminal")
         except Exception as e:  # noqa: BLE001 - o título da aba é conforto: falhar não desfaz o despacho
             log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
-    ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "modelo": modelo, "effort": effort, "terminal": terminal,
+    ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort, "terminal": terminal,
           **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
           **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
     append_event(ev)
@@ -4915,7 +4920,7 @@ MSG_CONTINUE = ("Continue de onde parou. A sessão caiu por uma queda de energia
                 "Orca recusar por causa do handle novo, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
 MSG_ESCALAR = ("Nunca deixe uma pergunta ou confirmação esperando no terminal: o coordenador ({coord}) não vê esta tela e o AskUserQuestion é recusado. Dúvida, permissão ou bloqueio: "
                "`orca orchestration send --from \"$ORCA_TERMINAL_HANDLE\" --to run:{run} --type escalation --subject \"<resumo>\" --body \"<detalhes>\" --task-id {task} --dispatch-id {dispatch}`. "
-               "Antes de comandos com `rm` e variável, proteja a variável (`\"${{VAR:?}}\"/*`) para o guard do Claude Code não pedir confirmação.")
+               "Antes de comandos com `rm` e variável, proteja a variável (`\"${{VAR:?}}\"/*`) para o guard do agente não pedir confirmação.")
 
 
 def msg_continuar(coord, task, dispatch, run):
@@ -5043,7 +5048,7 @@ USO_PADRAO = {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}  # cinco_h:
 PAUSA_ESPERA_S = float(os.environ.get("ORQ_PAUSA_ESPERA_S") or 300)  # quanto esperar cada worker escrever o PAUSA.md
 PAUSA_POLL_S = float(os.environ.get("ORQ_PAUSA_POLL_S") or 2)
 MSG_PAUSA = ("Pausa do coordenador (limite de uso do plano). Em até 3 linhas, escreva em PAUSA.md na raiz da sua worktree onde parou e o próximo passo, "
-             "pare qualquer E2E que tenha subido e encerre o turno. Não mande worker_done: você volta depois com claude --resume.")
+             "pare qualquer E2E que tenha subido e encerre o turno. Não mande worker_done: você volta depois nesta mesma sessão.")
 MSG_VOLTA = ("O uso do plano voltou ao normal e o coordenador retomou você. Leia o PAUSA.md na raiz da sua worktree, apague-o e siga do próximo passo. "
              "Ao terminar, mande o worker_done como antes; se o Orca recusar por causa do handle novo, escreva o relatório final num arquivo "
              "relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
@@ -5507,6 +5512,7 @@ def main(argv=None):
     de.add_argument("--titulo")
     de.add_argument("--spec-arquivo")
     de.add_argument("--ticket", help="número de um ticket criado por orq ticket novo: o worker sobe na task dele (no lugar de --titulo e --spec-arquivo)")
+    de.add_argument("--agente", default="claude", help=f"o harness do worker ({', '.join(HARNESSES)}; o padrão é claude)")
     de.add_argument("--modelo", required=True)
     de.add_argument("--effort", required=True)
     de.add_argument("--worktree", choices=["current", "new-top-level"])
@@ -5661,7 +5667,7 @@ def main(argv=None):
                 return 0
             print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
         elif a.cmd == "despachar":
-            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade)
+            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)

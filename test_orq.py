@@ -8570,6 +8570,43 @@ def test_ticket73_worker_codex_com_turno_gravado_tem_estado_e_agente_sem_adaptad
     ag = _agentes(a)
     assert ag["ctx_term_x"]["turno"] == "parado" and ag["ctx_term_y"]["turno"] == "unknown", ag
 
+
+
+def test_ticket73_despachar_com_agente_codex_sobe_o_worker_codex_e_grava_o_agente_no_evento():
+    a = Amb(run="run_a")
+    r = _despachar(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "max", spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert (arg[arg.index("--agent") + 1], arg[arg.index("--model") + 1], arg[arg.index("--effort") + 1]) == ("codex", "gpt-6-sol", "max"), arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["agente"] == "codex", ev
+    b = Amb(run="run_a")
+    assert _despachar(b).returncode == 0
+    (ev,) = [e for e in b.events() if e["tipo"] == "despacho"]
+    assert ev["agente"] == "claude", "sem --agente o worker é Claude, como antes"
+
+
+def test_ticket73_despachar_recusa_effort_que_o_harness_nao_tem_sem_criar_task():
+    a = Amb(run="run_a")
+    r = _despachar(a, "--effort", "ultra")
+    assert r.returncode != 0 and "ultra" in r.stderr and "claude" in r.stderr, r.stderr
+    assert _despachar(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "ultra").returncode == 0, "o Codex tem ultra"
+    assert a.orq("despachar", "--run", "run_a", "--agente", "cursor", "--titulo", "x", "--spec-arquivo", _spec(a), "--modelo", "m", "--effort", "low").returncode != 0
+    assert len(_log(a, "started.log")) == 1
+
+
+def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_e_sem_astra_nem_terra():
+    txt = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
+    assert "gpt-6-luna" in txt and "gpt-6-sol" in txt and "--agente codex" in txt, "a tabela do Codex e o jeito de despachar"
+    assert "learn.chatgpt.com/docs/models" in txt, "a fonte da equivalência"
+    linhas = [l for l in txt.splitlines() if "astra" in l.lower() or "terra" in l.lower()]
+    assert linhas and all("não" in l.lower() for l in linhas), linhas
+
+
+def test_ticket73_mensagens_ao_worker_nao_citam_o_claude():
+    for m in (orq_mod.MSG_ESCALAR, orq_mod.MSG_PAUSA, orq_mod.MSG_CONTINUE, orq_mod.MSG_VOLTA):
+        assert "claude" not in m.lower(), m
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
