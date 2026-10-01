@@ -8684,6 +8684,46 @@ def test_ticket73_pausar_e_retomar_pausados_de_um_worker_codex_usam_o_resume_del
     (c,) = _log(a, "create.log")
     assert c[c.index("--command") + 1].startswith("codex resume thr-c1 -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"'"), c
 
+
+
+def _conta73(a, codex_semana=None, codex_5h=None, claude_semana=None):
+    """O rateLimits do `orca account list`: resetsAt em milissegundos, como o Orca real."""
+    agora = time.time()
+    j = lambda p, minutos, dt: {"usedPercent": p, "windowMinutes": minutos, "resetsAt": int((agora + dt) * 1000)} if p is not None else None
+    a.set("account.json", {"codex": {"provider": "codex", "session": j(codex_5h, 300, 3600), "weekly": j(codex_semana, 10080, 2 * 86400 + 60), "status": "ok"},
+                           "claude": {"provider": "claude", "session": None, "weekly": j(claude_semana, 10080, 3 * 86400), "status": "ok"}})
+
+
+def test_ticket73_uso_do_codex_vem_do_orca_account_list():
+    a = Amb()
+    _conta73(a, codex_semana=93, codex_5h=10)
+    u = json.loads(a.orq("uso", "--agente", "codex", "--json").stdout)
+    assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 10, "pausa") and "vira em 2d" in u["motivo"], u
+    _conta73(a, codex_semana=40)
+    u = json.loads(a.orq("uso", "--agente", "codex", "--json").stdout)
+    assert (u["uso"]["cinco_h"], u["nivel"]) == (None, "ok"), "o Codex sem janela de 5 h só tem a semana"
+
+
+def test_ticket73_uso_do_claude_sem_quadro_do_hud_cai_no_orca_e_com_hud_fresco_nao_chama_o_orca():
+    a = Amb()
+    _conta73(a, claude_semana=88)
+    u = json.loads(a.orq("uso", "--json").stdout)
+    assert (u["uso"]["semana"], u["nivel"]) == (88, "avisa"), u
+    b = Amb()
+    _uso51(b, semana=50, cinco_h=10)
+    assert json.loads(b.orq("uso", "--json").stdout)["uso"]["semana"] == 50 and not _log(b, "calls.log")
+
+
+def test_ticket73_despachar_confere_a_cota_do_harness_escolhido():
+    a = Amb(run="run_a")
+    _uso51(a, semana=40, cinco_h=10)
+    _conta73(a, codex_semana=95)
+    r = _despachar(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "low")
+    assert r.returncode != 0 and "Codex" in r.stderr and "95%" in r.stderr, r.stderr
+    assert _despachar(a).returncode == 0, "a cota do Claude segue livre"
+    assert len(_log(a, "started.log")) == 1
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

@@ -4688,7 +4688,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 spec = f.read()
         except OSError as e:
             raise ValueError(f"não consegui ler {spec_arquivo}: {e.strerror}")
-    uso_checar(prioridade or prioridade_de(read_events(), tk and tk["task"], None, titulo))
+    uso_checar(prioridade or prioridade_de(read_events(), tk and tk["task"], None, titulo), agente=agente)
     pedido = _texto_da_entrada(entrada)
     _adotar(run)
     if not run_do_coordenador(run):
@@ -5113,10 +5113,38 @@ def _janela_uso(j, agora):
     return (0 if isinstance(r, (int, float)) and r <= agora else p), r
 
 
-def uso_plano(agora=None):
-    """{semana, semana_reset, cinco_h, cinco_h_reset} do `rate_limits` do quadro mais novo do HUD (percentuais 0-100, resets em epoch), ou None
-    sem quadro fresco. Só lê arquivo: sem rede, sem Orca."""
+def uso_plano(agora=None, agente="claude"):
+    """{semana, semana_reset, cinco_h, cinco_h_reset} do plano do `agente` (percentuais 0-100, resets em epoch), ou None sem número.
+
+    Claude: o quadro mais novo do HUD (só lê arquivo, sem rede nem Orca); sem quadro fresco, o `orca account list`. Codex: o `orca account list`,
+    que lê a conta de cada harness (as cotas são separadas)."""
     agora = agora or time.time()
+    if agente != "claude":
+        return _uso_orca(agente, agora)
+    return _uso_hud(agora) or _uso_orca(agente, agora)
+
+
+def _uso_orca(agente, agora):
+    """O `rateLimits.<agente>` do `orca account list`: `weekly` é a semana e `session` a janela de 5 h (resetsAt em ms). None sem número ou com o Orca fora."""
+    try:
+        rl = _dict(_dict(orca("list", area="account", timeout=5).get("rateLimits")).get(agente))
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+        log(f"uso {agente}: {type(e).__name__}: {e}")
+        return None
+
+    def janela(j):
+        p, r = _dict(j).get("usedPercent"), _dict(j).get("resetsAt")
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            return None, None
+        r = r / 1000 if isinstance(r, (int, float)) else None
+        return (0 if r and r <= agora else p), r
+
+    (s, sr), (c, cr) = janela(rl.get("weekly")), janela(rl.get("session"))
+    return {"semana": s, "semana_reset": sr, "cinco_h": c, "cinco_h_reset": cr} if s is not None or c is not None else None
+
+
+def _uso_hud(agora):
+    """O `rate_limits` do quadro mais novo do HUD do OMC, ou None sem quadro fresco."""
     try:
         arqs = sorted(glob.glob(os.path.join(HUD_CACHE, "stdin.*.json")), key=os.path.getmtime, reverse=True)
     except OSError:
@@ -5162,36 +5190,42 @@ def uso_nivel(uso, agora=None):
     return "ok", None, None
 
 
-def uso_checar(prioridade=2, agora=None):
+def uso_checar(prioridade=2, agora=None, agente="claude"):
     """Recusa o despacho com ValueError se o uso do plano passou do limiar de pausa (semana) ou de segurar (5 h); a prioridade 1 passa pela segura da
     janela de 5 h, mas não pela pausa da semana. Sem quadro fresco não recusa."""
-    nivel, motivo, _ = uso_nivel(uso_plano(agora), agora)
+    nivel, motivo, _ = uso_nivel(uso_plano(agora, agente), agora)
     if nivel == "pausa" or (nivel == "segura" and prioridade != 1):
-        append_event({"tipo": "uso_parou", "nivel": nivel, "motivo": motivo})
-        raise ValueError(f"uso do plano: {motivo}; nada foi despachado. "
+        append_event({"tipo": "uso_parou", "nivel": nivel, "motivo": motivo, **({"agente": agente} if agente != "claude" else {})})
+        raise ValueError(f"uso do plano{_do_harness(agente)}: {motivo}; nada foi despachado. "
                          + ("Rode orq pausar para abrir folga." if nivel == "pausa" else "Espere a janela virar, ou ajuste o limiar em uso.json."))
 
 
-def uso_avisar(agora=None):
+def _do_harness(agente):
+    """" do Codex" para o texto do uso de outro harness; o do Claude fica sem sufixo, como antes."""
+    return "" if agente == "claude" else f" do {agente.capitalize()}"
+
+
+def uso_avisar(agora=None, agente="claude"):
     """Digita no coordenador um aviso por (nível, janela): a primeira volta do painel depois de cruzar o limiar, e de novo só se o nível subir ou a
     janela virar. Coordenador ocupado: a próxima volta tenta. Devolve as linhas do painel."""
     g = _gerente_cfg()
     if not g or not g.get("coordenador"):
         return []
-    nivel, motivo, reset = uso_nivel(uso_plano(agora), agora)
+    nivel, motivo, reset = uso_nivel(uso_plano(agora, agente), agora)
+    k = "uso_aviso" if agente == "claude" else f"uso_aviso_{agente}"
     if nivel in ("ok", "desconhecido"):
-        if nivel == "ok" and _cursor_ro().get("uso_aviso"):
-            _cursor_mut(lambda c: c.pop("uso_aviso", None))
+        if nivel == "ok" and _cursor_ro().get(k):
+            _cursor_mut(lambda c: c.pop(k, None))
         return []
     chave = f"{nivel}:{reset}"
-    if _dict(_cursor_ro().get("uso_aviso")).get("chave") == chave:
+    if _dict(_cursor_ro().get(k)).get("chave") == chave:
         return []
     acao = {"pausa": "orq despachar recusa; rode orq pausar", "segura": "orq despachar recusa até a janela virar", "avisa": "evite despachar o que não for urgente"}[nivel]
-    if digita(g["coordenador"], f"orq: uso do plano, {motivo}. {acao[0].upper() + acao[1:]}.") != "enviado":
+    if digita(g["coordenador"], f"orq: uso do plano{_do_harness(agente)}, {motivo}. {acao[0].upper() + acao[1:]}.") != "enviado":
         return []
-    _cursor_mut(lambda c: c.__setitem__("uso_aviso", {"chave": chave, "ts": now()}))
-    append_event({"tipo": "uso_aviso", "nivel": nivel, "motivo": motivo})
-    return [f"uso do plano: {nivel} ({motivo}), coordenador avisado"]
+    _cursor_mut(lambda c: c.__setitem__(k, {"chave": chave, "ts": now()}))
+    append_event({"tipo": "uso_aviso", "nivel": nivel, "motivo": motivo, **({"agente": agente} if agente != "claude" else {})})
+    return [f"uso do plano{_do_harness(agente)}: {nivel} ({motivo}), coordenador avisado"]
 
 
 def prioridade_padrao(titulo):
@@ -5297,16 +5331,21 @@ def _fechar_pausado(linha):
 
 
 def retomar_pausados(run=None, forcar=False):
-    """Sobe de volta (claude --resume, com MSG_VOLTA) os dispatches de cursor.json `pausados`, os de prioridade mais alta primeiro, e os tira da lista.
-    Com o uso ainda acima do limiar recusa, salvo `forcar`: senão o worker voltaria para pausar de novo."""
-    if not forcar:
-        nivel, motivo, _ = uso_nivel(uso_plano())
+    """Sobe de volta (o resume do harness, com MSG_VOLTA) os dispatches de cursor.json `pausados`, os de prioridade mais alta primeiro, e os tira da lista.
+    Com o uso do plano do harness ainda acima do limiar, o worker dele fica (`uso_alto`), salvo `forcar`: senão ele voltaria para pausar de novo. Se
+    isso vale para todos, recusa."""
+    pausados = {d: p for d, p in _dict(_cursor_ro().get("pausados")).items() if not run or p.get("run") == run}
+    altos = {}
+    for ag in {p.get("agente") or "claude" for p in pausados.values()} if not forcar else ():
+        nivel, motivo, _ = uso_nivel(uso_plano(agente=ag))
         if nivel in ("pausa", "segura"):
-            raise ValueError(f"uso do plano ainda alto: {motivo}. Espere a janela virar ou use --forcar")
-    pausados = _dict(_cursor_ro().get("pausados"))
+            altos[ag] = motivo
+    if pausados and altos and all((p.get("agente") or "claude") in altos for p in pausados.values()):
+        raise ValueError(f"uso do plano ainda alto: {'; '.join(f'{m}{_do_harness(ag)}' for ag, m in altos.items())}. Espere a janela virar ou use --forcar")
     res = []
     for d, p in sorted(pausados.items(), key=lambda kv: kv[1].get("prioridade") or 2):
-        if run and p.get("run") != run:
+        if (p.get("agente") or "claude") in altos:
+            res.append({"dispatch": d, "task": p["task"], "titulo": p["titulo"], "estado": "uso_alto", "aviso": altos[p.get("agente") or "claude"]})
             continue
         linha = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p["titulo"], "prioridade": p.get("prioridade"), "modelo": p.get("modelo"),
                  "sessao": p["sessao"], "cwd": p["cwd"], "terminal": p["terminal"]}
@@ -5445,7 +5484,7 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - a tela ilegível não derruba o painel; a próxima volta tenta
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar()]
+        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex")]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     return "\n".join(linhas)
@@ -5612,6 +5651,7 @@ def main(argv=None):
     pr_.add_argument("valor", type=int, choices=[1, 2, 3])
     uz = sub.add_parser("uso", help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
     uz.add_argument("--json", action="store_true")
+    uz.add_argument("--agente", default="claude", choices=HARNESSES, help="de que plano (as cotas do Claude e do Codex são separadas)")
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
@@ -5759,7 +5799,7 @@ def main(argv=None):
         elif a.cmd == "prioridade":
             print(json.dumps(prioridade_definir(a.task, a.valor), ensure_ascii=False))
         elif a.cmd == "uso":
-            u = uso_plano()
+            u = uso_plano(agente=a.agente)
             nivel, motivo, _ = uso_nivel(u)
             print(json.dumps({"uso": u, "nivel": nivel, "motivo": motivo}, ensure_ascii=False) if a.json else
                   f"{nivel}" + (f": {motivo}" if motivo else "") + (f" (semana {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (sem quadro fresco do HUD)"))
