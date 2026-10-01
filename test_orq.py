@@ -7019,6 +7019,9 @@ try:
     dados = json.load(open(os.path.join(d, "gh.json")))
 except OSError:
     dados = {}
+if sys.argv[2] == "list":
+    repo = sys.argv[sys.argv.index("--repo") + 1]
+    print(json.dumps([{**v, "url": k} for k, v in dados.items() if k.startswith(f"https://github.com/{repo}/")])); sys.exit(0)
 if sys.argv[3] not in dados:
     sys.stderr.write("no pull requests found"); sys.exit(1)
 print(json.dumps(dados[sys.argv[3]]))
@@ -7036,9 +7039,10 @@ def _gh(a, **env):
     a.env.update({"ORQ_GH": caminho, "ORQ_PR_POLL_S": a.env.get("ORQ_PR_POLL_S", "0"), **env})
 
 
-def _pr(a, url, state="OPEN", base="development", titulo=None):
+def _pr(a, url, state="OPEN", base="development", titulo=None, **extra):
+    """extra: mergeable, headRefName, statusCheckRollup (como o gh os devolve)."""
     dados = _log_json(a, "gh.json", {})
-    dados[url] = {"state": state, "mergedAt": "2026-09-30T12:00:00Z" if state == "MERGED" else None, "baseRefName": base, **({"title": titulo} if titulo else {})}
+    dados[url] = {"state": state, "mergedAt": "2026-09-30T12:00:00Z" if state == "MERGED" else None, "baseRefName": base, **({"title": titulo} if titulo else {}), **extra}
     a.set("gh.json", dados)
 
 
@@ -7457,9 +7461,9 @@ def test_digest_grava_o_contrato_v1_no_caminho_fixo():
     assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
     d = json.load(open(r.stdout.splitlines()[0]))
     assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
-    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "features", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "features", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
     assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
-    assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito"} and d["fila"][0]["feito"] is False
+    assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito", "pronto", "avisos"} and d["fila"][0]["feito"] is False
     assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
         (1216, "development", "OPEN", "feat: base de auth"), (1230, "staging", "OPEN", "feat: base de auth (staging)")], d["fila"][0]["prs"]
     assert d["fila"][0]["prs"][0]["url"] == PR1
@@ -7642,12 +7646,99 @@ def test_fila_add_lista_feito_e_rm():
     assert json.loads(r.stdout) == {"passo": 1, "nome": "Plano 2 para main", "por": "Destrava o plano 1", "prs": [1216, 1230], "feito": False}
     _fila_add(a, "2", "Tela", "Depende do 1", "1220")
     lista = a.orq("fila", "lista").stdout.splitlines()
-    assert lista[0].startswith("1  Plano 2 para main  [a fazer]  #1216 open, #1230 open") and "Destrava o plano 1" in lista[0] and lista[1].startswith("2  Tela"), lista
+    assert lista[0].startswith("1  Plano 2 para main  [a fazer]  #1216 open ? sem leitura do CI, #1230 open ? sem leitura do CI") and "Destrava o plano 1" in lista[0] and lista[1].startswith("2  Tela"), lista
+    assert lista[-1] == "Próximo a mergear: nenhum passo pronto", lista
     assert a.orq("fila", "feito", "1").returncode == 0
     assert "[feito]" in a.orq("fila", "lista").stdout.splitlines()[0]
     assert a.orq("fila", "rm", "2").returncode == 0
-    assert len(a.orq("fila", "lista").stdout.splitlines()) == 1
+    assert len(a.orq("fila", "lista").stdout.splitlines()) == 2  # o passo e a linha do próximo
     assert [(e["op"], e["passo"]) for e in a.events() if e["tipo"] == "fila"] == [("add", 1), ("add", 2), ("feito", 1), ("rm", 2)]
+
+
+# ---- orq fila: CI, conflito e próximo passo (ticket 81) ----
+
+def _ck(nome, conclusao="SUCCESS", status="COMPLETED"):
+    return {"__typename": "CheckRun", "name": nome, "status": status, "conclusion": conclusao}
+
+
+def _fila_ci(**por_pr):
+    """Dois PRs (1216 e 1220) em dois passos; cada PR lê o `mergeable` e os checks dados e o poll roda uma vez."""
+    a = Amb(run="run_a")
+    _gh(a)
+    for url, k in ((PR1, "pr1"), (PR2, "pr2")):
+        _pr(a, url, "OPEN", "development", **{"mergeable": "MERGEABLE", "statusCheckRollup": [_ck("lint")], "headRefName": "feat/" + k, **por_pr.get(k, {})})
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    _fila_add(a, "1", "Primeiro", "", "1216")
+    _fila_add(a, "2", "Segundo", "", "1220")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    return a
+
+
+def test_fila_poll_guarda_mergeable_e_checks_com_uma_chamada_do_gh_para_todos_os_prs():
+    a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE"), _ck("test", None, "IN_PROGRESS"), _ck("build")]})
+    chamadas = [c for c in _gh_chamadas(a) if c[:2] == ["pr", "list"]]
+    assert len(chamadas) == 1, chamadas  # uma chamada para os dois PRs do mesmo repositório
+    ci = {i["numero"]: i["ci"] for i in json.load(open(os.path.join(a.home, "prs.json")))["itens"]}
+    assert (ci[1216]["mergeable"], ci[1216]["falhas"], ci[1216]["rodando"]) == ("MERGEABLE", ["lint"], ["test"]) and ci[1216]["lido_em"] > 0, ci
+    assert ci[1220]["falhas"] == [] and ci[1220]["rodando"] == []
+
+
+def test_fila_lista_mostra_o_check_vermelho_pelo_nome_o_conflito_e_o_ci_rodando():
+    a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE"), _ck("e2e", "TIMED_OUT")]}, pr2={"mergeable": "CONFLICTING", "statusCheckRollup": [_ck("test", None, "QUEUED")]})
+    l1, l2, fim = a.orq("fila", "lista").stdout.splitlines()
+    assert "#1216 open ✗ lint, e2e" in l1, l1
+    assert "#1220 open ⚠ conflito ⏳ CI rodando" in l2, l2
+    assert fim == "Próximo a mergear: nenhum passo pronto"
+
+
+def test_fila_lista_aponta_o_primeiro_passo_a_fazer_com_todos_os_prs_prontos():
+    a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE")]})
+    out = a.orq("fila", "lista").stdout.splitlines()
+    assert out[-1] == "Próximo a mergear: passo 2 (Segundo)" and "#1220 open ✓" in out[1], out
+    a.orq("fila", "feito", "2")
+    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Próximo a mergear: nenhum passo pronto", "passo feito não é o próximo"
+
+
+def test_fila_lista_leitura_velha_aparece_como_velha_e_nao_conta_como_pronta():
+    a = _fila_ci()
+    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Próximo a mergear: passo 1 (Primeiro)"
+    arq = os.path.join(a.home, "prs.json")
+    d = json.load(open(arq))
+    for i in d["itens"]:
+        i["ci"]["lido_em"] -= 3600
+    json.dump(d, open(arq, "w"))
+    out = a.orq("fila", "lista").stdout.splitlines()
+    assert "leitura velha, 60 min" in out[0] and out[-1] == "Próximo a mergear: nenhum passo pronto", out
+
+
+def test_fila_conflito_entre_passos_vira_aviso_no_passo_de_baixo():
+    a = _fila_ci()
+    repo = os.path.join(a.tmp.name, "repo")
+    g = lambda *x: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True)
+    os.makedirs(repo)
+    g("init", "-b", "main")
+    open(os.path.join(repo, "a.js"), "w").write("um\n")
+    g("add", "."), g("commit", "-m", "base")
+    for ramo, txt in (("feat/pr1", "dois\n"), ("feat/pr2", "tres\n")):
+        g("checkout", "-b", ramo, "main")
+        open(os.path.join(repo, "a.js"), "w").write(txt)
+        g("commit", "-am", ramo)
+    out = a.orq("fila", "lista", ORQ_REPOS=repo).stdout.splitlines()
+    assert out[0].startswith("1  Primeiro") and out[1].startswith("2  Segundo"), out
+    assert out[2] == "   ⚠ #1220 conflita com #1216 (passo 1): a.js", out
+    g("checkout", "main"), g("checkout", "-B", "feat/pr2", "main")
+    open(os.path.join(repo, "b.js"), "w").write("x\n")
+    g("add", "."), g("commit", "-m", "outro arquivo")
+    assert not [x for x in a.orq("fila", "lista", ORQ_REPOS=repo).stdout.splitlines() if x.startswith("   ⚠")]
+
+
+def test_digest_leva_o_ci_e_o_proximo_passo_do_painel():
+    a = _fila_ci(pr1={"mergeable": "CONFLICTING"})
+    d = _json_digest(a)
+    p1, p2 = d["fila"]
+    assert (p1["pronto"], p2["pronto"], d["proximoPasso"]) == (False, True, 2), d["fila"]
+    assert (p1["prs"][0]["mergeable"], p1["prs"][0]["falhas"], p1["prs"][0]["pronto"], p1["prs"][0]["velha"]) == ("CONFLICTING", [], False, False), p1
 
 
 def test_fila_add_troca_o_passo_de_mesmo_numero_e_recusa_pr_nao_ligado_e_passo_inexistente():

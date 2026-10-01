@@ -108,6 +108,8 @@ DESPACHO_SEM_ABERTURA = re.compile(r"(?:<pasted_content\b[^>]*>\s*)?You are work
 PRS = "prs.json"  # {itens: [{task, url, numero, base, estado, ligado_em, avisado, ...}], ultimo_poll}: os PRs de cada feature, ligados por `orq pr ligar`
 PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # intervalo mínimo entre dois polls do gh (fora dos hooks); `orq pr poll --forcar` ignora
 PR_GH_S = 15  # tempo de cada `gh pr view`
+LEITURA_VELHA_MIN = float(os.environ.get("ORQ_LEITURA_VELHA_MIN") or 10)  # minutos: o CI e o conflito lidos há mais que isso aparecem como leitura velha
+CHECK_FALHO = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
 WT_PARADA_D = 3  # worktree sem worker e sem atividade há mais que isto entra na linha do `orq status`
 PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
 AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
@@ -1842,6 +1844,48 @@ def _pr_estado(url):
     return d if isinstance(d, dict) else None
 
 
+def _pr_lista_gh(urls):
+    """{url: dados do gh} dos PRs de `urls`, com uma chamada `gh pr list` por repositório (nunca uma por PR). PR que a lista não traz (mais velho que o
+    limite) cai no `gh pr view`. gh fora do ar: o repositório inteiro fica sem leitura, sem chamar o gh de novo por PR."""
+    por_repo = {}
+    for u in urls:
+        por_repo.setdefault(u.rsplit("/pull/", 1)[0].removeprefix("https://github.com/"), []).append(u)
+    vistos = {}
+    for repo, us in por_repo.items():
+        try:
+            r = subprocess.run([GH, "pr", "list", "--repo", repo, "--state", "all", "--limit", "300", "--json",
+                                "url,state,mergedAt,baseRefName,headRefName,title,mergeable,statusCheckRollup"], capture_output=True, text=True, timeout=PR_GH_S)
+            lista = json.loads(r.stdout) if r.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            lista = None
+        if not isinstance(lista, list):
+            continue
+        achados = {x.get("url"): x for x in lista if isinstance(x, dict)}
+        for u in us:
+            vistos[u] = achados.get(u) or _pr_estado(u)
+    return vistos
+
+
+def _ci_do_gh(visto, agora):
+    """{mergeable, falhas, rodando, lido_em} do que o gh viu de um PR, ou None se a resposta não traz CI nem mergeable (gh sem resposta, `pr view`)."""
+    if "mergeable" not in visto and "statusCheckRollup" not in visto:
+        return None
+    falhas, rodando = [], []
+    for c in visto.get("statusCheckRollup") or []:
+        if not isinstance(c, dict):
+            continue
+        nome = c.get("name") or c.get("context") or "?"
+        if c.get("__typename") == "StatusContext" or "context" in c:  # status antigo: só `state`
+            est = c.get("state")
+            falhas += [nome] if est in CHECK_FALHO else []
+            rodando += [nome] if est in ("PENDING", "EXPECTED") else []
+        elif c.get("status") != "COMPLETED":
+            rodando.append(nome)
+        elif c.get("conclusion") in CHECK_FALHO:
+            falhas.append(nome)
+    return {"mergeable": visto.get("mergeable") or "UNKNOWN", "falhas": falhas, "rodando": rodando, "lido_em": agora}
+
+
 def _estado_do_gh(s):
     """`mergeado`, `fechado` ou None (aberto, ou sem resposta) para o que o gh devolveu."""
     return "mergeado" if s.get("state") == "MERGED" or s.get("mergedAt") else "fechado" if s.get("state") == "CLOSED" else None
@@ -2142,6 +2186,9 @@ def _aplica_prs(d, vistos, agora):
     for i in d["itens"]:
         visto = _dict(vistos.get(i["url"]))
         novo = _estado_do_gh(visto)
+        if i["estado"] == "aberto" and not novo:
+            ci = _ci_do_gh(visto, agora)
+            i.update(**({"ci": ci} if ci else {}), **({"head": visto["headRefName"]} if visto.get("headRefName") else {}))
         if i["estado"] != "aberto" or not novo:
             i["base"] = visto.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
@@ -2165,8 +2212,8 @@ def pr_poll(agora=None, forcar=False):
     """Pergunta ao gh pelos PRs abertos e grava os que entraram ou foram fechados (_aplica_prs). Devolve as linhas do que mudou.
 
     Roda fora dos hooks (o painel do gerente e `orq pr poll`), no máximo a cada PR_POLL_S (`forcar` ignora), sem PR aberto nem chama o gh, e
-    um poll por vez (lock não bloqueante). Os `gh pr view` saem em paralelo (4) para o painel não parar por PR lento. gh sem resposta deixa o
-    PR aberto para a próxima rodada. Limite: a volta do painel espera o gh mais lento, PR_GH_S no pior caso."""
+    um poll por vez (lock não bloqueante). Uma chamada `gh pr list` por repositório traz o estado, o `mergeable` e os checks de todos os PRs ligados
+    (guardados em `ci`). gh sem resposta deixa o PR aberto para a próxima rodada. Limite: a volta do painel espera o gh, PR_GH_S por repositório."""
     agora = time.time() if agora is None else agora
     os.makedirs(HOME, exist_ok=True)
     with open(_path("pr-poll.lock"), "w") as lock:
@@ -2178,8 +2225,7 @@ def pr_poll(agora=None, forcar=False):
         urls = [i["url"] for i in d["itens"] if i["estado"] == "aberto"]
         if not urls or (not forcar and agora - (d.get("ultimo_poll") or 0) < PR_POLL_S):
             return []
-        with ThreadPoolExecutor(4) as ex:
-            vistos = dict(zip(urls, ex.map(_pr_estado, urls)))
+        vistos = _pr_lista_gh(urls)
         return _mutar_prs(lambda d: _aplica_prs(d, vistos, agora))
 
 
@@ -2332,10 +2378,66 @@ def ordem_de_merge(grupos, ts):
     return ordem
 
 
-def _pr_contrato(i):
-    """O PR como o contrato do digest (contratos/digest-v1.md) o pede: estado em caixa alta e o título, ou `PR #N` se o gh nunca o deu."""
-    return {"numero": i.get("numero"), "url": i["url"], "base": i.get("base"), "estado": ESTADO_GH.get(i["estado"], "OPEN"),
-            "titulo": i.get("titulo") or f"PR #{i.get('numero')}"}
+def _leitura_pr(i, agora=None):
+    """O CI e o conflito que o poll guardou de um PR aberto: {marcas: [(ícone, texto)], pronto, velha, idade}. Sem leitura ou com leitura velha
+    (mais de LEITURA_VELHA_MIN minutos) o PR não conta como pronto. PR já resolvido: None."""
+    if i.get("estado") != "aberto":
+        return None
+    ci = _dict(i.get("ci"))
+    if not ci:
+        return {"marcas": [("?", "sem leitura do CI")], "pronto": False, "velha": False, "idade": None}
+    agora = time.time() if agora is None else agora
+    idade = (agora - (ci.get("lido_em") or 0)) / 60
+    marcas = ([("✗", ", ".join(ci["falhas"]))] if ci.get("falhas") else []) + ([("⚠", "conflito")] if ci.get("mergeable") == "CONFLICTING" else []) \
+        + ([("⏳", "CI rodando")] if ci.get("rodando") else []) + ([("?", "conflito ainda não calculado")] if ci.get("mergeable") == "UNKNOWN" and not ci.get("falhas") and not ci.get("rodando") else [])
+    velha = idade > LEITURA_VELHA_MIN
+    return {"marcas": marcas or [("✓", "pronto")], "pronto": not marcas and not velha, "velha": velha, "idade": idade}
+
+
+def _pr_contrato(i, agora=None):
+    """O PR como o contrato do digest (contratos/digest-v1.md) o pede: estado em caixa alta e o título, ou `PR #N` se o gh nunca o deu.
+    PR aberto leva também o que o poll leu do CI: mergeable, falhas, rodando, lidoEm, velha e pronto."""
+    out = {"numero": i.get("numero"), "url": i["url"], "base": i.get("base"), "estado": ESTADO_GH.get(i["estado"], "OPEN"),
+           "titulo": i.get("titulo") or f"PR #{i.get('numero')}"}
+    l = _leitura_pr(i, agora)
+    if l:
+        ci = _dict(i.get("ci"))
+        out.update(mergeable=ci.get("mergeable"), falhas=ci.get("falhas") or [], rodando=ci.get("rodando") or [], lidoEm=ci.get("lido_em"), velha=l["velha"], pronto=l["pronto"])
+    return out
+
+
+def _merge_tree(a, b):
+    """Os arquivos em conflito ao juntar as branches `a` e `b` (`git merge-tree`, sem tocar em nada), [] se juntam limpo, None se não deu para saber
+    (branch fora do clone, git velho). Procura nos repositórios de ORQ_REPOS, pelo `origin/<branch>` e depois pela branch local."""
+    for repo in [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]:
+        refs = [next((r for r in (f"origin/{h}", h) if _git(repo, "rev-parse", "--verify", "-q", r + "^{commit}")), None) for h in (a, b)]
+        if not all(refs):
+            continue
+        try:
+            r = subprocess.run(["git", "-C", repo, "merge-tree", "--write-tree", "--name-only", "--no-messages", *refs], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode == 0:
+            return []
+        return [x for x in r.stdout.splitlines()[1:] if x.strip()] if r.returncode == 1 else None
+    return None
+
+
+def _marca_passos(passos, prs, agora=None):
+    """Põe em cada passo (formato de `_passos_declarados`) `pronto` (a fazer e todos os PRs abertos prontos) e `avisos` (um PR conflita com um PR de passo
+    anterior da fila: `git merge-tree` entre as branches). Devolve o número do próximo passo a mergear: o primeiro a fazer com tudo pronto, ou None."""
+    heads = {i.get("numero"): i.get("head") for i in prs.get("itens") or []}
+    for n, p in enumerate(passos):
+        abertos = [i for i in p["prs"] if i["estado"] == "OPEN"]
+        p["pronto"] = not p["feito"] and bool(abertos) and all(i.get("pronto") for i in abertos)
+        p["avisos"] = []
+        for b in abertos:
+            for q in passos[:n]:
+                for a in (x for x in q["prs"] if x["estado"] == "OPEN" and heads.get(x["numero"]) and heads.get(b["numero"])):
+                    arqs = _merge_tree(heads[a["numero"]], heads[b["numero"]])
+                    if arqs:
+                        p["avisos"].append(f"#{b['numero']} conflita com #{a['numero']} (passo {q['passo']}): {', '.join(arqs[:5])}" + (f" e mais {len(arqs) - 5}" if len(arqs) > 5 else ""))
+    return next((p["passo"] for p in passos if p["pronto"]), None)
 
 
 def _fila_ro():
@@ -2385,10 +2487,28 @@ def fila_marca(passo, op):
     _mutar_fila(muda)
 
 
+def _txt_pr(i, raw):
+    """`#N estado` mais o que o poll leu do CI: ✓, ✗ com o nome dos checks, ⚠ conflito, ⏳ CI rodando, e `(leitura velha, N min)`."""
+    l = _leitura_pr(raw.get(i["numero"]) or {})
+    if not l:
+        return f"#{i['numero']} {i['estado'].lower()}"
+    return f"#{i['numero']} {i['estado'].lower()} " + " ".join(f"{ic} {tx}" if ic != "✓" else ic for ic, tx in l["marcas"]) + (f" (leitura velha, {l['idade']:.0f} min)" if l["velha"] else "")
+
+
 def fila_lista():
-    """Linhas de `orq fila lista`: o passo, o nome, se está feito e cada PR com o estado que o poll guardou."""
-    return [f"{p['passo']}  {p['nome']}  [{'feito' if p['feito'] else 'a fazer'}]  " + ", ".join(f"#{i['numero']} {i['estado'].lower()}" for i in p["prs"]) + (f"  — {p['por']}" if p["por"] else "")
-            for p in _passos_declarados(_fila_ro(), _prs_ro())]
+    """Linhas de `orq fila lista`: o passo, o nome, se está feito e cada PR com o estado, o CI e o conflito que o poll guardou; os avisos de conflito
+    entre passos; e o próximo passo a mergear (o primeiro a fazer com todos os PRs prontos). É por aqui que se responde "posso mergear?"."""
+    prs = _prs_ro()
+    passos, raw = _passos_declarados(_fila_ro(), prs), {i.get("numero"): i for i in prs["itens"]}
+    prox = _marca_passos(passos, prs)
+    linhas = []
+    for p in passos:
+        linhas.append(f"{p['passo']}  {p['nome']}  [{'feito' if p['feito'] else 'a fazer'}]  " + ", ".join(_txt_pr(i, raw) for i in p["prs"]) + (f"  — {p['por']}" if p["por"] else ""))
+        linhas += [f"   ⚠ {a}" for a in p["avisos"]]
+    if passos:
+        alvo = next((p for p in passos if p["passo"] == prox), None)
+        linhas.append(f"Próximo a mergear: passo {prox} ({alvo['nome']})" if alvo else "Próximo a mergear: nenhum passo pronto")
+    return linhas
 
 
 def _passos_declarados(fila, prs):
@@ -2475,6 +2595,7 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
                  "prs": [_pr_contrato(i) for i in g["itens"]], "feito": feito[g["task"]], "ticket": _dict(por_task.get(g["task"])).get("num"),
                  "proximo": None if feito[g["task"]] else pr_proximo(g["itens"]), "ciclo": g["ciclo"]} for n, g in enumerate(ordem, 1)]
     declarada = _passos_declarados(fila, prs)
+    proximo_passo = _marca_passos(declarada or derivada, prs)
     features = []
     for g in ordem:
         ext = [i for i in g["itens"] if i.get("tag") or i.get("nota")]
@@ -2491,7 +2612,7 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
         rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
     return {"versao": 1, "geradoEm": agora.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(ausente), "desde": _dict(ausente).get("ligada_em")},
-            "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando, "maquina": maquina,
+            "fila": declarada or derivada, "proximoPasso": proximo_passo, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando, "maquina": maquina,
             "tickets_orq": tickets_do_painel(ts, aberto),
             "pagina": {"data": agora.astimezone().strftime("%Y-%m-%d"), "gerado": agora.astimezone().strftime("%H:%M"), "desde": desde, "poll": prs.get("ultimo_poll"),
                        "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada)}}
@@ -2500,7 +2621,7 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
 def digest_json(d):
     """O que vai para o atual.json: as chaves do contrato, cada passo só com as dele, e `linha` vazia com o modo ausente desligado."""
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
-            "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito")} for p in d["fila"]],
+            "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
             "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"]}
 
