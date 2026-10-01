@@ -2703,10 +2703,25 @@ def digest_abrir(caminho):
     orca("create", "--url", pathlib.Path(caminho).as_uri(), area="tab", timeout=10)
 
 
+def _marcador_away(hora):
+    """O marcador `estado/away` que o statusline.sh lê sem Python: a hora local de quando o modo ligou, ou nada (apagado). Falha de disco não derruba o orq."""
+    caminho = os.path.join(HOME, "estado", "away")
+    try:
+        if hora is None:
+            os.remove(caminho)
+            return
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        with open(caminho, "w") as f:
+            f.write(hora)
+    except OSError:
+        pass
+
+
 def ausente_ligar():
     """Liga o modo ausente: o Stop do coordenador atualiza o digest a cada resposta (`hook_stop`). Devolve o estado gravado."""
     estado_ = {"ligada_em": now()}
     _cursor_mut(lambda c: c.__setitem__("ausente", estado_))
+    _marcador_away(_hora_local(estado_["ligada_em"]))
     append_event({"tipo": "ausente_ligar"})
     return estado_
 
@@ -2715,6 +2730,7 @@ def ausente_desligar():
     """Desliga o modo ausente; devolve se estava ligado."""
     ligado = bool(_dict(_cursor_ro().get("ausente")))
     _cursor_mut(lambda c: c.pop("ausente", None))
+    _marcador_away(None)
     if ligado:
         append_event({"tipo": "ausente_desligar"})
     return ligado
@@ -2725,7 +2741,7 @@ def linhas_ausente(cur):
     a = _dict(_dict(cur).get("ausente"))
     if not a:
         return ["modo ausente desligado"]
-    return [f"modo ausente ligado desde {_hora_local(a.get('ligada_em'))}: o Stop de cada resposta atualiza {_path(os.path.join(DIGEST, 'atual.json'))}",
+    return [f"modo ausente ligado desde {_hora_local(a.get('ligada_em'))} (o HUD mostra away desde ... pelo statusline.sh): o Stop de cada resposta atualiza {_path(os.path.join(DIGEST, 'atual.json'))}",
             *([] if _gerente_cfg() else ["aviso: sem agent manager ligado ninguém roda o poll dos PRs; rode `orq pr poll` (o Stop não chama o gh)"])]
 
 

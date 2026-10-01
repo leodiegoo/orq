@@ -10057,6 +10057,41 @@ def test_ticket78_digest_mostra_as_ultimas_rodadas_do_retro_so_quando_existem():
     assert d1["retro"] == [{"ate": "2026-09-29T00:00:00Z", "falhas": 4, "metricas": {"nao_iniciou": 1, "regra_violada": None}}], d1.get("retro")
 
 
+def _statusline(a, hud_saida="X"):
+    os.makedirs(a.home, exist_ok=True)
+    hud = os.path.join(a.home, "hud-falso.sh")
+    open(hud, "w").write(f"cat >/dev/null\nprintf '%s\\n' '{hud_saida}'\n")
+    env = {**os.environ, "ORQ_HOME": a.home, "ORQ_HUD": hud}
+    return subprocess.run(["sh", os.path.join(AQUI, "statusline.sh")], input="{}", capture_output=True, text=True, env=env)
+
+
+def test_ausente_ligar_cria_o_marcador_e_desligar_apaga():
+    a = Amb(run="run_a")
+    marca = os.path.join(a.home, "estado", "away")
+    a.orq("ausente", "ligar")
+    assert os.path.exists(marca) and len(open(marca).read()) == 5, marca
+    a.orq("ausente", "desligar")
+    assert not os.path.exists(marca)
+
+
+def test_statusline_imprime_o_hud_igual_desligado_e_com_o_segmento_ligado():
+    a = Amb(run="run_a")
+    r = _statusline(a)
+    assert r.returncode == 0 and r.stdout == "X\n", r
+    a.orq("ausente", "ligar")
+    r = _statusline(a)
+    assert r.returncode == 0 and r.stdout.startswith("X ") and "away desde " in r.stdout and r.stdout.endswith("\n"), r
+    assert _statusline(a, "A\nB").stdout.split("\n")[1] == "B"
+
+
+def test_statusline_sai_0_e_imprime_o_hud_se_o_marcador_estiver_ilegivel():
+    a = Amb(run="run_a")
+    os.makedirs(os.path.join(a.home, "estado"))
+    os.mkdir(os.path.join(a.home, "estado", "away"))  # diretório no lugar do arquivo: cat falha
+    r = _statusline(a)
+    assert r.returncode == 0 and r.stdout == "X\n", r
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
