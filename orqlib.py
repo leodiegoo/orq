@@ -5600,10 +5600,14 @@ def _maquina_avisar(motivo, na_fila, cfg):
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
         alvo = _candidato_a_pausar()
     dica = f" Para abrir folga: orq pausar {alvo['task']} (P{alvo['prioridade']} {alvo.get('titulo') or alvo['task']})." if alvo else ""
-    if digita(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{dica}") != "enviado":
+    filhos = {}
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):
+        filhos = _filhos_por_task()
+    peso = f" Processos em segundo plano: {', '.join(f'{t} {n}' for t, n in filhos.items())}." if filhos else ""
+    if digita(g["coordenador"], f"orq: máquina sob pressão ({motivo}). O gerente parou de subir worker ({na_fila} na fila de despacho).{peso}{dica}") != "enviado":
         return []
     _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": motivo}))
-    append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"sugerido": alvo["task"]} if alvo else {})})
+    append_event({"tipo": "maquina_aviso", "motivo": motivo, "na_fila": na_fila, **({"sugerido": alvo["task"]} if alvo else {}), **({"filhos": filhos} if filhos else {})})
     linhas = [f"máquina sob pressão ({motivo}): coordenador avisado, nada sobe"]
     if cfg["pausar_sob_pressao"] and alvo:
         r = pausar((alvo["task"],))
@@ -6058,14 +6062,15 @@ def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
 
 def _fechar_pausado(linha):
     """O PAUSA.md chegou: fecha o terminal do worker, guarda o dispatch em `pausados` e grava o evento."""
+    encerrados = encerrar_filhos(linha["cwd"], linha["agente"])  # shells e monitores em segundo plano sobrariam órfãos e seguiriam pesando na máquina
     try:
         orca("close", "--terminal", linha["terminal"], area="terminal")
     except (RuntimeError, subprocess.TimeoutExpired) as e:
-        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSA.md está escrito"}
+        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSA.md está escrito", "encerrados": encerrados}
     guarda = {k: linha[k] for k in ("task", "run", "titulo", "prioridade", "agente", "modelo", "effort", "sessao", "cwd", "terminal")}
     _cursor_mut(lambda c: c.setdefault("pausados", {}).__setitem__(linha["dispatch"], {**guarda, "desde": now()}))
-    append_event({"tipo": "pausa_plano", "dispatch": linha["dispatch"], **guarda})
-    return {**linha, "estado": "pausado"}
+    append_event({"tipo": "pausa_plano", "dispatch": linha["dispatch"], **guarda, "encerrados": encerrados})
+    return {**linha, "estado": "pausado", "encerrados": encerrados}
 
 
 def retomar_pausados(run=None, forcar=False):
@@ -6111,7 +6116,8 @@ def retomar_pausados(run=None, forcar=False):
 
 def texto_pausar(res):
     """Uma linha por worker pausado ou poupado."""
-    ls = [f"{w['dispatch']} P{w['prioridade']} {w.get('titulo') or w['task']}: {w['estado']}" + (f" ({w['aviso']})" if w.get("aviso") else "") for w in res["pausados"]]
+    ls = [f"{w['dispatch']} P{w['prioridade']} {w.get('titulo') or w['task']}: {w['estado']}" + (f" ({w['aviso']})" if w.get("aviso") else "")
+          + (f" [{len(w['encerrados'])} processos em segundo plano encerrados]" if w.get("encerrados") else "") for w in res["pausados"]]
     ls += [f"{w['dispatch']} P{w['prioridade']} {w.get('titulo') or w['task']}: preservado (fase {w.get('fase')})" for w in res["preservados"]]
     return "\n".join(ls) or "nenhum worker a pausar"
 
@@ -6229,6 +6235,67 @@ def _protegidos(run):
     except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError):
         coord = None
     return {x for x in (os.environ.get("ORCA_TERMINAL_HANDLE"), g.get("coordenador"), g.get("gerente"), coord) if x}
+
+
+ENCERRA_ESPERA_S = float(os.environ.get("ORQ_ENCERRA_ESPERA_S") or 5)  # do SIGTERM ao SIGKILL nos filhos do worker pausado
+
+
+def _filhos_do_worker(procs, cwd, agente):
+    """Os processos que o Bash tool do worker deixou vivos: cada comando filho do agente (HARNESS[…]["filho"]) e tudo o que sobe abaixo dele. Fora o agente, os
+    servidores MCP da sessão (o close do terminal leva) e os ancestrais deste processo. [] sem lista, sem agente nesse cwd ou harness sem padrão."""
+    padrao = HARNESS.get(agente, {}).get("filho")
+    pids, _ = _processo_do_worker(procs, cwd, agente)
+    if not padrao or not pids:
+        return []
+    raizes = [p["pid"] for p in procs if p["pid"] in _descendentes(procs, pids) - set(pids) and padrao.search(p["args"])]
+    pai = {p["pid"]: p["ppid"] for p in procs}
+    nos, eu = set(), os.getpid()
+    while eu in pai and eu not in nos:
+        nos.add(eu)
+        eu = pai[eu]
+    return [p for p in procs if p["pid"] in _descendentes(procs, raizes) and p["pid"] not in nos]
+
+
+def _sinal(pid, sig):
+    """Manda `sig` ao pid. ORQ_PROCESSOS (testes): tira o processo do JSON; o SIGTERM só o tira se ele não tem `ignora_term`."""
+    if os.environ.get("ORQ_PROCESSOS"):
+        arq = os.environ["ORQ_PROCESSOS"]
+        ps = _read_json(arq)
+        json.dump([p for p in ps if p["pid"] != pid or (sig == signal.SIGTERM and p.get("ignora_term"))], open(arq, "w"))
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, sig)
+
+
+def encerrar_filhos(cwd, agente):
+    """Encerra os processos que o worker deixou em segundo plano (testes, node, sleep/until de monitor): SIGTERM, e depois de ENCERRA_ESPERA_S o SIGKILL nos que
+    ficaram. Nada fora da árvore do agente é tocado. Devolve [{pid, args, sinal}] (`sinal`: o último que o matou: TERM ou KILL)."""
+    filhos = _filhos_do_worker(_processos(), cwd, agente)
+    for p in filhos:
+        _sinal(p["pid"], signal.SIGTERM)
+    vivos = {p["pid"] for p in filhos}
+    fim = time.time() + ENCERRA_ESPERA_S
+    while vivos and time.time() < fim:
+        vivos &= {p["pid"] for p in _processos() or ()}
+        if vivos:
+            time.sleep(0.2)
+    for pid in vivos:
+        _sinal(pid, signal.SIGKILL)
+    return [{"pid": p["pid"], "args": p["args"][:200], "sinal": "KILL" if p["pid"] in vivos else "TERM"} for p in filhos]
+
+
+def _filhos_por_task():
+    """{task: n processos em segundo plano} dos workers vivos que têm algum, para o aviso de pressão mostrar quem pesa; {} sem ps."""
+    procs, turnos = _processos(), _turnos_ro()
+    if not procs:
+        return {}
+    res = {}
+    for a in agentes():
+        t = _dict(turnos.get(a["dispatch"]))
+        n = len(_filhos_do_worker(procs, t.get("cwd"), a.get("agente") or t.get("harness") or "claude")) if t.get("cwd") else 0
+        if n:
+            res[a["task"]] = n
+    return res
 
 
 def _tela_ocupada(handle, agente):

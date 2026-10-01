@@ -9548,6 +9548,71 @@ def test_ticket79_leitura_real_do_sistema_tem_as_quatro_medidas_no_macos():
     assert set(l["rss_mb"]) == {"claude", "codex", "node", "docker"} and all(v >= 0 for v in l["rss_mb"].values()), l
 
 
+# ---------- ticket 84: pausar encerra os processos em segundo plano do worker ----------
+
+SNAP84 = "/bin/zsh -c source /Users/leo/.claude/shell-snapshots/snapshot-zsh-1.sh && eval '%s'"
+
+
+def _procs84(a, teimoso=False):
+    """Dois claude (f e i) com a pasta de cada um; f tem um shell de teste com um node abaixo e um monitor (`until`) que, com `teimoso`, ignora o SIGTERM; i tem o seu."""
+    cl = "claude --dangerously-skip-permissions --model claude-opus-5-5"
+    ps = [{"pid": 7, "ppid": 1, "rss": 1000, "args": "/usr/bin/outro-programa", "cwd": None},
+          {"pid": 100, "ppid": 1, "rss": 600_000, "args": cl, "cwd": a.wt + "/f"},
+          {"pid": 101, "ppid": 100, "rss": 150_000, "args": "node /opt/mcp/server.js", "cwd": None},
+          {"pid": 150, "ppid": 100, "rss": 5000, "args": SNAP84 % "python3 -m pytest test_orq.py", "cwd": None},
+          {"pid": 151, "ppid": 150, "rss": 5000, "args": "python3 -m pytest test_orq.py", "cwd": None},
+          {"pid": 152, "ppid": 100, "rss": 5000, "args": SNAP84 % "until false; do sleep 1; done", "cwd": None, **({"ignora_term": True} if teimoso else {})},
+          {"pid": 200, "ppid": 1, "rss": 600_000, "args": cl, "cwd": a.wt + "/i"},
+          {"pid": 250, "ppid": 200, "rss": 5000, "args": SNAP84 % "bash scripts/e2e-infra.sh test", "cwd": None}]
+    a.set("../procs.json", ps)
+    a.env["ORQ_PROCESSOS"] = os.path.join(a.tmp.name, "procs.json")
+
+
+def _pausa84(teimoso=False):
+    a = Amb(run="run_a", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2", ORQ_ENCERRA_ESPERA_S="1")
+    _pausa51(a)
+    _procs84(a, teimoso)
+    f = _escreve_pausa51(a, "f")
+    r = a.orq("pausar", "task_term_f", "--json")
+    f.result()
+    assert r.returncode == 0, r.stderr
+    return a, json.loads(r.stdout)["pausados"][0], {p["pid"] for p in json.load(open(os.path.join(a.tmp.name, "procs.json")))}
+
+
+def test_ticket84_pausar_encerra_os_filhos_do_worker_e_preserva_o_que_esta_fora_da_arvore():
+    a, w, vivos = _pausa84()
+    assert w["estado"] == "pausado" and {p["pid"] for p in w["encerrados"]} == {150, 151, 152}, w
+    assert vivos == {7, 100, 101, 200, 250}, "o agente e o MCP dele (o close leva), o outro worker e o programa alheio ficam"
+    assert all(p["sinal"] == "TERM" for p in w["encerrados"])
+
+
+def test_ticket84_filho_que_ignora_sigterm_recebe_sigkill():
+    a, w, vivos = _pausa84(teimoso=True)
+    assert {p["pid"]: p["sinal"] for p in w["encerrados"]} == {150: "TERM", 151: "TERM", 152: "KILL"}, w
+    assert 152 not in vivos and 250 in vivos
+
+
+def test_ticket84_o_evento_da_pausa_lista_o_que_saiu():
+    a, w, _ = _pausa84(teimoso=True)
+    ev = next(e for e in a.events() if e["tipo"] == "pausa_plano")
+    assert sorted((p["pid"], p["sinal"]) for p in ev["encerrados"]) == [(150, "TERM"), (151, "TERM"), (152, "KILL")], ev
+    assert "pytest" in next(p for p in ev["encerrados"] if p["pid"] == 151)["args"]
+
+
+def test_ticket84_aviso_de_pressao_mostra_quantos_processos_em_segundo_plano_cada_worker_tem():
+    a = _painel79()
+    _gerente(a)
+    _pausa51(a)
+    _procs84(a)
+    a.maquina(carga=40)
+    assert _desp79(a, "Ticket 05", 1).returncode == 0
+    a.orq("gerente", "absorver")
+    ev = next(e for e in a.events() if e["tipo"] == "maquina_aviso")
+    assert ev["filhos"] == {"task_term_f": 3, "task_term_i": 1}, ev
+    texto = next(c[c.index("--text") + 1] for c in _log(a, "send.log") if c[c.index("--terminal") + 1] == "term_coord")
+    assert "task_term_f 3" in texto and "task_term_i 1" in texto, texto
+
+
 # ---------- ticket 60: hibernar worker ocioso e acordar quando precisar ----------
 
 HIB60 = {"ORQ_HIBERNA_VOLTA_S": "0", "ORQ_HIBERNA_RSS_ESPERA_S": "1", "ORQ_RETOMAR_ESPERA_S": "2"}
