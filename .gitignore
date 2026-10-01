@@ -11,6 +11,7 @@ pendencias.json
 ask-guard.off
 *.lock
 handoff/
+groups/
 
 # decision pages and answers
 .lavish/

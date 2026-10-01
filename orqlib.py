@@ -30,7 +30,7 @@ ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
-EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado")
+EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
 HOOK_TIMEOUT = 3
 TIPOS_PEND = ("acao", "decisao", "avisar")
 PEND_IDADE_DIAS = 14  # pendência sem mexer há mais de 14 dias sai da vista e vai para "Depois"
@@ -125,6 +125,7 @@ HARNESS = {
         "resume": lambda sessao, modelo, effort, msg: ["claude", "--resume", sessao, *(["--model", modelo] if modelo else []),
                                                        "--dangerously-skip-permissions", msg],
         "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
+        "abrir": lambda modelo, effort, msg: ["claude", *(["--model", modelo] if modelo else []), "--dangerously-skip-permissions", msg],  # o mate (ticket 80)
         "efforts": ("low", "medium", "high", "xhigh", "max"),
         "filho": re.compile(r"/shell-snapshots/"),  # o comando do Bash tool (E2E, teste, build, shell em segundo plano) sobe como `zsh -c source ~/.claude/shell-snapshots/…`, filho do claude
     },
@@ -135,6 +136,8 @@ HARNESS["codex"] = {
     "resume": lambda sessao, modelo, effort, msg: ["codex", "resume", sessao, *(["-m", modelo] if modelo else []),
                                                    *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
                                                    "--dangerously-bypass-approvals-and-sandbox", msg],
+    "abrir": lambda modelo, effort, msg: ["codex", *(["-m", modelo] if modelo else []), *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
+                                          "--dangerously-bypass-approvals-and-sandbox", msg],
     "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›", "enter_separado": True,  # o número com Enter no mesmo send não confirma o menu (01/10)
              "perguntas": (("trust", re.compile(r"Trust this folder\?|Do you trust the contents of this directory", re.I)),
                            ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
@@ -149,7 +152,7 @@ PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.
 
 # ---------- puras ----------
 
-AVISOS_ORQ = ("orq: PR ", "orq: Fila do E2E", "orq: uso do plano", "orq: worker ")  # o que o painel digita no coordenador (avisa_coordenador)
+AVISOS_ORQ = ("orq: PR ", "orq: Fila do E2E", "orq: uso do plano", "orq: worker ", "orq ▸ pedido ", "orq ▸ mate ")  # o que o painel digita no coordenador (avisa_coordenador)
 
 
 def origem(prompt):
@@ -177,10 +180,12 @@ def separa_aviso(prompt):
     return (p[:m.start()].rstrip(), True) if m else (p, False)
 
 
-def abertas(events):
-    """Entradas sem nenhum intake com o mesmo id, na ordem em que entraram."""
+def abertas(events, grupo=None):
+    """Entradas sem nenhum intake com o mesmo id, na ordem em que entraram. Só as de quem lê: as do mate do `grupo` (padrão: o ORQ_MATE do ambiente)
+    ou, sem grupo, as do coordenador. A entrada digitada no mate leva `grupo`; a que o mate sobe (origem mate) não, e é do coordenador (ticket 80)."""
+    g = grupo or os.environ.get("ORQ_MATE") or None
     fechadas = {e.get("entrada") for e in events if e.get("tipo") == "intake"}
-    return [e for e in events if e.get("tipo") == "entrada" and e.get("id") and e["id"] not in fechadas]
+    return [e for e in events if e.get("tipo") == "entrada" and e.get("id") and e["id"] not in fechadas and e.get("grupo") == g]
 
 
 def marcadas(resposta, opcoes):
@@ -1550,7 +1555,7 @@ def _ingest_msg(m, desde, ja, titulos):
     _prova_de_entrega(m, p)
     if p.get("reportPath"):
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": m.get("subject") or "", "fonte": f"worker {m.get('subject') or ''}",
-                      "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId")}, novo_id=True)
+                      "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId"), **_grupo_do_run(m["run_id"])}, novo_id=True)
         return 1
     log(f"ingest: worker_done {m['id']} sem reportPath (task {p.get('taskId')}, {m.get('subject')})")
     if p.get("outcome") != "succeeded":  # scout que falhou não tem relatório e não é alerta
@@ -3133,6 +3138,8 @@ def coordenador(ev):
     if run is None:
         return None
     lembrar_run(sid, run["id"], ev.get("cwd"), ev.get("_harness_orq") or "claude")
+    if (g := os.environ.get("ORQ_MATE")) and run["id"] not in (_dict(_mates().get(g)).get("runs") or []):
+        _mate_mut(g, run=run["id"])  # o Run do mate: as entradas dele (relatório de worker) ficam no mundo do mate
     return run
 
 
@@ -3287,10 +3294,10 @@ def hook_prompt(ev, run):
         ln = linhas_noite(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # a noite acorda o coordenador por aviso, não por usuário
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
-                            **({"com_aviso": True} if com_aviso else {})}, novo_id=True)
+                            **({"com_aviso": True} if com_aviso else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, novo_id=True)
     checar_gerente_bg()
     ctx = estado(entrada)
-    if adiados := avisos_do_contexto():
+    if not os.environ.get("ORQ_MATE") and (adiados := avisos_do_contexto()):  # a fila de avisos é do coordenador
         ctx += "\n" + adiados
     refresh_bg()
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
@@ -3298,7 +3305,8 @@ def hook_prompt(ev, run):
 
 def hook_stop(ev, run):
     # modo aviso (fatia 1): nunca bloqueia; a fatia 5 troca o systemMessage por decision=block com stop_hook_active
-    digest_no_stop(ev)
+    if not os.environ.get("ORQ_MATE"):  # o fim de turno do mate não é resposta do coordenador ao usuário ausente
+        digest_no_stop(ev)
     sem = abertas(read_events())
     if not sem:
         return None
@@ -3620,6 +3628,12 @@ def run_hook(kind, harness="claude"):
             return 0  # fora do Orca não há Run nem terminal: nem chama o Orca nem enche o log
         ev = json.load(sys.stdin)
         ev["_harness_orq"] = harness  # de que agente veio o hook: o coordenador guarda o dele
+        if os.environ.get("ORQ_MATE"):
+            if kind in ("prompt", "stop"):
+                mate_turno(kind, ev)  # sem Orca: o prazo dos pedidos ao mate conta do fim do turno dele
+            elif kind == "guard" and ev.get("tool_name") == "AskUserQuestion":
+                print(json.dumps(guard_mate(), ensure_ascii=False))
+                return 0
         if kind == "externas":  # todo Bash, de qualquer sessão: só lê o cursor, sem Orca
             out = hook_externas(ev, None)
             if out:
@@ -3664,6 +3678,295 @@ def run_hook(kind, harness="claude"):
     return 0
 
 
+# ---------- grupos e secondmates (ticket 80) ----------
+# Desenho: ~/.claude/orquestrador-plan/secondmate-por-grupo.md. Um grupo (ORQ_HOME/groups/<nome>.json) junta os projetos de um domínio; o mate do grupo é
+# uma sessão de coordenador com ORQ_MATE=<nome> no ambiente, que `orq mate abrir` sobe num terminal (não pelo worker-start: sem dispatch, não há
+# capability para o Orca revogar depois do primeiro worker_done). O canal é o events.jsonl: o coordenador pede (`mate_pedido`, id pN, prazo), o mate
+# sobe (`entrada` origem mate, com `corr` quando responde a um pedido), e o gerente cobra o prazo (mate_volta).
+
+GRUPOS_DIR = "groups"
+PRAZO_PEDIDO_S = int(os.environ.get("ORQ_PRAZO_PEDIDO_S") or 120)  # o do firstmate, contado do fim do turno que recebeu o pedido
+TIPOS_SUBIDA = ("resposta", "decisao", "pr", "bloqueio", "resumo")
+TURNOS_MATE = 20  # turnos guardados por mate: o prazo conta do primeiro que começou depois da entrega, não do último
+TURNO_ABERTO_TETO_S = 1800  # turno sem fim (Esc, erro da API: o Stop não rodou) conta como acabado no começo depois disto
+ENTREGUE = ("enviado", "adiado")  # o avisa_coordenador (ticket 82): adiado já é entrega, sai no contexto do próximo prompt do coordenador
+CHARTER_MATE = """Você é o secondmate do grupo {grupo} no orq. O usuário fala só com o coordenador; você coordena os workers deste grupo e não conversa com o usuário.
+Projetos do grupo: {projetos}.{regras}
+1. Crie o seu Run uma vez: `orca orchestration run-create --objective "{grupo}: secondmate"`. Depois de um resume, o Run já está em `orq grupos`: use `orca orchestration run-use --id <run>`.
+2. Despache e acompanhe os workers como o coordenador faz (`orq despachar`, `orq agentes`, `orq steer`, `orq liberar`), com a skill worker-routing.
+3. Pedido do coordenador chega digitado como `orq ▸ pedido pN ...`. Responda sempre com `orq mate subir --corr pN --tipo resposta --texto "<resposta>"`: a resposta no chat ninguém lê.
+4. Suba ao coordenador, com `orq mate subir --tipo <decisao|pr|bloqueio|resumo> --texto "..."`: decisão que só o usuário toma, PR ou branch pronta, bloqueio, e um resumo quando um ticket fecha. O resto fica com você.
+5. Nunca use AskUserQuestion, não faça push nem abra PR: quem faz é o coordenador, depois da subida `pr`."""
+MSG_MATE_VOLTA = ("Você é o secondmate do grupo {grupo} e o seu terminal caiu. Confira `orq grupos` (o seu Run), `orq agentes --run <run>` e os pedidos sem resposta "
+                  "em `orq mate pedidos`; responda cada um com `orq mate subir --corr pN`.")
+
+
+def grupos():
+    """{nome: cfg} de ORQ_HOME/groups/*.json. Arquivo ilegível, ou com `projetos`/`prefixos` que não são listas, fica de fora com uma linha no log."""
+    out = {}
+    for arq in sorted(glob.glob(os.path.join(_path(GRUPOS_DIR), "*.json"))):
+        cfg = _read_json(arq)
+        if not isinstance(cfg, dict) or not all(isinstance(cfg.get(k, []), list) for k in ("projetos", "prefixos")):
+            log(f"grupos: {arq} ilegível ou fora do formato, ignorado")
+            continue
+        out[os.path.basename(arq)[:-len(".json")]] = cfg
+    return out
+
+
+def _dentro(cwd, pasta):
+    c, p = os.path.abspath(os.path.expanduser(cwd)), os.path.abspath(os.path.expanduser(pasta))
+    return c == p or c.startswith(p.rstrip("/") + "/")
+
+
+def grupo_de(grupos_, titulo=None, cwd=None, grupo=None):
+    """(nome, motivo) do grupo de um pedido; (None, motivo) quando fica com o coordenador. Ordem: `grupo` explícito, prefixo do título (sem caixa),
+    cwd dentro de um projeto do grupo. Dois grupos no mesmo critério é ambíguo e não roteia: o coordenador decide ou pergunta."""
+    if grupo:
+        if grupo not in grupos_:
+            raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/ (há: {', '.join(grupos_) or 'nenhum'})")
+        return grupo, "explícito"
+    t = (titulo or "").strip().lower()
+    criterios = (("título", lambda g: t and any(p and t.startswith(p.lower()) for p in g.get("prefixos") or [])),
+                 ("cwd", lambda g: cwd and any(_dentro(cwd, p) for p in g.get("projetos") or [])))
+    for nome, casa in criterios:
+        achados = [n for n, g in grupos_.items() if casa(g)]
+        if len(achados) == 1:
+            return achados[0], f"pelo {nome}"
+        if achados:
+            return None, f"ambíguo pelo {nome} ({', '.join(achados)}): fica com o coordenador"
+    return None, "nenhum grupo serve: fica com o coordenador"
+
+
+def _mates():
+    return _dict(_cursor_ro().get("mates"))
+
+
+def _mate_mut(grupo, **campos):
+    def grava(c):
+        m = _sub(_sub(c, "mates"), grupo)
+        for k, v in campos.items():
+            if k == "run":
+                m["runs"] = [*[r for r in m.get("runs") or [] if r != v], v]
+            else:
+                m[k] = v
+
+    _cursor_mut(grava)
+
+
+def mate_turno(kind, ev):
+    """Hooks prompt e stop de uma sessão com ORQ_MATE: o início e o fim do turno do mate (o prazo dos pedidos conta do fim), a sessão e o cwd do resume."""
+    if kind == "prompt" and origem(ev.get("prompt")) == "comando":
+        return
+    g, agora = os.environ["ORQ_MATE"], now()
+
+    def grava(c):
+        m = _sub(_sub(c, "mates"), g)
+        ts = [t for t in m.get("turnos") or [] if isinstance(t, list) and len(t) == 2]
+        if kind == "prompt":
+            ts.append([agora, None])
+        elif ts and ts[-1][1] is None:
+            ts[-1][1] = agora
+        m["turnos"] = ts[-TURNOS_MATE:]
+        m["terminal"] = os.environ.get("ORCA_TERMINAL_HANDLE")
+        if ev.get("session_id"):
+            m["sessao"] = ev["session_id"]
+        if kind == "prompt" and ev.get("cwd") and not m.get("cwd"):
+            m["cwd"] = ev["cwd"]
+
+    _cursor_mut(grava)
+
+
+def _num_entrada(e):
+    m = re.fullmatch(r"e(\d+)", str(e.get("id") or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _grupo_do_run(run):
+    """{"grupo": g} quando o Run é de um mate (o hook dele o registrou), para a entrada do Run ficar no mundo do mate; senão {}."""
+    return next(({"grupo": g} for g, m in _mates().items() if run in (_dict(m).get("runs") or [])), {})
+
+
+def mate_pendentes(eventos, mates, agora):
+    """Pedidos ao mate sem resposta correlacionada, com o estado: a_entregar, aguardando, reenviar, escalar ou escalado. Pura.
+
+    O prazo conta do fim do primeiro turno do mate que começou depois da entrega (ou da repostagem): turno longo não estoura, e os turnos seguintes (avisos do
+    Orca, heartbeats) não empurram o prazo. Sem turno começado depois dela, conta da própria entrega. Turno aberto há mais de TURNO_ABERTO_TETO_S conta do começo. Só uma `entrada` origem mate com o mesmo `corr` resolve. Uma repostagem, uma escalada, e nada mais: nunca em laço."""
+    respondidos = {e.get("corr") for e in eventos if e.get("tipo") == "entrada" and e.get("origem") == "mate" and e.get("corr")}
+    marcas = {}
+    for e in eventos:
+        if e.get("tipo") in ("mate_entregue", "mate_reenvio", "mate_escalado"):
+            marcas.setdefault(e.get("corr"), {})[e["tipo"]] = _ts(e.get("ts"))
+    out = []
+    for p in (e for e in eventos if e.get("tipo") == "mate_pedido" and e.get("corr") not in respondidos):
+        m, mt = marcas.get(p["corr"], {}), _dict(mates.get(p.get("grupo")))
+        base = {"corr": p["corr"], "grupo": p.get("grupo"), "texto": p.get("texto"), "prazo": p.get("prazo"), "ts": p.get("ts")}
+        if "mate_entregue" not in m:
+            out.append({**base, "estado": "a_entregar"})
+            continue
+        if not p.get("prazo"):
+            continue
+        if "mate_escalado" in m:
+            out.append({**base, "estado": "escalado"})
+            continue
+        desde = m.get("mate_reenvio") or m["mate_entregue"]
+        turno = next(((_ts(i), _ts(f)) for i, f in (t for t in mt.get("turnos") or [] if isinstance(t, list) and len(t) == 2)
+                      if _ts(i) and _ts(i) >= desde), None)
+        if turno and not turno[1] and (agora - turno[0]).total_seconds() <= TURNO_ABERTO_TETO_S:
+            out.append({**base, "estado": "aguardando"})
+            continue
+        conta = (turno[1] or turno[0]) if turno else desde
+        if (agora - conta).total_seconds() <= p["prazo"]:
+            out.append({**base, "estado": "aguardando"})
+        else:
+            out.append({**base, "estado": "escalar" if "mate_reenvio" in m else "reenviar"})
+    return out
+
+
+def _texto_pedido(corr, texto, prazo, de_novo=False):
+    resposta = f" Responda com `orq mate subir --corr {corr} --tipo resposta --texto \"...\"`." if prazo else ""
+    texto = " ".join((texto or "").split())  # a quebra de linha submeteria o pedido pela metade; o evento guarda o texto inteiro
+    return f"orq ▸ pedido {corr}{' de novo, sem resposta no canal' if de_novo else ''} do coordenador: {texto}{resposta}"
+
+
+def mate_pedir(grupo, texto, prazo=PRAZO_PEDIDO_S, responde=None):
+    """Grava o pedido (`mate_pedido`, corr pN) antes de digitá-lo no terminal do mate; se o mate está no meio do turno, o gerente entrega depois.
+    `responde`: a entrada que o mate subiu e este pedido responde (a decisão voltando); ela fecha com o efeito `mate`."""
+    if grupo not in grupos():
+        raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/")
+    terminal = _dict(_mates().get(grupo)).get("terminal")
+    if not terminal:
+        raise ValueError(f"o grupo {grupo} não tem mate aberto: orq mate abrir {grupo}")
+    if responde:
+        eventos = read_events()
+        alvo = next((e for e in eventos if e.get("tipo") == "entrada" and e.get("id") == responde), None)
+        if not alvo or alvo.get("origem") != "mate" or alvo.get("mate") != grupo:
+            raise ValueError(f"--responde {responde}: não é uma entrada que o mate {grupo} subiu; nada foi gravado")
+        if any(e.get("tipo") == "intake" and e.get("entrada") == responde for e in eventos):
+            raise ValueError(f"--responde {responde}: a entrada já foi fechada; nada foi gravado")
+    with _trava("cursor.lock"):
+        n = 1 + max((int(e["corr"][1:]) for e in read_events() if e.get("tipo") == "mate_pedido" and re.fullmatch(r"p\d+", str(e.get("corr")))), default=0)
+        corr = f"p{n}"
+        _grava_evento({"tipo": "mate_pedido", "corr": corr, "grupo": grupo, "texto": texto[:2000], "prazo": prazo, **({"responde": responde} if responde else {})})
+    if responde:
+        intake(responde, "mate", corr)
+    antes = now()  # o hook do mate grava o início do turno antes de o digita voltar: a entrega vale de antes dele
+    entrega = digita(terminal, _texto_pedido(corr, texto, prazo))
+    if entrega == "enviado":
+        append_event({"tipo": "mate_entregue", "corr": corr, "ts": antes})
+    return {"corr": corr, "grupo": grupo, "entrega": entrega}
+
+
+def mate_subir(tipo, texto, corr=None, link=None, grupo=None):
+    """O mate sobe ao coordenador: uma entrada origem mate (o coordenador a trata como as outras, com orq intake), com `corr` quando responde a um pedido."""
+    g = grupo or os.environ.get("ORQ_MATE")
+    if not g:
+        raise ValueError("orq mate subir roda no terminal do mate (ORQ_MATE) ou com --grupo")
+    if tipo not in TIPOS_SUBIDA:
+        raise ValueError(f"--tipo {tipo}: use {'|'.join(TIPOS_SUBIDA)}")
+    if corr and not any(e.get("tipo") == "mate_pedido" and e.get("corr") == corr and e.get("grupo") == g for e in read_events()):
+        raise ValueError(f"pedido {corr} não existe para o grupo {g}: a resposta não foi gravada")
+    if tipo == "resposta" and not corr:
+        raise ValueError("--tipo resposta pede --corr <pedido>")
+    return append_event({"tipo": "entrada", "origem": "mate", "mate": g, "tipo_mate": tipo, "texto": texto[:2000], "fonte": f"mate {g}",
+                         **({"corr": corr} if corr else {}), **({"link": link} if link else {})}, novo_id=True)
+
+
+def _comando_mate(grupo, cfg, sessao):
+    agente, modelo = cfg.get("harness") or "claude", cfg.get("modelo")
+    if agente not in HARNESS:
+        raise ValueError(f"harness {agente} do grupo {grupo}: o orq só abre {', '.join(HARNESSES)}")
+    if sessao:
+        cmd = HARNESS[agente]["resume"](sessao, modelo, cfg.get("effort"), MSG_MATE_VOLTA.format(grupo=grupo))
+    else:
+        regras = f"\nLeia antes as regras do grupo em {cfg['regras']}." if cfg.get("regras") else ""
+        charter = CHARTER_MATE.format(grupo=grupo, projetos=", ".join(cfg.get("projetos") or []) or "nenhum", regras=regras)
+        cmd = HARNESS[agente]["abrir"](modelo, cfg.get("effort"), charter)
+    return shlex.join(["env", f"ORQ_MATE={grupo}", *cmd])
+
+
+def mate_abrir(grupo):
+    """Abre o mate do grupo num terminal novo, ou o retoma (`--resume` da sessão que os hooks dele gravaram) se ele caiu. Um mate vivo por grupo."""
+    cfg = grupos().get(grupo)
+    if cfg is None:
+        raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/")
+    m, vivos = _dict(_mates().get(grupo)), _terminais_vivos()
+    if vivos is None:
+        raise ValueError("o Orca não listou os terminais: sem saber se o mate está vivo, nada foi aberto")
+    if m.get("terminal") in vivos:
+        raise ValueError(f"o mate {grupo} já está aberto no terminal {m['terminal']}")
+    cwd = m.get("cwd") or cfg.get("cwd") or next(iter(cfg.get("projetos") or []), None)
+    cwd = cwd and os.path.expanduser(cwd)
+    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", _comando_mate(grupo, cfg, m.get("sessao")), cwd)
+    if m.get("sessao") and not _voltou(novo, cfg.get("harness") or "claude"):
+        # sessão que não volta deixa um shell: o gerente digitaria o pedido nele. Fecha, esquece a sessão, e o próximo abrir sobe com o charter
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+            orca("close", "--terminal", novo, area="terminal")
+        _mate_mut(grupo, terminal=None, sessao=None)
+        append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": False, "falhou": "a sessão não voltou"})
+        raise ValueError(f"a sessão {m['sessao']} do mate {grupo} não voltou; terminal fechado. Rode orq mate abrir {grupo} de novo para abrir com o charter")
+    _mate_mut(grupo, terminal=novo, morto=None, **({"cwd": cwd} if cwd else {}))
+    append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao")), "anterior": m.get("terminal")})
+    return {"grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao"))}
+
+
+def mate_volta():
+    """Uma volta do gerente pelos mates: entrega o pedido que esperava o mate ficar livre, reenvia uma vez o que estourou o prazo, escala uma vez o que estourou
+    de novo, avisa o coordenador de cada subida nova e do mate que caiu (uma vez por terminal). Devolve uma linha por ação."""
+    mates, linhas = _mates(), []
+    if not mates:
+        return linhas
+    coord = (_gerente_cfg() or {}).get("coordenador")
+    eventos, agora = read_events(), datetime.now(timezone.utc)
+    for p in mate_pendentes(eventos, mates, agora):
+        terminal, antes = _dict(mates.get(p["grupo"])).get("terminal"), now()
+        if p["estado"] == "a_entregar" and terminal and digita(terminal, _texto_pedido(p["corr"], p["texto"], p["prazo"])) == "enviado":
+            append_event({"tipo": "mate_entregue", "corr": p["corr"], "ts": antes})
+            linhas.append(f"mate {p['grupo']}: {p['corr']} entregue")
+        elif p["estado"] == "reenviar" and terminal and digita(terminal, _texto_pedido(p["corr"], p["texto"], p["prazo"], de_novo=True)) == "enviado":
+            append_event({"tipo": "mate_reenvio", "corr": p["corr"], "ts": antes})
+            linhas.append(f"mate {p['grupo']}: {p['corr']} reenviado")
+        elif p["estado"] == "escalar" and coord and avisa_coordenador(coord, f"orq ▸ mate {p['grupo']} não respondeu ao pedido {p['corr']} ({_cita(p['texto'])!r}) "
+                                                                               f"nem depois da repostagem. Veja o terminal {terminal}.") in ENTREGUE:
+            append_event({"tipo": "mate_escalado", "corr": p["corr"]})
+            linhas.append(f"mate {p['grupo']}: {p['corr']} escalado ao coordenador")
+    ate = _cursor_ro().get("mate_avisada_ate")
+    ate = ate if isinstance(ate, int) else 0  # a marca d'água: o maior eN de subida já avisado (uma lista com teto reavisaria as velhas)
+    for e in (x for x in eventos if x.get("tipo") == "entrada" and x.get("origem") == "mate" and _num_entrada(x) > ate):
+        if not coord or avisa_coordenador(coord, f"orq ▸ mate {e['mate']} subiu {e['id']} ({e.get('tipo_mate')}): {_cita(e.get('texto'), 200)}. Trate com orq intake {e['id']} "
+                                                 f"<efeito>; para responder ao mate, orq mate pedir {e['mate']} --responde {e['id']} --texto \"...\"") not in ENTREGUE:
+            break
+        _cursor_mut(lambda c, n=_num_entrada(e): c.__setitem__("mate_avisada_ate", n))
+        linhas.append(f"mate {e['mate']}: subida {e['id']} avisada ao coordenador")
+    vivos = _terminais_vivos()
+    for g, m in mates.items():
+        t = _dict(m).get("terminal")
+        if vivos is None or not t or t in vivos or _dict(m).get("morto") == t:
+            continue
+        if coord and avisa_coordenador(coord, f"orq ▸ mate {g} caiu (terminal {t} sumiu do Orca). Suba de novo com: orq mate abrir {g}") in ENTREGUE:
+            _mate_mut(g, morto=t)
+            linhas.append(f"mate {g}: caiu, coordenador avisado")
+    return linhas
+
+
+def texto_grupos(gs, mates, vivos, eventos, agora):
+    linhas = []
+    for nome, cfg in gs.items():
+        m = _dict(mates.get(nome))
+        estado = "sem mate" if not m.get("terminal") else "vivo" if vivos is None or m["terminal"] in vivos else "caiu"
+        pend = [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == nome]
+        linhas.append(f"{nome}: {', '.join(cfg.get('projetos') or [])} | prefixos {', '.join(cfg.get('prefixos') or []) or '-'} | mate {estado}"
+                      + (f" ({m['terminal']}, Runs {', '.join(m.get('runs') or []) or '-'})" if m.get("terminal") else "")
+                      + (f" | pedidos: {', '.join(p['corr'] + ' ' + p['estado'] for p in pend)}" if pend else ""))
+    return "\n".join(linhas) or f"nenhum grupo em {_path(GRUPOS_DIR)}"
+
+
+def guard_mate():
+    """PreToolUse de AskUserQuestion num mate: o usuário não olha o terminal dele; a decisão sobe ao coordenador."""
+    motivo = (f"{MARCA} o secondmate não pergunta ao usuário: suba a decisão com `orq mate subir --tipo decisao --texto \"<pergunta e opções, com a recomendada>\"`; "
+              "a resposta volta como `orq ▸ pedido pN`.")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
+
+
 # ---------- comandos ----------
 
 def intake(e, efeito, ref=None, run=None, nota=None):
@@ -3691,6 +3994,10 @@ def intake(e, efeito, ref=None, run=None, nota=None):
         if not any(t["id"] == ref for t in orca("task-list", "--run", alvo, timeout=20)["tasks"]):
             raise ValueError(f"task {ref} não existe no Run {alvo}")
         ev.update(ref=ref, run=alvo)
+    elif efeito == "mate":
+        if not any(x.get("tipo") == "mate_pedido" and x.get("corr") == ref for x in eventos):
+            raise ValueError(f"mate pede o pedido que respondeu à entrada (pN), e {ref} não existe")
+        ev["ref"] = ref
     elif efeito in ("pend", "decisao"):
         if not ref:
             raise ValueError(f"{efeito} pede o id da pendência")
@@ -3905,7 +4212,7 @@ def coordenador_ativo(agora=None, minutos=None):
     """True se o último prompt do usuário é mais novo que `minutos` (COORD_OCIOSO_MIN): o coordenador tem gente, e digitar nele cai no meio do que ela escreve."""
     minutos = COORD_OCIOSO_MIN if minutos is None else minutos
     agora = agora or datetime.now(timezone.utc)
-    ult = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts")), None)
+    ult = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts") and not e.get("grupo")), None)  # a do mate não
     return bool(ult) and (agora - _dt(ult)).total_seconds() < minutos * 60
 
 
@@ -5579,6 +5886,8 @@ def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, na
     id_ = "fd" + uuid.uuid4().hex[:6]
     item = {"id": id_, "tipo": "despacho", "run": run, "titulo": titulo, "modelo": modelo, "effort": effort, "agente": agente, "prioridade": prio,
             **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"])) if v}}
+    if os.environ.get("ORQ_MATE"):  # o Run é do mate e só o terminal dele o comanda: o gerente drena com esse handle (ticket 80)
+        item.update(coord=os.environ.get("ORCA_TERMINAL_HANDLE"), mate=os.environ["ORQ_MATE"])
     copia = _path(os.path.join(FILA_DESPACHO_SPECS, id_ + ".md"))
     if spec is not None:
         os.makedirs(os.path.dirname(copia), exist_ok=True)
@@ -5598,24 +5907,29 @@ def _ocupar(ocup, dispatch, modelo):
 
 
 @contextlib.contextmanager
-def _como_coordenador():
-    """O painel roda no terminal do agent manager; o despacho precisa do handle do coordenador (é ele que comanda os Runs, e o orca() troca pelo do gerente)."""
-    g, antes = _gerente_cfg(), os.environ.get("ORCA_TERMINAL_HANDLE")
-    if g.get("coordenador"):
+def _como_coordenador(it=None):
+    """O painel roda no terminal do agent manager; o despacho precisa do handle do coordenador (é ele que comanda os Runs, e o orca() troca pelo do gerente).
+    O item que um mate enfileirou (`mate`, `coord`) sobe como o mate: o Run é dele."""
+    g, antes = _gerente_cfg(), {k: os.environ.get(k) for k in ("ORCA_TERMINAL_HANDLE", "ORQ_MATE")}
+    it = it or {}
+    if it.get("mate") and it.get("coord"):  # o terminal de agora: o mate pode ter caído e voltado depois de enfileirar
+        os.environ.update(ORCA_TERMINAL_HANDLE=_dict(_mates().get(it["mate"])).get("terminal") or it["coord"], ORQ_MATE=it["mate"])
+    elif g.get("coordenador"):
         os.environ["ORCA_TERMINAL_HANDLE"] = g["coordenador"]
     try:
         yield
     finally:
-        if antes is None:
-            os.environ.pop("ORCA_TERMINAL_HANDLE", None)
-        else:
-            os.environ["ORCA_TERMINAL_HANDLE"] = antes
+        for k, v in antes.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _sobe_da_fila(it):
     """Sobe um item da fila. Devolve a linha do painel; levanta SemVaga, ValueError ou RuntimeError se não subiu (o item volta)."""
     if it["tipo"] == "despacho":
-        with _como_coordenador():
+        with _como_coordenador(it):
             r = despachar(it["run"], it.get("titulo") if not it.get("ticket") else None, it.get("spec_arquivo"), it["modelo"], it["effort"], it.get("worktree"), it.get("nome"),
                           it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", _drenando=True)
         return f"fila: {it['titulo']} subiu ({r.get('dispatchId')})"
@@ -5907,6 +6221,12 @@ def retomar(dry_run=False, run=None):
             else:
                 por_d[d] = {**_subir_sessao(linha, linha["sessao"], linha["modelo"], cp, dica, msg_continuar(meu, linha["task"], d, linha["run"]), linha["agente"], linha["effort"]), "prioridade": prio}
     res["workers"] = [por_d[w["dispatchId"]] for w in cand]
+    for g, m in _mates().items():  # o mate que caiu volta pela sessão dele (ticket 80); o pedido sem resposta continua com o prazo
+        if _dict(m).get("terminal") not in vivos and _dict(m).get("sessao") and g in grupos():
+            try:
+                res.setdefault("mates", []).append({"grupo": g, "estado": "a_retomar"} if dry_run else {**mate_abrir(g), "estado": "retomado"})
+            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                res.setdefault("mates", []).append({"grupo": g, "estado": "falhou", "aviso": str(e)})
     return res
 
 
@@ -5917,6 +6237,8 @@ def texto_retomar(res):
         ls.append(f"gerente {g['terminal']}: {g['estado']}" + (f" -> {g['novo']}" if g.get("novo") else "") + f" ({len(g['runs'])} Run(s))")
     for w in res["workers"]:
         ls.append(f"{w['dispatch']} {w['titulo']}: {w['estado']}" + (f" -> {w['novo']}" if w.get("novo") else "") + (f" ({w['aviso']})" if w.get("aviso") else ""))
+    for m in res.get("mates") or []:
+        ls.append(f"mate {m['grupo']}: {m['estado']}" + (f" -> {m['terminal']}" if m.get("terminal") else "") + (f" ({m['aviso']})" if m.get("aviso") else ""))
     return "\n".join(ls) or "nada a retomar"
 
 
@@ -6706,6 +7028,10 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     try:
+        linhas += mate_volta()
+    except Exception as e:  # noqa: BLE001 - o canal dos mates não derruba o painel; a próxima volta tenta
+        log(f"mates: {type(e).__name__}: {e}")
+    try:
         linhas += maquina_volta()
     except Exception as e:  # noqa: BLE001 - a fila de despacho não derruba o painel; a próxima volta tenta
         log(f"fila de despacho: {type(e).__name__}: {e}")
@@ -7199,6 +7525,24 @@ def main(argv=None):
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
+    gp = sub.add_parser("grupos", help="os grupos (ORQ_HOME/groups/*.json) e os mates; com --titulo/--cwd/--grupo diz para qual grupo o pedido vai")
+    gp.add_argument("--titulo")
+    gp.add_argument("--cwd")
+    gp.add_argument("--grupo")
+    mt = sub.add_parser("mate", help="o secondmate de um grupo: abrir | pedir | subir | pedidos").add_subparsers(dest="op", required=True)
+    mt.add_parser("abrir").add_argument("grupo")
+    mp = mt.add_parser("pedir")
+    mp.add_argument("grupo")
+    mp.add_argument("--texto", required=True)
+    mp.add_argument("--prazo", type=int, default=PRAZO_PEDIDO_S, help="segundos do fim do turno do mate até a repostagem; 0: não espera resposta")
+    mp.add_argument("--responde", help="a entrada que o mate subiu e este pedido responde: fecha com o efeito mate")
+    ms = mt.add_parser("subir")
+    ms.add_argument("--tipo", required=True, choices=TIPOS_SUBIDA)
+    ms.add_argument("--texto", required=True)
+    ms.add_argument("--corr")
+    ms.add_argument("--link")
+    ms.add_argument("--grupo")
+    mt.add_parser("pedidos").add_argument("--grupo")
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
     rr = sub.add_parser("retro", help="os sinais de falha dos eventos, transcritos e PRs de uma janela (padrão 7 dias), sem LLM: quantos, quais casos, em que modelo")
     rr.add_argument("--desde", help="início da janela (data ou ISO)")
@@ -7367,6 +7711,22 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_pausar(r))
         elif a.cmd == "prioridade":
             print(json.dumps(prioridade_definir(a.task, a.valor), ensure_ascii=False))
+        elif a.cmd == "grupos" and (a.titulo or a.cwd or a.grupo):
+            nome, motivo = grupo_de(grupos(), a.titulo, a.cwd, a.grupo)
+            t = nome and _dict(_mates().get(nome)).get("terminal")
+            vivos = _terminais_vivos() if t else None
+            print(json.dumps({"grupo": nome, "motivo": motivo, "mate": t if t and (vivos is None or t in vivos) else None}, ensure_ascii=False))
+        elif a.cmd == "grupos":
+            print(texto_grupos(grupos(), _mates(), _terminais_vivos() if _mates() else None, read_events(), datetime.now(timezone.utc)))
+        elif a.cmd == "mate" and a.op == "abrir":
+            print(json.dumps(mate_abrir(a.grupo), ensure_ascii=False))
+        elif a.cmd == "mate" and a.op == "pedir":
+            print(json.dumps(mate_pedir(a.grupo, a.texto, a.prazo, a.responde), ensure_ascii=False))
+        elif a.cmd == "mate" and a.op == "subir":
+            print(json.dumps(mate_subir(a.tipo, a.texto, a.corr, a.link, a.grupo), ensure_ascii=False))
+        elif a.cmd == "mate":
+            ps = [p for p in mate_pendentes(read_events(), _mates(), datetime.now(timezone.utc)) if not a.grupo or p["grupo"] == a.grupo]
+            print("\n".join(f"{p['corr']} {p['grupo']} {p['estado']}: {_cita(p['texto'])}" for p in ps) or "nenhum pedido sem resposta")
         elif a.cmd == "maquina" and a.op == "set":
             if not a.chave or a.valor is None:
                 raise ValueError("orq maquina set <chave> <valor>")

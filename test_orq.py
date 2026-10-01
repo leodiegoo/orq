@@ -10428,6 +10428,386 @@ def test_ticket85_fila_do_run_isento_sobe_pelo_gerente_mesmo_sob_pressao():
     assert _titulos_iniciados79(a) == ["Ticket 05"] and not _fila79(a), "o item do Run isento sai da fila com a pressão alta"
 
 
+# ---------- grupos e secondmates (ticket 80) ----------
+
+GRUPOS_T = {"orq": {"projetos": ["/h/.claude/orq", "/h/.claude/dashboard"], "prefixos": ["orq:"]},
+            "trabalho": {"projetos": ["/h/dev/web", "/h/dev/api"], "prefixos": ["web:", "api:"]},
+            "pessoal": {"projetos": ["/h/dev/dbq"], "prefixos": ["dbq:"]}}
+
+
+def test_grupo_de_roteia_pelo_explicito_pelo_titulo_e_pelo_cwd():
+    g = orq_mod.grupo_de
+    assert g(GRUPOS_T, titulo="orq: secondmate por grupo")[0] == "orq"
+    assert g(GRUPOS_T, titulo="ORQ: maiúscula")[0] == "orq"
+    assert g(GRUPOS_T, titulo="corrigir o filtro", cwd="/h/dev/api/src")[0] == "trabalho"
+    assert g(GRUPOS_T, titulo="corrigir o filtro", cwd="/h/dev/api-velha")[0] is None  # prefixo de caminho não é pasta de dentro
+    assert g(GRUPOS_T, titulo="dbq: x", cwd="/h/dev/web")[0] == "pessoal"  # o título vence o cwd
+    assert g(GRUPOS_T, titulo="web: x", grupo="orq")[0] == "orq"  # o explícito vence tudo
+    nome, motivo = g(GRUPOS_T, titulo="sem prefixo", cwd="/tmp")
+    assert nome is None and "coordenador" in motivo
+    try:
+        g(GRUPOS_T, grupo="nenhum")
+        assert False, "grupo inexistente passou"
+    except ValueError as e:
+        assert "nenhum" in str(e)
+
+
+def test_grupo_de_ambiguo_fica_com_o_coordenador():
+    gs = {**GRUPOS_T, "painel": {"projetos": ["/h/.claude/dashboard"], "prefixos": ["orq: painel"]}}
+    nome, motivo = orq_mod.grupo_de(gs, titulo="orq: painel novo")
+    assert nome is None and "orq" in motivo and "painel" in motivo, motivo
+    nome, motivo = orq_mod.grupo_de(gs, cwd="/h/.claude/dashboard/web")
+    assert nome is None and "ambíguo" in motivo, motivo
+
+
+def _grupo(a, nome="orq", **cfg):
+    os.makedirs(os.path.join(a.home, "groups"), exist_ok=True)
+    with open(os.path.join(a.home, "groups", f"{nome}.json"), "w") as f:
+        json.dump({"projetos": [a.home], "prefixos": [f"{nome}:"], "modelo": "claude-sonnet-5-5", **cfg}, f)
+
+
+def test_orq_grupos_lista_e_roteia_e_pula_arquivo_ruim():
+    a = Amb()
+    _grupo(a)
+    with open(os.path.join(a.home, "groups", "quebrado.json"), "w") as f:
+        f.write("{nao é json")
+    r = a.orq("grupos")
+    assert r.returncode == 0 and "orq" in r.stdout and "quebrado" not in r.stdout, r.stdout + r.stderr
+    r = json.loads(a.orq("grupos", "--titulo", "orq: ticket pequeno").stdout)
+    assert r["grupo"] == "orq" and r["mate"] is None, r  # grupo sem mate aberto: o coordenador despacha ele mesmo
+    assert "quebrado" in a.log()
+
+
+T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _z(seg):
+    return (T0 + timedelta(seconds=seg)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _pedido(corr="p1", prazo=120, entregue=10):
+    evs = [{"tipo": "mate_pedido", "corr": corr, "grupo": "orq", "texto": "x", "prazo": prazo, "ts": _z(0)}]
+    if entregue is not None:
+        evs.append({"tipo": "mate_entregue", "corr": corr, "ts": _z(entregue)})
+    return evs
+
+
+def _estado(evs, mates, seg):
+    return {p["corr"]: p["estado"] for p in orq_mod.mate_pendentes(evs, mates, T0 + timedelta(seconds=seg))}
+
+
+def test_mate_pendentes_conta_o_prazo_do_fim_do_turno_que_recebeu_o_pedido():
+    evs = _pedido()
+    assert _estado(_pedido(entregue=None), {}, 5) == {"p1": "a_entregar"}
+    # o mate entrou no turno depois da entrega e não terminou: um turno longo não estoura o prazo
+    no_turno = {"orq": {"turnos": [[_z(1), _z(5)], [_z(11), None]]}}
+    assert _estado(evs, no_turno, 1000) == {"p1": "aguardando"}
+    fechou = {"orq": {"turnos": [[_z(11), _z(400)]]}}
+    assert _estado(evs, fechou, 400 + 119) == {"p1": "aguardando"}  # o prazo conta do fim do turno, não da entrega
+    assert _estado(evs, fechou, 400 + 121) == {"p1": "reenviar"}
+    # o turno nem começou depois da entrega: conta da entrega
+    assert _estado(evs, {"orq": {"turnos": [[_z(1), _z(2)]]}}, 10 + 121) == {"p1": "reenviar"}
+    # turnos seguintes (aviso do Orca, heartbeat) não empurram o prazo: vale o primeiro depois da entrega
+    assert _estado(evs, {"orq": {"turnos": [[_z(11), _z(30)], [_z(400), _z(410)]]}}, 500) == {"p1": "reenviar"}
+    # turno sem fim (o Stop não rodou) não segura o pedido para sempre
+    assert _estado(evs, {"orq": {"turnos": [[_z(11), None]]}}, 11 + orq_mod.TURNO_ABERTO_TETO_S + 1) == {"p1": "reenviar"}
+    # uma repostagem, depois uma escalada, depois nada (nunca em laço)
+    rep = [*evs, {"tipo": "mate_reenvio", "corr": "p1", "ts": _z(600)}]
+    depois = {"orq": {"turnos": [[_z(11), _z(30)], [_z(601), _z(700)]]}}
+    assert _estado(rep, depois, 700 + 60) == {"p1": "aguardando"}
+    assert _estado(rep, depois, 700 + 121) == {"p1": "escalar"}
+    esc = [*rep, {"tipo": "mate_escalado", "corr": "p1", "ts": _z(900)}]
+    assert _estado(esc, depois, 5000) == {"p1": "escalado"}
+
+
+def test_mate_pendentes_resolve_so_com_a_resposta_correlacionada():
+    evs = _pedido()
+    fechou = {"orq": {"turnos": [[_z(11), _z(20)]]}}
+    outra = [*evs, {"tipo": "entrada", "id": "e9", "origem": "mate", "mate": "orq", "corr": "p7", "ts": _z(15)}]
+    assert _estado(outra, fechou, 1000) == {"p1": "reenviar"}  # resposta de outro pedido não conta
+    sem_corr = [*evs, {"tipo": "entrada", "id": "e9", "origem": "mate", "mate": "orq", "ts": _z(15)}]
+    assert _estado(sem_corr, fechou, 1000) == {"p1": "reenviar"}  # subida sem corr (um resumo) também não
+    certa = [*evs, {"tipo": "entrada", "id": "e9", "origem": "mate", "mate": "orq", "corr": "p1", "ts": _z(15)}]
+    assert _estado(certa, fechou, 1000) == {}
+    # prazo 0: não espera resposta, só a entrega
+    assert _estado(_pedido(prazo=0), fechou, 9999) == {}
+    assert _estado(_pedido(prazo=0, entregue=None), fechou, 9999) == {"p1": "a_entregar"}
+
+
+def _mate_vivo(a, terminal="term_mate"):
+    a.set("terminals.json", [terminal, "term_coord"])
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"terminal": terminal, "sessao": "sess-mate", "cwd": a.home, "turnos": []}}}, f)
+
+
+def test_mate_pedir_digita_no_mate_e_a_subida_volta_como_entrada_do_coordenador():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    r = a.orq("mate", "pedir", "orq", "--texto", "despache o ticket 77")
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)
+    assert p["corr"] == "p1" and p["entrega"] == "enviado", p
+    send = [json.loads(x) for x in open(os.path.join(a.fake, "send.log"))]
+    texto = next(c[c.index("--text") + 1] for c in send if "--text" in c)
+    assert "term_mate" in send[0] and texto.startswith("orq ▸ pedido p1") and "orq mate subir --corr p1" in texto, texto
+    assert orq_mod.origem(texto) == "aviso_orq"  # no mate o pedido não vira entrada: quem o cobra é o prazo
+    # o mate responde: vira entrada do coordenador (origem mate) e resolve o pedido
+    r = a.orq("mate", "subir", "--tipo", "resposta", "--corr", "p1", "--texto", "despachado, ctx_x", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
+    assert r.returncode == 0, r.stderr
+    ent = next(e for e in a.events() if e.get("tipo") == "entrada")
+    assert ent["origem"] == "mate" and ent["mate"] == "orq" and ent["corr"] == "p1" and "grupo" not in ent, ent
+    assert [e["id"] for e in orq_mod.abertas(a.events())] == [ent["id"]]  # aberta para o coordenador
+    assert orq_mod.mate_pendentes(a.events(), {}, datetime.now(timezone.utc)) == []
+    # corr que não existe é recusado: a resposta não some calada
+    r = a.orq("mate", "subir", "--tipo", "resposta", "--corr", "p9", "--texto", "x", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
+    assert r.returncode != 0 and "p9" in r.stderr, r.stderr
+
+
+def test_mate_responde_a_decisao_e_fecha_a_entrada_que_subiu():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    sub = json.loads(a.orq("mate", "subir", "--tipo", "decisao", "--texto", "integrar t77 na main?", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate").stdout)
+    r = a.orq("mate", "pedir", "orq", "--texto", "sim, integre", "--responde", sub["id"], "--prazo", "0")
+    assert r.returncode == 0, r.stderr
+    intake = [e for e in a.events() if e.get("tipo") == "intake"]
+    assert intake and intake[-1]["entrada"] == sub["id"] and intake[-1]["efeito"] == "mate" and intake[-1]["ref"] == "p1", intake
+    assert orq_mod.abertas(a.events()) == []
+    r = a.orq("intake", sub["id"], "mate", "p8")
+    assert r.returncode != 0 and "p8" in r.stderr  # o efeito mate confere o pedido
+
+
+def test_entrada_digitada_no_mate_nao_aparece_para_o_coordenador():
+    a = Amb()
+    a.prompt("trabalho do mate", ORQ_MATE="orq")
+    a.prompt("trabalho do coordenador")
+    ents = [e for e in a.events() if e.get("tipo") == "entrada"]
+    assert [e.get("grupo") for e in ents] == ["orq", None], ents
+    assert [e["texto"] for e in orq_mod.abertas(a.events())] == ["trabalho do coordenador"]
+    assert [e["texto"] for e in orq_mod.abertas(a.events(), grupo="orq")] == ["trabalho do mate"]
+    cur = _cursor(a)
+    t = cur["mates"]["orq"]["turnos"]
+    assert cur["mates"]["orq"]["sessao"] == "abcdef123456" and len(t) == 1 and t[0][0] and t[0][1] is None, cur.get("mates")
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}), ORQ_MATE="orq")
+    assert _cursor(a)["mates"]["orq"]["turnos"][-1][1], _cursor(a)["mates"]
+
+
+def test_mate_volta_entrega_reenvia_uma_vez_escala_e_avisa_o_coordenador():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.set("busy.json", ["term_mate"])  # o mate está no meio do turno: o pedido não é digitado
+    p = json.loads(a.orq("mate", "pedir", "orq", "--texto", "status do t77", "--prazo", "1").stdout)
+    assert p["entrega"] == "ocupado", p
+    a.set("busy.json", [])
+    with EmProcesso(a):
+        assert any("p1 entregue" in x for x in orq_mod.mate_volta())
+        cur = _cursor(a)
+        cur["mates"]["orq"]["turnos"] = [[_z(-10), _z(-5)]]  # o turno que recebeu o pedido acabou há tempo (T0 fica no passado)
+        json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+        evs = [e for e in a.events() if e.get("tipo") != "mate_entregue"] + [{"tipo": "mate_entregue", "corr": "p1", "ts": _z(-20)}]
+        with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in evs))
+        assert any("p1 reenviado" in x for x in orq_mod.mate_volta())
+        evs = [e if e.get("tipo") != "mate_reenvio" else {**e, "ts": _z(-15)} for e in a.events()]  # o turno -10..-5 veio depois da repostagem
+        with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in evs))
+        assert any("p1 escalado" in x for x in orq_mod.mate_volta())
+        assert not any("p1" in x for x in orq_mod.mate_volta())  # escalado uma vez só
+    send = [json.loads(x) for x in open(os.path.join(a.fake, "send.log"))]
+    alvos = [c[c.index("--terminal") + 1] for c in send if "--text" in c]
+    textos = [c[c.index("--text") + 1] for c in send if "--text" in c]
+    assert alvos == ["term_mate", "term_mate", "term_coord"], alvos
+    assert "de novo" in textos[1] and "p1" in textos[2] and "não respondeu" in textos[2], textos
+
+
+def test_mate_volta_avisa_a_subida_e_o_mate_morto_uma_vez():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.orq("mate", "subir", "--tipo", "pr", "--texto", "PR pronto: t77", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
+    with EmProcesso(a):
+        assert any("subida" in x for x in orq_mod.mate_volta())
+        assert orq_mod.mate_volta() == []  # avisada uma vez
+        a.set("terminals.json", ["term_coord"])  # o terminal do mate sumiu
+        assert any("caiu" in x for x in orq_mod.mate_volta())
+        assert orq_mod.mate_volta() == []
+    textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert textos[0].startswith("orq ▸ mate orq subiu") and "PR pronto" in textos[0], textos
+    assert "orq mate abrir orq" in textos[1], textos
+
+
+def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
+    a = Amb()
+    _grupo(a, regras="/h/regras-orq.md")
+    a.set("terminals.json", ["term_coord"])
+    r = a.orq("mate", "abrir", "orq")
+    assert r.returncode == 0, r.stderr
+    cria = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
+    cmd = cria[0][cria[0].index("--command") + 1]
+    assert cmd.startswith("env ORQ_MATE=orq claude --model claude-sonnet-5-5") and "/h/regras-orq.md" in cmd and "orq mate subir" in cmd, cmd
+    assert f"path:{a.home}" in cria[0]
+    assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
+    r = a.orq("mate", "abrir", "orq")
+    assert r.returncode != 0 and "aberto" in r.stderr  # um mate por grupo
+    cur = _cursor(a)
+    cur["mates"]["orq"]["sessao"] = "sess-mate"
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    a.set("terminals.json", ["term_coord"])  # caiu
+    a.set("screens.json", {"term_ret2": ["esc to interrupt"]})
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
+    cmd = cmd[cmd.index("--command") + 1]
+    assert cmd.startswith("env ORQ_MATE=orq claude --resume sess-mate"), cmd
+
+
+def test_mate_nao_abre_pergunta_no_terminal():
+    a = Amb()
+    _grupo(a)
+    ev = {"session_id": "abcdef123456", "tool_name": "AskUserQuestion", "tool_input": {"questions": []}}
+    r = a.orq("hook", "guard", stdin=json.dumps(ev), ORQ_MATE="orq")
+    out = json.loads(r.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "orq mate subir --tipo decisao" in out["hookSpecificOutput"]["permissionDecisionReason"], out
+
+
+def test_retomar_sobe_o_mate_que_caiu_pela_sessao():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    a.set("workers.json", [])
+    a.set("terminals.json", ["term_coord"])  # a queda levou o terminal do mate
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    r = a.orq("retomar", "--dry-run")
+    assert "mate orq: a_retomar" in r.stdout and not os.path.exists(os.path.join(a.fake, "create.log")), r.stdout + r.stderr
+    r = a.orq("retomar")
+    assert "mate orq: retomado -> term_ret1" in r.stdout, r.stdout + r.stderr
+    cria = json.loads(open(os.path.join(a.fake, "create.log")).readline())
+    assert "--resume sess-mate" in cria[cria.index("--command") + 1]
+
+
+def test_despacho_enfileirado_pelo_mate_drena_com_o_handle_do_mate():
+    a = Amb()
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    with EmProcesso(a):
+        os.environ.update(ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
+        r = orq_mod._enfileirar_despacho("sem vaga", "run_mate", "orq: t", "# orq: t\n", "claude-sonnet-5-5", "medium", None, None, None, None, None, 2, "claude")
+        it = next(i for i in orq_mod.fila_despacho_itens() if i["id"] == r["fila"])
+        assert it["coord"] == "term_mate" and it["mate"] == "orq", it
+        del os.environ["ORQ_MATE"]
+        os.environ["ORCA_TERMINAL_HANDLE"] = "term_ger"
+        visto, antes = {}, orq_mod.despachar
+        orq_mod.despachar = lambda *x, **k: visto.update(h=os.environ.get("ORCA_TERMINAL_HANDLE"), m=os.environ.get("ORQ_MATE")) or {"dispatchId": "ctx_1"}
+        try:
+            orq_mod._sobe_da_fila(it)
+        finally:
+            orq_mod.despachar = antes
+        assert visto == {"h": "term_mate", "m": "orq"}, visto
+        assert os.environ["ORCA_TERMINAL_HANDLE"] == "term_ger" and "ORQ_MATE" not in os.environ
+
+
+def test_subida_do_mate_com_o_usuario_no_coordenador_espera_o_proximo_prompt():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.prompt("algo no mate", ORQ_MATE="orq")  # quem digita no mate não torna o coordenador ativo
+    a.orq("mate", "subir", "--tipo", "decisao", "--texto", "integrar?", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
+    with EmProcesso(a):
+        assert not orq_mod.coordenador_ativo()
+        a.prompt("o usuário fala com o coordenador")
+        assert any("avisada" in x for x in orq_mod.mate_volta())
+        assert orq_mod.mate_volta() == []
+    assert not os.path.exists(os.path.join(a.fake, "send.log")), "digitou por cima do usuário"
+    assert "subiu" in _cursor(a)["avisos"][0]["texto"], _cursor(a).get("avisos")
+
+
+def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
+    a = Amb(ORQ_RETOMAR_ESPERA_S="0.5")
+    _grupo(a)
+    _mate_vivo(a)
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["No conversation found with session ID: sess-mate"]})
+    r = a.orq("mate", "abrir", "orq")
+    assert r.returncode != 0 and "não voltou" in r.stderr, r.stderr
+    assert "term_ret1" in open(os.path.join(a.fake, "close.log")).read()  # o shell que sobrou não recebe pedido
+    m = _cursor(a)["mates"]["orq"]
+    assert m.get("terminal") is None and m.get("sessao") is None, m
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
+    assert "--resume" not in cmd[cmd.index("--command") + 1]  # o segundo abre com o charter
+
+
+def test_mate_pedir_responde_invalido_nao_grava_e_texto_vai_numa_linha():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    a.prompt("entrada do usuário")
+    r = a.orq("mate", "pedir", "orq", "--texto", "x", "--responde", "e1")
+    assert r.returncode != 0 and "nada foi gravado" in r.stderr, r.stderr
+    assert not any(e.get("tipo") == "mate_pedido" for e in a.events())
+    p = json.loads(a.orq("mate", "pedir", "orq", "--texto", "linha um\nlinha dois\n\nfim").stdout)
+    texto = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
+    assert "\n" not in texto and "linha um linha dois fim" in texto, texto
+    assert next(e for e in a.events() if e.get("tipo") == "mate_pedido")["texto"] == "linha um\nlinha dois\n\nfim"
+    ent = next(e for e in a.events() if e.get("tipo") == "mate_entregue")
+    assert ent["ts"] <= orq_mod.now(), ent  # o ts é o de antes do digita
+    # o mate de outro grupo não responde este pedido
+    _grupo(a, "outro")
+    r = a.orq("mate", "subir", "--tipo", "resposta", "--corr", p["corr"], "--texto", "x", ORQ_MATE="outro", ORCA_TERMINAL_HANDLE="term_x")
+    assert r.returncode != 0 and "outro" in r.stderr, r.stderr
+
+
+def test_mate_volta_nao_reavisa_subida_velha_com_mais_de_cinquenta():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps({"tipo": "entrada", "id": f"e{i}", "origem": "mate", "mate": "orq", "tipo_mate": "resumo", "texto": f"r{i}", "ts": _z(i)}) + "\n"
+                        for i in range(1, 56)))
+    with EmProcesso(a):
+        for _ in range(55):
+            orq_mod.mate_volta()
+        assert orq_mod.mate_volta() == []
+    textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert len(textos) == 55 and len(set(textos)) == 55, len(textos)
+
+
+def test_prompt_no_mate_nao_esvazia_os_avisos_do_coordenador_e_o_stop_nao_vai_ao_digest():
+    a = Amb()
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"avisos": [{"texto": "orq: PR #1 entrou", "ts": _z(0), "contexto": True}]}, f)
+    a.prompt("oi, mate", ORQ_MATE="orq")
+    assert _cursor(a).get("avisos"), "o mate levou o aviso do coordenador"
+    a.orq("ausente", "ligar")
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456", "last_assistant_message": "feito"}), ORQ_MATE="orq")
+    assert not any(e.get("tipo") == "resposta_coordenador" for e in a.events())
+
+
+def test_fila_do_mate_drena_com_o_terminal_atual_do_mate():
+    a = Amb()
+    _grupo(a)
+    _mate_vivo(a, terminal="term_mate_novo")  # o mate caiu e voltou depois de enfileirar
+    with EmProcesso(a):
+        visto, antes = {}, orq_mod.despachar
+        orq_mod.despachar = lambda *x, **k: visto.update(h=os.environ.get("ORCA_TERMINAL_HANDLE")) or {"dispatchId": "ctx_1"}
+        try:
+            orq_mod._sobe_da_fila({"tipo": "despacho", "run": "run_m", "titulo": "orq: t", "modelo": "m", "effort": "low", "prioridade": 2, "mate": "orq", "coord": "term_mate_velho"})
+        finally:
+            orq_mod.despachar = antes
+    assert visto["h"] == "term_mate_novo", visto
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
