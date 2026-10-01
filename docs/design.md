@@ -262,7 +262,25 @@ Order: (1) refuse before touching anything: `--para` is the same harness, worktr
 
 **Failure.** After the stop there is no going back to the harness that hit the limit. If `worker-start` fails (`controle passar falhou`, `passo: worker-start`), the old dispatch stays stopped with its terminal retained, the worktree and `PASSAGEM.md` stay, and the error prints `orq passar <dispatch> --para <harness>`; running it again skips the stop. A `worker-start` that times out is never retried. A failed steer or release leaves `ok` with the command in `aviso`.
 
-**Not in this ticket.** Perceiving the limit on the worker's screen, the neutral `orq transcrito` reader with tool calls, the 20-second package for a worker with no turn, the open-passage alert in `orq status`, and the coordinator's own handoff are tickets 2 to 7 of the analysis. Here the end of the transcript is messages only.
+**Not in this ticket.** Perceiving the limit on the worker's screen, the neutral `orq transcrito` reader with tool calls, the open-passage alert in `orq status`, and the coordinator's own handoff are tickets 3 to 7 of the analysis. Here the end of the transcript is messages only.
+
+### The package for a worker with no turn (ticket 88)
+
+When the worker hit its plan limit it has no turn left, so the package cannot depend on it. `orq passagem <dispatch> [--para codex|claude]` writes `PASSAGEM.md` from facts only and touches nothing else: no stop, no `worker-start`, no message to the worker. `orq passar` builds the same text (`_texto_passagem`), so both paths give one file. Nothing in it comes from the model.
+
+Sections, in the order of the analysis (2.3): Próximo passo, Perguntas abertas, Decisões já tomadas, Estado do git, Relatório parcial, Fim do transcrito, Onde está o resto, Como agir. What each one reads:
+
+- **Próximo passo**: always "Desconhecido" when the worker left no note. If the last transcript record is a tool call, a tool result or a prompt with no answer, it starts with "a sessão parou sem fechar o turno" (lesson 3): the tool may have run halfway, so check `git status` first.
+- **Perguntas abertas**: the worker's `question` or `escalation` in the Run inbox with no reply (`perguntas_abertas`), plus the pending decisions tied to the task.
+- **Decisões já tomadas**: the task's steers and the coordinator's answers (`resposta_worker`), each answer next to the question it answered when the inbox still has it.
+- **Estado do git**: head, branch, dirty paths with the count, commits and `diff --stat` since `origin/main`, and the PR linked to the task (`prs.json`).
+- **Relatório parcial**: the last heartbeat phase, `PAUSA.md` and `relatorio-final.md` if present, and the worker's last visible answer from the transcript, fenced as history.
+- **Onde está o resto**: transcript path, `claude --resume <id>` or `codex resume <id>` for the old session, and the `orca search` command. Any source that failed shows up here as "não li <fonte>".
+- **Como agir**: fixed text, plus whether the old worker holds the E2E queue (`fila_e2e` matches its worktree), since that lock dies with nobody to release it.
+
+**Deadline.** `PASSAGEM_PRAZO_S` is 20 seconds. The reads that can hang (inbox, the Orca session index, each git call) share what is left of it, with a cap per read; a read that fails or runs out becomes a "não li" line and the rest of the file is written as usual. `worker-show` (10 s) runs before and is not part of the budget. The tests cover a hung inbox (`FAKE_SLEEP_CMD=inbox:60`) and check the whole command ends within 20 s.
+
+**Fixture.** `fixtures/tela-claude-limite.txt` is the limit screen the tests put in the worker's terminal. Its text is a stand-in for the real Claude message, which ticket 4 still has to capture. The package does not read the screen, so nothing here depends on that text.
 
 ## Resuming after a crash
 

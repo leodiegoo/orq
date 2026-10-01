@@ -11428,6 +11428,115 @@ def test_it_should_read_the_visible_messages_of_a_codex_rollout_handover():
     assert len(corte) <= 3100 and "m99 " in corte and "m0 " not in corte, "fica o fim"
 
 
+# ---------- ticket 88: PASSAGEM.md escrito pelo orq quando o worker não tem turno ----------
+
+def _worker_no_limite(a, repo, t, aberto=True):
+    """O W1 parou no limite do plano: a tela mostra o aviso (fixture; o texto real do Claude ainda precisa ser conferido), sem PAUSA.md e sem turno novo; o transcrito termina
+    numa ferramenta (`aberto`) ou numa resposta; no inbox há uma pergunta sem resposta e outra já respondida."""
+    _passagem_env(a, repo)
+    a.set("screens.json", {"term_w1": open(os.path.join(FIX, "tela-claude-limite.txt"), encoding="utf-8").read().splitlines()})
+    arq = os.path.join(t, "w1.jsonl")
+    linhas = [{"type": "user", "message": {"role": "user", "content": "faça o ticket"}},
+              {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "segredo"}, {"type": "text", "text": "criei o índice, falta rodar a suíte"}]}}]
+    linhas.append({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "pytest"}}]}} if aberto
+                  else {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "pronto para a suíte"}]}})
+    open(arq, "w", encoding="utf-8").write("\n".join(json.dumps(x) for x in linhas) + "\n")
+    a.set("search.json", [{"agent": "claude", "sessionId": "sess-w1", "cwd": repo, "source": {"filePath": arq}, "evidence": {"role": "user"}}])
+    q = lambda i, seq, tipo, de, para, assunto: {"id": i, "run_id": "run_a", "type": tipo, "subject": assunto, "body": "detalhe de " + assunto, "sequence": seq,  # noqa: E731
+                                                  "from_handle": de, "to_handle": para, "created_at": "2026-10-01T10:00:00Z", "payload": json.dumps({"dispatchId": "ctx_w1", "taskId": "task_w1"})}
+    a.set("inbox.json", {"result": {"messages": [q("msg_q1", 1, "question", "dispatch:ctx_w1", "run:run_a", "Qual índice criar?"),
+                                                 q("msg_r1", 2, "reply", "term_coord", "dispatch:ctx_w1", "re"),
+                                                 q("msg_q2", 3, "question", "dispatch:ctx_w1", "run:run_a", "Posso apagar a coleção velha?")]}})
+    with open(os.path.join(a.home, "events.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": now_iso(-300), "tipo": "resposta_worker", "msg_id": "msg_q1", "dispatch": "ctx_w1", "texto": "o índice parcial"}) + "\n")
+    return arq
+
+
+def test_it_should_write_the_package_for_a_worker_with_no_turn_within_the_deadline_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        os.makedirs(a.home, exist_ok=True)
+        arq = _worker_no_limite(a, repo, t)
+        antes = _head(repo)
+        t0 = time.monotonic()
+        r = a.orq("passagem", "ctx_w1")
+        assert r.returncode == 0, r.stderr
+        assert time.monotonic() - t0 <= 20 and json.loads(r.stdout)["segundos"] <= 20, "o pacote sai em até 20 s"
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        assert texto.splitlines()[0] == "<!-- orq-passagem v1 de=ctx_w1 para=codex -->", "o outro harness é o padrão"
+        titulos = ["## Próximo passo", "## Perguntas abertas", "## Decisões já tomadas", "## Estado do git", "## Relatório parcial", "## Fim do transcrito",
+                   "## Onde está o resto", "## Como agir"]
+        pos = [texto.index(x) for x in titulos]
+        assert pos == sorted(pos), "as seções seguem a ordem da 2.3"
+        secao = lambda i: texto[pos[i]:pos[i + 1] if i + 1 < len(pos) else None]  # noqa: E731
+        assert "parou sem fechar o turno" in secao(0) and "Desconhecido" in secao(0), "o transcrito termina numa ferramenta e não há nota do worker"
+        assert "Posso apagar a coleção velha?" in secao(1) and "Qual índice criar?" not in secao(1), "só a pergunta sem resposta"
+        assert "Qual índice criar? → o índice parcial" in secao(2), "a pergunta respondida vira decisão"
+        assert antes[:12] in secao(3) and "arquivos sujos, 1" in secao(3) and "novo" in secao(3), secao(3)
+        assert "criei o índice, falta rodar a suíte" in secao(4), "sem relatório do worker, vale a última resposta visível dele"
+        assert "segredo" not in texto and arq in secao(6) and "claude --resume sess-w1" in secao(6), secao(6)
+        assert "não está na fila do E2E" in secao(7)
+        assert not _log(a, "stopped.log") and not _log(a, "started.log") and not _enviados(a), "o worker não é parado, relançado nem consultado"
+        assert _head(repo) == antes and not [e for e in a.events() if e["tipo"] == "passagem"]
+        (ctl,) = _ctl_eventos(a, "passagem")
+        assert ctl["resultado"] == "ok" and ctl["de"] == "claude" and ctl["para"] == "codex" and len(ctl["pacote"]) == 12, ctl
+
+
+def test_it_should_not_say_the_turn_was_cut_when_the_transcript_ends_in_an_answer_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        os.makedirs(a.home, exist_ok=True)
+        _worker_no_limite(a, repo, t, aberto=False)
+        assert a.orq("passagem", "ctx_w1", "--para", "codex").returncode == 0
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        assert "parou sem fechar o turno" not in texto and "pronto para a suíte" in texto
+
+
+def test_it_should_write_the_package_even_when_a_source_is_slow_or_down_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        os.makedirs(a.home, exist_ok=True)
+        _worker_no_limite(a, repo, t)
+        t0 = time.monotonic()
+        r = a.orq("passagem", "ctx_w1", FAKE_SLEEP_CMD="inbox:60")
+        assert r.returncode == 0, r.stderr
+        assert time.monotonic() - t0 <= 20, "o inbox parado não segura o pacote além do prazo"
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        assert "não li o inbox do Run" in texto, "a fonte que falhou é dita no pacote"
+        assert "criei o índice" in texto and "novo" in texto, "o resto do pacote sai igual"
+
+
+def test_it_should_say_when_the_old_worker_holds_the_e2e_queue_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        os.makedirs(a.home, exist_ok=True)
+        _worker_no_limite(a, repo, t)
+        fila = os.path.join(t, "queue", "0001-" + str(os.getpid()))
+        os.makedirs(os.path.join(fila, "pids"))
+        open(os.path.join(fila, "owner"), "w").write(f"pid={os.getpid()}\nworktree={repo}\nproject=produto\ncommand=test-e2e\nstarted={int(time.time())}\n")
+        open(os.path.join(fila, "pids", str(os.getpid())), "w").close()
+        assert a.orq("passagem", "ctx_w1", E2E_LOCK_DIR=os.path.dirname(fila)).returncode == 0
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        assert "segura a fila do E2E" in texto and "lock-release" in texto, texto[-700:]
+
+
+def test_it_should_refuse_a_passagem_to_the_same_harness_or_without_worktree_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo)
+        r = a.orq("passagem", "ctx_w1", "--para", "claude")
+        assert r.returncode == 1 and "outro harness" in r.stderr and not os.path.exists(os.path.join(repo, "PASSAGEM.md")), r
+        a2 = Amb(run="run_a")
+        _passagem_env(a2, os.path.join(t, "sumiu"))
+        r = a2.orq("passagem", "ctx_w1")
+        assert r.returncode == 1 and "worktree" in r.stderr, r
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

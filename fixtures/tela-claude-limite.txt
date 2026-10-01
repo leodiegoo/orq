@@ -1,0 +1,11 @@
+  ⎿  Running…
+
+✻ Cogitating… (312s · ↓ 4.1k tokens · esc to interrupt)
+
+  Weekly limit reached ∙ resets Oct 5, 9am
+  /upgrade to increase your usage limit.
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
