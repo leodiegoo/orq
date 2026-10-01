@@ -416,7 +416,7 @@ class Amb:
         with open(self.bin, "w") as f:
             f.write(FAKE)
         os.chmod(self.bin, 0o755)
-        self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
+        self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
                     "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
@@ -7140,6 +7140,45 @@ def test_pr_poll_merge_vira_uma_entrada_uma_so_vez():
     assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1, "o mesmo merge não vira outra entrada"
     assert len(_gh_chamadas(a)) == antes, "PR já resolvido não volta ao gh"
     assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "entrou"]
+
+
+def _limpar_falso(a):
+    """Um limpar-mergeados falso que grava os argumentos que recebeu em limpar.args."""
+    falso = os.path.join(a.fake, "limpar.py")
+    with open(falso, "w") as f:
+        f.write("import sys, json\nopen(%r, 'w').write(json.dumps(sys.argv[1:]))\n" % os.path.join(a.fake, "limpar.args"))
+    a.env.update(ORQ_LIMPAR=falso, ORQ_LIMPAR_ATRASO_S="0")
+    return os.path.join(a.fake, "limpar.args")
+
+
+def _espera_arquivo(caminho, s=5):
+    fim = time.time() + s
+    while time.time() < fim and not os.path.exists(caminho):
+        time.sleep(0.05)
+    return os.path.exists(caminho)
+
+
+def test_pr_poll_merge_em_main_dispara_a_limpeza_da_branch():
+    a = _prs_env()
+    args = _limpar_falso(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "main", headRefName="fix/x")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert _espera_arquivo(args), "o poll não chamou a limpeza"
+    lido = json.load(open(args))
+    assert lido[0] == "--repo" and lido[2:] == ["--branch", "fix/x", "--task", "task_feat1"], lido
+    (ev,) = [e for e in a.events() if e["tipo"] == "pr" and e["op"] == "limpeza"]
+    assert (ev["branch"], ev["task"]) == ("fix/x", "task_feat1"), ev
+
+
+def test_pr_poll_merge_fora_de_main_nao_dispara_a_limpeza():
+    a = _prs_env()
+    args = _limpar_falso(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development", headRefName="fix/x")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    time.sleep(0.5)
+    assert not os.path.exists(args) and not [e for e in a.events() if e.get("op") == "limpeza"]
 
 
 def test_pr_poll_fechado_sem_merge_vira_entrada_e_nao_sugere_o_proximo():

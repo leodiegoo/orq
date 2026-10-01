@@ -29,6 +29,9 @@ def ThreadPoolExecutor(n):  # import tardio: concurrent.futures custa ~11 ms e s
 HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
+LIMPAR = os.environ.get("ORQ_LIMPAR") or os.path.expanduser("~/.claude/scripts/limpar-mergeados.py")
+LIMPAR_ATRASO_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # o mesmo atraso do hook "merged"
+FINAL_BASE = os.environ.get("ORQ_FINAL_BASE") or "main"  # o merge que encerra a branch (o mesmo do limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
@@ -2320,6 +2323,24 @@ def avisa_fila_e2e(f=None):
     return [f"fila do E2E presa ({f['ticket']}): aviso digitado no coordenador"]
 
 
+def _limpar_pos_merge(i, branch):
+    """PR mergeado na base final: dispara o limpar-mergeados.py dessa branch em segundo plano, com o atraso do hook "merged" (o GitHub leva uns
+    segundos para marcar o PR). O repositório vem do projeto do despacho da task, senão do cwd. Sem a branch não há o que limpar. Falha em
+    disparar vira só log: a limpeza nunca derruba o poll."""
+    if not branch:
+        return
+    desp = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == i["task"]), {})
+    try:
+        repo = pasta_do_repo(projetos()[desp["projeto"]]["repo"]) if desp.get("projeto") in projetos() else None
+        repo = repo or os.getcwd()
+        subprocess.Popen(["sh", "-c", f'sleep {LIMPAR_ATRASO_S}; exec python3 "$0" --repo "$1" --branch "$2" --task "$3"', LIMPAR, repo, branch, i["task"]],
+                         stdin=subprocess.DEVNULL, stdout=open(LOG, "a"), stderr=subprocess.STDOUT, start_new_session=True)
+    except (OSError, ValueError) as e:
+        log(f"_limpar_pos_merge: {i['url']}: {type(e).__name__}: {e}")
+        return
+    append_event({"tipo": "pr", "op": "limpeza", "task": i["task"], "url": i["url"], "branch": branch, "repo": repo})
+
+
 def _aplica_prs(d, vistos, agora):
     """Passa ao estado novo cada PR aberto que o gh viu mergeado ou fechado: um evento `pr` e uma entrada `pr` por PR, uma vez só (o `ref` da
     entrada é a URL, então repetir a passagem não a duplica). Devolve as linhas do que mudou."""
@@ -2342,6 +2363,8 @@ def _aplica_prs(d, vistos, agora):
             else f"PR #{i['numero']} fechado sem merge (base {i['base']}, {onde})"
         append_event({"tipo": "pr", "op": "entrou" if novo == "mergeado" else "fechou", "task": i["task"], "url": i["url"], "numero": i["numero"],
                       "base": i["base"], **({"proximo": prox} if prox else {})})
+        if novo == "mergeado" and i["base"] == FINAL_BASE:
+            _limpar_pos_merge(i, visto.get("headRefName") or i.get("head"))
         if i["url"] in ja:
             i["avisado"] = True
             continue
