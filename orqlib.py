@@ -2617,7 +2617,7 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
                        **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
                       for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in (*ANDA, "hibernado")), key=lambda r: r.get("prioridade") or 2)  # a mais alta primeiro
     if maquina:  # as vagas e a fila de despacho (ticket 79): uma chave a mais, `rodando` segue só com workers e a fila do E2E
-        maquina = {**maquina, "ocupadas": sum(r["estado"] != "hibernado" for r in rodando), "livres": max(maquina["max_workers"] - sum(r["estado"] != "hibernado" for r in rodando), 0)}
+        maquina = {**maquina, "ocupadas": sum(not r["estado"].startswith("hibernado") for r in rodando), "livres": max(maquina["max_workers"] - sum(not r["estado"].startswith("hibernado") for r in rodando), 0)}
     if e2e:  # a fila do E2E é uma linha a mais em `rodando`: `presa` quando não anda
         rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]

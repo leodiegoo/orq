@@ -9489,6 +9489,14 @@ def test_ticket79_status_painel_e_digest_mostram_vagas_ocupadas_livres_e_a_fila(
     assert "Máquina: 4/4 vagas ocupadas, 0 livres, 1 na fila de despacho" in pagina
 
 
+def test_ticket79_digest_nao_conta_o_worker_hibernado_nas_vagas_ocupadas():
+    agentes = [{"titulo": "vivo", "estado": "rodando", "desde": None}, {"titulo": "dormindo", "estado": "hibernado", "desde": None}]
+    agora = datetime.now(timezone.utc)
+    d = orq_mod.monta_digest([], {}, {}, {"agentes": agentes}, [], {"passos": []}, "", agora, maquina={"max_workers": 4})
+    assert [r["titulo"] for r in d["rodando"]] == ["vivo", "dormindo"], "o hibernado segue listado"
+    assert (d["maquina"]["ocupadas"], d["maquina"]["livres"]) == (1, 3), d["maquina"]
+
+
 def test_ticket79_status_sem_worker_sem_fila_e_sem_pressao_nao_diz_nada_da_maquina():
     a = Amb(run="run_a")
     assert "Máquina:" not in a.orq("status").stdout
