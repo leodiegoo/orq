@@ -4677,11 +4677,19 @@ def test_review7_b40_liberar_refaz_o_cache_do_resumo_em_segundo_plano():
 
 # ---------- agent manager em terminal próprio (seção 25, ticket 17) ----------
 
+def _away_ligado(home):
+    """Liga o modo ausente no cursor.json: sem ele o orq não digita aviso no coordenador (ticket 107)."""
+    caminho = os.path.join(home, "cursor.json")
+    cur = json.load(open(caminho)) if os.path.exists(caminho) else {}
+    json.dump({**cur, "ausente": {"ligada_em": "2026-10-01T12:00:00Z"}}, open(caminho, "w"))
+
+
 def _gerente(a, run="run_a"):
     """O Run ligado ao terminal do agent manager (term_ger), e o coordenador (term_coord) apontando para ele no gerente.json."""
     a.set("run.json", {"id": run, "handle": "term_ger"})
     os.makedirs(a.home, exist_ok=True)
     json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": [run]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    _away_ligado(a.home)
 
 
 def test_gerente_ligado_despachar_e_agentes_falam_com_o_orca_pelo_handle_do_gerente():
@@ -4835,6 +4843,7 @@ def _multi(a, ligados, runs=None):
     if runs is not None:
         os.makedirs(a.home, exist_ok=True)
         json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": runs}, open(os.path.join(a.home, "gerente.json"), "w"))
+        _away_ligado(a.home)
 
 
 def _binds(a):
@@ -8394,6 +8403,7 @@ def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
         orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append((h, t)) or "enviado"
         try:
             json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _away_ligado(home)
             _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=0)
             f = orq_mod.fila_e2e(fila, agora=40 * 60)
             assert orq_mod.avisa_fila_e2e(f) and len(enviados) == 1 and "PRESA" in enviados[0][1], enviados
@@ -8407,6 +8417,7 @@ def _prs_avisar(home, avisado=False):
     json.dump({"itens": [{"task": "task_a", "url": PR1, "numero": 1216, "base": "development", "estado": "mergeado", "avisado": avisado,
                           "entrada": "e292", "texto": "PR #1216 entrou em development (task_a)"}], "sem_task": []}, open(os.path.join(home, "prs.json"), "w"))
     json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+    _away_ligado(home)
 
 
 def test_it_should_type_the_pr_notice_once_even_when_another_panel_runs_at_the_same_time():
@@ -8513,6 +8524,7 @@ def test_it_should_type_a_queued_notice_only_after_the_coordinator_is_idle_for_n
         orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append(t) or "enviado"
         try:
             json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _away_ligado(home)
             _usuario_falou(home, 2)
             assert orq_mod.avisa_fila_e2e(_fila_presa(fila)) and enviados == []
             assert orq_mod.avisos_entregar() == [] and enviados == [], "2 min: ainda tem gente"
@@ -8531,6 +8543,7 @@ def test_it_should_keep_the_queued_notice_when_the_idle_coordinator_is_busy_or_h
         orq_mod.HOME, orq_mod.digita = home, lambda h, t: next(respostas)
         try:
             json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _away_ligado(home)
             _usuario_falou(home, 2)
             orq_mod.avisa_fila_e2e(_fila_presa(fila))
             os.remove(os.path.join(home, "events.jsonl"))
@@ -10664,7 +10677,7 @@ def test_mate_pendentes_resolve_so_com_a_resposta_correlacionada():
 def _mate_vivo(a, terminal="term_mate"):
     a.set("terminals.json", [terminal, "term_coord"])
     with open(os.path.join(a.home, "cursor.json"), "w") as f:
-        json.dump({"mates": {"orq": {"terminal": terminal, "sessao": "sess-mate", "cwd": a.home, "turnos": []}}}, f)
+        json.dump({"mates": {"orq": {"terminal": terminal, "sessao": "sess-mate", "cwd": a.home, "turnos": []}}, "ausente": {"ligada_em": "2026-10-01T12:00:00Z"}}, f)
 
 
 def test_mate_pedir_digita_no_mate_e_a_subida_volta_como_entrada_do_coordenador():
@@ -12281,6 +12294,39 @@ def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
     for chave in ("deploy", "comentario", "limpeza"):
         assert a.orq("feito", e, chave, "--prova", "ok").returncode == 0
     assert "A fazer por você" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
+
+
+def test_ticket107_without_away_mode_no_notice_is_typed_in_the_coordinator_and_all_reach_the_next_prompt():
+    a = Amb()
+    with tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        orq_mod.HOME, orq_mod.digita = a.home, lambda h, t: _nao_digita()
+        try:
+            os.makedirs(a.home, exist_ok=True)
+            json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(a.home, "gerente.json"), "w"))
+            _usuario_falou(a.home, 60)  # prompt antigo: a regra do ticket 86 não adiaria
+            assert orq_mod.avisa_fila_e2e(_fila_presa(fila))
+            assert orq_mod.avisa_coordenador("term_c", "orq: wake de teste", minutos=orq_mod.WAKE_OCIOSO_MIN) == "adiado"
+            assert orq_mod.avisos_entregar() == []
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "PRESA" in ctx and "wake de teste" in ctx, ctx
+
+
+def test_ticket107_with_away_mode_the_notice_is_typed_keeping_the_old_guards():
+    with tempfile.TemporaryDirectory() as home:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append(t) or "enviado"
+        try:
+            orq_mod.ausente_ligar()
+            _usuario_falou(home, 1)
+            assert orq_mod.avisa_coordenador("term_c", "orq: a") == "adiado" and enviados == []
+            os.remove(os.path.join(home, "events.jsonl"))
+            assert orq_mod.avisa_coordenador("term_c", "orq: b") == "enviado" and enviados == ["orq: b"]
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
 
 
 if __name__ == "__main__":

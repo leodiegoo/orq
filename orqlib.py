@@ -4712,10 +4712,11 @@ def _notifica_mac(texto):
 
 
 def avisa_coordenador(handle, texto, contexto=True, minutos=None):
-    """Leva um aviso ao coordenador sem digitar por cima de quem escreve (ticket 82). Devolve `enviado` (coordenador ocioso: digitado), `adiado`
-    (coordenador com gente: o aviso espera na fila `avisos` do cursor, sai no contexto do próximo prompt, `contexto` False para o que o resumo já
+    """Leva um aviso ao coordenador sem digitar por cima de quem escreve (tickets 82 e 107). Só digita com o modo ausente ligado e o coordenador ocioso
+    (a guarda do prompt antigo e a do rascunho do `digita` continuam); sem o modo ausente o aviso nunca é digitado. Devolve `enviado` (digitado), `adiado`
+    (sem modo ausente ou coordenador com gente: o aviso espera na fila `avisos` do cursor, sai no contexto do próximo prompt, `contexto` False para o que o resumo já
     mostra, e `avisos_entregar` o digita se o coordenador ficar ocioso) ou o motivo do `digita` (nada saiu: repita depois). `adiado` já é entrega."""
-    if not coordenador_ativo(minutos=minutos):
+    if _dict(_cursor_ro().get("ausente")) and not coordenador_ativo(minutos=minutos):  # só com o modo ausente ligado ninguém escreve na caixa de composição do Orca (ticket 107)
         return digita(handle, texto)
     _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": texto, "ts": now(), "contexto": contexto, **({"minutos": minutos} if minutos is not None else {})}))
     _notifica_mac(texto)
@@ -4726,7 +4727,7 @@ def avisos_entregar():
     """Uma volta do painel: com o coordenador ocioso há mais de COORD_OCIOSO_MIN (WAKE_OCIOSO_MIN no aviso de acordar), digita o aviso mais antigo da fila (um por volta; o seguinte
     encontra o coordenador ocupado). Devolve as linhas do painel."""
     g, fila = _gerente_cfg(), _cursor_ro().get("avisos")
-    if not g.get("coordenador") or not isinstance(fila, list) or not fila:
+    if not g.get("coordenador") or not isinstance(fila, list) or not fila or not _dict(_cursor_ro().get("ausente")):
         return []
     a = next((x for x in fila if not coordenador_ativo(minutos=x.get("minutos"))), None)  # o aviso de acordar (2 min) não espera atrás de um de 10
     if not a or digita(g["coordenador"], a["texto"]) != "enviado":
