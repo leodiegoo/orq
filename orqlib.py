@@ -72,7 +72,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "hibernado": 6, "encerrado": 7, "liberado": 8}
+ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "aguardando_integracao": 5, "entregue": 6, "servico": 7, "hibernado": 8, "encerrado": 9, "liberado": 10}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -80,9 +80,13 @@ HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorv
 HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack devolve o próximo lote)
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
 RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do próprio `orq resumo`
-ANDA = ("rodando", "perguntando", "travado", "parado", "nao_comecou")  # estados que aparecem em "Anda" do `orq resumo`
+ANDA = ("rodando", "perguntando", "travado", "parado", "nao_comecou", "aguardando_integracao")  # estados que aparecem em "Anda" do `orq resumo`
 PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
-PAINEL_PARADO_S = 60
+PAINEL_PARADO_S = 60  # carimbo mais velho que isto já vale um aviso de "painel lento"; parado é o limite de painel_limite_s
+PAINEL_LIMITE_MIN_S = 90  # o carimbo só vale como painel parado depois de tanto tempo (ou de PAINEL_VOLTAS_X voltas médias, o que for maior)
+PAINEL_VOLTAS_X = 3
+VOLTAS_LEMBRADAS = 10  # durações de volta guardadas no gerente.json `voltas_s`
+INTEGRAR_FILA = "integrar-fila.json"  # {itens: [{branch, ticket, ts}]}: as branches que esperam o integrador; o worker do ticket fica "aguardando integração"
 PAINEL_CHECAGEM = "gerente-checagem.json"  # {ts, terminal, morto}: o que o último `orq gerente checar` (fora do hook) viu no Orca; o hook só o lê
 GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
 RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
@@ -380,7 +384,64 @@ def _sem_terminal(w, liberados, vivos):
     return w.get("dispatchStatus") != "dispatched" and (w.get("dispatchId") in liberados or (vivos is not None and w.get("agentTerminalHandle") not in vivos))
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None):
+def integracao_fila():
+    """{ticket: {branch, ticket, ts}} das branches que esperam o integrador (integrar-fila.json, alimentado por `orq integrar fila add`)."""
+    return {i["ticket"]: i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict) and i.get("ticket")}
+
+
+def integrar_fila_add(branch, ticket):
+    """Põe a branch do ticket na fila do integrador (repetir troca a branch, não duplica). Enquanto ela está lá, o worker do ticket fica `aguardando integração`."""
+    n = str(ticket).strip().zfill(2)
+    if not branch or not branch.strip():
+        raise ValueError("branch vazia")
+    novo = {"branch": branch.strip(), "ticket": n, "ts": now()}
+    with _trava("integrar-fila.lock"):
+        itens = [i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict)]
+        pos = next((k for k, i in enumerate(itens) if i.get("ticket") == n), len(itens))
+        itens[pos:pos + 1] = [novo]
+        _write_json(_path(INTEGRAR_FILA), {"itens": itens}, indent=2)
+    return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": novo["branch"]})
+
+
+def integrar_fila_rm(ticket):
+    """Tira o ticket da fila do integrador (a branch já está na main, ou desistiram dela). ValueError se não estava lá."""
+    n = str(ticket).strip().zfill(2)
+    with _trava("integrar-fila.lock"):
+        itens = [i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict)]
+        resto = [i for i in itens if i.get("ticket") != n]
+        if len(resto) == len(itens):
+            raise ValueError(f"o ticket {n} não está na fila do integrador (orq integrar fila lista)")
+        _write_json(_path(INTEGRAR_FILA), {"itens": resto}, indent=2)
+    return append_event({"tipo": "integrar_fila", "op": "rm", "ticket": n})
+
+
+def _ticket_do_dispatch(events):
+    """{dispatch ou task: número do ticket} dos despachos feitos com `orq despachar --ticket`: é o que liga um worker à fila do integrador."""
+    out = {}
+    for e in events:
+        if e.get("tipo") == "despacho" and e.get("ticket"):
+            out.update({k: e["ticket"] for k in (e.get("dispatch"), e.get("task")) if k})
+    return out
+
+
+def _servicos(events):
+    """{dispatch: último ciclo {ts, hash, nota} ou None} dos dispatches que o `orq despachar --servico` marcou (integrador, secondmate)."""
+    out = {e["dispatch"]: None for e in events if e.get("tipo") == "despacho" and e.get("servico") and e.get("dispatch")}
+    for e in events:
+        if e.get("tipo") == "ciclo" and e.get("dispatch") in out:
+            out[e["dispatch"]] = {k: e.get(k) for k in ("ts", "hash", "nota")}
+    return out
+
+
+def ciclo_feito(dispatch, hash_, nota=None):
+    """O worker de serviço terminou um ciclo: grava o evento `ciclo`. Não fala com o Orca (depois do primeiro worker_done ele não tem mais capability).
+    ValueError se o dispatch não foi despachado com --servico."""
+    if dispatch not in _servicos(read_events()):
+        raise ValueError(f"{dispatch} não é um dispatch de serviço (orq despachar --servico)")
+    return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {})})
+
+
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
@@ -389,10 +450,13 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando;
     `perguntas_tela` é {dispatch: tela_pergunta} dos menus esperando resposta humana no terminal (o worker vira `perguntando`, com a `pergunta` na linha);
     `hibernados` é o cursor.json `hibernados` ({dispatch: {desde, motivo, …}}): o worker vira `hibernado` (terminal fechado de propósito, sessão guardada).
+    `integracao` é {ticket: {branch, ticket}} da fila do integrador: o worker do ticket que estaria `travado`, `nao_comecou` ou `parado` vira `aguardando_integracao`
+    (espera conhecida, sem sugestão de steer). O dispatch de serviço (`orq despachar --servico`) entregue vira `servico`, com o último ciclo.
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados, pausas, telas, nao_iniciou = _liberados(events), interrompidos(events), telas or {}, _nao_iniciou(events)
     avisos_entrega = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
+    integracao, tickets_de, servicos = integracao_fila() if integracao is None else integracao, _ticket_do_dispatch(events), _servicos(events)
     controles = {}
     for e in events:
         if e.get("tipo") == "controle" and e.get("resultado") != "iniciado":
@@ -421,12 +485,14 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             espera = motivo = None
             feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
             estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue" if feito else "encerrado"), None
+            estado = "servico" if estado == "entregue" and d in servicos else estado
         ag = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": det.get("titulo"), "modelo": det.get("modelo"),
               "effort": det.get("effort"), "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
               "desde": _z(det.get("desde")), "idade_s": idade, "agente": det.get("agente"), "turno": turno,
               "turno_inicio": _z(t.get("inicio")), "turno_fim": _z(t.get("fim"))}
         if espera:
             ag["espera"] = espera
+        _marca_integracao_e_servico(ag, integracao, tickets_de, servicos)
         if (perguntas_tela or {}).get(d) and w.get("dispatchStatus") == "dispatched":
             ag["pergunta"] = perguntas_tela[d]
         if telas.get(d):
@@ -448,21 +514,37 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
 
 
+def _marca_integracao_e_servico(ag, integracao, tickets_de, servicos):
+    """Põe em `ag` (a linha de um agente) o que a fila do integrador e os despachos de serviço dizem dele: o estado `aguardando_integracao` no lugar de
+    travado/nao_comecou/parado, e o `ciclo` do serviço. O motivo do travado sai: o worker não está travado, espera a main."""
+    ag.pop("integracao", None)
+    tk = tickets_de.get(ag.get("dispatch")) or tickets_de.get(ag.get("task"))
+    if ag["estado"] in ("travado", "nao_comecou", "parado") and tk in integracao:
+        ag["estado"], ag["integracao"] = "aguardando_integracao", integracao[tk]
+        ag.pop("motivo", None)
+    if ag["estado"] == "servico" and servicos.get(ag.get("dispatch")):
+        ag["ciclo"] = servicos[ag["dispatch"]]
+
+
 def _nao_iniciou(events):
     """Os dispatches que o `orq despachar` marcou com `nao_iniciou` (o prompt do spec não entrou, nem depois do Enter)."""
     return {e.get("dispatch") for e in events if e.get("tipo") == "nao_iniciou"}
 
 
-def reavalia(agentes_, events, agora, turnos=None):
-    """Os agentes do cache do aberto.json com rodando/travado/nao_comecou/parado refeito pelo heartbeat mais novo do log e, com `turnos`, pelo turnos.json (o cache atrasa até um prompt)."""
+def reavalia(agentes_, events, agora, turnos=None, integracao=None):
+    """Os agentes do cache do aberto.json com rodando/travado/nao_comecou/parado refeito pelo heartbeat mais novo do log e, com `turnos`, pelo turnos.json (o cache atrasa até um prompt).
+    Refaz também o `aguardando_integracao` (a fila do integrador é lida agora, ou vem em `integracao`) e o `servico` (o ciclo mais novo do log)."""
+    integracao, tickets_de, servicos = integracao_fila() if integracao is None else integracao, _ticket_do_dispatch(events), _servicos(events)
     sinais = sinais_de_vida(events)
     liberados = _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}
     pausas, out = interrompidos(events), []
     for ag in agentes_:
         ag = dict(ag)
-        if ag.get("estado") in ("entregue", "rodando", "travado", "nao_comecou", "parado") and ag.get("dispatch") in liberados:
+        if ag.get("estado") in ("entregue", "servico", "rodando", "travado", "nao_comecou", "parado", "aguardando_integracao") and ag.get("dispatch") in liberados:
             ag["estado"] = "liberado"  # o orq liberar depois do cache (M13); só existe liberar depois do worker_done, então vale mesmo com cache anterior a ele (B38)
-        if ag.get("estado") in ("rodando", "travado", "nao_comecou", "parado"):
+        if ag.get("estado") in ("entregue", "servico") and ag.get("dispatch") in servicos:
+            ag["estado"] = "servico"
+        if ag.get("estado") in ("rodando", "travado", "nao_comecou", "parado", "aguardando_integracao"):
             h = sinais.get(ag.get("dispatch")) or {}
             if _ts(h.get("ts")) and (not _ts(ag.get("ultimo_heartbeat")) or _ts(h["ts"]) > _ts(ag["ultimo_heartbeat"])):
                 ag["fase"], ag["ultimo_heartbeat"] = h.get("fase"), _z(h["ts"])
@@ -483,6 +565,7 @@ def reavalia(agentes_, events, agora, turnos=None):
                 ag["estado"], ag["idade_s"] = ag["turno"], int((agora - quando).total_seconds())
             elif ag.get("dispatch") in _nao_iniciou(events) and not (ag.get("turno_inicio") or h):
                 ag["estado"] = "nao_comecou"
+        _marca_integracao_e_servico(ag, integracao, tickets_de, servicos)
         out.append(ag)
     return out
 
@@ -495,7 +578,7 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
     agora = agora or datetime.now(timezone.utc)
     if isinstance((aberto or {}).get("agentes"), list):
         ags = reavalia(aberto["agentes"], events, agora, turnos)
-        vivos = sorted((a for a in ags if a["estado"] in ("travado", "nao_comecou", "parado", "perguntando", "rodando")), key=lambda a: a.get("prioridade") or 2)
+        vivos = sorted((a for a in ags if a["estado"] in ("travado", "nao_comecou", "parado", "perguntando", "rodando", "aguardando_integracao")), key=lambda a: a.get("prioridade") or 2)
         sem_liberar = sum(a["estado"] == "entregue" and not a.get("retido") for a in ags)
         itens = []
         for a in vivos[:3]:
@@ -503,6 +586,7 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
             itens.append(nome + (f"TRAVADO há {(a.get('idade_s') or 0) // 60} min" + (f" ({a['motivo']})" if a.get("motivo") else "") if a["estado"] == "travado"
                                  else f"NÃO COMEÇOU há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "nao_comecou"
                                  else f"parado no prompt há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "parado" else "pergunta" if a["estado"] == "perguntando"
+                                 else f"aguardando integração de {a['integracao']['branch']}" if a["estado"] == "aguardando_integracao"
                                  else f"{a.get('fase') or '?'} {_hora_local(a['ultimo_heartbeat'])}" if a.get("ultimo_heartbeat") else "sem heartbeat"))
             if a["estado"] == "rodando" and a.get("espera") and a["espera"] not in (a.get("fase") or ""):
                 itens[-1] += f" (esperando: {a['espera']})"
@@ -631,6 +715,17 @@ def aviso_recuperado(r):
     return f"cursor.json estava ilegível: reconstruído do events.jsonl (cópia em {r.get('copia')}); papéis e ingest recomeçaram."
 
 
+def _media_voltas(g):
+    """Duração média, em segundos, das últimas voltas do painel (gerente.json `voltas_s`); 0 sem nenhuma."""
+    voltas = [v for v in g.get("voltas_s") or [] if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+    return sum(voltas) / len(voltas) if voltas else 0
+
+
+def painel_limite_s(g):
+    """Quanto o carimbo `gerente-vivo` pode envelhecer até o painel valer como parado: o maior entre PAINEL_LIMITE_MIN_S e PAINEL_VOLTAS_X vezes a volta média."""
+    return max(PAINEL_LIMITE_MIN_S, PAINEL_VOLTAS_X * _media_voltas(g))
+
+
 def aviso_painel(agora=None):
     """Aviso de que o painel do agent manager parou, ou None: com o gerente ligado a este coordenador, os avisos do Orca vão para o terminal do
     gerente e só o painel os repassa; o carimbo `gerente-vivo` é do shell do painel, então vale mesmo com o orq.py quebrado (M19)."""
@@ -647,6 +742,9 @@ def aviso_painel(agora=None):
     if ck.get("morto") and ck.get("terminal") == g.get("gerente"):
         return (f"o terminal do agent manager ({g['gerente']}) sumiu do Orca: nenhum aviso de worker chega e os worker_done ficam na caixa. "
                 "Suba de novo com: orq gerente subir")
+    if idade is not None and idade <= painel_limite_s(g):  # o processo está vivo, a volta é que demora (carga alta)
+        media = _media_voltas(g)
+        return (f"painel lento ({media:.0f} s por volta)" if media else f"painel lento ({int(idade)} s sem carimbo)") + ": o processo está vivo, os avisos de worker demoram"
     if idade is None:
         return f"painel do agent manager sem carimbo ({PAINEL_VIVO}): ele não subiu ou roda o script antigo; nenhum aviso de worker chega enquanto isso"
     return f"painel do agent manager parado há {int(idade // 60)} min: nenhum aviso de worker chega; reinicie painel-agent-manager.sh no terminal dele"
@@ -660,7 +758,7 @@ def checar_gerente_bg(agora=None):
         return
     agora = agora or time.time()
     try:
-        if agora - os.path.getmtime(_path(PAINEL_VIVO)) <= PAINEL_PARADO_S:
+        if agora - os.path.getmtime(_path(PAINEL_VIVO)) <= painel_limite_s(g):
             return
     except OSError:
         pass
@@ -966,6 +1064,27 @@ def dica_ligar(run):
     if g and g.get("coordenador") == os.environ.get("ORCA_TERMINAL_HANDLE"):
         return f"rode orq gerente ligar --terminal {g['gerente']} --run {run}"
     return f"rode run-use --id {run}"
+
+
+@contextlib.contextmanager
+def _no_run(alvo):
+    """O coordenador comanda `alvo` dentro do bloco: se não comandava, o orq faz o `run-use` dele e, ao sair, religa o Run que estava ligado (o Orca liga
+    um Run por terminal). Com o agent manager ligado nada troca: o terminal do coordenador é dono dos Runs soltos e o `run-use` o tiraria do Run que o
+    gerente segura; vale o erro com a dica de `orq gerente ligar`, que o chamador mantém. Sem Run antes, o `alvo` fica ligado, como no run-use à mão."""
+    if not alvo or run_do_coordenador(alvo) or runs_do_gerente():
+        yield
+        return
+    meu = os.environ.get("ORCA_TERMINAL_HANDLE")
+    antes = _run_proprio()
+    orca("run-use", "--id", alvo, como=meu)
+    try:
+        yield
+    finally:
+        if antes and antes != alvo:
+            try:
+                orca("run-use", "--id", antes, como=meu)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                log(f"run-use de volta ao Run {antes}: {type(e).__name__}: {e}")
 
 
 def _gerente_cfg():
@@ -2323,7 +2442,7 @@ def telas_avisar():
 def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
     txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
-    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events)])
+    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets())])])
 
 
 # ---------- digest e modo ausente ----------
@@ -2549,7 +2668,7 @@ def _estado_de_gente(a):
     """O estado de um worker vivo em texto de gente: a fase que ele declarou, ou o estado sem o jargão do orq."""
     if a["estado"] == "rodando":
         return a.get("fase") or "rodando"
-    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou",
+    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou", "aguardando_integracao": "aguardando integração",
             "hibernado": f"hibernado desde {_hora_local(a.get('hibernado_desde'))}"}.get(a["estado"], a["estado"])
 
 
@@ -4495,6 +4614,12 @@ def steer(task, texto, run=None, entrada=None):
     alvo = run_padrao(run)
     if not alvo:
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
+    with _no_run(alvo):
+        return _steer(task, texto, alvo, entrada, pedido)
+
+
+def _steer(task, texto, alvo, entrada, pedido):
+    """O corpo do steer, com o Run `alvo` já comandado pelo coordenador (ou com a recusa que explica o que falta)."""
     fenced = f"o coordenador precisa comandar o Run do worker: {dica_ligar(alvo)}"
     if not run_do_coordenador(alvo):
         raise ValueError(f"a task está em {alvo}; {fenced}")
@@ -4577,7 +4702,8 @@ def _escrever(caminho, txt):
 
 
 def le_ticket(caminho):
-    """{num, arquivo, titulo, status, blocked_by, run, task} do cabeçalho de um ticket `NN-slug.md`; levanta OSError ou ValueError se ilegível."""
+    """{num, arquivo, titulo, status, blocked_by, run, task, modelo, effort} do cabeçalho de um ticket `NN-slug.md` (`Modelo:` e `Effort:` são opcionais: o que o
+    orq despacha sozinho quando o ticket é liberado); levanta OSError ou ValueError se ilegível."""
     with open(caminho, encoding="utf-8") as f:
         txt = f.read()
     cab = _cabecalho(txt)
@@ -4586,7 +4712,7 @@ def le_ticket(caminho):
         raise ValueError(f"{caminho} não começa com o título (# NN: Título)")
     return {"num": os.path.basename(caminho).split("-")[0].zfill(2), "arquivo": caminho, "titulo": titulo.group(1).strip(),
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
-            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None}
+            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None}
 
 
 def tickets():
@@ -4651,31 +4777,32 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
             deps.append(t["task"])
     if not alvo:
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
-    if not run_do_coordenador(alvo):
-        raise ValueError(f"o ticket é para o Run {alvo}, que o coordenador não comanda: o Orca recusa task-create em outro Run (consumer_fenced); {dica_ligar(alvo)}")
-    os.makedirs(ISSUES, exist_ok=True)
-    with _trava("ticket.lock"):  # B25: dois `ticket novo` ao mesmo tempo não escolhem o mesmo número
+    with _no_run(alvo):
+        if not run_do_coordenador(alvo):
+            raise ValueError(f"o ticket é para o Run {alvo}, que o coordenador não comanda: o Orca recusa task-create em outro Run (consumer_fenced); {dica_ligar(alvo)}")
+        os.makedirs(ISSUES, exist_ok=True)
+        with _trava("ticket.lock"):  # B25: dois `ticket novo` ao mesmo tempo não escolhem o mesmo número
+            try:
+                maior = max(int(n.split("-")[0]) for n in os.listdir(ISSUES) if _NUM_ARQ.match(n))
+            except ValueError:
+                maior = 0
+            num = f"{maior + 1:02d}"
+            caminho = os.path.join(ISSUES, f"{num}-{_slug(titulo)}.md")
+            txt = f"# {num}: {titulo}\n\nStatus: {STATUS_NOVO}\nBlocked by: {', '.join(bloqueios) or '(nenhum)'}\nRun: {alvo}\n\n{corpo}\n"
+            with open(caminho, "x", encoding="utf-8") as f:
+                f.write(txt)
         try:
-            maior = max(int(n.split("-")[0]) for n in os.listdir(ISSUES) if _NUM_ARQ.match(n))
-        except ValueError:
-            maior = 0
-        num = f"{maior + 1:02d}"
-        caminho = os.path.join(ISSUES, f"{num}-{_slug(titulo)}.md")
-        txt = f"# {num}: {titulo}\n\nStatus: {STATUS_NOVO}\nBlocked by: {', '.join(bloqueios) or '(nenhum)'}\nRun: {alvo}\n\n{corpo}\n"
-        with open(caminho, "x", encoding="utf-8") as f:
-            f.write(txt)
-    try:
-        res = orca("task-create", "--spec", f"Leia e execute o ticket {caminho}", "--task-title", titulo, "--run", alvo,
-                   *(["--deps", json.dumps(deps)] if deps else []), timeout=20)
-        task = (res.get("task") or res).get("id")
-        if not task:
-            raise RuntimeError(f"task-create sem id na resposta: {json.dumps(res)[:300]}")
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.remove(caminho)
-        raise
-    _escrever(caminho, _trocar_campo(txt, "Task", task))
-    append_event({"tipo": "ticket", "op": "novo", "ticket": num, "task": task, "run": alvo, "titulo": titulo, **({"deps": deps} if deps else {})})
+            res = orca("task-create", "--spec", f"Leia e execute o ticket {caminho}", "--task-title", titulo, "--run", alvo,
+                       *(["--deps", json.dumps(deps)] if deps else []), timeout=20)
+            task = (res.get("task") or res).get("id")
+            if not task:
+                raise RuntimeError(f"task-create sem id na resposta: {json.dumps(res)[:300]}")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(caminho)
+            raise
+        _escrever(caminho, _trocar_campo(txt, "Task", task))
+        append_event({"tipo": "ticket", "op": "novo", "ticket": num, "task": task, "run": alvo, "titulo": titulo, **({"deps": deps} if deps else {})})
     return {"ticket": num, "arquivo": caminho, "task": task, "run": alvo, **({"aviso": "; ".join(avisos)} if avisos else {})}
 
 
@@ -4698,16 +4825,118 @@ def ticket_fechar(numero, answer):
     fechada, aviso = False, ""
     if t["task"] and t["run"]:
         try:
-            tk = next((x for x in orca("task-list", "--run", t["run"], timeout=20)["tasks"] if x["id"] == t["task"]), None)
-            if tk and tk.get("status") not in ("completed", "failed"):
-                orca("task-update", "--id", t["task"], "--status", "completed", "--run", t["run"], "--result", json.dumps({"ticket": n}), timeout=20)
-                fechada = True
-                if tk.get("status") == "dispatched":
-                    aviso = f"a task {t['task']} estava dispatched: confira se o worker ainda roda (orq agentes)"
+            with _no_run(t["run"]):
+                tk = next((x for x in orca("task-list", "--run", t["run"], timeout=20)["tasks"] if x["id"] == t["task"]), None)
+                if tk and tk.get("status") not in ("completed", "failed"):
+                    orca("task-update", "--id", t["task"], "--status", "completed", "--run", t["run"], "--result", json.dumps({"ticket": n}), timeout=20)
+                    fechada = True
+                    if tk.get("status") == "dispatched":
+                        aviso = f"a task {t['task']} estava dispatched: confira se o worker ainda roda (orq agentes)"
         except Exception as e:  # noqa: BLE001 - o ticket já está resolvido: a task fecha à mão
             aviso = f"task {t['task']} não fechada ({e}): {dica_ligar(t['run'])} e orca orchestration task-update --id {t['task']} --status completed"
-    append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": fechada, **({"aviso": aviso} if aviso else {})})
-    return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso}
+    liberados, avisos = _libera_dependentes(n)
+    aviso = "; ".join(x for x in (aviso, *avisos) if x)
+    append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": fechada, **({"aviso": aviso} if aviso else {}),
+                  "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in liberados]})
+    return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso, "liberados": liberados}
+
+
+def _libera_dependentes(n):
+    """O ticket `n` acabou de ser resolvido: tira o número do `Blocked by:` de quem dependia dele (e os outros bloqueios já resolvidos).
+
+    O que ficou sem nenhum bloqueio e ainda é ready-for-agent é "liberado": com prioridade 1 ou 2 e `Modelo:` e `Effort:` no cabeçalho entra na fila de
+    despacho (o gerente sobe por vaga e prioridade); sem eles só avisa; P3 nunca sobe sozinho. A task do Orca em `blocked` de quem ficou livre vira `ready`.
+    Devolve ([{ticket, prioridade, fila?}] por prioridade, avisos). Falha do Orca vira aviso: os arquivos já estão certos."""
+    ts = tickets()
+    status = {t["num"]: t["status"] for t in ts}
+    liberados, avisos, livres = [], [], []
+    for t in ts:
+        if n not in t["blocked_by"] or t["status"] == STATUS_FECHADO:
+            continue
+        restam = [b for b in t["blocked_by"] if b != n and status.get(b) != STATUS_FECHADO]
+        try:
+            with open(t["arquivo"], encoding="utf-8") as f:
+                _escrever(t["arquivo"], _trocar_campo(f.read(), "Blocked by", ", ".join(restam) or "(nenhum)"))
+        except OSError as e:
+            avisos.append(f"ticket {t['num']}: Blocked by não atualizado ({e.strerror}): tire o {n} à mão")
+            continue
+        if restam:
+            continue
+        livres.append(t)
+        if t["status"] != STATUS_NOVO:
+            continue
+        prio = prioridade_de(read_events(), t["task"], None, t["titulo"])
+        item = {"ticket": t["num"], "prioridade": prio}
+        if prio < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
+            try:
+                item["fila"] = _enfileirar_despacho(f"ticket {n} resolvido: liberou o {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], None, None, None, None, t, prio, "claude")["fila"]
+            except (OSError, ValueError) as e:
+                avisos.append(f"ticket {t['num']} liberado, mas não entrou na fila de despacho ({e}): despache com orq despachar --ticket {t['num']}")
+        elif prio < 3:
+            avisos.append(f"ticket {t['num']} (P{prio}) liberado sem Modelo:/Effort: válidos no cabeçalho: despache com orq despachar --ticket {t['num']}")
+        liberados.append(item)
+    for t in livres:  # a task bloqueada por um blocker do Orca (worker-stop, deps) volta a ficar pronta
+        if not (t["task"] and t["run"]):
+            continue
+        try:
+            with _no_run(t["run"]):
+                tk = next((x for x in orca("task-list", "--run", t["run"], timeout=20)["tasks"] if x["id"] == t["task"]), None)
+                if tk and tk.get("status") == "blocked":
+                    orca("task-update", "--id", t["task"], "--status", "ready", "--run", t["run"], timeout=20)
+        except Exception as e:  # noqa: BLE001 - os arquivos já estão certos; a task volta a ready à mão
+            avisos.append(f"task {t['task']} do ticket {t['num']} segue blocked ({e}): orca orchestration task-update --id {t['task']} --status ready")
+    return sorted(liberados, key=lambda x: (x["prioridade"], x["ticket"])), avisos
+
+
+def linha_liberados(events, ts):
+    """'liberados: 91, 88 (P1, P2)': os tickets que um `ticket fechar` deixou sem bloqueio e que ainda são ready-for-agent (sem worker, sem nova trava); '' se não há."""
+    por_num = {t["num"]: t for t in ts}
+    prio = {x["ticket"]: x["prioridade"] for e in events if e.get("tipo") == "ticket" and e.get("op") == "fechar" for x in e.get("liberados") or []}
+    abertos = sorted((p, n) for n, p in prio.items() if por_num.get(n, {}).get("status") == STATUS_NOVO and not por_num[n]["blocked_by"])
+    return f"liberados: {', '.join(n for _, n in abertos)} ({', '.join(f'P{p}' for p, _ in abertos)})" if abertos else ""
+
+
+def doctor_tasks(dry_run=False):
+    """`orq doctor tasks`: cruza as tasks abertas do Orca (todos os Runs) com os tickets. Task `blocked` ou `pending` cujo ticket está resolvido vira
+    `completed` com `supersededBy` (o ticket que a substituiu); a que não tem ticket só é listada, quem decide é o coordenador (o orq não sabe se o
+    trabalho ainda faz sentido). `dry_run` só lista. Devolve {completadas: [{task, ticket, run}], sem_ticket: [{task, run, status, titulo}], avisos}."""
+    por_task = {t["task"]: t for t in tickets() if t["task"]}
+    completadas, sem_ticket, avisos = [], [], []
+    for r in _todos_os_runs():
+        try:
+            tasks = orca("task-list", "--run", r["id"], timeout=20)["tasks"]
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            avisos.append(f"Run {r['id']}: task-list falhou ({e})")
+            continue
+        for tk in tasks:
+            if tk.get("status") not in ("blocked", "pending"):
+                continue
+            t = por_task.get(tk["id"])
+            if not t:
+                if not (tk.get("task_title") or "").startswith(PREFIXO_PROVA):
+                    sem_ticket.append({"task": tk["id"], "run": r["id"], "status": tk["status"], "titulo": tk.get("task_title")})
+            elif t["status"] == STATUS_FECHADO:
+                if not dry_run:
+                    try:
+                        with _no_run(r["id"]):
+                            orca("task-update", "--id", tk["id"], "--status", "completed", "--run", r["id"],
+                                 "--result", json.dumps({"ticket": t["num"], "supersededBy": f"ticket {t['num']}"}), timeout=20)
+                    except (RuntimeError, subprocess.TimeoutExpired) as e:
+                        avisos.append(f"task {tk['id']} segue {tk['status']} ({e}): {dica_ligar(r['id'])}")
+                        continue
+                completadas.append({"task": tk["id"], "ticket": t["num"], "run": r["id"]})
+    if completadas and not dry_run:
+        append_event({"tipo": "doctor", "op": "tasks", "completadas": completadas})
+    return {"completadas": completadas, "sem_ticket": sem_ticket, "avisos": avisos}
+
+
+def texto_doctor_tasks(r, dry_run=False):
+    """Uma linha por task: a que foi (ou seria) completada e a que não tem ticket."""
+    verbo = "completaria" if dry_run else "completada"
+    ls = [f"{verbo}: {x['task']} (ticket {x['ticket']} resolvido, {x['run']})" for x in r["completadas"]]
+    ls += [f"sem ticket: {x['task']} ({x['status']}, {x['run']}) {_cita(x.get('titulo') or '', 50)}: decida se completa (task-update --status completed) ou se vira ticket" for x in r["sem_ticket"]]
+    ls += [f"aviso: {x}" for x in r["avisos"]]
+    return "\n".join(ls) or "nenhuma task presa"
 
 
 def contexto_sessao():
@@ -4932,6 +5161,12 @@ def texto_agentes(ags):
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
         elif a["estado"] == "hibernado":
             hb = f"hibernado desde {_hora_local(a.get('hibernado_desde'))}" + (f" ({a['motivo_hibernado']})" if a.get("motivo_hibernado") else "")
+        elif a["estado"] == "aguardando_integracao":
+            i = a["integracao"]
+            hb = f"aguardando integração: {i['branch']} (ticket {i['ticket']}) na fila do integrador" + (f" há {a['idade_s'] // 60} min" if a.get("idade_s") is not None else "")
+        elif a["estado"] == "servico":
+            c = a.get("ciclo")
+            hb = f"serviço, último ciclo {_hora_local(c['ts'])} {c.get('hash') or ''}".rstrip() + (f": {c['nota']}" if c.get("nota") else "") if c else "serviço, nenhum ciclo ainda"
         if a.get("espera") and a["espera"] not in (a.get("fase") or ""):  # espera vista na tela ou pausa do coordenador: não está na fase do heartbeat
             hb += f" — esperando: {a['espera']}"
         elif a["estado"] == "travado" and a.get("motivo"):
@@ -5126,6 +5361,12 @@ def liberar(dispatch, run=None):
         raise ValueError(f"dispatch {dispatch} não aparece no worker-list: o orq só libera worker de Run do Orca")
     if w.get("dispatchStatus") == "dispatched":
         raise ValueError(f"dispatch {dispatch} ainda está rodando: espere o worker_done ou use worker-stop")
+    with _no_run(w.get("runId")):
+        return _liberar(dispatch, w)
+
+
+def _liberar(dispatch, w):
+    """O corpo do liberar, com o Run do dispatch já comandado pelo coordenador (ou com a recusa que explica o que falta)."""
     run_id, handle, avisos = w.get("runId"), w.get("agentTerminalHandle"), []
     if dispatch in _liberados(read_events()):
         return {"tipo": "liberar", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, "terminal": handle, "estado": w.get("terminalState"),
@@ -5857,7 +6098,7 @@ def pasta_do_repo(seletor):
     return next((os.path.realpath(r["path"]) for r in repos if campo and r.get(campo) == valor and r.get("path")), None)
 
 
-def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False):
+def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False, servico=False):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
     Devolve os ids e o comando do waiter; não espera nada. Recusa antes de criar a task o que o Orca recusaria depois.
@@ -5869,6 +6110,9 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     Orçamento da máquina (ticket 79): sem vaga (workers vivos ou caros no teto) ou com a máquina sob pressão, o pedido entra na fila de despacho e a resposta é
     `{estado: "enfileirado", fila, posicao, motivo}` no lugar dos ids do worker; o gerente sobe o item por prioridade quando abrir vaga (`_drenando`: é ele
     quem chama, e sem vaga levanta SemVaga em vez de enfileirar de novo).
+
+    `servico`: o worker é um serviço (integrador, secondmate) que segue vivo depois do primeiro worker_done, quando o Orca revoga a capability dele. O evento
+    leva `servico: true`: o `orq agentes` o mostra como `servico` (nunca "entregue sem liberar") e o worker reporta cada ciclo com `orq ciclo feito`.
     """
     if prioridade is not None and prioridade not in (1, 2, 3):
         raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
@@ -5924,7 +6168,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         if motivo and _drenando:
             raise SemVaga(motivo)
         if motivo:
-            return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto)
+            return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto, servico)
         if spec is not None and not spec.lstrip().startswith("#"):
             spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
         if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
@@ -5955,7 +6199,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort, "terminal": terminal,
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {}),
-              **({"projeto": projeto} if projeto else {})}
+              **({"projeto": projeto} if projeto else {}),
+              **({"servico": True} if servico else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if agente == "codex":
@@ -6514,12 +6759,12 @@ def fila_despacho_rm(id_, op="removido", **extra):
     return achado
 
 
-def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto=None):
+def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto=None, servico=False):
     """O despacho que não coube: guarda o pedido (o spec numa cópia em ORQ_HOME) e devolve a resposta do `orq despachar` no lugar dos ids do worker."""
     import uuid
     id_ = "fd" + uuid.uuid4().hex[:6]
     item = {"id": id_, "tipo": "despacho", "run": run, "titulo": titulo, "modelo": modelo, "effort": effort, "agente": agente, "prioridade": prio,
-            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"]), ("projeto", projeto)) if v}}
+            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"]), ("projeto", projeto), ("servico", servico)) if v}}
     if os.environ.get("ORQ_MATE"):  # o Run é do mate e só o terminal dele o comanda: o gerente drena com esse handle (ticket 80)
         item.update(coord=os.environ.get("ORCA_TERMINAL_HANDLE"), mate=os.environ["ORQ_MATE"])
     copia = _path(os.path.join(FILA_DESPACHO_SPECS, id_ + ".md"))
@@ -6565,7 +6810,7 @@ def _sobe_da_fila(it):
     if it["tipo"] == "despacho":
         with _como_coordenador(it):
             r = despachar(it["run"], it.get("titulo") if not it.get("ticket") else None, it.get("spec_arquivo"), it["modelo"], it["effort"], it.get("worktree"), it.get("nome"),
-                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", it.get("projeto"), _drenando=True)
+                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", it.get("projeto"), _drenando=True, servico=bool(it.get("servico")))
         return f"fila: {it['titulo']} subiu ({r.get('dispatchId')})"
     d = it["dispatch"]
     cp = _checkpoint(d)
@@ -7091,7 +7336,14 @@ def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
     if ate_prioridade is not None and ate_prioridade not in (1, 2, 3):
         raise ValueError("--ate-prioridade espera 1, 2 ou 3")
     alvo, poupados = _lista_pausa(agentes(run), read_events(), set(tasks), ate_prioridade, _dict(_cursor_ro().get("pausados")))
-    turnos, saida, espera = _turnos_ro(), [], {}
+    entregues = {_dispatch_da_msg(m) for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m, dict) and m.get("type") == "worker_done"} if alvo else set()
+    feitos = [a for a in alvo if a["dispatch"] in entregues]  # o worker já mandou o worker_done: não há turno a pausar nem PAUSA.md por vir; o caminho é o liberar
+    if feitos and tasks:
+        raise ValueError("; ".join(f"{a['dispatch']} já entregou (worker_done): rode orq liberar {a['dispatch']}, não pausar" for a in feitos))
+    alvo = [a for a in alvo if a["dispatch"] not in entregues]
+    turnos = _turnos_ro()
+    saida, espera = [{"dispatch": a["dispatch"], "task": a["task"], "run": a["run"], "titulo": a.get("titulo"), "prioridade": a["prioridade"], "estado": "entregue",
+                      "aviso": f"já entregou (worker_done): rode orq liberar {a['dispatch']}"} for a in feitos], {}
     for a in alvo:
         t = _dict(turnos.get(a["dispatch"]))
         cwd = t.get("cwd") or _checkpoint(a["dispatch"]).get("caminho")
@@ -7379,7 +7631,9 @@ def _acordada_em(events):
 
 
 def _espera_externa(a, pend, prs, tks):
-    """O que o orq já sabe que o worker espera de fora, em texto, ou None: pendência do usuário ligada à task, PR aberto esperando merge, ticket bloqueado."""
+    """O que o orq já sabe que o worker espera de fora, em texto, ou None: branch na fila do integrador, pendência do usuário ligada à task, PR aberto esperando merge, ticket bloqueado."""
+    if a.get("estado") == "aguardando_integracao" and a.get("integracao"):
+        return f"integração de {a['integracao']['branch']} (ticket {a['integracao']['ticket']})"
     for p in pend:
         if p.get("task") == a["task"]:
             return f"pendência {p.get('id')}"
@@ -7402,7 +7656,7 @@ def motivo_hibernar(a, agora, cfg, pend=(), prs=(), tks=(), acordada=None):
     espera declarada) e o `entregue` sem liberar. Pergunta presa, travado e a tela com shell em segundo plano ficam de fora (essas continuam escalando).
     Três motivos: esperando algo externo que o orq conhece (já depois de cfg.externa_min), entregue e sem liberar, ou parado (os dois depois de cfg.min)."""
     fim, ini = _ts(a.get("turno_fim")), _ts(a.get("turno_inicio"))
-    if a["estado"] not in ("parado", "rodando", "entregue") or a.get("retido") or a.get("tela") or not fim or (ini and ini > fim):
+    if a["estado"] not in ("parado", "rodando", "entregue", "aguardando_integracao") or a.get("retido") or a.get("tela") or not fim or (ini and ini > fim):
         return None
     if a["estado"] != "entregue" and a.get("turno") != "parado":
         return None
@@ -7606,6 +7860,25 @@ def gerente_soltar(parados):
                 append_event({"tipo": "gerente", "op": "soltar", "terminal": g["gerente"], "run": r, "motivo": motivo})
 
 
+def _toca_painel():
+    """Marca o `gerente-vivo` agora: o painel está vivo, mesmo no meio de uma volta lenta (o shell do painel só o toca entre uma volta e outra)."""
+    p = _path(PAINEL_VIVO)
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a"):
+            os.utime(p)
+
+
+def _grava_volta(segundos):
+    """Guarda a duração da volta no gerente.json (as últimas VOLTAS_LEMBRADAS): o limite do aviso de painel parado acompanha a média delas."""
+    with trava_gerente():
+        g = _gerente_cfg()
+        if g.get("gerente") != os.environ.get("ORCA_TERMINAL_HANDLE"):
+            return
+        voltas = [v for v in g.get("voltas_s") or [] if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        _write_json(_path(GERENTE), {**{k: v for k, v in g.items() if k != "run"}, "voltas_s": [*voltas[-(VOLTAS_LEMBRADAS - 1):], round(segundos, 1)]})
+
+
 def gerente_absorver():
     """Uma volta do painel do agent manager, no terminal dele: percorre os Runs ligados (um `run-use` por Run, o Orca liga um por terminal),
     absorve heartbeat e, quando sobra um lote com outra coisa, digita no coordenador um aviso no formato do Orca, uma vez por lote de
@@ -7617,6 +7890,8 @@ def gerente_absorver():
     if not g or g.get("gerente") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return "agent manager desligado (orq gerente ligar --terminal <este terminal>, no coordenador)"
     _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # o cartão da manhã lê daqui se o gerente estava vivo
+    inicio = time.time()
+    _toca_painel()
     liga = bool(g["runs"])  # gerente.json do ticket 17 (sem runs): o Run é o ligado ao terminal, sem revezar
     runs = g["runs"] or [r for r in [(orca("run-current")["run"] or {}).get("id")] if r]
     if not runs:
@@ -7626,6 +7901,7 @@ def gerente_absorver():
     linhas, pendentes = [], {}
     for r in [*presos, *(x for x in runs if x not in presos)]:
         linha, msgs = _absorver_run(r, liga)
+        _toca_painel()  # a volta com carga alta passa de 60 s: o carimbo não pode esperar o fim dela
         vistos = set(avisos.get(r, {}).get("vistos") or [])
         ids = sorted(str(m.get("id")) for m in msgs) if msgs else []
         if msgs:
@@ -7687,6 +7963,8 @@ def gerente_absorver():
         linhas += [*acordar_gatilhos(), *hibernar_ociosos()]
     except Exception as e:  # noqa: BLE001 - hibernar é economia, não pode derrubar o painel; a próxima volta tenta
         log(f"hibernar: {type(e).__name__}: {e}")
+    _toca_painel()
+    _grava_volta(time.time() - inicio)
     return "\n".join(linhas)
 
 
@@ -8131,6 +8409,19 @@ def main(argv=None):
     rp.add_argument("--run")
     pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo)")
     pj.add_argument("--json", action="store_true")
+    de.add_argument("--servico", action="store_true", help="worker de serviço (integrador, secondmate): segue vivo depois do worker_done e reporta cada ciclo com orq ciclo feito")
+    cc = sub.add_parser("ciclo", help="worker de serviço: reporta um ciclo terminado (sem capability do Orca)").add_subparsers(dest="op", required=True)
+    cf = cc.add_parser("feito", help="orq ciclo feito --dispatch <id> --hash <commit> [--nota <texto>]")
+    cf.add_argument("--dispatch", required=True)
+    cf.add_argument("--hash", required=True)
+    cf.add_argument("--nota")
+    ig = sub.add_parser("integrar", help="a fila do integrador").add_subparsers(dest="op", required=True)
+    igf = ig.add_parser("fila", help="as branches que esperam o integrador: add, rm, lista").add_subparsers(dest="acao", required=True)
+    iga = igf.add_parser("add", help="orq integrar fila add <branch> <ticket>: o worker do ticket fica aguardando integração, não parado")
+    iga.add_argument("branch")
+    iga.add_argument("ticket")
+    igf.add_parser("rm", help="tira o ticket da fila").add_argument("ticket")
+    igf.add_parser("lista").add_argument("--json", action="store_true")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
     tn = tk.add_parser("novo", help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
     tn.add_argument("--titulo", required=True)
@@ -8140,6 +8431,10 @@ def main(argv=None):
     tf = tk.add_parser("fechar", help="grava o Answer, põe resolved e completa a task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="texto ou caminho de um arquivo")
+    dc = sub.add_parser("doctor", help="confere o estado do orq contra o Orca e corrige o que dá").add_subparsers(dest="op", required=True)
+    dt = dc.add_parser("tasks", help="completa a task blocked/pending de ticket resolvido (supersededBy) e lista a que não tem ticket")
+    dt.add_argument("--dry-run", action="store_true", help="só lista")
+    dt.add_argument("--json", action="store_true")
     tl = tk.add_parser("lista", help="os tickets abertos (--todos inclui os resolvidos)")
     tl.add_argument("--todos", action="store_true")
     tl.add_argument("--json", action="store_true")
@@ -8344,7 +8639,7 @@ def main(argv=None):
                 return 0
             print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
         elif a.cmd == "despachar":
-            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente, a.projeto)
+            r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente, a.projeto, servico=a.servico)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
@@ -8360,6 +8655,18 @@ def main(argv=None):
             else:
                 print("\n".join(f"{n}  {d['repo'] or '-'}  {d['harness'] or '-'}" + (f"  grupo {d['grupo']}" if d["grupo"] else "") +
                                 (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
+        elif a.cmd == "ciclo":
+            print(json.dumps(ciclo_feito(a.dispatch, a.hash, a.nota), ensure_ascii=False))
+        elif a.cmd == "integrar" and a.acao == "add":
+            print(json.dumps(integrar_fila_add(a.branch, a.ticket), ensure_ascii=False))
+        elif a.cmd == "integrar" and a.acao == "rm":
+            print(json.dumps(integrar_fila_rm(a.ticket), ensure_ascii=False))
+        elif a.cmd == "integrar":
+            itens = list(integracao_fila().values())
+            print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (desde {_hora_local(i['ts'])})" for i in itens) or "fila do integrador vazia")
+        elif a.cmd == "doctor":
+            r = doctor_tasks(a.dry_run)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))
         elif a.cmd == "ticket":
             if a.op == "novo":
                 print(json.dumps(ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run), ensure_ascii=False))
