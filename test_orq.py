@@ -5120,6 +5120,57 @@ def test_ticket20_steer_a_worker_ocupado_nao_digita_nada_no_terminal():
     assert _log(a, "send.log") == [] and len(_enviados(a)) == 1, "o Orca avisa o worker ocupado sozinho: sem duplicar"
 
 
+def _steer_ocupado74(tela, draft=None, **env):
+    a = Amb()
+    a.set("busy.json", ["term_w1"])
+    a.set("screens.json", {"term_w1": tela})
+    if draft:
+        a.set("drafts.json", {"term_w1": draft})
+    return a, _steer_com_worker(a, **env)
+
+
+def test_ticket74_steer_a_worker_no_meio_do_turno_digita_o_aviso_com_o_resumo_e_registra():
+    a, r = _steer_ocupado74(["● Lendo os arquivos", "✻ Pensando… (12s · esc to interrupt)"])
+    assert r.returncode == 0, r.stderr
+    (env,) = _avisos_enviados(a, "term_w1")
+    texto = env[env.index("--text") + 1]
+    assert "--enter" in env and "use o índice novo" in texto and "orca orchestration check --terminal term_w1" in texto, env
+    assert [e["tipo"] for e in a.events()].count("steer_digitado_ocupado") == 1
+    (ev,) = [e for e in a.events() if e["tipo"] == "steer"]
+    assert ev["aviso_terminal"] == "ocupado_digitado", ev
+
+
+def test_ticket74_o_resumo_do_aviso_tem_ate_300_caracteres_numa_linha_so():
+    a = Amb()
+    a.set("busy.json", ["term_w1"])
+    a.set("screens.json", {"term_w1": ["esc to interrupt"]})
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    _steer_env(a)
+    assert a.orq("steer", "task_rodando", "ajuste\n" + "x" * 900).returncode == 0
+    (env,) = _avisos_enviados(a, "term_w1")
+    texto = env[env.index("--text") + 1]
+    assert "\n" not in texto and "x" * 250 in texto and "x" * 301 not in texto, texto
+
+
+def test_ticket74_steer_a_worker_ocupado_nao_digita_por_cima_de_rascunho_nem_de_menu():
+    a, r = _steer_ocupado74(["esc to interrupt"], draft="estou digitando")
+    assert r.returncode == 0 and _log(a, "send.log") == [], "rascunho do usuário"
+    b, r = _steer_ocupado74(_tela52("tela-permissao.txt"))
+    assert r.returncode == 0 and _log(b, "send.log") == [], "menu de permissão"
+    c, r = _steer_ocupado74(["● sem spinner na tela"])
+    assert r.returncode == 0 and _log(c, "send.log") == [], "sem turno em andamento na tela"
+    for x in (a, b, c):
+        assert "steer_digitado_ocupado" not in [e["tipo"] for e in x.events()]
+        assert len(_enviados(x)) == 1, "a mensagem do steer segue pela caixa"
+
+
+def test_ticket74_orca_que_barra_o_texto_no_meio_do_turno_deixa_o_steer_como_estava():
+    a, r = _steer_ocupado74(["esc to interrupt"], FAKE_PROMPT_BLOCKED="1")
+    assert r.returncode == 0 and "steer_digitado_ocupado" not in [e["tipo"] for e in a.events()]
+    assert "aviso_terminal" not in [e for e in a.events() if e["tipo"] == "steer"][0]
+
+
 def test_ticket20_steer_sem_terminal_do_worker_ou_com_falha_no_terminal_nao_derruba_o_steer():
     a = Amb()
     _steer_env(a)  # worker-list vazio: o dispatch não aparece

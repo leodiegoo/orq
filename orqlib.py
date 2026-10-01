@@ -3679,6 +3679,35 @@ def digita(handle, texto):
     return "enviado"
 
 
+STEER_AVISO_MAX = 300  # caracteres do ajuste que o aviso digitado no worker ocupado carrega
+
+
+def digita_ocupado(handle, texto):
+    """Digita `texto` + Enter num agente no meio do turno, para o Claude Code pôr na fila e injetar no próximo resultado de ferramenta (01/10).
+
+    Só com o spinner (`esc to interrupt`, igual nos dois agentes) na tela, sem rascunho na caixa e sem menu esperando resposta humana: nos três casos
+    devolve `ocupado` sem digitar. Devolve `ocupado_digitado`, ou `ocupado` se o Orca barrou o send (agent_prompt_blocked) ou falhou."""
+    try:
+        t = orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal").get("terminal") or {}
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return "ocupado"
+    tail = t.get("tail") or []
+    if (t.get("draft") or "").strip() or any(tela_pergunta(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])):
+        return "ocupado"
+    try:
+        orca("send", "--terminal", handle, "--text", texto, "--enter", area="terminal", timeout=TIMEOUT_ORCA)
+    except subprocess.TimeoutExpired:
+        return "ocupado_digitado"  # o texto pode ter saído: repetir empilharia
+    except RuntimeError:
+        return "ocupado"
+    return "ocupado_digitado"
+
+
+def _aviso_ajuste(handle, ajuste):
+    """O aviso do Orca com o resumo do ajuste, numa linha só (a quebra de linha submeteria o texto antes da hora)."""
+    return f"{_aviso_worker(handle)} Ajuste do coordenador: {_cita(ajuste, STEER_AVISO_MAX)}"
+
+
 def _terminal_do_dispatch(run, dispatch):
     """agentTerminalHandle do dispatch no worker-list do Run, ou None (sem linha, ou o Orca falhou)."""
     try:
@@ -3818,6 +3847,10 @@ def steer(task, texto, run=None, entrada=None):
     time.sleep(STEER_ESPERA_S)
     handle = _terminal_do_dispatch(alvo, t["dispatch_id"])
     entrega = "orca" if _orca_avisou(msg.get("id")) else digita(handle, _aviso_worker(handle)) if handle else "sem_terminal"
+    if entrega == "ocupado":
+        entrega = digita_ocupado(handle, _aviso_ajuste(handle, texto))
+        if entrega == "ocupado_digitado":
+            append_event({"tipo": "steer_digitado_ocupado", "task": task, "dispatch": t["dispatch_id"], "run": alvo, "msg_id": msg.get("id")})
     ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": alvo, "texto": texto, "msg_id": msg.get("id"),
                        **({"pedido": pedido} if pedido is not None else {}), **({"aviso_terminal": entrega} if entrega != "ocupado" else {})})
     if entrada:
