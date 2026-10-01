@@ -8724,6 +8724,49 @@ def test_ticket73_despachar_confere_a_cota_do_harness_escolhido():
     assert len(_log(a, "started.log")) == 1
 
 
+
+def test_ticket73_tela_do_codex_reconhece_o_trust_e_nao_ve_menu_na_tela_ociosa_nem_na_ocupada():
+    t = orq_mod.tela_pergunta(_tela52("tela-codex-trust.txt"), "codex")
+    assert t["tipo"] == "trust" and [o[0] for o in t["opcoes"]] == [1, 2] and t["opcoes"][0][1] == "Trust and continue", t
+    assert orq_mod.tela_pergunta(_tela52("tela-codex-trust.txt"), "claude") is None, "o cursor › é do Codex"
+    for f in ("tela-codex-ocioso.txt", "tela-codex-ocupado.txt"):
+        assert orq_mod.tela_pergunta(_tela52(f), "codex") is None, f
+    h = orq_mod.tela_pergunta(["  Hooks need review", "  3 hooks are new or changed", "› 1. Review hooks", "  2. Trust all and continue", "  3. Continue without trusting"], "codex")
+    assert h["tipo"] == "hooks" and len(h["opcoes"]) == 3, h
+
+
+def test_ticket73_tela_do_codex_com_terminal_em_segundo_plano_e_espera_e_o_resume_que_falhou_e_reconhecido():
+    esp = orq_mod.HARNESS["codex"]["tela"]["espera"]
+    m = esp.search("\n".join(_tela52("tela-codex-ocupado.txt")))
+    assert m and m.group(0).strip() == "1 background terminal running", m
+    assert not esp.search("\n".join(_tela52("tela-codex-ocioso.txt")))
+    falha = "ERROR: No saved session found with ID 01a0ffff-0000-7000-8000-000000000000. Run `codex resume` without an ID to choose f"
+    assert any(f in falha for f in orq_mod.HARNESS["codex"]["tela"]["falha"])
+
+
+def test_ticket73_responder_tela_de_worker_codex_digita_a_opcao_do_menu_dele():
+    a = Amb(run="run_a")
+    a.set("workers.json", [{"handle": "term_x", "run": "run_a", "status": "dispatched", "task": "task_x", "agente": "codex"}])
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ctx_term_x": {"task": "task_x", "sessao": "thr", "inicio": now_iso(-60), "fim": None, "harness": "codex"}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    a.set("screens.json", {"term_x": _tela52("tela-codex-trust.txt")})
+    r = a.orq("responder-tela", "task_x", "Trust")
+    assert r.returncode == 0, r.stderr
+    (s,) = _log(a, "send.log")
+    assert s[s.index("--text") + 1] == "1" and "--enter" in s, s
+
+
+
+def test_ticket73_telas_le_o_worker_codex_rodando_com_os_padroes_dele():
+    orig = orq_mod.orca
+    orq_mod.orca = lambda *a, **k: {"terminal": {"tail": _tela52("tela-codex-ocupado.txt")}}
+    try:
+        ws = [{"dispatchId": "ctx_c", "agentTerminalHandle": "term_c", "dispatchStatus": "dispatched"}]
+        assert orq_mod._telas(ws, {"ctx_c": {"agente": "codex"}}) == {"ctx_c": "1 background terminal running (tela)"}
+    finally:
+        orq_mod.orca = orig
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

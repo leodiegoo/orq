@@ -133,9 +133,10 @@ HARNESS["codex"] = {
                                                    *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
                                                    "--dangerously-bypass-approvals-and-sandbox", msg],
     "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›",
-             "perguntas": (("trust", re.compile(r"Do you trust the contents of this directory", re.I)),
+             "perguntas": (("trust", re.compile(r"Trust this folder\?|Do you trust the contents of this directory", re.I)),
                            ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
-             "espera": None, "falha": ("command not found",)},
+             "espera": re.compile(r"\d+\s+background terminals?\s+running", re.I),  # `• Working (9s • esc to interrupt) · 1 background terminal running`
+             "falha": ("No saved session found", "command not found")},
     "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: o ultra só nos modelos que o têm (o Orca recusa no Luna)
 }
 HARNESSES = tuple(HARNESS)

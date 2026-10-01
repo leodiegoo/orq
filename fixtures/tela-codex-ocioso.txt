@@ -1,0 +1,14 @@
+╭───────────────────────────────────────────────────────────────╮
+│ ✨ Update available! 0.159.2 -> 0.159.3                       │
+│ See https://github.com/openai/codex for installation options. │
+│                                                               │
+│ See full release notes:                                       │
+│ https://github.com/openai/codex/releases/latest               │
+╰───────────────────────────────────────────────────────────────╯
+  >_ OpenAI Codex (v0.159.2)
+     /tmp/repo-tela
+  permissions: YOLO mode
+  Welcome to our little rectangle of possibility.
+› Ask Codex to do anything
+  GPT-6-Luna low · /tmp/repo-tela
+  ? for shortcuts                                                                             ⚠ 2 warnings · f2 to view
