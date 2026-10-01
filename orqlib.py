@@ -123,6 +123,7 @@ CHECK_FALHO = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_
 WT_PARADA_D = 3  # worktree sem worker e sem atividade há mais que isto entra na linha do `orq status`
 PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do `orq status`
 AMBIENTES = ("development", "staging", "main")  # a ordem da promoção por feature branch
+WORKFLOW_AMBIENTE = {"development": "development", "staging": "staging", "production": "main"}  # palavra no nome do workflow de deploy -> base a que ele vale
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
 TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
 
@@ -2050,15 +2051,26 @@ def _pr_lista_gh(urls):
     return vistos
 
 
+def _workflow_de_outro_ambiente(workflow, base):
+    """True se o nome do workflow é de deploy de um ambiente que não é a base do PR. O GitHub liga o check ao commit, e a mesma branch abre um PR por ambiente."""
+    ambientes = {a for palavra, a in WORKFLOW_AMBIENTE.items() if palavra in (workflow or "").lower()}
+    return bool(base and ambientes and base not in ambientes)
+
+
 def _ci_do_gh(visto, agora):
-    """{mergeable, falhas, rodando, lido_em} do que o gh viu de um PR, ou None se a resposta não traz CI nem mergeable (gh sem resposta, `pr view`)."""
+    """{mergeable, falhas, rodando, outro_ambiente, lido_em} do que o gh viu de um PR, ou None se a resposta não traz CI nem mergeable (gh sem resposta, `pr view`).
+    Check de workflow de outro ambiente (ex.: o de staging num PR para main) não entra em falhas nem em rodando: o workflow vira `outro_ambiente`, só se falhou."""
     if "mergeable" not in visto and "statusCheckRollup" not in visto:
         return None
-    falhas, rodando = [], []
+    falhas, rodando, outro = [], [], []
     for c in visto.get("statusCheckRollup") or []:
         if not isinstance(c, dict):
             continue
         nome = c.get("name") or c.get("context") or "?"
+        if _workflow_de_outro_ambiente(c.get("workflowName"), visto.get("baseRefName")):
+            if c.get("conclusion") in CHECK_FALHO and c["workflowName"] not in outro:
+                outro.append(c["workflowName"])
+            continue
         if c.get("__typename") == "StatusContext" or "context" in c:  # status antigo: só `state`
             est = c.get("state")
             falhas += [nome] if est in CHECK_FALHO else []
@@ -2067,7 +2079,7 @@ def _ci_do_gh(visto, agora):
             rodando.append(nome)
         elif c.get("conclusion") in CHECK_FALHO:
             falhas.append(nome)
-    return {"mergeable": visto.get("mergeable") or "UNKNOWN", "falhas": falhas, "rodando": rodando, "lido_em": agora}
+    return {"mergeable": visto.get("mergeable") or "UNKNOWN", "falhas": falhas, "rodando": rodando, "outro_ambiente": outro, "lido_em": agora}
 
 
 def _estado_do_gh(s):
@@ -2695,7 +2707,8 @@ def _leitura_pr(i, agora=None):
     marcas = ([("✗", ", ".join(ci["falhas"]))] if ci.get("falhas") else []) + ([("⚠", "conflito")] if ci.get("mergeable") == "CONFLICTING" else []) \
         + ([("⏳", "CI rodando")] if ci.get("rodando") else []) + ([("?", "conflito ainda não calculado")] if ci.get("mergeable") == "UNKNOWN" and not ci.get("falhas") and not ci.get("rodando") else [])
     velha = idade > LEITURA_VELHA_MIN
-    return {"marcas": marcas or [("✓", "pronto")], "pronto": not marcas and not velha, "velha": velha, "idade": idade}
+    nota = [("ℹ", "falha em outro ambiente: " + ", ".join(ci["outro_ambiente"]))] if ci.get("outro_ambiente") else []  # informa, não bloqueia
+    return {"marcas": (marcas or [("✓", "pronto")]) + nota, "pronto": not marcas and not velha, "velha": velha, "idade": idade}
 
 
 def _pr_contrato(i, agora=None):

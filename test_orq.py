@@ -7751,6 +7751,25 @@ def test_fila_lista_mostra_o_check_vermelho_pelo_nome_o_conflito_e_o_ci_rodando(
     assert fim == "Próximo a mergear: nenhum passo pronto"
 
 
+def _ckw(nome, workflow, conclusao="SUCCESS"):
+    return {**_ck(nome, conclusao), "workflowName": workflow}
+
+
+def test_fila_pr_de_main_com_falha_so_no_workflow_de_staging_fica_pronto_com_a_nota():
+    a = _fila_ci(pr1={"baseRefName": "main", "statusCheckRollup": [_ckw("lint", "Web CI"), _ckw("check", "Web Deploy Staging", "FAILURE")]})
+    out = a.orq("fila", "lista").stdout.splitlines()
+    assert "#1216 open ✓ ℹ falha em outro ambiente: Web Deploy Staging" in out[0] and "✗" not in out[0], out
+    assert out[-1] == "Próximo a mergear: passo 1 (Primeiro)", out
+    ci = {i["numero"]: i["ci"] for i in json.load(open(os.path.join(a.home, "prs.json")))["itens"]}
+    assert ci[1216]["falhas"] == [] and ci[1216]["outro_ambiente"] == ["Web Deploy Staging"], ci
+
+
+def test_fila_pr_de_main_com_falha_no_workflow_da_propria_base_fica_vermelho():
+    a = _fila_ci(pr1={"baseRefName": "main", "statusCheckRollup": [_ckw("check", "Web Deploy Staging", "FAILURE"), _ckw("check", "Web Deploy Production", "FAILURE")]})
+    l1 = a.orq("fila", "lista").stdout.splitlines()[0]
+    assert "#1216 open ✗ check" in l1 and "falha em outro ambiente: Web Deploy Staging" in l1, l1
+
+
 def test_fila_lista_aponta_o_primeiro_passo_a_fazer_com_todos_os_prs_prontos():
     a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE")]})
     out = a.orq("fila", "lista").stdout.splitlines()
