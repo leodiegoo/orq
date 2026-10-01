@@ -8626,7 +8626,12 @@ def _pausa51(a):
 
 def _escreve_pausa51(a, *nomes, depois=1.0):
     """O worker obedece: depois de `depois` s escreve o PAUSA.md novo na worktree dele."""
+    n0 = len(_log(a, "send.log"))
+
     def escreve():
+        fim = time.time() + 30  # só depois do steer de cada worker: a linha de base do PAUSA.md é tirada antes dele, e sob carga 1 s pode vir antes
+        while len(_log(a, "send.log")) < n0 + len(nomes) and time.time() < fim:
+            time.sleep(0.05)
         time.sleep(depois)
         for n in nomes:
             f = os.path.join(a.wt, n, "PAUSA.md")
