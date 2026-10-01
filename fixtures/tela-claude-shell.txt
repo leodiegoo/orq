@@ -1,0 +1,6 @@
+● Subi o E2E em segundo plano e espero o resultado.
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell still running

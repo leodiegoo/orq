@@ -61,6 +61,7 @@ The model does the classifying. The code only checks that a classification was r
 | `prioridade` | `orq prioridade <task> <1-3>`: `task`, `valor` |
 | `despacho_fila` (`op: entrou/subiu/saiu/removido/desistiu`), `maquina_aviso` | the dispatch queue of the machine budget; the manager loop warns the coordinator once per pressure episode |
 | `pausa_plano`, `pausa_fim` | `orq pausar` parked a worker (session, cwd, model); `orq retomar --pausados` resumed it |
+| `hibernar`, `acordar` | `orq hibernar` (or the manager loop) closed an idle worker's terminal (`motivo`, `rss_antes_mb`, `rss_depois_mb`, `rss_liberado_mb`); `orq acordar`, `steer`, `responder` or the loop's triggers resumed it (`terminal`, `motivo`) |
 | `worker_done` | ingest: `msg`, `task`, `dispatch`, `outcome`, `subject`, one per inbox message (no report needed) |
 | `ausente_ligar`, `ausente_desligar` | `orq ausente` |
 | `resposta_coordenador` | the coordinator's Stop hook while away mode is on: `texto`, `sessao` |
@@ -295,6 +296,35 @@ Manager loop (`maquina_volta`, one call per lap of `gerente absorver`). Under hi
 Where it shows. `orq status` prints `Máquina: 3/4 workers (2/2 caros), 1 vagas livres; N na fila de despacho: …` (and the high-pressure reason) when there is something to say. `aberto.json` carries `maquina` for the panel. The digest page has a "Máquina" line under "Rodando agora"; `atual.json` is unchanged because its key set is a contract.
 
 Known limits. `retomar` does not hold the lock while it resumes many workers, so a drain lap during it can overshoot the ceiling by one. A relaunch counts the live set at the start, not after the stop. Load average lags: a burst of builds shows up after the next worker is already starting, which is why the queue drains one item per lap.
+
+## Hibernating idle workers (ticket 60)
+
+A worker is a live `claude` (node plus the session's MCP servers) and keeps its memory while it waits at the prompt for hours: delivered and not released, waiting for the user's decision, for a PR merge, for someone else's E2E. Hibernating records the session and closes the terminal; waking resumes the same session. It reuses what `orq pausar` (ticket 51) and `orq retomar` (ticket 48) already do, and the state lives in `cursor.json` `hibernados` (`{dispatch: {task, run, titulo, agente, modelo, effort, sessao, cwd, terminal, entregue, motivo, desde, rss_liberado_mb}}`), so it survives an Orca crash. Orca does not learn about it: the task stays as it was, and `worktrees_ocupadas` still protects the worktree.
+
+Criterion (`motivo_hibernar`, pure, over a row of `agentes()`; `hibernar_ociosos`, once per `HIBERNA_VOLTA_S` = 60 s from the manager loop). It looks only at workers whose turn is closed in `turnos.json` (the Stop hook wrote `fim`, no later prompt or heartbeat): state `parado`, `rodando` with a declared wait, or `entregue` and not retained by Orca.
+
+| Motivo | Condition |
+|---|---|
+| `ocioso no prompt` | parked more than N min, N = 15 (`ORQ_HIBERNA_MIN`; `hibernar.json` `min` wins) |
+| `entregue e sem liberar` | `worker_done` given, terminal still open, more than N min since the turn ended |
+| `esperando: pendência <id>` / `PR #n esperando merge` / `ticket NN bloqueado por MM` | the task has a pending item (`pend add --task` now stores `task` on the item), an open linked PR, or a ticket whose `Blocked by` is not `resolved`; more than `externa_min` = 2 min parked |
+
+A wake-up inside N min of the last `acordar` does not count (the new turn may not be in `turnos.json` yet): the parked time starts at the later of the turn end and the `acordar` event.
+
+Guards, in order, in `_hibernar_agente` (shared by the loop and `orq hibernar`): protected terminals (the caller's `ORCA_TERMINAL_HANDLE`, `gerente.json` coordinator and manager, the Run's `coordinator_handle`); session and cwd from the worker hooks (otherwise it is not an orq worker, or there is no way back); no question; the screen (`_tela_ocupada`: spinner `esc to interrupt`, `N shell still running` / `background terminals running`, or a menu waiting for an answer); `terminal_livre` (Orca's `tui-idle` and an empty input box); no child process. Child process: `_processos` reads `ps -axo pid=,ppid=,rss=,command=` and `lsof -a -d cwd -Fpn` for the agent processes only; the agent of the worktree is the `claude` whose cwd is the worker's, and a live child is any descendant matching `HARNESS[agent]["filho"]` (Claude: `/shell-snapshots/`, the `zsh -c source ~/.claude/shell-snapshots/…` that runs every Bash tool command, background ones included, while MCP servers are plain `node` children). No `ps`, no process at that cwd (the worker `cd`'d), or no pattern for the harness (Codex): no proof, the loop skips, `orq hibernar --forcar` goes ahead. A live child is never forced. Refusals in the loop are silent (logged); the next lap checks again. `ORQ_PROCESSOS` (a JSON list of `{pid, ppid, rss, args, cwd}`) replaces `ps`/`lsof` in tests.
+
+The record is written before `orca terminal close`, so a crash in between never lets `orq retomar` start a worker that was meant to sleep; a failed close removes it. After the close, `rss_agentes_mb` (sum of RSS of the `claude`/`codex` processes and their descendants, the MCP servers included) is measured again, waiting up to `ORQ_HIBERNA_RSS_ESPERA_S` = 5 s for the process to leave `ps`. The difference is `rss_liberado_mb` in the `hibernar` event and in `hibernados`, and `orq agentes` closes with the total.
+
+Waking is `acordar`: `_subir_sessao` (the resume of the harness in a new terminal in the worktree, a `retomada` event so `_workers_todos` applies the new terminal) with `MSG_ACORDA` (what arrived, check git status, how to finish) plus `MSG_ESCALAR` (the escalation command, because the resumed session lost the dispatch preamble). Triggers:
+
+- `orq steer` on a hibernated worker (even a delivered one, which the plain steer refuses): no `send` to the dead terminal, the text goes in the resume; the `steer` event carries `acordado`.
+- `orq responder` on a hibernated worker's message: replies through Orca as before, then wakes with the answer.
+- The manager loop (`acordar_gatilhos`, after the PR poll): a `pend done` event with the worker's `task`, or a `pr` event `entrou`/`fechou` for it, newer than the hibernation. Not for workers hibernated after delivering. A failed terminal create keeps the entry and is retried every lap.
+- `orq acordar <task|dispatch> [--texto]` by hand.
+
+`orq retomar` skips hibernated dispatches (its `pausados` rule, extended); `orq liberar` and `_parar` (`encerrar`, `relancar`) drop the entry. `agentes()` keeps a hibernated dispatch even though its terminal is gone (and, if delivered, not released), as state `hibernado` with `hibernado_desde` and `motivo_hibernado`; the digest lists it under `rodando` as "hibernado desde HH:MM".
+
+Known limits: the child-process proof matches by cwd, so a coordinator `claude` in the same worktree with a running command blocks the worker (safe side); Codex workers hibernate only by hand with `--forcar`; N is global, not per priority.
 
 ## Dead manager, takeover and PR heads (ticket 54)
 

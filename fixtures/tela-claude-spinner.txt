@@ -1,0 +1,9 @@
+● Bash(npm run test-unit)
+  ⎿  Running…
+
+✻ Pondering… (12s · ↓ 340 tokens · esc to interrupt)
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

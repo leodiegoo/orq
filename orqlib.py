@@ -69,7 +69,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "encerrado": 6, "liberado": 7}
+ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "entregue": 5, "hibernado": 6, "encerrado": 7, "liberado": 8}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -126,6 +126,7 @@ HARNESS = {
                                                        "--dangerously-skip-permissions", msg],
         "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
         "efforts": ("low", "medium", "high", "xhigh", "max"),
+        "filho": re.compile(r"/shell-snapshots/"),  # o comando do Bash tool (E2E, teste, build, shell em segundo plano) sobe como `zsh -c source ~/.claude/shell-snapshots/…`, filho do claude
     },
 }
 # o Codex numera as opções com `›` (ou `>`) no cursor; o trust da pasta e o modal dos hooks não confiados são os menus que param um worker dele
@@ -366,14 +367,15 @@ def _sem_terminal(w, liberados, vivos):
     return w.get("dispatchStatus") != "dispatched" and (w.get("dispatchId") in liberados or (vivos is not None and w.get("agentTerminalHandle") not in vivos))
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None):
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
     último heartbeat (ou, sem nenhum, o despacho) tem mais de TRAVADO_S; completed com o terminal released é `liberado`, o resto é `entregue`
     (worker_done dado, terminal ainda aberto). `detalhes` é {dispatch: titulo, modelo, desde, agente}; `vivos` são os handles do `orca terminal list`;
     `turnos` é o turnos.json (None: sem dado, o turno fica `unknown`); `telas` é {dispatch: motivo} do que a tela do terminal mostra esperando;
-    `perguntas_tela` é {dispatch: tela_pergunta} dos menus esperando resposta humana no terminal (o worker vira `perguntando`, com a `pergunta` na linha).
+    `perguntas_tela` é {dispatch: tela_pergunta} dos menus esperando resposta humana no terminal (o worker vira `perguntando`, com a `pergunta` na linha);
+    `hibernados` é o cursor.json `hibernados` ({dispatch: {desde, motivo, …}}): o worker vira `hibernado` (terminal fechado de propósito, sessão guardada).
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados, pausas, telas, nao_iniciou = _liberados(events), interrompidos(events), telas or {}, _nao_iniciou(events)
@@ -425,6 +427,10 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
         retido = _retencao(w, humanos)
         if estado == "entregue" and retido:
             ag["retido"] = retido
+        if d in (hibernados or {}):
+            ag.update(estado="hibernado", idade_s=None, hibernado_desde=_dict(hibernados[d]).get("desde"), motivo_hibernado=_dict(hibernados[d]).get("motivo"))
+            for k in ("espera", "pergunta", "tela", "tela_ts", "motivo", "retido"):
+                ag.pop(k, None)
         out.append(ag)
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
 
@@ -1789,7 +1795,7 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
             if v:
                 item[k] = v
         item["desde"] = datetime.now().date().isoformat()
-        for k, v in (("link", link), ("comando", comando), ("espera", espera), ("ate", ate), ("gate", gate), ("gate_run", gate_run)):
+        for k, v in (("link", link), ("comando", comando), ("espera", espera), ("ate", ate), ("gate", gate), ("gate_run", gate_run), ("task", task)):
             if v:
                 item[k] = v
         itens.append(item)
@@ -1819,7 +1825,7 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
                 return itens.pop(i)
         raise ValueError(f"pendência {id_} não existe em pendencias.json")
 
-    item = _mutar_pend(rm, lambda it: {"tipo": "pend", "op": "done", "pend": id_, **({"resposta": resposta} if resposta else {}),
+    item = _mutar_pend(rm, lambda it: {"tipo": "pend", "op": "done", "pend": id_, **({"resposta": resposta} if resposta else {}), **({"task": it["task"]} if it.get("task") else {}),
                                        **({"gate": it["gate"]} if it.get("gate") else {}),
                                        **({"gate_run": it["gate_run"]} if it.get("gate") and it.get("gate_run") else {})})
     if item.get("gate"):
@@ -2281,9 +2287,9 @@ def telas_avisar():
     g = _gerente_cfg()
     if not g or not g.get("coordenador"):
         return []
-    turnos, ws = _turnos_ro(), []
+    turnos, ws, hib = _turnos_ro(), [], _hibernados()
     for r in g["runs"]:
-        ws += [w for w in _workers_todos(r) if w.get("dispatchId") in turnos]
+        ws += [w for w in _workers_todos(r) if w.get("dispatchId") in turnos and w.get("dispatchId") not in hib]
     lidas = _ler_telas(ws, {w["dispatchId"]: {"agente": _dict(turnos[w["dispatchId"]]).get("harness") or "claude"} for w in ws})
     abertas, linhas = _pergunta_aberta(read_events()), []
     for w in ws:
@@ -2530,7 +2536,8 @@ def _estado_de_gente(a):
     """O estado de um worker vivo em texto de gente: a fase que ele declarou, ou o estado sem o jargão do orq."""
     if a["estado"] == "rodando":
         return a.get("fase") or "rodando"
-    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou"}.get(a["estado"], a["estado"])
+    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou",
+            "hibernado": f"hibernado desde {_hora_local(a.get('hibernado_desde'))}"}.get(a["estado"], a["estado"])
 
 
 def _linha_do_log(e, titulo):
@@ -2608,9 +2615,9 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
     pend = [{**i, "depois": bool(pend_depois(i, hoje))} for i in _dict(pendencias).get("itens", []) if isinstance(i, dict)]
     rodando = sorted(({"titulo": a.get("titulo") or "worker sem título", "estado": _estado_de_gente(a), "desde": a.get("desde"),
                        **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
-                      for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in ANDA), key=lambda r: r.get("prioridade") or 2)  # a mais alta primeiro
+                      for a in reavalia(_dict(aberto).get("agentes") or [], events, agora, turnos) if a.get("estado") in (*ANDA, "hibernado")), key=lambda r: r.get("prioridade") or 2)  # a mais alta primeiro
     if maquina:  # as vagas e a fila de despacho (ticket 79): uma chave a mais, `rodando` segue só com workers e a fila do E2E
-        maquina = {**maquina, "ocupadas": len(rodando), "livres": max(maquina["max_workers"] - len(rodando), 0)}
+        maquina = {**maquina, "ocupadas": sum(r["estado"] != "hibernado" for r in rodando), "livres": max(maquina["max_workers"] - sum(r["estado"] != "hibernado" for r in rodando), 0)}
     if e2e:  # a fila do E2E é uma linha a mais em `rodando`: `presa` quando não anda
         rodando.append({"titulo": linha_e2e(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
@@ -4024,8 +4031,10 @@ def responder(msg_id, texto):
         res = orca("reply", "--id", msg_id, "--body", texto, "--run", alvo, timeout=10)
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
-    return append_event({"tipo": "resposta_worker", "msg_id": msg_id, "run": alvo, "dispatch": _dispatch_da_msg(linha), "texto": texto,
-                         "resposta_id": (res.get("message") or res).get("id")})
+    dispatch = _dispatch_da_msg(linha)
+    acordado = acordar(dispatch, f"resposta do coordenador à sua mensagem {msg_id}: {texto}") if dispatch in _hibernados() else None  # o worker hibernado não leria a resposta no inbox
+    return append_event({"tipo": "resposta_worker", "msg_id": msg_id, "run": alvo, "dispatch": dispatch, "texto": texto,
+                         "resposta_id": (res.get("message") or res).get("id"), **({"acordado": acordado["estado"]} if acordado else {})})
 
 
 PEDIDO_TITULO = "## Pedido do usuário"
@@ -4056,12 +4065,21 @@ def steer(task, texto, run=None, entrada=None):
     t = next((t for t in orca("task-list", "--run", alvo, timeout=20)["tasks"] if t["id"] == task), None)
     if not t:
         raise ValueError(f"task {task} não existe no Run {alvo}")
+    corpo = texto if pedido is None else f"{texto}\n\n{PEDIDO_TITULO} (acréscimo)\n{pedido}"
+    if t.get("dispatch_id") in _hibernados():  # sem terminal para receber: o resume leva o ajuste (mesmo a task já entregue, que o worker hibernado ainda pode seguir)
+        r = acordar(t["dispatch_id"], f"ajuste do coordenador: {corpo}")
+        if r["estado"] == "falhou":
+            raise ValueError(f"o worker está hibernado e não acordou: {r['aviso']}")
+        ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": alvo, "texto": texto, "acordado": r["estado"],
+                           **({"pedido": pedido} if pedido is not None else {})})
+        if entrada:
+            intake(entrada, "steer", task, run=alvo)
+        return ev
     if t.get("status") != "dispatched" or not t.get("dispatch_id"):
         raise ValueError(f"task {task} está {t.get('status')}, não dispatched: sem worker para receber o ajuste")
     try:
         res = orca("send", "--run", alvo, "--to", f"dispatch:{t['dispatch_id']}", "--subject", "Ajuste",
-                   "--body", texto if pedido is None else f"{texto}\n\n{PEDIDO_TITULO} (acréscimo)\n{pedido}",
-                   "--priority", "high", timeout=10)
+                   "--body", corpo, "--priority", "high", timeout=10)
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
     msg = res.get("message") or res
@@ -4437,18 +4455,18 @@ def _telas(ws, detalhes):
 
 def agentes(run=None, todos=False, agora=None):
     """O estado de cada dispatch: worker-list de todos os Runs (ou de `run`) mais o inbox. Liberados, sem terminal, retidos pelo Orca e as tasks "Prova r5" só com `todos`."""
-    ws, events, vivos = _workers_todos(run), read_events(), _terminais_vivos()
+    ws, events, vivos, hib = _workers_todos(run), read_events(), _terminais_vivos(), _hibernados()
     if not todos:
         liberados = _liberados(events)
-        ws = [w for w in ws if not _sem_terminal(w, liberados, vivos)]  # os retidos por motivo do Orca (external_terminal…) e o user_takeover com prompt humano não têm ação possível: só aparecem com --todos
+        ws = [w for w in ws if w.get("dispatchId") in hib or not _sem_terminal(w, liberados, vivos)]  # o hibernado fechou o terminal de propósito, e o entregue hibernado ainda não foi liberado; os retidos por motivo do Orca (external_terminal…) e o user_takeover com prompt humano não têm ação possível: só aparecem com --todos
         humanos = _interacao_registrada(events)
-        ws = [w for w in ws if _ativo(w) and (w.get("dispatchStatus") == "dispatched" or not _retencao(w, humanos))]
+        ws = [w for w in ws if w.get("dispatchId") in hib or _ativo(w) and (w.get("dispatchStatus") == "dispatched" or not _retencao(w, humanos))]
     msgs = orca("inbox", "--limit", "200", timeout=20)["messages"]
     agora = agora or datetime.now(timezone.utc)
     det = _detalhes(ws)
-    lidas = _ler_telas(ws, det)
+    lidas = _ler_telas([w for w in ws if w.get("dispatchId") not in hib], det)  # o terminal do hibernado não existe: nada a ler
     ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), {d: a["espera"] for d, a in lidas.items() if a["espera"]},
-                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]})
+                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]}, hib)
     nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
     for a in ags:
         if a["dispatch"] in nao_lidos:
@@ -4476,6 +4494,8 @@ def texto_agentes(ags):
             hb = f"não começou: nenhum turno {a['idade_s'] // 60} min depois do despacho ({_hora_local(a.get('desde'))})"
         elif a["estado"] == "parado":
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
+        elif a["estado"] == "hibernado":
+            hb = f"hibernado desde {_hora_local(a.get('hibernado_desde'))}" + (f" ({a['motivo_hibernado']})" if a.get("motivo_hibernado") else "")
         if a.get("espera") and a["espera"] not in (a.get("fase") or ""):  # espera vista na tela ou pausa do coordenador: não está na fase do heartbeat
             hb += f" — esperando: {a['espera']}"
         elif a["estado"] == "travado" and a.get("motivo"):
@@ -4495,6 +4515,8 @@ def texto_agentes(ags):
             linhas.append(f'            -> orq steer {a["task"]} "<ajuste>" --run {a["run"]}')
         elif a["estado"] == "entregue":
             linhas.append(f"            -> orq liberar {a['dispatch']}" if not a.get("retido") else f"            retido: {a['retido']} (o orq liberar não fecha)")
+        elif a["estado"] == "hibernado":
+            linhas.append(f"            -> orq acordar {a['task']} (o steer e o responder também acordam)")
     return "\n".join(linhas)
 
 
@@ -4697,6 +4719,8 @@ def liberar(dispatch, run=None):
         avisos.append("release_pending: o Orca ainda está liberando; repita orq liberar depois")
     if estado != "release_pending":  # a repetição do release_pending grava o fim de novo; vale o último
         append_event({"tipo": "fim_dispatch", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, **fim})
+    if estado != "release_pending":
+        _esquece_hibernado(dispatch)  # liberado não volta: o terminal já estava fechado e não há o que acordar
     ev = {"tipo": "liberar", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, "terminal": handle, "estado": estado, "fechado": fechado, "ack": entregas,
           **({"interacao": True} if humano else {})}
     append_event({**ev, **({"aviso": "; ".join(avisos)} if avisos else {})})
@@ -4795,6 +4819,7 @@ def _parar(acao, w, base):
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         _controle(acao, w, "falhou", passo="worker-stop", erro=str(e), **base)
         raise
+    _esquece_hibernado(w["dispatchId"])
 
 
 def encerrar(dispatch, motivo, run=None, parada=None):
@@ -5719,7 +5744,9 @@ def retomar(dry_run=False, run=None):
             gerente_ligar(novo, g["runs"])
             res["gerente"] = {**res["gerente"], "novo": novo, "estado": "religado"}
     pausados = _dict(_cursor_ro().get("pausados"))  # pausados pelo orçamento de uso voltam com `retomar --pausados`, não aqui
-    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and w.get("dispatchId") not in pausados]
+    hib = _hibernados()  # hibernados também não: o terminal fechado foi de propósito, e quem os acorda é o orq acordar (ou o steer, o responder, a pendência, o merge)
+    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and w.get("dispatchId") not in pausados
+            and w.get("dispatchId") not in hib]
     det, turnos, eventos = _detalhes(cand), _turnos_ro(), read_events()
     despachos = {e.get("dispatch"): e for e in eventos if e.get("tipo") == "despacho"}
     por_d, subir = {}, []
@@ -6070,6 +6097,317 @@ def texto_pausar(res):
     return "\n".join(ls) or "nenhum worker a pausar"
 
 
+# ---------- hibernar worker ocioso e acordar quando precisar (ticket 60) ----------
+
+# Cada worker é um `claude` vivo (com os servidores MCP da sessão) que ocupa memória mesmo parado no prompt. Hibernar = guardar a sessão em
+# cursor.json `hibernados` e fechar o terminal; a task segue como está no Orca. Acordar = o resume do harness (o mesmo caminho do `orq retomar`),
+# com a mensagem que o acordou. O critério é determinístico (tela, hooks do worker, processos, estado do orq), sem LLM. Desenho: docs/design.md.
+HIBERNA = "hibernar.json"  # {"min": 15, "externa_min": 2}: os limiares, por cima destes padrões
+HIBERNA_MIN = float(os.environ.get("ORQ_HIBERNA_MIN") or 15)  # minutos parado no prompt (ou entregue sem liberar) até hibernar
+HIBERNA_EXTERNA_MIN = float(os.environ.get("ORQ_HIBERNA_EXTERNA_MIN") or 2)  # esperando algo externo que o orq conhece: hiberna logo depois deste tempo parado
+HIBERNA_VOLTA_S = float(os.environ.get("ORQ_HIBERNA_VOLTA_S") or 60)  # o painel confere os workers a cada tanto, não a cada volta de 10 s
+HIBERNA_RSS_ESPERA_S = float(os.environ.get("ORQ_HIBERNA_RSS_ESPERA_S") or 5)  # quanto esperar o processo do terminal fechado sumir do ps antes de medir o RSS depois
+TELA_OCUPADA = re.compile(r"esc to interrupt", re.I)  # o spinner do Claude Code e do Codex: o turno corre
+MSG_ACORDA = ("Você estava hibernado: o coordenador fechou o terminal por ociosidade para liberar memória e agora o acordou, na mesma sessão. O que chegou: {texto}\n"
+              "Antes: confira git status e o estado da sua worktree. Ao terminar, mande o worker_done como antes; se o Orca recusar por causa do handle novo "
+              "ou da task já entregue, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+
+
+def _hibernados():
+    """cursor.json `hibernados`: {dispatch: {task, run, titulo, agente, modelo, effort, sessao, cwd, terminal, entregue, desde, motivo, rss_liberado_mb}}."""
+    return {d: p for d, p in _dict(_cursor_ro().get("hibernados")).items() if isinstance(p, dict)}
+
+
+def _esquece_hibernado(dispatch):
+    """Tira o dispatch de `hibernados` (acordado, liberado ou parado); sem a entrada não grava nada."""
+    if dispatch in _hibernados():
+        _cursor_mut(lambda c: c.get("hibernados", {}).pop(dispatch, None))
+
+
+def _hiberna_cfg():
+    """{min, externa_min} em minutos: hibernar.json por cima de ORQ_HIBERNA_MIN, ORQ_HIBERNA_EXTERNA_MIN e dos padrões (15 e 2)."""
+    cfg = {"min": HIBERNA_MIN, "externa_min": HIBERNA_EXTERNA_MIN}
+    for k, v in _dict(_read_json(_path(HIBERNA))).items():
+        if k in cfg and isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            cfg[k] = v
+    return cfg
+
+
+def _agente_do(p):
+    """O harness de um processo do `ps` (claude, codex) pelo nome do executável, ou None."""
+    nome = os.path.basename((p.get("args") or "").split(" ", 1)[0])
+    return nome if nome in HARNESS else None
+
+
+def _processos():
+    """[{pid, ppid, rss (KB), args, cwd}] do `ps`, com o cwd (lsof) só dos processos de agente; None se o ps falhar. `cwd` None: o lsof não o disse.
+
+    ORQ_PROCESSOS: caminho de um JSON com essa lista, no lugar do ps e do lsof (testes)."""
+    if os.environ.get("ORQ_PROCESSOS"):
+        return _read_json(os.environ["ORQ_PROCESSOS"])
+    try:
+        saida = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,command="], capture_output=True, text=True, timeout=10, check=True).stdout
+    except (subprocess.SubprocessError, OSError) as e:
+        log(f"hibernar: ps: {type(e).__name__}: {e}")
+        return None
+    ps = []
+    for l in saida.splitlines():
+        c = l.split(None, 3)
+        if len(c) == 4 and all(x.isdigit() for x in c[:3]):
+            ps.append({"pid": int(c[0]), "ppid": int(c[1]), "rss": int(c[2]), "args": c[3], "cwd": None})
+    donos = [p for p in ps if _agente_do(p)]
+    if donos:
+        try:
+            lsof = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(str(p["pid"]) for p in donos)], capture_output=True, text=True, timeout=10).stdout
+        except (subprocess.SubprocessError, OSError) as e:
+            log(f"hibernar: lsof: {type(e).__name__}: {e}")
+            return ps
+        pid = None
+        for l in lsof.splitlines():
+            if l[:1] == "p" and l[1:].isdigit():
+                pid = int(l[1:])
+            elif l[:1] == "n" and pid is not None:
+                next(p for p in donos if p["pid"] == pid)["cwd"] = l[1:]
+    return ps
+
+
+def _descendentes(procs, pids):
+    """Os pids de `pids` e de todos os processos abaixo deles."""
+    vistos, fila = set(), list(pids)
+    while fila:
+        pid = fila.pop()
+        if pid not in vistos:
+            vistos.add(pid)
+            fila += [p["pid"] for p in procs if p["ppid"] == pid]
+    return vistos
+
+
+def rss_agentes_mb(procs):
+    """Soma do RSS, em MB, dos processos de agente (claude, codex) e de tudo o que sobe abaixo deles (os servidores MCP da sessão); None sem a lista."""
+    if procs is None:
+        return None
+    vivos = _descendentes(procs, [p["pid"] for p in procs if _agente_do(p)])
+    return round(sum(p["rss"] for p in procs if p["pid"] in vivos) / 1024)
+
+
+def _processo_do_worker(procs, cwd, agente):
+    """(pids, filho): os processos do agente cujo cwd é o do worker e se algum comando do Bash dele ainda roda.
+
+    `filho` True/False; None quando não há prova: sem ps, nenhum processo do agente nesse cwd (o lsof falhou ou o worker `cd`ou) ou harness sem padrão de
+    filho (HARNESS[…]["filho"]). Dois agentes no mesmo cwd (o coordenador na mesma worktree) contam juntos: na dúvida, há filho."""
+    padrao = HARNESS.get(agente, {}).get("filho")
+    pids = [p["pid"] for p in procs or [] if _agente_do(p) == agente and p.get("cwd") == cwd]
+    if not padrao or not pids:
+        return pids, None
+    return pids, any(padrao.search(p["args"]) for p in procs if p["pid"] in _descendentes(procs, pids) - set(pids))
+
+
+def _protegidos(run):
+    """Os terminais que nunca hibernam: o deste processo, o coordenador e o gerente do gerente.json e o coordenador do Run."""
+    g = _gerente_cfg() or {}
+    try:
+        coord = (orca("run-show", "--id", run)["run"] or {}).get("coordinator_handle")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError):
+        coord = None
+    return {x for x in (os.environ.get("ORCA_TERMINAL_HANDLE"), g.get("coordenador"), g.get("gerente"), coord) if x}
+
+
+def _tela_ocupada(handle, agente):
+    """O motivo se a tela do terminal mostra o turno correndo (spinner), um processo em segundo plano ou um menu esperando resposta; senão None."""
+    tail = _fundo(orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal", timeout=10), "terminal", "tail") or []
+    tela = "\n".join(map(str, tail[-15:]))
+    espera = HARNESS[agente]["tela"]["espera"]
+    return ("spinner na tela" if TELA_OCUPADA.search(tela) else f"{espera.search(tela).group(0).strip()} (tela)" if espera and espera.search(tela)
+            else "menu esperando resposta na tela" if tela_pergunta(tail, agente) else None)
+
+
+def _acordada_em(events):
+    """{dispatch: ts do último `acordar`}: o resume novo adia a próxima hibernação (o turno novo ainda pode não estar no turnos.json)."""
+    return {e.get("dispatch"): e.get("ts") for e in events if e.get("tipo") == "acordar"}
+
+
+def _espera_externa(a, pend, prs, tks):
+    """O que o orq já sabe que o worker espera de fora, em texto, ou None: pendência do usuário ligada à task, PR aberto esperando merge, ticket bloqueado."""
+    for p in pend:
+        if p.get("task") == a["task"]:
+            return f"pendência {p.get('id')}"
+    for i in prs:
+        if i.get("task") == a["task"] and i.get("estado") == "aberto":
+            return f"PR #{i.get('numero')} esperando merge"
+    status = {t["num"]: t["status"] for t in tks}
+    for t in tks:
+        if t.get("task") == a["task"]:
+            abertos = [n for n in t["blocked_by"] if status.get(n) != STATUS_FECHADO]
+            if abertos:
+                return f"ticket {t['num']} bloqueado por {', '.join(abertos)}"
+    return None
+
+
+def motivo_hibernar(a, agora, cfg, pend=(), prs=(), tks=(), acordada=None):
+    """Pura: por que o worker `a` (linha de agentes()) deve hibernar, ou None. Só olha o estado do orq; a tela e os processos são conferidos depois.
+
+    Só o turno encerrado conta (fim do turno nos hooks do worker, sem heartbeat nem prompt depois): `parado`, o que espera de propósito (`rodando` com
+    espera declarada) e o `entregue` sem liberar. Pergunta presa, travado e a tela com shell em segundo plano ficam de fora (essas continuam escalando).
+    Três motivos: esperando algo externo que o orq conhece (já depois de cfg.externa_min), entregue e sem liberar, ou parado (os dois depois de cfg.min)."""
+    fim, ini = _ts(a.get("turno_fim")), _ts(a.get("turno_inicio"))
+    if a["estado"] not in ("parado", "rodando", "entregue") or a.get("retido") or a.get("tela") or not fim or (ini and ini > fim):
+        return None
+    if a["estado"] != "entregue" and a.get("turno") != "parado":
+        return None
+    desde = max(fim, _ts(acordada) or fim)
+    parado_min = (agora - desde).total_seconds() / 60
+    externa = _espera_externa(a, pend, prs, tks) if a["estado"] != "entregue" else None
+    if externa and parado_min >= cfg["externa_min"]:
+        return f"esperando: {externa}"
+    if parado_min >= cfg["min"]:
+        return "entregue e sem liberar" if a["estado"] == "entregue" else "ocioso no prompt"
+    return None
+
+
+def _hibernar_agente(a, motivo, procs, forcar=False):
+    """Hiberna o worker `a` se nada o impede e devolve a linha com `estado`: hibernado, recusado (com `aviso`) ou falhou. Confere, nesta ordem: terminal
+    protegido (coordenador, gerente), worker do orq (sessão e cwd gravados pelos hooks, para o resume), tela (spinner, shell em segundo plano, menu),
+    caixa de entrada livre (`terminal_livre`) e processo filho vivo (E2E, teste, build). Sem prova de processo filho só `forcar` passa."""
+    t = _dict(_turnos_ro().get(a["dispatch"]))
+    agente = a.get("agente") or t.get("harness") or "claude"
+    try:
+        cwd = t.get("cwd") or _checkpoint(a["dispatch"]).get("caminho")
+    except (RuntimeError, subprocess.TimeoutExpired):
+        cwd = None
+    linha = {"dispatch": a["dispatch"], "task": a["task"], "run": a["run"], "titulo": a.get("titulo"), "agente": agente, "modelo": a.get("modelo"), "effort": a.get("effort"),
+             "sessao": t.get("sessao"), "cwd": cwd, "terminal": a.get("terminal"), "entregue": a["estado"] == "entregue", "motivo": motivo}
+
+    def nao(aviso):
+        return {**linha, "estado": "recusado", "aviso": aviso}
+
+    if not a.get("terminal") or a["estado"] in ("hibernado", "liberado", "encerrado"):
+        return nao(f"worker {a['estado']}: sem terminal a fechar")
+    if a["terminal"] in _protegidos(a["run"]):
+        return nao("é o coordenador ou o gerente: nunca hibernam")
+    if not (linha["sessao"] and cwd and os.path.isdir(cwd)) or agente not in HARNESS:
+        return nao("sem session_id e worktree gravados pelos hooks do worker (não é um worker do orq, ou não há como voltar)")
+    if a["estado"] == "perguntando":
+        return nao("há uma pergunta esperando resposta")
+    try:
+        ocupada = _tela_ocupada(a["terminal"], agente)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        return nao(f"tela ilegível ({e})")
+    if ocupada or (ocupada := terminal_livre(a["terminal"])):
+        return nao(f"não está livre: {ocupada}")
+    _, filho = _processo_do_worker(procs, cwd, agente)
+    if filho:
+        return nao("processo filho vivo (E2E, teste ou build)")
+    if filho is None and not forcar:
+        return nao("sem prova de que não há processo filho (o ps/lsof não achou o processo do agente nessa worktree, ou o harness não tem padrão): use --forcar")
+    antes = rss_agentes_mb(procs)
+    guarda = {k: linha[k] for k in ("task", "run", "titulo", "agente", "modelo", "effort", "sessao", "cwd", "terminal", "entregue", "motivo")}
+    _cursor_mut(lambda c: c.setdefault("hibernados", {}).__setitem__(a["dispatch"], {**guarda, "desde": now()}))  # antes do close: uma queda no meio não deixa o retomar subir o worker
+    try:
+        orca("close", "--terminal", a["terminal"], area="terminal")
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        _esquece_hibernado(a["dispatch"])
+        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e})"}
+    depois, fim = antes, time.time() + HIBERNA_RSS_ESPERA_S
+    while antes is not None and (depois := rss_agentes_mb(_processos())) is not None and depois >= antes and time.time() < fim:
+        time.sleep(0.5)
+    liberou = max(0, antes - depois) if antes is not None and depois is not None else None
+    _cursor_mut(lambda c: c.get("hibernados", {}).get(a["dispatch"], {}).__setitem__("rss_liberado_mb", liberou))
+    append_event({"tipo": "hibernar", "dispatch": a["dispatch"], **guarda, "rss_antes_mb": antes, "rss_depois_mb": depois, "rss_liberado_mb": liberou})
+    return {**linha, "estado": "hibernado", "rss_antes_mb": antes, "rss_depois_mb": depois, "rss_liberado_mb": liberou}
+
+
+def hibernar(alvo, run=None, forcar=False):
+    """`orq hibernar <task|dispatch>`: hiberna o worker à mão, com as mesmas recusas do automático (`forcar` só passa a falta de prova de processo filho).
+    Levanta ValueError com o motivo se não hibernou."""
+    a = next((x for x in agentes(run) if alvo in (x["task"], x["dispatch"])), None)
+    if not a:
+        raise ValueError(f"sem worker para {alvo} (o orq agentes mostra os dispatches)")
+    r = _hibernar_agente(a, "manual", _processos(), forcar)
+    if r["estado"] != "hibernado":
+        raise ValueError(f"{alvo} não hibernou: {r['aviso']}")
+    return r
+
+
+def hibernar_ociosos(agora=None):
+    """Uma volta do gerente: hiberna o que o critério (motivo_hibernar) escolhe e a tela e os processos deixam. No máximo uma vez por HIBERNA_VOLTA_S.
+    Devolve as linhas do painel. Recusa na tela ou nos processos é silenciosa: a próxima volta confere de novo."""
+    if time.time() - (_cursor_ro().get("hibernar_volta") or 0) < HIBERNA_VOLTA_S:
+        return []
+    _cursor_mut(lambda c: c.__setitem__("hibernar_volta", time.time()))
+    agora, cfg = agora or datetime.now(timezone.utc), _hiberna_cfg()
+    acordada, pend, prs, tks = _acordada_em(read_events()), _load_pend()["itens"], _prs_ro()["itens"], tickets()
+    cand = [(a, m) for a in agentes() if (m := motivo_hibernar(a, agora, cfg, pend, prs, tks, acordada.get(a["dispatch"])))]
+    if not cand:
+        return []
+    procs, linhas = _processos(), []
+    for a, motivo in cand:
+        r = _hibernar_agente(a, motivo, procs)
+        if r["estado"] == "recusado":
+            log(f"hibernar {a['task']}: recusado ({r['aviso']})")
+        elif r["estado"] == "falhou":
+            linhas.append(f"{a['task']}: não hibernou ({r['aviso']})")
+        else:
+            linhas.append(f"{a['task']}: hibernado ({motivo}" + (f", ~{r['rss_liberado_mb']} MB" if r.get("rss_liberado_mb") else "") + ")")
+    return linhas
+
+
+def acordar(alvo, texto=None):
+    """Sobe de volta o worker hibernado (task ou dispatch): o resume do harness numa terminal novo, pelo mesmo caminho do `orq retomar`, com MSG_ACORDA
+    (o `texto` do que chegou) e o jeito de escalar. Tira o dispatch de `hibernados` e grava `acordar`, salvo se o terminal nem subiu (`falhou`: segue
+    hibernado, e o gerente tenta de novo). ValueError se `alvo` não está hibernado."""
+    d, p = next(((d, p) for d, p in _hibernados().items() if alvo in (d, p.get("task"))), (None, None))
+    if not d:
+        raise ValueError(f"{alvo} não está hibernado")
+    linha = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p.get("titulo") or d, "cwd": p["cwd"], "terminal": p["terminal"]}
+    if not os.path.isdir(p["cwd"]):
+        return {**linha, "estado": "sem_worktree", "aviso": f"a pasta {p['cwd']} não existe: nada foi subido"}
+    try:
+        cp = _checkpoint(d)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        cp = {"head": None, "sujo": None}
+    coord = (_gerente_cfg() or {}).get("coordenador") or os.environ.get("ORCA_TERMINAL_HANDLE")
+    msg = f"{MSG_ACORDA.format(texto=texto or 'acordado à mão (orq acordar).')} " + MSG_ESCALAR.format(coord=coord or "<coordenador>", run=p["run"], task=p["task"], dispatch=d)
+    r = _subir_sessao(linha, p["sessao"], p.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão hibernada não pôde ser retomada'", msg,
+                      p.get("agente") or "claude", p.get("effort"))
+    if r["estado"] != "falhou":
+        _esquece_hibernado(d)
+        append_event({"tipo": "acordar", "dispatch": d, "task": p["task"], "run": p["run"], "terminal": r.get("novo"), "motivo": _cita(texto or "manual", 200)})
+    return r
+
+
+def acordar_gatilhos():
+    """Uma volta do gerente: acorda o hibernado (que ainda não entregou) cuja pendência ligada à task foi respondida, ou cujo PR foi mergeado ou fechado,
+    depois que ele hibernou. O steer e o responder acordam na hora, pelos próprios comandos. Devolve as linhas do painel.
+    ponytail: o `falhou` tenta de novo a cada volta (10 s); com o Orca recusando o terminal isso vira ruído no log, sem limite de tentativas."""
+    hib = {d: p for d, p in _hibernados().items() if not p.get("entregue")}
+    if not hib:
+        return []
+    events, linhas = read_events(), []
+    for d, p in hib.items():
+        e = next((e for e in reversed(events) if e.get("task") == p["task"] and (e.get("ts") or "") >= p["desde"]
+                  and (e.get("tipo") == "pend" and e.get("op") == "done" or e.get("tipo") == "pr" and e.get("op") in ("entrou", "fechou"))), None)
+        if not e:
+            continue
+        texto = (f"a pendência {e.get('pend')} foi respondida: {e.get('resposta') or 'fechada sem resposta'}" if e["tipo"] == "pend"
+                 else f"o PR #{e.get('numero')} " + (f"entrou em {e.get('base')}" if e["op"] == "entrou" else "foi fechado sem merge"))
+        r = acordar(d, texto)
+        linhas.append(f"{p['task']}: acordado ({texto[:70]}) -> {r['estado']}")
+    return linhas
+
+
+def linhas_hibernacao():
+    """A linha do `orq agentes` com quantos workers estão hibernados e a memória que a hibernação liberou (RSS dos processos de agente, antes e depois)."""
+    hib = _hibernados()
+    mb = sum(p.get("rss_liberado_mb") or 0 for p in hib.values())
+    return [f"Hibernados: {len(hib)}" + (f", ~{mb} MB de RSS liberados (soma dos processos claude e dos MCPs deles, antes e depois do close)" if mb else "")] if hib else []
+
+
+def texto_hibernado(r):
+    """Uma linha para o resultado de `orq hibernar`."""
+    return f"{r['dispatch']} {r.get('titulo') or r['task']}: hibernado ({r['motivo']})" + (f", RSS {r['rss_antes_mb']} -> {r['rss_depois_mb']} MB (~{r['rss_liberado_mb']} MB liberados)"
+                                                                                       if r.get("rss_liberado_mb") is not None else "")
+
+
 def _avisos_gerente():
     """gerente-aviso.json como {run: {vistos, ts}}: os ids das mensagens (fora heartbeat) que o painel já avisou ao coordenador, por Run, e a
     hora do último aviso. O id vale mesmo depois da confirmação: entrega que o coordenador já leu não é avisada de novo. O formato antigo
@@ -6189,6 +6527,10 @@ def gerente_absorver():
         linhas += maquina_volta()
     except Exception as e:  # noqa: BLE001 - a fila de despacho não derruba o painel; a próxima volta tenta
         log(f"fila de despacho: {type(e).__name__}: {e}")
+    try:
+        linhas += [*acordar_gatilhos(), *hibernar_ociosos()]
+    except Exception as e:  # noqa: BLE001 - hibernar é economia, não pode derrubar o painel; a próxima volta tenta
+        log(f"hibernar: {type(e).__name__}: {e}")
     return "\n".join(linhas)
 
 
@@ -6342,6 +6684,15 @@ def main(argv=None):
     rt.add_argument("--json", action="store_true")
     rt.add_argument("--pausados", action="store_true", help="sobe os workers que o orq pausar parou (em vez dos que caíram); recusa com o uso ainda alto")
     rt.add_argument("--forcar", action="store_true", help="com --pausados, sobe mesmo com o uso acima do limiar")
+    hb = sub.add_parser("hibernar", help="fecha o terminal de um worker ocioso e guarda a sessão (o gerente faz sozinho, com o critério do README); o steer, o responder e o orq acordar o trazem de volta")
+    hb.add_argument("alvo", help="id da task ou do dispatch")
+    hb.add_argument("--run")
+    hb.add_argument("--forcar", action="store_true", help="passa a falta de prova de processo filho (ps/lsof sem achar o agente); nunca passa processo filho vivo, tela ocupada nem coordenador")
+    hb.add_argument("--json", action="store_true")
+    ac = sub.add_parser("acordar", help="sobe de volta, com o resume do harness, o worker hibernado (task ou dispatch)")
+    ac.add_argument("alvo")
+    ac.add_argument("--texto", help="o que o worker recebe ao acordar (o padrão é 'acordado à mão')")
+    ac.add_argument("--json", action="store_true")
     pz = sub.add_parser("pausar", help="pausa workers para abrir folga no plano: PAUSA.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
     pz.add_argument("tasks", nargs="*", help="ids de task ou de dispatch; sem eles vale o critério de prioridade")
     pz.add_argument("--ate-prioridade", type=int, choices=[1, 2, 3], help="pausa as de prioridade N e mais baixas (3 = só as baixas)")
@@ -6424,7 +6775,7 @@ def main(argv=None):
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]
-            print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([texto_agentes(ags), *parada]))
+            print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([texto_agentes(ags), *linhas_hibernacao(), *parada]))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))
@@ -6512,6 +6863,14 @@ def main(argv=None):
         elif a.cmd == "retomar":
             r = retomar(a.dry_run, a.run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
+        elif a.cmd == "hibernar":
+            r = hibernar(a.alvo, a.run, a.forcar)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_hibernado(r))
+        elif a.cmd == "acordar":
+            r = acordar(a.alvo, a.texto)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar({"gerente": None, "workers": [r]}))
+            if r["estado"] in ("falhou", "sem_worktree"):
+                return 1
         elif a.cmd == "pausar":
             r = pausar(a.tasks, a.ate_prioridade, a.run, a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_pausar(r))

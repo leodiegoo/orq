@@ -106,6 +106,14 @@ if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
         falha("falhou terminal send")  # o enésimo send em diante falha (o texto do anterior já foi digitado)
     if cmd == "close":
         json.dump([h for h in ler("terminals.json", []) if h != opt("--terminal")], open(os.path.join(d, "terminals.json"), "w"))
+        arq = os.environ.get("ORQ_PROCESSOS")
+        if arq and os.path.exists(arq):
+            # fechar o terminal mata o agente e tudo o que sobe abaixo dele (ORQ_PROCESSOS: a lista de processos falsa, com o terminal de cada agente)
+            ps = json.load(open(arq))
+            mortos = {p["pid"] for p in ps if p.get("terminal") == opt("--terminal")}
+            while any(p["ppid"] in mortos and p["pid"] not in mortos for p in ps):
+                mortos |= {p["pid"] for p in ps if p["ppid"] in mortos}
+            json.dump([p for p in ps if p["pid"] not in mortos], open(arq, "w"))
     res = {"handle": opt("--terminal")}
     if cmd == "send" and "--text" not in a and os.environ.get("FAKE_INICIO") == "depois_do_enter":
         turno_comeca("ctx_" + opt("--terminal"))
@@ -9530,6 +9538,319 @@ def test_ticket79_leitura_real_do_sistema_tem_as_quatro_medidas_no_macos():
             os.environ["ORQ_MAQUINA_LEITURA"] = antes
     assert l["mem_livre_mb"] > 0 and 0 <= l["livre_pct"] <= 100 and l["carga"] >= 0 and l["ncpu"] >= 1, l
     assert set(l["rss_mb"]) == {"claude", "codex", "node", "docker"} and all(v >= 0 for v in l["rss_mb"].values()), l
+
+
+# ---------- ticket 60: hibernar worker ocioso e acordar quando precisar ----------
+
+HIB60 = {"ORQ_HIBERNA_VOLTA_S": "0", "ORQ_HIBERNA_RSS_ESPERA_S": "1", "ORQ_RETOMAR_ESPERA_S": "2"}
+FILHO60 = "/bin/zsh -c source /Users/leo/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'bash scripts/e2e-infra.sh test'"
+
+
+def _z60(minutos):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutos * 60))
+
+
+def _procs60(a, extra=(), sem=()):
+    """Um claude (600000 KB) com um servidor MCP filho (150000 KB) por worker, no cwd da worktree dele, mais um processo que não é agente."""
+    ps = [{"pid": 7, "ppid": 1, "rss": 99_999_999, "args": "/usr/bin/outro-programa", "cwd": None}]
+    for i, n in enumerate(a.nomes60):
+        if n in sem:
+            continue
+        ps += [{"pid": 100 + i * 10, "ppid": 1, "rss": 600_000, "args": "claude --dangerously-skip-permissions --model claude-opus-5-5", "cwd": a.wt + "/" + n, "terminal": "term_" + n},
+               {"pid": 101 + i * 10, "ppid": 100 + i * 10, "rss": 150_000, "args": "node /opt/mcp/server.js", "cwd": None}]
+    a.set("../procs.json", ps + list(extra))
+
+
+def _hib60(a, parado_min=20, nomes=("w1",), **kw):
+    """Workers claude parados no prompt há `parado_min` min (hooks: turno fechado) no run_a, com a tela ociosa e os processos de cada um. `kw` vai ao worker-list."""
+    os.makedirs(a.home, exist_ok=True)
+    a.wt, a.nomes60 = os.path.join(a.tmp.name, "wt"), nomes
+    for n in nomes:
+        os.makedirs(os.path.join(a.wt, n))
+    a.set("workers.json", [_w48("term_" + n, agente="claude", modelo="claude-opus-5-5", **kw) for n in nomes])
+    a.set("tasks_run_a.json", [{"id": "task_term_" + n, "task_title": "Ticket " + n, "status": kw.get("status", "dispatched"), "dispatch_id": "ctx_term_" + n, "created_at": _iso(-3600)} for n in nomes])
+    a.set("terminals.json", ["term_coord", "term_ger", *("term_" + n for n in nomes)])
+    json.dump({"ctx_term_" + n: {"task": "task_term_" + n, "sessao": "sess-" + n, "inicio": _z60(parado_min + 5), "fim": _z60(parado_min), "harness": "claude", "cwd": a.wt + "/" + n}
+               for n in nomes}, open(os.path.join(a.home, "turnos.json"), "w"))
+    a.set("screens.json", {"term_" + n: _tela52("tela-claude-ocioso.txt") for n in nomes} | {"term_ret1": ["esc to interrupt"], "term_ret2": ["esc to interrupt"]})
+    a.env["ORQ_PROCESSOS"] = os.path.join(a.tmp.name, "procs.json")
+    _procs60(a)
+
+
+def _no_gerente60(a, **kw):
+    """O agent manager ligado (term_ger, run_a) e a volta dele: `orq gerente absorver`."""
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    _hib60(a, **kw)
+    return lambda: a.orq("gerente", "absorver")
+
+
+def _hibernados60(a):
+    try:
+        return _cursor(a).get("hibernados") or {}
+    except OSError:
+        return {}
+
+
+def test_ticket60_ocioso_ha_mais_de_n_min_hiberna_fecha_o_terminal_guarda_a_sessao_e_mede_o_rss():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=20)
+    r = volta()
+    assert r.returncode == 0 and "task_term_w1: hibernado (ocioso no prompt, ~732 MB)" in r.stdout, (r.stdout, r.stderr)
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
+    h = _hibernados60(a)["ctx_term_w1"]
+    assert (h["sessao"], h["cwd"], h["modelo"], h["task"], h["run"], h["agente"], h["entregue"], h["motivo"]) == \
+        ("sess-w1", a.wt + "/w1", "claude-opus-5-5", "task_term_w1", "run_a", "claude", False, "ocioso no prompt"), h
+    ev = next(e for e in a.events() if e["tipo"] == "hibernar")
+    assert (ev["dispatch"], ev["rss_antes_mb"], ev["rss_depois_mb"], ev["rss_liberado_mb"]) == ("ctx_term_w1", 732, 0, 732), "o RSS do claude e do MCP, não o do outro programa"
+    assert h["rss_liberado_mb"] == 732
+    assert not _log(a, "create.log"), "hibernar não sobe nada"
+    volta()
+    assert len(_log(a, "close.log")) == 1, "o hibernado não é fechado de novo"
+
+
+def test_ticket60_ocioso_ha_menos_de_n_min_nao_hiberna_e_o_n_e_configuravel():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=10)
+    assert volta().returncode == 0 and not _log(a, "close.log") and not _hibernados60(a), "10 min < 15"
+    json.dump({"min": 5}, open(os.path.join(a.home, "hibernar.json"), "w"))
+    volta()
+    assert list(_hibernados60(a)) == ["ctx_term_w1"], "hibernar.json baixou o N para 5"
+    b = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", ORQ_HIBERNA_MIN="30", **HIB60)
+    _no_gerente60(b, parado_min=20)()
+    assert not _hibernados60(b), "ORQ_HIBERNA_MIN=30 e o worker parado há 20 min"
+    assert (orq_mod.HIBERNA_MIN, orq_mod.HIBERNA_EXTERNA_MIN) == (15, 2), "padrões do ticket"
+
+
+def test_ticket60_nao_hiberna_com_shell_still_running_spinner_pergunta_presa_rascunho_ocupado_ou_processo_filho():
+    def tela(nome):
+        return lambda a: a.set("screens.json", {"term_w1": _tela52(nome)})
+    casos = {
+        "shell still running": tela("tela-claude-shell.txt"),
+        "spinner": tela("tela-claude-spinner.txt"),
+        "pergunta presa": tela("tela-permissao.txt"),
+        "rascunho": lambda a: a.set("drafts.json", {"term_w1": "estava digitando"}),
+        "no meio do turno": lambda a: a.set("busy.json", ["term_w1"]),
+        "processo filho vivo": lambda a: _procs60(a, extra=[{"pid": 150, "ppid": 100, "rss": 5000, "args": FILHO60, "cwd": None}]),
+        "sem prova do processo": lambda a: _procs60(a, sem=("w1",)),
+    }
+    for nome, prepara in casos.items():
+        a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+        volta = _no_gerente60(a, parado_min=40)
+        prepara(a)
+        r = volta()
+        assert r.returncode == 0, (nome, r.stderr)
+        assert not _log(a, "close.log") and not _hibernados60(a), f"hibernou com {nome}"
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=40)
+    _procs60(a, extra=[{"pid": 150, "ppid": 100, "rss": 5000, "args": FILHO60, "cwd": None}])
+    volta()
+    _procs60(a)  # o E2E acabou
+    volta()
+    assert list(_hibernados60(a)) == ["ctx_term_w1"], "sem o filho, a volta seguinte hiberna"
+
+
+def test_ticket60_coordenador_gerente_e_terminal_que_nao_e_worker_do_orq_nunca_hibernam():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=40, nomes=("coord", "ger", "x", "w1"))  # term_coord e term_ger como workers ociosos; term_x sem hook do orq
+    t = json.load(open(os.path.join(a.home, "turnos.json")))
+    del t["ctx_term_x"]
+    json.dump(t, open(os.path.join(a.home, "turnos.json"), "w"))
+    r = volta()
+    assert r.returncode == 0, r.stderr
+    assert list(_hibernados60(a)) == ["ctx_term_w1"], "só o worker do orq hiberna"
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
+    for alvo in ("task_term_coord", "task_term_ger"):  # nem à mão
+        r = a.orq("hibernar", alvo, "--run", "run_a", "--forcar")
+        assert r.returncode == 1 and "coordenador ou o gerente" in r.stderr, (alvo, r.stderr)
+
+
+def test_ticket60_espera_externa_conhecida_pendencia_pr_ou_ticket_bloqueado_hiberna_antes_do_n():
+    pend = {"itens": [{"id": "teto-pod", "tipo": "decisao", "titulo": "Teto por pod?", "task": "task_term_w1"}]}
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=5)
+    volta()
+    assert not _hibernados60(a), "parado há 5 min sem nada que ele espere: fica"
+    json.dump(pend, open(a.env["ORQ_PENDENCIAS"], "w"))
+    assert "esperando: pendência teto-pod" in volta().stdout
+    assert _hibernados60(a)["ctx_term_w1"]["motivo"] == "esperando: pendência teto-pod"
+    b = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    _gh(b)
+    _pr(b, PR1)
+    volta = _no_gerente60(b, parado_min=5)
+    assert b.orq("pr", "ligar", "task_term_w1", PR1).returncode == 0
+    assert "esperando: PR #1216 esperando merge" in volta().stdout
+    c = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    os.makedirs(c.env["ORQ_ISSUES"])
+    open(os.path.join(c.env["ORQ_ISSUES"], "01-base.md"), "w").write("# 01: Base\n\nStatus: claimed\nBlocked by: (nenhum)\n\n## What to build\n\nx\n")
+    open(os.path.join(c.env["ORQ_ISSUES"], "02-feature.md"), "w").write("# 02: Feature\n\nStatus: claimed\nBlocked by: 01\nTask: task_term_w1\n\n## What to build\n\nx\n")
+    volta = _no_gerente60(c, parado_min=5)
+    assert "esperando: ticket 02 bloqueado por 01" in volta().stdout
+
+
+def test_ticket60_entregue_e_sem_liberar_hiberna_e_o_liberar_tira_da_lista():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    volta = _no_gerente60(a, parado_min=20, status="completed", terminal="retained")
+    assert _agentes(a, "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord")["ctx_term_w1"]["estado"] == "entregue"
+    assert "entregue e sem liberar" in volta().stdout
+    h = _hibernados60(a)["ctx_term_w1"]
+    assert h["entregue"] is True and [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
+    assert _agentes(a, "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord")["ctx_term_w1"]["estado"] == "hibernado", "o terminal fechado não o faz sumir: ele não foi liberado"
+    r = a.orq("liberar", "ctx_term_w1", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    assert r.returncode == 0, r.stderr
+    assert not _hibernados60(a), "liberado não volta"
+
+
+def test_ticket60_steer_num_hibernado_acorda_com_resume_e_entrega_a_mensagem():
+    a = Amb(run="run_a", **HIB60)
+    _hib60(a)
+    r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
+    assert r.returncode == 0 and "hibernado (manual)" in r.stdout and "RSS 732 -> 0 MB" in r.stdout, (r.stdout, r.stderr)
+    assert _log(a, "close.log") and not _log(a, "create.log")
+    r = a.orq("steer", "task_term_w1", "Faça o rebase na main antes do push")
+    assert r.returncode == 0, r.stderr
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--worktree") + 1] == "path:" + a.wt + "/w1"
+    comando = c[c.index("--command") + 1]
+    assert comando.startswith("claude --resume sess-w1 --model claude-opus-5-5 --dangerously-skip-permissions '"), comando
+    assert "Faça o rebase na main antes do push" in comando and "hibernado" in comando and "--type escalation" in comando and "--task-id task_term_w1" in comando, comando
+    assert not _enviados(a), "nada vai ao terminal morto: o resume leva a mensagem"
+    assert not _hibernados60(a)
+    tipos = [e["tipo"] for e in a.events()]
+    assert tipos.count("acordar") == 1 and tipos.count("retomada") == 1 and "steer" in tipos, tipos
+    (ev,) = [e for e in a.events() if e["tipo"] == "steer"]
+    assert ev["acordado"] == "retomado" and ev["task"] == "task_term_w1", ev
+    ag = _agentes(a, "--run", "run_a")["ctx_term_w1"]
+    assert ag["terminal"] == "term_ret1" and ag["estado"] != "hibernado", "o terminal novo é o do dispatch"
+
+
+def test_ticket60_responder_a_um_hibernado_responde_e_acorda():
+    a = Amb(run="run_a", **HIB60)
+    _hib60(a)
+    assert a.orq("hibernar", "ctx_term_w1", "--run", "run_a").returncode == 0
+    _inbox(a, {**_pergunta_ask(50, "ctx_term_w1"), "type": "escalation"})
+    r = a.orq("responder", "msg_q50", "use o índice composto")
+    assert r.returncode == 0, r.stderr
+    (chamada,) = _log(a, "replied.log")
+    assert chamada[:5] == ["reply", "--id", "msg_q50", "--body", "use o índice composto"], chamada
+    (c,) = _log(a, "create.log")
+    comando = c[c.index("--command") + 1]
+    assert "claude --resume sess-w1" in comando and "use o índice composto" in comando and "msg_q50" in comando, comando
+    (ev,) = [e for e in a.events() if e["tipo"] == "resposta_worker"]
+    assert ev["acordado"] == "retomado" and not _hibernados60(a), ev
+
+
+def test_ticket60_pendencia_respondida_e_pr_mergeado_acordam_pelo_gerente_mas_o_entregue_nao():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    _gh(a)
+    _pr(a, PR1)
+    volta = _no_gerente60(a, parado_min=20, nomes=("w1", "w2"))
+    json.dump({"itens": [{"id": "teto-pod", "tipo": "decisao", "titulo": "Teto por pod?", "task": "task_term_w2"}]}, open(a.env["ORQ_PENDENCIAS"], "w"))
+    assert a.orq("pr", "ligar", "task_term_w1", PR1).returncode == 0
+    volta()
+    assert set(_hibernados60(a)) == {"ctx_term_w1", "ctx_term_w2"}
+    assert not _log(a, "create.log"), "nada o acorda sozinho"
+    _pr(a, PR1, state="MERGED", base="development")
+    r = volta()
+    assert "task_term_w1: acordado (o PR #1216 entrou em development)" in r.stdout, (r.stdout, r.stderr)
+    assert set(_hibernados60(a)) == {"ctx_term_w2"}
+    assert a.orq("pend", "done", "teto-pod", "--resposta", "usar 4").returncode == 0
+    r = volta()
+    assert "task_term_w2: acordado (a pendência teto-pod foi respondida: usar 4)" in r.stdout, r.stdout
+    c1, c2 = _log(a, "create.log")
+    assert "claude --resume sess-w1" in c1[c1.index("--command") + 1] and "PR #1216 entrou em development" in c1[c1.index("--command") + 1]
+    assert "claude --resume sess-w2" in c2[c2.index("--command") + 1] and "usar 4" in c2[c2.index("--command") + 1]
+    assert not _hibernados60(a)
+    e = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
+    _gh(e)
+    _pr(e, PR1)
+    volta = _no_gerente60(e, parado_min=20, status="completed", terminal="retained")
+    e.orq("pr", "ligar", "task_term_w1", PR1)
+    volta()
+    _pr(e, PR1, state="MERGED")
+    volta()
+    assert list(_hibernados60(e)) == ["ctx_term_w1"] and not _log(e, "create.log"), "quem já entregou não volta sozinho por causa do merge"
+
+
+def test_ticket60_o_estado_sobrevive_a_uma_queda_e_o_retomar_nao_sobe_hibernados_sem_motivo():
+    a = Amb(run="run_a", **HIB60)
+    _hib60(a, nomes=("w1", "w2"))
+    assert a.orq("hibernar", "task_term_w1", "--run", "run_a").returncode == 0
+    a.set("terminals.json", ["term_coord"])  # a queda levou o terminal do w2 também
+    r = a.orq("retomar", "--dry-run", "--json")
+    assert r.returncode == 0, r.stderr
+    assert [(w["task"], w["estado"]) for w in json.loads(r.stdout)["workers"]] == [("task_term_w2", "a_retomar")], "o w1 hibernado fica de fora"
+    assert "ctx_term_w1" in _hibernados60(a), "o cursor.json guardou a sessão"
+    ag = _agentes(a, "--run", "run_a")["ctx_term_w1"]
+    assert ag["estado"] == "hibernado", "depois da queda ele continua hibernado, não 'sem terminal'"
+    assert a.orq("acordar", "task_term_w1").returncode == 0 and len(_log(a, "create.log")) == 1
+
+
+def test_ticket60_agentes_e_digest_mostram_hibernado_desde_hh_mm_e_a_economia():
+    a = Amb(run="run_a", **HIB60)
+    _hib60(a)
+    assert a.orq("hibernar", "task_term_w1", "--run", "run_a").returncode == 0
+    ag = _agentes(a, "--run", "run_a")["ctx_term_w1"]
+    assert ag["estado"] == "hibernado" and ag["hibernado_desde"] and ag["motivo_hibernado"] == "manual", ag
+    hora = orq_mod._hora_local(ag["hibernado_desde"])
+    txt = a.orq("agentes", "--run", "run_a").stdout
+    assert f"hibernado desde {hora} (manual)" in txt and "orq acordar task_term_w1" in txt, txt
+    assert "Hibernados: 1, ~732 MB de RSS liberados" in txt, txt
+    assert a.orq("ingest", "--refresh").returncode == 0 and a.orq("digest").returncode == 0
+    rod = json.load(open(os.path.join(a.home, "digest", "atual.json")))["rodando"]
+    assert [r["estado"] for r in rod] == [f"hibernado desde {hora}"], rod
+
+
+def test_ticket60_hibernar_e_acordar_a_mao_com_as_recusas_e_o_forcar():
+    a = Amb(run="run_a", **HIB60)
+    _hib60(a)
+    _procs60(a, extra=[{"pid": 150, "ppid": 100, "rss": 5000, "args": FILHO60, "cwd": None}])
+    r = a.orq("hibernar", "task_term_w1", "--run", "run_a", "--forcar")
+    assert r.returncode == 1 and "processo filho vivo" in r.stderr and not _log(a, "close.log"), "nem --forcar passa processo filho"
+    _procs60(a, sem=("w1",))
+    r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
+    assert r.returncode == 1 and "--forcar" in r.stderr and not _log(a, "close.log"), r.stderr
+    assert a.orq("hibernar", "task_term_w1", "--run", "run_a", "--forcar").returncode == 0 and _log(a, "close.log")
+    r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
+    assert r.returncode == 1 and "hibernado" in r.stderr, "já hibernado"
+    assert a.orq("hibernar", "task_nao_existe", "--run", "run_a").returncode == 1
+    r = a.orq("acordar", "task_term_w1", "--texto", "o PR passou no CI")
+    assert r.returncode == 0 and "retomado" in r.stdout, (r.stdout, r.stderr)
+    (c,) = _log(a, "create.log")
+    assert "o PR passou no CI" in c[c.index("--command") + 1]
+    r = a.orq("acordar", "task_term_w1")
+    assert r.returncode == 1 and "não está hibernado" in r.stderr, r.stderr
+
+
+def test_ticket60_o_resume_adia_a_proxima_hibernacao_e_o_criterio_puro():
+    cfg = {"min": 15, "externa_min": 2}
+    agora = datetime.now(timezone.utc)
+    base = {"estado": "parado", "turno": "parado", "task": "task_t", "turno_inicio": _z60(40), "turno_fim": _z60(20)}
+    m = orq_mod.motivo_hibernar
+    assert m(base, agora, cfg) == "ocioso no prompt"
+    assert m(base, agora, cfg, acordada=_z60(1)) is None, "acordado há 1 min: o turno novo ainda não está no turnos.json"
+    assert m(base, agora, cfg, acordada=_z60(30)) == "ocioso no prompt"
+    assert m({**base, "turno_fim": _z60(10)}, agora, cfg) is None
+    assert m({**base, "turno_fim": _z60(10)}, agora, cfg, pend=[{"id": "p", "task": "task_t"}]) == "esperando: pendência p"
+    assert m({**base, "turno_inicio": _z60(5)}, agora, cfg) is None, "turno aberto depois do fim"
+    for estado in ("travado", "perguntando", "nao_comecou", "hibernado", "liberado"):
+        assert m({**base, "estado": estado}, agora, cfg) is None, estado
+    assert m({**base, "tela": "1 shell still running (tela)"}, agora, cfg) is None
+    assert m({**base, "turno": "aberto"}, agora, cfg) is None
+    assert m({**base, "estado": "entregue", "turno": "unknown"}, agora, cfg) == "entregue e sem liberar"
+    assert m({**base, "estado": "entregue", "turno": "unknown", "retido": "external_terminal"}, agora, cfg) is None
+
+
+def test_ticket60_rss_e_processo_filho_sobre_a_lista_de_processos():
+    ps = [{"pid": 1, "ppid": 0, "rss": 9_000_000, "args": "/sbin/launchd", "cwd": None},
+          {"pid": 10, "ppid": 1, "rss": 512_000, "args": "claude --model x", "cwd": "/wt/a"}, {"pid": 11, "ppid": 10, "rss": 256_000, "args": "node mcp.js", "cwd": None},
+          {"pid": 12, "ppid": 11, "rss": 256_000, "args": "node filho-do-mcp.js", "cwd": None},
+          {"pid": 20, "ppid": 1, "rss": 1_024_000, "args": "codex --yolo", "cwd": "/wt/b"}]
+    assert orq_mod.rss_agentes_mb(ps) == 2000 and orq_mod.rss_agentes_mb(None) is None
+    assert orq_mod._processo_do_worker(ps, "/wt/a", "claude") == ([10], False)
+    assert orq_mod._processo_do_worker(ps + [{"pid": 30, "ppid": 12, "rss": 1, "args": FILHO60, "cwd": None}], "/wt/a", "claude") == ([10], True), "o filho do filho conta"
+    assert orq_mod._processo_do_worker(ps, "/wt/outra", "claude") == ([], None)
+    assert orq_mod._processo_do_worker(ps, "/wt/b", "codex") == ([20], None), "o Codex não tem padrão de filho: sem prova"
+    assert orq_mod._processo_do_worker(None, "/wt/a", "claude") == ([], None)
 
 
 if __name__ == "__main__":

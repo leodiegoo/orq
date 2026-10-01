@@ -1,0 +1,8 @@
+● Pronto: o PR está aberto e a suíte passa (41/41).
+
+  Fico esperando o merge.
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
