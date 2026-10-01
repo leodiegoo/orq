@@ -11600,6 +11600,83 @@ def test_ticket91_aviso_de_pausa_sem_folga_no_outro_harness_ou_sem_numero_dele_s
         env = _log(a, "send.log")[0]  # o do Claude vem primeiro; o do Codex, se houver, é outro aviso
         assert "orq passar" not in env[env.index("--text") + 1] and "orq pausar" in env[env.index("--text") + 1], conta
 
+# ticket 92: relatorio-final.md como worker_done de reserva e passagem aberta no status
+
+def _reserva92(a, relatorio="# Entrega\n\nfeito", fim=-300, mtime=-400, inicio=-600, cwd=True, done=False):
+    """Um worker sem worker_done: turnos.json com cwd, `relatorio-final.md` na worktree e, se `done`, o worker_done dele já no log."""
+    _ingest_env(a)
+    wt = os.path.join(a.tmp.name, "wt92")
+    os.makedirs(wt)
+    arq = os.path.join(wt, "relatorio-final.md")
+    if relatorio is not None:
+        open(arq, "w").write(relatorio)
+        os.utime(arq, (time.time() + mtime, time.time() + mtime))
+    json.dump({"ctx_92": {"task": "task_92", "inicio": now_iso(inicio), "fim": now_iso(fim) if fim is not None else None, "harness": "claude",
+                          **({"cwd": wt} if cwd else {})}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    linhas = [{"ts": now_iso(-900), "tipo": "despacho", "run": "run_a", "task": "task_92", "dispatch": "ctx_92", "titulo": "t"}]
+    if done:
+        linhas.append({"ts": now_iso(-100), "tipo": "worker_done", "msg": "msg_real", "run": "run_a", "task": "task_92", "dispatch": "ctx_92", "outcome": "succeeded", "subject": "x"})
+    open(os.path.join(a.home, "events.jsonl"), "w").write("".join(json.dumps(e) + "\n" for e in linhas))
+    return arq
+
+
+def test_ticket_92_relatorio_final_sem_worker_done_vira_worker_done_e_entrada():
+    a = Amb()
+    arq = _reserva92(a)
+    assert a.orq("ingest").returncode == 0
+    (wd,) = [e for e in a.events() if e["tipo"] == "worker_done" and e.get("dispatch") == "ctx_92"]
+    assert wd["dispatch"] == "ctx_92" and wd["task"] == "task_92" and wd["run"] == "run_a" and wd["origem"] == "relatorio-final"
+    (ent,) = [e for e in _entradas(a, "relatorio_worker") if e.get("task") == "task_92"]
+    assert ent["caminho"] == arq and ent["task"] == "task_92" and ent["ref"] == wd["msg"]
+    a.orq("ingest")
+    assert len([e for e in a.events() if e["tipo"] == "worker_done" and e.get("dispatch") == "ctx_92"]) == 1, "o segundo ingest não repete"
+    assert len([e for e in _entradas(a, "relatorio_worker") if e.get("task") == "task_92"]) == 1
+
+
+def test_ticket_92_relatorio_final_nao_vale_com_worker_done_real_turno_aberto_ou_arquivo_velho():
+    for campos in ({"done": True}, {"fim": None}, {"mtime": -700}, {"cwd": False}, {"relatorio": None}):
+        a = Amb()
+        _reserva92(a, **campos)
+        assert a.orq("ingest").returncode == 0
+        assert [e for e in a.events() if e.get("origem") == "relatorio-final"] == [], campos
+        assert [e for e in _entradas(a, "relatorio_worker") if e.get("task") == "task_92"] == [], campos
+
+
+def test_ticket_92_worker_done_real_depois_da_reserva_nao_duplica():
+    a = Amb()
+    _reserva92(a)
+    a.orq("ingest")
+    ib = _fix("inbox.json")
+    ib["result"]["messages"].append({**ib["result"]["messages"][0], "id": "msg_tardio", "sequence": 990, "run_id": "run_a", "type": "worker_done",
+                                     "created_at": "2099-01-01T00:00:00Z", "payload": json.dumps({"taskId": "task_92", "dispatchId": "ctx_92", "outcome": "succeeded", "reportPath": "/x/r.md"})})
+    a.set("inbox.json", ib)
+    a.orq("ingest")
+    assert len([e for e in a.events() if e["tipo"] == "worker_done" and e.get("dispatch") == "ctx_92"]) == 1
+    assert len([e for e in _entradas(a, "relatorio_worker") if e.get("task") == "task_92"]) == 1, "só a entrada da reserva: a do worker_done tardio é descartada"
+
+
+def _passagem92(a, minutos, aceita=False, inicio_novo=False):
+    os.makedirs(a.home, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutos * 60))
+    open(os.path.join(a.home, "events.jsonl"), "w").write(json.dumps(
+        {"ts": ts, "tipo": "passagem", "de": "ctx_A", "agente_de": "claude", "para": "ctx_B", "agente_para": "codex", "aceita": aceita, "task": "task_92", "run": "run_a"}) + "\n")
+    json.dump({"ctx_B": {"task": "task_92", "inicio": now_iso(-60), "fim": None}} if inicio_novo else {}, open(os.path.join(a.home, "turnos.json"), "w"))
+
+
+def test_ticket_92_status_mostra_passagem_aberta_ha_mais_de_15_min():
+    a = Amb()
+    _passagem92(a, 22)
+    out = a.orq("status").stdout
+    assert "Passagens abertas" in out and "ctx_B" in out and "ctx_A" in out and "22 min" in out and "claude→codex" in out
+
+
+def test_ticket_92_status_cala_passagem_recente_aceita_ou_com_turno_novo():
+    for minutos, campos in ((5, {}), (30, {"aceita": True}), (30, {"inicio_novo": True})):
+        a = Amb()
+        _passagem92(a, minutos, **campos)
+        assert "Passagens abertas" not in a.orq("status").stdout, (minutos, campos)
+
+
 
 # ---------- ticket 105: o orq destrava sozinho o que fica preso ----------
 

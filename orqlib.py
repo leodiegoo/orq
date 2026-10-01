@@ -1723,6 +1723,7 @@ def ingest_inbox():
     eventos = read_events()
     ja = {e.get("ref") for e in eventos if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in eventos if e.get("tipo") == "alerta"}
     feitos = {e.get("msg") for e in eventos if e.get("tipo") == "worker_done"}  # o digest lê daqui o que cada worker entregou
+    reservas = {e.get("dispatch") for e in eventos if e.get("origem") == "relatorio-final"}  # o relatorio-final.md já entregou: o worker_done tardio não repete
     msgs = sorted((m for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m.get("sequence"), int)),
                   key=lambda m: m["sequence"])
     if ultimo and msgs and msgs[0]["sequence"] > ultimo + 1:
@@ -1731,6 +1732,9 @@ def ingest_inbox():
         if m["sequence"] <= ultimo:
             continue
         try:
+            if m.get("type") == "worker_done" and _payload(m).get("dispatchId") in reservas:
+                avancou = m["sequence"]
+                continue
             if m.get("type") == "worker_done" and _dt(m["created_at"]) > desde and m["id"] not in feitos:
                 _registra_worker_done(m)
                 feitos.add(m["id"])
@@ -1754,6 +1758,40 @@ def ingest_inbox():
     return novos
 
 
+RELATORIO_FINAL = "relatorio-final.md"
+
+
+def ingest_relatorios_finais():
+    """Worker que escreveu `relatorio-final.md` na worktree e não tem worker_done (o Orca recusou o handle novo) -> worker_done de reserva + entrada.
+
+    Só vale com o turno do worker fechado (Stop), o cwd gravado pelo hook e o arquivo escrito depois do início do turno e do ponto de partida do ingest:
+    o de um dispatch anterior na mesma worktree não conta. O outcome é `succeeded` porque o worker só escreve o arquivo ao terminar. Roda depois do inbox,
+    então um worker_done de verdade, se existe, ganha. Devolve o número de entradas novas."""
+    eventos = read_events()
+    feitos = {e.get("dispatch") for e in eventos if e.get("tipo") == "worker_done"}
+    runs = {e.get("dispatch"): e.get("run") for e in eventos if e.get("tipo") == "despacho"}
+    desde, novos = _dt(_read_cursor()["ingest"]["desde"]), 0
+    for dispatch, t in _turnos_ro().items():
+        t = _dict(t)
+        if dispatch in feitos or not t.get("cwd") or not t.get("fim") or not _ts(t.get("inicio")):
+            continue
+        arq = os.path.join(t["cwd"], RELATORIO_FINAL)
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(arq), timezone.utc)
+            titulo = next((l.lstrip("# ").strip() for l in open(arq, encoding="utf-8", errors="replace").read().splitlines() if l.strip()), "")
+        except OSError:
+            continue
+        if mtime <= max(desde, _ts(t["inicio"])):
+            continue
+        run, msg = runs.get(dispatch), f"relatorio-final:{dispatch}"
+        subject = titulo or f"relatório final do worker {dispatch}"
+        append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
+        append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": arq, "ref": msg, "run": run,
+                      "task": t.get("task"), **_grupo_do_run(run)}, novo_id=True)
+        novos += 1
+    return novos
+
+
 def ingest():
     """Automations e inbox -> entradas, e gates de pendência já fechada -> resolvidos. Devolve (entradas novas, gates resolvidos), ou None se
     outro ingest está rodando; cada fonte falha sozinha e vai para o log."""
@@ -1766,7 +1804,7 @@ def ingest():
         # primeira execução: grava o ponto de partida, e só o que for posterior a ele entra
         _cursor_mut(lambda c: c.__setitem__("ingest", {"desde": INICIO, "inbox_seq": 0, "runs": [], **_dict(c.get("ingest"))}))
         total = gates = 0
-        for nome, fn in (("automations", ingest_automations), ("inbox", ingest_inbox), ("gates", reconciliar_gates)):
+        for nome, fn in (("automations", ingest_automations), ("inbox", ingest_inbox), ("relatorios finais", ingest_relatorios_finais), ("gates", reconciliar_gates)):
             try:
                 if nome == "gates":
                     gates = fn()
@@ -6541,9 +6579,27 @@ def gerente_subir(forcar=False):
     return {**ev, "terminal": novo, "runs": g["runs"]}
 
 
+PASSAGEM_ABERTA_MIN = 15  # minutos sem o worker novo registrar turno até a passagem virar linha no `orq status`
+
+
+def linhas_passagens(events, turnos, agora=None):
+    """A linha do `orq status` com as passagens (`orq passar`) abertas há mais de PASSAGEM_ABERTA_MIN: o evento não foi aceito e o dispatch novo
+    ainda não tem turno em turnos.json. Função pura do log; sem passagem aberta, sem linha."""
+    agora = agora or datetime.now(timezone.utc)
+    itens = []
+    for e in events:
+        ts = _ts(e.get("ts"))
+        if e.get("tipo") != "passagem" or e.get("aceita") or _dict(turnos.get(e.get("para"))).get("inicio") or not ts:
+            continue
+        minutos = int((agora - ts).total_seconds() // 60)
+        if minutos > PASSAGEM_ABERTA_MIN:
+            itens.append(f"{e.get('para')} (de {e.get('de')}, {e.get('agente_de')}→{e.get('agente_para')}, {minutos} min)")
+    return [f"Passagens abertas ({len(itens)}): " + "; ".join(_lim(itens, 3, str)) + " — confira o terminal do worker novo"] if itens else []
+
+
 def texto_status():
-    """O que `orq status` imprime: o estado, os PRs, as worktrees, a fila de E2E e a máquina."""
-    return "\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
+    """O que `orq status` imprime: o estado, as passagens abertas, os PRs, as worktrees, a fila de E2E e a máquina."""
+    return "\n".join([estado(), *linhas_passagens(read_events(), _turnos_ro()), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
 
 
 # ---------- orq iniciar: o coordenador que já está aberto, em qualquer harness ----------
