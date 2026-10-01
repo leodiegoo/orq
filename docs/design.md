@@ -12,6 +12,8 @@ The coordinator is the Claude Code or Codex session the user talks to. It create
 
 Workers are Claude Code or Codex sessions Orca starts for a task (`orq despachar --agente claude|codex`). Their first prompt is always Orca's dispatch preamble.
 
+A secondmate (`mate`, ticket 80) is a coordinator for one group of projects: a Claude Code or Codex session opened by `orq mate abrir` with `ORQ_MATE=<group>` in its environment, bound to its own Run. It talks to the coordinator only through `events.jsonl` (see "Secondmates by group").
+
 The agent manager (`gerente`) is a plain shell running `painel-agent-manager.sh`. It has no model and costs no tokens.
 
 The hooks are installed globally, so they run in every session, workers included. Each one first works out its role:
@@ -68,6 +70,7 @@ The model does the classifying. The code only checks that a classification was r
 | `fila` (`op: add/feito/rm`) | `orq fila` |
 | `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
+| `mate` (`op: abrir`), `mate_pedido`, `mate_entregue`, `mate_reenvio`, `mate_escalado` | `orq mate abrir`, `orq mate pedir`, the manager loop (`mate_volta`) |
 
 `orq retro` reads all of these (see "Retro"); a new failure event should get a signal there.
 
@@ -354,6 +357,28 @@ Two rules, one for each side of that failure:
 - **A hook never breaks a turn.** The entry points `orq.py hook ...`, `precompact.py` and `hooks/limpar-mergeados-hook.py` wrap the import of `orqlib`; if it fails for any reason they call `falha_segura.sair`: exit 0, nothing on stdout or stderr, one line in `ORQ_LOG` (`~/.claude/logs/orq.log`). `falha_segura.py` imports nothing from orq, so it survives a broken `orqlib.py`. A command typed by hand (`orq status`) still raises, so the cause is visible. A silent hook means no guard for that call, so a line in `orq.log` with `import falhou` is the signal to look.
 
 Limits: the fast-forward rewrites the live files one by one, so a process that starts in that instant can read a mix of old and new (milliseconds, and both are green). The hooks outside the orq repo (`worker-routing-guard.py`) do not import the orq and are not wrapped.
+
+## Secondmates by group (ticket 80)
+
+Why. The user talks to one coordinator, and the coordinator piles up the detail of every domain and compacts often. A secondmate holds one domain (a group of projects) and its workers; the coordinator keeps the decisions. The full design, with the alternatives, is `~/.claude/orquestrador-plan/secondmate-por-grupo.md`.
+
+Groups. `ORQ_HOME/groups/<name>.json` (`grupos()`; a file that does not parse, or whose `projetos`/`prefixos` are not lists, is skipped and logged). `grupo_de(groups, titulo, cwd, grupo)` is pure: an explicit group wins (an unknown one is an error), then a title prefix (case-insensitive), then a cwd inside a project folder (a real subfolder, not a string prefix). Two groups on the same criterion is ambiguous and, like no match, stays with the coordinator. `orq grupos --titulo` prints `{grupo, motivo, mate}`, where `mate` is the live terminal or null.
+
+Opening. `orq mate abrir <group>` refuses while the recorded terminal is still listed (one mate per group) and when Orca gives no reliable list. With a recorded session it resumes (`HARNESS[agent]["resume"]`, `MSG_MATE_VOLTA`); otherwise it starts the harness with `CHARTER_MATE` (`HARNESS[agent]["abrir"]`), both wrapped in `env ORQ_MATE=<group>`, in `cwd` (recorded, then the group's `cwd`, then its first project). The mate is not a dispatch: no preamble, so the hooks treat it as a coordinator once it binds its Run, and Orca has no capability to revoke. Its Run never joins `gerente.json` (`_adotar` only adopts Runs of the file's coordinator), so Orca types the Run's notices straight into the mate.
+
+Hooks in a mate (`ORQ_MATE` set). `prompt` opens and `stop` closes a turn in `cursor.json` `mates[<group>].turnos` (the last 20, `[inicio, fim]`), next to the session, the terminal and the first cwd (`mate_turno`); `coordenador()` adds each Run the mate binds to `mates[<group>].runs`. An entry typed into the mate carries `grupo`, and so does a `relatorio_worker` entry from one of its Runs (`_grupo_do_run`). `abertas(events, grupo)` returns only the reader's entries: the mate's own (`ORQ_MATE`), or, without a group, the coordinator's; `coordenador_ativo` ignores entries with `grupo`, so typing into a mate never defers the coordinator's notices. `guard` refuses AskUserQuestion with the `orq mate subir --tipo decisao` command.
+
+Channel. Both ways go through `events.jsonl`, and typing into a terminal is only the doorbell. `orq mate pedir <group> --texto T [--prazo S] [--responde eN]` writes `mate_pedido` (`corr` `pN`, the next number under `cursor.lock`, and `prazo`, default 120 s) before typing `orq ▸ pedido pN ...` into the mate; a `digita` that went through writes `mate_entregue`. `--responde eN` closes the mate's entry `eN` with the new intake effect `mate` (its reference must be an existing `pN`). `orq mate subir --tipo resposta|decisao|pr|bloqueio|resumo --texto T [--corr pN] [--link]` (from the mate, or with `--grupo`) appends an `entrada` with `origem: mate`, `mate`, `tipo_mate` and `corr`; `resposta` needs `--corr`, and an unknown `corr` is refused so an answer cannot vanish. The typed texts start with `orq ▸ pedido ` and `orq ▸ mate ` (a prefix nobody types), which `origem()` classifies as `aviso_orq`: not entries.
+
+Deadline (`mate_pendentes`, pure). Only an `entrada` origin `mate` with the same `corr` resolves a request. Without `mate_entregue` it is `a_entregar`. With `prazo` 0 delivery is enough. Otherwise the clock starts at the delivery or at the repost, whichever is later: the first mate turn that started after it decides (later turns, such as Orca notices or heartbeats, never push the deadline): still open, `aguardando`, up to `TURNO_ABERTO_TETO_S` (30 min, for a turn whose Stop never ran); ended, the deadline is that end plus `prazo`; no turn started, the delivery plus `prazo`. `mate_entregue` and `mate_reenvio` carry the time taken before typing, because the mate's prompt hook records the turn start before `digita` returns. Past the deadline it is `reenviar`, past it again after the repost `escalar`, and then `escalado` for good. This is firstmate's rule (`bin/fm-pending-reply-lib.sh`, commit `1f2c9548`): count from the end of the turn, repost once, escalate once, never loop, never resolve from chat.
+
+Manager loop (`mate_volta`, every lap, before the machine queue). Delivers what waited for the mate to be idle, reposts (`mate_reenvio`), escalates to the coordinator (`mate_escalado`), announces each new mate entry once (`cursor.json` `mate_avisada_ate`, the highest entry number announced) with the `orq intake` and `orq mate pedir --responde` commands, and announces once per terminal (`mates[<group>].morto`) a mate whose terminal left `orca terminal list`. Notices to the coordinator go through `avisa_coordenador`, so they follow the ticket 82 deferral; `adiado` counts as delivered.
+
+Recovery and budget. `orq retomar` resumes every mate whose terminal is gone and whose session is known (`mates` in its result, `a_retomar` with `--dry-run`). The mate's workers go through the same machine budget, since `orq despachar` is the same; a queued item from a mate stores `mate` and `coord` (its terminal), and the drain runs it with that handle and `ORQ_MATE` (`_como_coordenador(it)`), because the coordinator's handle does not command the mate's Run. The mate itself does not count toward `max_workers`.
+
+A resume that does not come back (`_voltou`) closes the new terminal and forgets the session, so the next `orq mate abrir` starts from the charter instead of leaving a shell that would receive the requests. The mate's prompt hook leaves the coordinator's deferred notices alone, and its Stop hook writes nothing to the away-mode digest. A queued item from a mate drains with the mate's current terminal. A mate can only answer requests of its own group, `--responde` is checked before anything is written, and the typed request is one line.
+
+Known limits. No automatic relaunch of a fallen mate (the coordinator runs `orq mate abrir`). No hibernation of an idle mate and no `max_mates`. `aberto.json`, the "Vivos" line and `orq agentes` still list the mate's workers to the coordinator. Push and PR stay with the coordinator.
 
 ## Worker idle state
 
