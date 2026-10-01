@@ -8659,8 +8659,11 @@ def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_e_sem_astra_n
     txt = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
     assert "gpt-6-luna" in txt and "gpt-6-sol" in txt and "--agente codex" in txt, "a tabela do Codex e o jeito de despachar"
     assert "learn.chatgpt.com/docs/models" in txt, "a fonte da equivalência"
-    linhas = [l for l in txt.splitlines() if "astra" in l.lower() or "terra" in l.lower()]
-    assert linhas and all("não" in l.lower() for l in linhas), linhas
+    terra = [l for l in txt.splitlines() if "terra" in l.lower()]
+    assert terra and all("não" in l.lower() for l in terra), terra
+    astra = [l for l in txt.splitlines() if "astra" in l.lower()]  # só low e medium, no lugar do Opus xhigh e max
+    assert astra and all("low" in l.lower() or "medium" in l.lower() or "não" in l.lower() for l in astra), astra
+    assert not [l for l in astra if "astra" in l.lower() and ("astra` high" in l.lower() or "astra` xhigh" in l.lower())], astra
 
 
 def test_ticket73_mensagens_ao_worker_nao_citam_o_claude():
