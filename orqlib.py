@@ -2022,7 +2022,7 @@ _ESTADO_PR = {"aberto": "aberto", "mergeado": "✓", "fechado": "fechado"}
 def _pr_estado(url):
     """{state, mergedAt, baseRefName} do PR pelo gh, ou None se o gh não existe, falha, demora ou não há rede."""
     try:
-        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName,title"], capture_output=True, text=True, timeout=PR_GH_S)
+        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName,title,body"], capture_output=True, text=True, timeout=PR_GH_S)
         d = json.loads(r.stdout) if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
@@ -2140,7 +2140,8 @@ def pr_ligar(task, url, issue=None, tag=None, nota=None):
         item = {"task": task, "url": url, "numero": int(url.rsplit("/", 1)[1]), "base": visto.get("baseRefName"), "estado": estado,
                 "ligado_em": now(), "avisado": estado != "aberto", **({"resolvido_em": now()} if estado != "aberto" else {}),
                 **({"issue": int(issue)} if issue else {}), **({"titulo": visto["title"]} if visto.get("title") else {}),
-                **({"tag": tag} if tag else {}), **({"nota": nota} if nota else {})}
+                **({"tag": tag} if tag else {}), **({"nota": nota} if nota else {}),
+                **({"por": _primeiro_paragrafo(visto["body"])} if (visto.get("body") or "").strip() else {})}
         d["itens"].append(item)
         d["sem_task"] = [x for x in d.get("sem_task") or [] if x.get("url") != url]
         append_event({"tipo": "pr", "op": "ligar", "task": task, "url": url, "numero": item["numero"], "base": item["base"], "estado": estado,
@@ -2148,6 +2149,37 @@ def pr_ligar(task, url, issue=None, tag=None, nota=None):
         return item
 
     return _mutar_prs(add)
+
+
+def _primeiro_paragrafo(texto, limite=120):
+    """O primeiro parágrafo do corpo do PR numa linha, cortado em `limite` caracteres."""
+    p = " ".join((texto or "").strip().split("\n\n", 1)[0].split())
+    return p if len(p) <= limite else p[: limite - 1].rstrip() + "…"
+
+
+def fila_auto(item):
+    """Põe o PR recém-ligado na fila de merge. Task com passo aberto (algum PR dela ainda aberto, do mesmo grupo: main ou development/staging):
+    o PR entra nele. Sem passo, abre um: nome do despacho (ou título do PR), e o "por" é o corpo do PR ou, em main, quem já entrou."""
+    task, main = item["task"], item.get("base") == "main"
+    desp = [e for e in read_events() if e.get("tipo") == "despacho" and e.get("task") == task and e.get("titulo")]
+    irmaos = [i for i in _prs_ro()["itens"] if i["task"] == task and i["url"] != item["url"] and (i.get("base") == "main") == main]
+
+    def poe(d):
+        meus = {i["numero"] for i in irmaos}
+        achado = next((p for p in d["passos"] if not p["feito"] and meus & set(p["prs"])), None)
+        if achado:
+            achado["prs"] = list(dict.fromkeys([*achado["prs"], item["numero"]]))
+            append_event({"tipo": "fila", "op": "auto", "passo": achado["passo"], "prs": achado["prs"]})
+            return achado
+        nome = desp[-1]["titulo"] if desp else item.get("titulo") or f"PR #{item['numero']}"
+        antes = [f"#{i['numero']}" for i in _prs_ro()["itens"] if i["task"] == task and i.get("base") in ("development", "staging") and i["estado"] != "aberto"]
+        por = f"development e staging já entraram ({', '.join(antes)})" if main and antes else item.get("por", "")
+        novo = {"passo": max([p["passo"] for p in d["passos"]], default=0) + 1, "nome": f"{nome} para main" if main else nome, "por": por, "prs": [item["numero"]], "feito": False}
+        d["passos"].append(novo)
+        append_event({"tipo": "fila", "op": "auto", "passo": novo["passo"], "nome": novo["nome"], "prs": novo["prs"]})
+        return novo
+
+    return _mutar_fila(poe)
 
 
 def pr_orfao(url, head=None):
@@ -2214,7 +2246,12 @@ def pr_auto(url, head=None, wt=None, cwd=None):
         head = _head_do_pr(url)
         wt = wt or (_worktrees_por_ramo(cwd).get(head) if head and cwd else None)
     task = task_do_ramo(head, wt, read_events())
-    return pr_ligar(task, url) if task else pr_orfao(url, head)
+    if not task and head and head.startswith("merge/"):  # branch de conflito: merge/<feature>-<ambiente> é da task da feature
+        task = task_do_ramo(re.sub(r"-(development|staging|main)$", "", head[len("merge/"):]), wt, read_events())
+    item = pr_ligar(task, url) if task else pr_orfao(url, head)
+    if task:
+        fila_auto(item)
+    return item
 
 
 def pr_desligar(task, url):

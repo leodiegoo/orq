@@ -7420,6 +7420,62 @@ def test_it_should_list_a_pr_without_a_known_task_and_show_it_in_status():
     assert _prs_json(a)["sem_task"] == [] and "PR sem tarefa" not in a.orq("status").stdout
 
 
+def _fila_json(a):
+    return json.load(open(os.path.join(a.home, "fila.json")))["passos"]
+
+
+def _fila_auto_env():
+    a, p, w = _ambiente_46()
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T01:30:00Z", "tipo": "despacho", "run": "run_a", "task": "task_feat1", "dispatch": "ctx_w", "worktree": "current", "titulo": "Filtro por marca"}) + "\n")
+    corpo = "Corrige o filtro por marca que perdia a seleção.\n\nSegundo parágrafo que não entra."
+    _pr(a, PR1, base="development", body=corpo)
+    _pr(a, PR2, base="staging", body=corpo)
+    _pr(a, PR3, base="main", body=corpo)
+    return a, w
+
+
+def test_it_should_queue_the_development_and_staging_prs_of_a_task_in_one_step():
+    a, p = _fila_auto_env()
+    _pos_pr(a, p, saida=PR1 + "\n")
+    _pos_pr(a, p, saida=PR2 + "\n")
+    assert _fila_json(a) == [{"passo": 1, "nome": "Filtro por marca", "por": "Corrige o filtro por marca que perdia a seleção.", "prs": [1216, 1220], "feito": False}]
+
+
+def test_it_should_open_a_main_step_that_names_the_environments_already_merged():
+    a, p = _fila_auto_env()
+    _pos_pr(a, p, saida=PR1 + "\n")
+    _pos_pr(a, p, saida=PR2 + "\n")
+    _pr(a, PR1, state="MERGED", base="development")
+    _pr(a, PR2, state="MERGED", base="staging")
+    a.orq("pr", "poll")
+    _pos_pr(a, p, saida=PR3 + "\n")
+    assert [(x["passo"], x["nome"], x["por"], x["prs"]) for x in _fila_json(a)][1] == (2, "Filtro por marca para main", "development e staging já entraram (#1216, #1220)", [1230])
+
+
+def test_it_should_not_duplicate_the_queue_step_when_the_pr_is_reopened():
+    a, p = _fila_auto_env()
+    _pos_pr(a, p, saida=PR1 + "\n")
+    _pos_pr(a, p, saida=PR1 + "\n")
+    assert [x["prs"] for x in _fila_json(a)] == [[1216]]
+
+
+def test_it_should_put_a_merge_branch_pr_in_the_step_of_its_feature():
+    a, p = _fila_auto_env()
+    _despacho_por_nome(a, "task_feat1", "feat/w", "ctx_w2")
+    _pos_pr(a, p, saida=PR1 + "\n")
+    _pr(a, PR2, base="staging", body="x")
+    _pos_pr(a, p, cmd="gh pr create --head merge/feat/w-staging --base staging", saida=PR2 + "\n")
+    assert [x["prs"] for x in _fila_json(a)] == [[1216, 1220]]
+
+
+def test_it_should_keep_a_pr_without_a_task_out_of_the_queue():
+    a, p = _fila_auto_env()
+    a.set("workers.json", [])
+    _pos_pr(a, p, cmd="gh pr create --head feat/desconhecida --base development")
+    assert not os.path.exists(os.path.join(a.home, "fila.json")) and "PR sem tarefa" in a.orq("status").stdout
+
+
 def test_it_should_ignore_what_is_not_a_fresh_pr_create_or_not_the_coordinator():
     a, p, w = _ambiente_46()
     assert _pos_pr(a, w, cmd="gh pr view 1216", saida=PR1).stdout == ""
