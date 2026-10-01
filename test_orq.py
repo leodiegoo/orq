@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -7450,7 +7451,7 @@ def test_digest_grava_o_contrato_v1_no_caminho_fixo():
     assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
     d = json.load(open(r.stdout.splitlines()[0]))
     assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
-    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "features", "pendencias", "linha", "rodando"}, set(d)
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "features", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
     assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
     assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito"} and d["fila"][0]["feito"] is False
     assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
@@ -7464,6 +7465,41 @@ def test_digest_grava_o_contrato_v1_no_caminho_fixo():
     assert d["rodando"] == [{"titulo": "Ticket 47 digest", "estado": "fase-3", "desde": None}], d["rodando"]
     assert d["linha"] == [], "a linha só existe com o modo ausente ligado"
     assert "task_aaaa" not in json.dumps(d["rodando"]) and "ctx_1" not in json.dumps(d["rodando"]) and "term_1" not in json.dumps(d["rodando"])
+
+
+def _tk_status(a, nn, titulo, status, bloqueado=None, task=None, dias=0):
+    _tk_arq(a, nn, titulo, task, bloqueado)
+    caminho = os.path.join(a.env["ORQ_ISSUES"], f"{nn}-t.md")
+    txt = open(caminho).read().replace("Status: claimed", f"Status: {status}")
+    open(caminho, "w").write(txt)
+    t = time.time() - dias * 86400
+    os.utime(caminho, (t, t))
+
+
+def test_digest_lista_os_tickets_abertos_por_status_com_bloqueio_e_os_5_ultimos_resolvidos():
+    a = Amb(run="run_a")
+    _tk_status(a, "01", "Pronto", "ready-for-agent")
+    _tk_status(a, "02", "Espera o 01", "ready-for-agent", bloqueado="01")
+    _tk_status(a, "03", "Em curso", "claimed", task="task_aaaaaaaaaa")
+    _tk_status(a, "04", "Bloqueio ja resolvido", "ready-for-agent", bloqueado="05")
+    for n in range(5, 13):
+        _tk_status(a, f"{n:02d}", f"Feito {n}", "resolved", dias=20 - n)
+    _tk_status(a, "13", "Descartado", "wontfix")
+    os.makedirs(os.path.join(a.home, "..", "orq"), exist_ok=True)
+    a.set("../orq/aberto.json", _aberto_ag("rodando"))
+    t = _json_digest(a)["tickets_orq"]
+    ab = {x["num"]: x for x in t["abertos"]}
+    assert sorted(ab) == ["01", "02", "03", "04"], ab
+    assert [(ab[n]["grupo"], ab[n]["bloqueios"]) for n in ("01", "02", "03", "04")] == [
+        ("pronto", []), ("bloqueado", ["01"]), ("andamento", []), ("pronto", [])], ab
+    assert ab["03"]["task"] == "task_aaaaaaaaaa" and ab["03"]["worker"] == "fase-3" and ab["01"]["worker"] is None
+    assert ab["01"]["titulo"] == "Pronto" and ab["01"]["arquivo"].endswith("01-t.md")
+    assert [x["num"] for x in t["resolvidos"]] == ["12", "11", "10", "09", "08"], t["resolvidos"]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\d", t["resolvidos"][0]["em"])
+
+
+def test_digest_sem_tickets_manda_tickets_orq_vazio():
+    assert _json_digest(Amb(run="run_a"))["tickets_orq"] == {"abertos": [], "resolvidos": []}
 
 
 def test_digest_pendencia_em_depois_sai_marcada_no_contrato():

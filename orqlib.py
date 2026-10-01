@@ -2431,6 +2431,29 @@ def _linha_do_log(e, titulo):
     return None
 
 
+def tickets_do_painel(ts, aberto):
+    """`tickets_orq` do digest: os tickets abertos (não resolved nem wontfix) com grupo (pronto, bloqueado, andamento), os bloqueios ainda
+    abertos, a task e o estado do worker vivo dela; mais os 5 resolvidos mais recentes, com a data do arquivo."""
+    vivos = {a.get("task"): _estado_de_gente(a) for a in _dict(aberto).get("agentes") or [] if a.get("estado") in ANDA}
+    fechado = ("resolved", "wontfix")
+    abertos = {t["num"] for t in ts if t["status"] not in fechado}
+    saida = []
+    for t in ts:
+        if t["status"] in fechado:
+            continue
+        bloqueios = [n for n in t["blocked_by"] if n in abertos]
+        grupo = "bloqueado" if bloqueios else "andamento" if t["status"] == "claimed" else "pronto"
+        saida.append({"num": t["num"], "titulo": t["titulo"], "status": t["status"], "grupo": grupo, "bloqueios": bloqueios,
+                      "task": t["task"], "worker": vivos.get(t["task"]), "arquivo": t["arquivo"]})
+    feitos = []
+    for t in ts:
+        if t["status"] == "resolved":
+            with contextlib.suppress(OSError):
+                feitos.append({"num": t["num"], "titulo": t["titulo"], "em": datetime.fromtimestamp(os.path.getmtime(t["arquivo"])).strftime("%Y-%m-%d"),
+                               "arquivo": t["arquivo"]})
+    return {"abertos": saida, "resolvidos": sorted(feitos, key=lambda x: (x["em"], x["num"]), reverse=True)[:5]}
+
+
 def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos=None, ausente=None, e2e=None):
     """O digest como dados no formato do contrato (contratos/digest-v1.md) mais o que só a página usa. Só arquivos do orq: nada de gh nem de Orca.
 
@@ -2466,6 +2489,7 @@ def monta_digest(events, prs, pendencias, aberto, ts, fila, desde, agora, turnos
     linha = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= desde and (x := _linha_do_log(e, titulo))]
     return {"versao": 1, "geradoEm": agora.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(ausente), "desde": _dict(ausente).get("ligada_em")},
             "fila": declarada or derivada, "features": features, "pendencias": pend, "linha": linha[-DIGEST_LINHAS:], "rodando": rodando,
+            "tickets_orq": tickets_do_painel(ts, aberto),
             "pagina": {"data": agora.astimezone().strftime("%Y-%m-%d"), "gerado": agora.astimezone().strftime("%H:%M"), "desde": desde, "poll": prs.get("ultimo_poll"),
                        "linha_antes": max(0, len(linha) - DIGEST_LINHAS), "declarada": bool(declarada)}}
 
@@ -2474,7 +2498,8 @@ def digest_json(d):
     """O que vai para o atual.json: as chaves do contrato, cada passo só com as dele, e `linha` vazia com o modo ausente desligado."""
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito")} for p in d["fila"]],
-            "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"]}
+            "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
+            "tickets_orq": d["tickets_orq"]}
 
 
 def html_digest(d):
