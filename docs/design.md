@@ -594,6 +594,18 @@ First slices of per-project settings: the files and the harness (94), the Run's 
 - Divergences from the plan notes: the order has no "task harness" step because tasks carry no harness; `--worktree current` is not forced to `new-top-level` when the project was found only through the cwd (it would break a dispatch the user asked for explicitly, in the same repository); an explicit project or a Run project with `current` is refused instead of overridden.
 - Not yet: `AMBIENTES`/`fila_e2e`/`TRANSCRITOS` from the file, `modelos`, `sem_cota`, the project column in `orq agentes`, `orq iniciar`.
 
+## `orq iniciar`: one coordinator, from inside any harness (ticket 97)
+
+The user opens Claude or Codex in the orq's folder and that session is the coordinator. `orq iniciar` makes it one without creating a second coordinator: it only ever creates the manager's terminal.
+
+1. **Harness.** `--agente`, else the first ancestor process that is a harness (`harness_proprio`, reusing `_processos`). The inherited environment alone never decides: it can come from an older session. With no ancestor and no `--agente` it stops.
+2. **Hooks.** The calls of the harness's example file (`settings.hooks.example.json`, `codex.hooks.example.json`) must all be in its hooks file, compared as `event + orq.py hook <kind>` or `precompact.py [retomar]`, so `~` versus an absolute path and the trailing `codex` argument do not matter. A missing hook refuses before the Orca is touched, with the install command. Codex also gets the position-based trust check of ticket 77 (`hooks_codex_nao_confiados`), but only as a warning: trust is given in `/hooks` inside the same Codex, so refusing would block the only way to fix it.
+3. **Run.** `--run` runs `run-use`; `--objetivo` runs `run-create` (one Run per front); with neither it reuses the Run the coordinator already commands (`run_padrao`) and stops asking for `--objetivo` when there is none.
+4. **Manager.** No `gerente.json`, or the manager's terminal gone: a new terminal with `painel-agent-manager.sh`. A live manager is reused. The manager of another coordinator that still exists needs `--assumir`; one whose coordinator is gone is taken over, as in `gerente ligar`. Binding goes through `gerente_ligar`, so the Runs of the old manager are kept.
+5. **Status.** The same text as `orq status` (`texto_status`).
+
+Differences from the sketch in `firstmate-licoes-2.md`: there is no `--projeto` (the `projects/<name>.json` layer of ticket 94 is not in this branch's base, and `run_projeto` belongs to the next slice), and the Codex trust check warns instead of refusing. Limit: the harness is read from `ps`, so a harness wrapped by another launcher whose executable is not named `claude` or `codex` needs `--agente`.
+
 ## Design decisions
 
 Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.

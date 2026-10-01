@@ -67,6 +67,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - Report ingestion. `orq ingest` turns completed Orca automation runs and `worker_done` messages carrying a `reportPath` into entries, one per numbered action item in the report.
 - Heartbeat absorption. Orca notices whose mailbox holds only heartbeats are acknowledged and blocked before they reach the model, both in the prompt hook and in the manager loop.
 - Agent manager. `orq gerente ligar|desligar|subir|checar|absorver` binds Runs to a separate terminal and rotates through several Runs, because Orca binds one Run per terminal.
+- `orq iniciar [--objetivo "<front>" | --run <r>] [--agente claude|codex] [--assumir]` turns the Claude or Codex you already opened into the coordinator, and never opens another one. It finds the harness from the processes above it (the inherited environment can be stale), refuses if a hook of the orq is missing from that harness's hooks file (`~/.claude/settings.json`, `~/.codex/hooks.json`), warns when the Codex hooks are installed but not yet trusted, binds the Run (`--run`, a new one from `--objetivo`, or the one the coordinator already commands), raises the agent manager or reuses the live one, and prints `orq status`. A manager that belongs to another live coordinator needs `--assumir`. Running it twice changes nothing.
 - `orq despachar` starts a worker with an explicit model and effort, renames its tab, records the dispatch and links the entry.
 - Night mode. `orq noite ligar --ate HH:MM [--max-despachos N] [--max-falhas 3]` gives the coordinator a budget: the hooks tell it the rules for an unattended night, and `orq despachar` refuses past the end time, at the dispatch ceiling or after N failures in a row (`orq noite desligar` frees it). See `docs/design.md`, "Night mode". With night mode on, `orq hook externas` also denies push, PR merge, deploy, `--no-verify` and a few destructive commands (see "External-action guard"), and workers start without git prompts.
 - Morning card. `orq resumo --noite` prints, in at most 40 lines, how each dispatch of the last night ended (`entregue`, `falhou`, `parou: orçamento|decisão pendente|limite de uso`, `sem worker_done`), dirty worktrees, unpushed commits, parked decisions, whether the manager stayed alive, log gaps that may be sleep, and the commands to paste. `orq liberar` records the ending as `fim_dispatch`; `orq encerrar --parada orcamento|decisao|limite` names a stop. SessionStart adds the first line for 12 hours after the night ends.
@@ -162,7 +163,10 @@ Start the manager in a plain shell terminal inside Orca, then bind your Run to i
 echo $ORCA_TERMINAL_HANDLE          # term_manager
 ~/.claude/orq/painel-agent-manager.sh
 
-# coordinator, after `orca orchestration run-create --objective "Auth work"`
+# coordinator, one command (creates the Run, raises the manager, binds the Run to it)
+orq iniciar --objetivo "Auth work"
+
+# or by hand, after `orca orchestration run-create --objective "Auth work"`
 orq gerente ligar --terminal term_manager
 orq gerente desligar --run run_demo  # hand one Run back; without --run, all of them
 ```

@@ -244,6 +244,10 @@ elif cmd == "run-use" and os.path.exists(multi):
         v["handle"], v["gen"] = h, v["gen"] + 1
     json.dump(_b, open(multi, "w"))
     res = {"run": {"id": opt("--id"), "coordinator_handle": h}}
+elif cmd == "run-create":
+    # como o Orca real: o Run novo fica ligado ao terminal que chama
+    json.dump({"id": "run_novo", "handle": os.environ.get("ORCA_TERMINAL_HANDLE")}, open(os.path.join(d, "run.json"), "w"))
+    res = {"run": {"id": "run_novo", "objective": opt("--objective"), "coordinator_handle": os.environ.get("ORCA_TERMINAL_HANDLE")}}
 elif cmd == "run-use":
     # como o Orca real: liga o Run ao terminal que chama (a variável ORCA_TERMINAL_HANDLE), e o terminal anterior perde a ligação
     json.dump({"id": opt("--id"), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")}, open(os.path.join(d, "run.json"), "w"))
@@ -11154,6 +11158,124 @@ def test_ticket77_o_instalador_acrescenta_no_fim_e_nunca_reordena_os_grupos_exis
     vazio, add3 = orq_mod.mesclar_hooks_codex({}, exemplo)
     assert len(add3) == 2 and vazio["hooks"]["Stop"] == exemplo["hooks"]["Stop"]
     assert atual["hooks"]["Stop"] == [{"hooks": [{"command": "graphify hook-check"}]}], "a entrada não é mutada"
+
+
+# ---------- ticket 97: `orq iniciar` liga o coordenador que já está aberto, em qualquer harness ----------
+
+def _hooks_do_harness(a, agente, confiar=True):
+    """Instala no Amb os hooks do orq do harness (o exemplo do repositório); no Codex, com o trust de todos em [hooks.state] quando `confiar`."""
+    exemplo = os.path.join(os.path.dirname(ORQ), "settings.hooks.example.json" if agente == "claude" else "codex.hooks.example.json")
+    if agente == "claude":
+        shutil.copy(exemplo, a.env["ORQ_CLAUDE_SETTINGS"])
+        return
+    shutil.copy(exemplo, a.env["ORQ_CODEX_HOOKS"])
+    hooks = json.load(open(exemplo))["hooks"]
+    chaves = [f"{a.env['ORQ_CODEX_HOOKS']}:{re.sub(r'(?<!^)(?=[A-Z])', '_', ev).lower()}:{g}:{h}" for ev, gs in hooks.items() for g, grupo in enumerate(gs) for h, _ in enumerate(grupo["hooks"])]
+    open(a.env["ORQ_CODEX_CONFIG"], "w").write("[hooks.state]\n" + "".join(f'[hooks.state."{k}"]\ntrusted_hash = "sha256:ab"\n' for k in chaves if confiar))
+
+
+def _amb97(agente="claude", **env):
+    a = Amb(run=None, ORQ_CLAUDE_SETTINGS=os.path.join(tempfile.mkdtemp(), "settings.json"), **env)
+    a.set("terminals.json", ["term_coord"])
+    _hooks_do_harness(a, agente)
+    return a
+
+
+def test_ticket97_it_should_check_the_hooks_bind_a_new_run_raise_the_manager_and_print_the_status_in_claude():
+    a = _amb97("claude")
+    r = a.orq("iniciar", "--agente", "claude", "--objetivo", "Frente X")
+    assert r.returncode == 0, r.stderr
+    chamadas = _log(a, "calls.log")
+    (rc,) = [c for c in chamadas if c[0] == "run-create"]
+    assert rc[rc.index("--objective") + 1] == "Frente X"
+    (c,) = _log(a, "create.log")  # só o terminal do gerente: nenhum outro coordenador
+    assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}", c
+    assert not [x for x in chamadas if x[0] == "worker-start"]
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_novo"]}
+    assert "harness: claude" in r.stdout and "run_novo" in r.stdout and "term_ret1" in r.stdout, r.stdout
+    assert "hooks: ok" in r.stdout and "Run" in r.stdout.split("hooks: ok", 1)[1], "o status do orq vem depois da conferência"
+
+
+def test_ticket97_it_should_do_the_same_in_codex_with_the_trusted_hooks():
+    a = _amb97("codex")
+    r = a.orq("iniciar", "--agente", "codex", "--objetivo", "Frente Y")
+    assert r.returncode == 0, r.stderr
+    assert "harness: codex" in r.stdout and "hooks: ok" in r.stdout and "não confiados" not in r.stdout, r.stdout
+    assert json.load(open(os.path.join(a.home, "gerente.json")))["runs"] == ["run_novo"]
+    assert len(_log(a, "create.log")) == 1
+
+
+def test_ticket97_it_should_warn_but_go_on_when_codex_hooks_are_installed_and_not_trusted():
+    a = _amb97("codex")
+    _hooks_do_harness(a, "codex", confiar=False)
+    r = a.orq("iniciar", "--agente", "codex", "--objetivo", "Frente Y")
+    assert r.returncode == 0 and "hooks do orq não confiados no Codex: rode /hooks" in r.stdout, r
+    assert os.path.exists(os.path.join(a.home, "gerente.json"))
+
+
+def test_ticket97_it_should_refuse_before_touching_the_orca_when_a_hook_is_missing():
+    a = _amb97("claude")
+    cfg = json.load(open(a.env["ORQ_CLAUDE_SETTINGS"]))
+    cfg["hooks"]["Stop"] = []
+    json.dump(cfg, open(a.env["ORQ_CLAUDE_SETTINGS"], "w"))
+    r = a.orq("iniciar", "--agente", "claude", "--objetivo", "Frente X")
+    assert r.returncode == 1 and "Stop: orq.py hook stop" in r.stderr, r
+    assert not [c for c in _log(a, "calls.log") if c[0] in ("run-create", "run-use")] and not _log(a, "create.log")
+    sem = _amb97("claude")
+    os.remove(sem.env["ORQ_CLAUDE_SETTINGS"])
+    assert sem.orq("iniciar", "--agente", "claude", "--objetivo", "x").returncode == 1, "sem settings.json não há hook nenhum"
+
+
+def test_ticket97_it_should_need_an_objective_when_there_is_no_run_and_reuse_the_bound_one_otherwise():
+    a = _amb97("claude")
+    r = a.orq("iniciar", "--agente", "claude")
+    assert r.returncode == 1 and "--objetivo" in r.stderr and not _log(a, "create.log"), r
+    a.set("run.json", {"id": "run_a", "handle": "term_coord"})  # o coordenador já comanda um Run
+    r = a.orq("iniciar", "--agente", "claude")
+    assert r.returncode == 0, r.stderr
+    assert not [c for c in _log(a, "calls.log") if c[0] == "run-create"]
+    assert json.load(open(os.path.join(a.home, "gerente.json")))["runs"] == ["run_a"]
+
+
+def test_ticket97_it_should_bind_an_existing_run_with_run_and_stay_idempotent_on_the_second_call():
+    a = _amb97("claude")
+    assert a.orq("iniciar", "--agente", "claude", "--run", "run_b").returncode == 0
+    assert not [c for c in _log(a, "calls.log") if c[0] == "run-create"]
+    assert a.orq("iniciar", "--agente", "claude", "--run", "run_b").returncode == 0
+    assert len(_log(a, "create.log")) == 1, "o gerente vivo é reaproveitado, não sobe outro"
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_b"]}
+
+
+def test_ticket97_it_should_keep_the_manager_runs_and_raise_a_new_terminal_when_the_old_one_is_gone():
+    a = _amb97("claude")
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]}, open((os.makedirs(a.home, exist_ok=True), os.path.join(a.home, "gerente.json"))[1], "w"))
+    assert a.orq("iniciar", "--agente", "claude", "--run", "run_b").returncode == 0
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a", "run_b"]}
+
+
+def test_ticket97_it_should_refuse_another_live_coordinators_manager_without_assumir_and_take_it_with_assumir():
+    a = _amb97("claude")
+    a.set("terminals.json", ["term_coord", "term_outro", "term_ger"])
+    json.dump({"coordenador": "term_outro", "gerente": "term_ger", "runs": ["run_a"]}, open((os.makedirs(a.home, exist_ok=True), os.path.join(a.home, "gerente.json"))[1], "w"))
+    r = a.orq("iniciar", "--agente", "claude", "--run", "run_b")
+    assert r.returncode == 1 and "--assumir" in r.stderr and "term_outro" in r.stderr and not _log(a, "create.log"), r
+    assert a.orq("iniciar", "--agente", "claude", "--run", "run_b", "--assumir").returncode == 0
+    assert json.load(open(os.path.join(a.home, "gerente.json"))) == {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b"]}
+    assert not _log(a, "create.log"), "o gerente vivo de quem foi assumido continua"
+
+
+def test_ticket97_it_should_find_the_harness_from_the_ancestor_processes_and_ask_for_agente_when_there_is_none():
+    a = _amb97("codex")
+    procs = os.path.join(a.tmp.name, "ps.json")
+    json.dump([{"pid": os.getpid(), "ppid": 2000, "rss": 1, "cpu": 0, "args": "/bin/zsh -c orq", "cwd": None},
+               {"pid": 2000, "ppid": 1999, "rss": 1, "cpu": 0, "args": "/opt/homebrew/bin/codex --foo", "cwd": None},
+               {"pid": 1999, "ppid": 1, "rss": 1, "cpu": 0, "args": "-fish", "cwd": None}], open(procs, "w"))
+    r = a.orq("iniciar", "--objetivo", "Frente Z", ORQ_PROCESSOS=procs)
+    assert r.returncode == 0 and "harness: codex" in r.stdout, r
+    sem = _amb97("claude")
+    json.dump([{"pid": os.getpid(), "ppid": 1, "rss": 1, "cpu": 0, "args": "/bin/zsh", "cwd": None}], open(procs, "w"))
+    r = sem.orq("iniciar", "--objetivo", "Frente Z", ORQ_PROCESSOS=procs, CLAUDECODE="1")
+    assert r.returncode == 1 and "--agente" in r.stderr, "o ambiente herdado não decide sozinho"
 
 
 if __name__ == "__main__":

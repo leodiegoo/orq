@@ -150,6 +150,10 @@ HARNESS["codex"] = {
 HARNESSES = tuple(HARNESS)
 CODEX_CONFIG = os.environ.get("ORQ_CODEX_CONFIG") or os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "config.toml")
 CODEX_HOOKS = os.environ.get("ORQ_CODEX_HOOKS") or os.path.join(os.path.dirname(CODEX_CONFIG), "hooks.json")
+CLAUDE_SETTINGS = os.environ.get("ORQ_CLAUDE_SETTINGS") or os.path.expanduser("~/.claude/settings.json")
+HOOKS_ARQUIVO = {"claude": CLAUDE_SETTINGS, "codex": CODEX_HOOKS}  # onde cada harness lê os hooks; o exemplo de cada um fica ao lado do orq.py
+HOOKS_EXEMPLO = {"claude": "settings.hooks.example.json", "codex": "codex.hooks.example.json"}
+HOOK_ORQ = re.compile(r"orq\.py hook \w+|precompact\.py(?: retomar)?")  # a chamada de um hook do orq, sem o caminho nem o argumento do harness
 PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)  # o caminho de cada arquivo que o apply_patch do Codex mexe
 
 
@@ -5848,6 +5852,71 @@ def gerente_subir(forcar=False):
     return {**ev, "terminal": novo, "runs": g["runs"]}
 
 
+def texto_status():
+    """O que `orq status` imprime: o estado, os PRs, as worktrees, a fila de E2E e a máquina."""
+    return "\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
+
+
+# ---------- orq iniciar: o coordenador que já está aberto, em qualquer harness ----------
+
+def harness_proprio():
+    """claude ou codex: o primeiro ancestral deste processo que é um harness. O ambiente é herdado e pode vir velho, então só a ancestralidade
+    decide; None sem ancestral de harness (ou sem `ps`)."""
+    por_pid = {p["pid"]: p for p in _processos(com_cwd=False) or ()}
+    p, vistos = por_pid.get(os.getppid()), set()
+    while p and p["pid"] not in vistos:
+        if _agente_do(p):
+            return _agente_do(p)
+        vistos.add(p["pid"])
+        p = por_pid.get(p["ppid"])
+
+
+def _hooks_do_orq(arquivo):
+    """{(evento, chamada)} dos hooks do orq num settings.json ou hooks.json; vazio se o arquivo não existe ou não lê."""
+    try:
+        eventos = _dict(json.load(open(arquivo, encoding="utf-8")).get("hooks"))
+    except (OSError, ValueError):
+        return set()
+    return {(ev, m.group(0)) for ev, gs in eventos.items() for g in gs for h in _dict(g).get("hooks", []) if (m := HOOK_ORQ.search(_dict(h).get("command") or ""))}
+
+
+def hooks_faltando(agente):
+    """Os hooks do exemplo do harness (`settings.hooks.example.json`, `codex.hooks.example.json`) que o arquivo de hooks dele não tem, como `Evento: chamada`."""
+    exemplo = _hooks_do_orq(os.path.join(os.path.dirname(os.path.abspath(__file__)), HOOKS_EXEMPLO[agente]))
+    return [f"{ev}: {chamada}" for ev, chamada in sorted(exemplo - _hooks_do_orq(HOOKS_ARQUIVO[agente]))]
+
+
+def iniciar(agente=None, run=None, objetivo=None, assumir=False):
+    """Liga o coordenador que já está aberto (nunca abre outro): confere os hooks do harness, liga o Run (`run`, senão um novo com `objetivo`, senão o
+    que o coordenador já comanda), sobe ou reaproveita o agent manager e devolve o texto com o estado. Hook que falta recusa antes de tocar o Orca;
+    hook do Codex ainda não confiado só avisa (a confiança sai em `/hooks`, dentro do próprio Codex). Gerente vivo de outro coordenador vivo pede `assumir`."""
+    meu = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if not meu:
+        raise ValueError("fora de um terminal do Orca (sem ORCA_TERMINAL_HANDLE)")
+    agente = agente or harness_proprio()
+    if not agente:
+        raise ValueError("não achei claude nem codex entre os processos acima deste: passe --agente claude|codex")
+    if faltam := hooks_faltando(agente):
+        como = "orq hooks-codex" if agente == "codex" else f"mescle {HOOKS_EXEMPLO[agente]} em {CLAUDE_SETTINGS}"
+        raise ValueError(f"hooks do orq que faltam em {HOOKS_ARQUIVO[agente]}: {'; '.join(faltam)}. Instale com: {como}")
+    g, vivos = _gerente_cfg(), _terminais_vivos()
+    morto = lambda h: vivos is not None and h not in vivos  # noqa: E731 - sem lista confiável nada prova que morreu
+    if g and g.get("coordenador") != meu and not assumir and not morto(g["coordenador"]):
+        raise ValueError(f"o agent manager {g['gerente']} é do coordenador {g['coordenador']}, que ainda existe no Orca: --assumir toma o gerente e os Runs dele")
+    atual = run or (None if objetivo else run_padrao())
+    if not atual and not objetivo:
+        raise ValueError("sem Run ligado a este coordenador: passe --objetivo '<assunto da frente>' (Run novo) ou --run <r>")
+    if run:
+        orca("run-use", "--id", run, como=meu)
+    elif objetivo:
+        atual = orca("run-create", "--objective", objetivo, como=meu)["run"]["id"]
+    novo = not g or morto(g["gerente"])
+    terminal = _terminal_novo("agent manager", f"sh {shlex.quote(_path('painel-agent-manager.sh'))}") if novo else g["gerente"]
+    gerente_ligar(terminal, [atual], assumir=assumir)
+    return "\n".join([f"harness: {agente}", "hooks: ok", *filter(None, [aviso_hooks_codex() if agente == "codex" else ""]),
+                      f"Run: {atual}", f"gerente: {terminal} ({'novo' if novo else 'já existia'})", texto_status()])
+
+
 def gerente_desligar(run=None, assumir=False):
     """Devolve ao terminal do coordenador (`run-use` com o handle próprio) o Run `run`, ou todos, e tira do gerente.json.
 
@@ -7676,6 +7745,11 @@ def main(argv=None):
     rp.add_argument("msg_id")
     rp.add_argument("texto")
     sub.add_parser("status")
+    ini = sub.add_parser("iniciar", help="no coordenador já aberto (Claude ou Codex): confere os hooks, liga o Run, sobe ou assume o agent manager e imprime o status")
+    ini.add_argument("--agente", choices=HARNESSES, help="o harness deste coordenador; sem ele, o dos processos acima")
+    ini.add_argument("--run", help="liga este Run (run-use) em vez de criar um")
+    ini.add_argument("--objetivo", help="cria um Run novo com este objetivo (um Run por frente)")
+    ini.add_argument("--assumir", action="store_true", help="toma o agent manager de outro coordenador que ainda aparece no Orca, com os Runs dele")
     sub.add_parser("ocupadas", help="os caminhos das worktrees com worker vivo, um por linha (o limpar-mergeados não apaga essas)")
     rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
     rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
@@ -7881,7 +7955,9 @@ def main(argv=None):
             add = instalar_hooks_codex(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex.hooks.example.json"))
             print("\n".join([*(f"acrescentado: {ev} grupo {g}" for ev, g in add), aviso_hooks_codex() or "hooks do orq confiados no Codex"]))
         elif a.cmd == "status":
-            print("\n".join([estado(), *linhas_pr(), *linhas_worktrees(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])]))
+            print(texto_status())
+        elif a.cmd == "iniciar":
+            print(iniciar(a.agente, a.run, a.objetivo, a.assumir))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":
