@@ -9352,8 +9352,16 @@ def test_ticket79_pressao_por_memoria_livre_e_por_percentual_livre():
     assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "máquina folgada: sobe"
 
 
+def _sem_processos():
+    """Um ORQ_PROCESSOS com a lista vazia: o `orq` não chama o ps real."""
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    f.write("[]")
+    f.close()
+    return f.name
+
+
 def test_ticket79_pressao_com_pausar_sob_pressao_ligado_o_gerente_pausa_o_de_menor_prioridade_sozinho():
-    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2")
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", ORQ_PAUSA_ESPERA_S="6", ORQ_PAUSA_POLL_S="0.2", ORQ_PROCESSOS=_sem_processos())  # sem o ps real: com a máquina carregada ele passa de 1 s e o PAUSA.md deixa de ser novo
     _gerente(a)
     _pausa51(a)
     a.maquina(carga=40)
