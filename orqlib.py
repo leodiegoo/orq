@@ -5338,17 +5338,50 @@ def projeto_por_pasta(ps, pasta):
     return melhor and melhor[1]
 
 
-def projeto_do_despacho(nome=None):
-    """O projeto de um despacho: `--projeto` (recusa nome que não existe ou está inválido), senão o que contém o cwd (ou o checkout principal dele), senão None."""
+def projeto_do_run(run):
+    """O projeto que `orq run projeto` gravou para o Run (o último evento `run_projeto` dele), ou None."""
+    return next((e["projeto"] for e in reversed(read_events()) if e.get("tipo") == "run_projeto" and e.get("run") == run), None)
+
+
+def run_guardar_projeto(run, nome):
+    """Grava no log que o Run é do projeto `nome` (recusa nome sem arquivo ou com arquivo inválido). Vale para os despachos seguintes dele."""
     ps = projetos()
+    if nome not in ps:
+        raise ValueError(f"projeto {nome}: não existe {_path('projects')}/{nome}.json (orq projetos lista os que há)")
+    if ps[nome]["erro"]:
+        raise ValueError(f"projeto {nome}: arquivo inválido, {ps[nome]['erro']}")
+    return append_event({"tipo": "run_projeto", "run": run, "projeto": nome})
+
+
+def projeto_do_despacho(nome=None, run=None):
+    """O projeto de um despacho: `--projeto`, senão o que o Run guarda, senão o que contém o cwd (ou o checkout principal dele), senão None.
+
+    Nome pedido ou guardado no Run que não existe mais ou está inválido recusa: cair no cwd subiria o worker no repositório errado."""
+    ps = projetos()
+    origem = "--projeto" if nome else f"o Run {run}"
+    nome = nome or (projeto_do_run(run) if run else None)
     if nome:
         if nome not in ps:
-            raise ValueError(f"--projeto {nome}: não existe {_path('projects')}/{nome}.json (orq projetos lista os que há)")
+            raise ValueError(f"{origem} aponta para o projeto {nome}, mas {_path('projects')}/{nome}.json não existe (orq projetos lista os que há)")
         if ps[nome]["erro"]:
-            raise ValueError(f"--projeto {nome}: arquivo inválido, {ps[nome]['erro']}")
+            raise ValueError(f"{origem} aponta para o projeto {nome}, de arquivo inválido: {ps[nome]['erro']}")
         return nome
     cwd = os.path.realpath(os.getcwd())
     return projeto_por_pasta(ps, cwd) or (projeto_por_pasta(ps, _raiz_do_repo(cwd) or cwd) if ps else None)
+
+
+def pasta_do_repo(seletor):
+    """A pasta do repositório que um seletor do Orca aponta: `path:` direto; `id:` e `name:` pelo `orca repo list`. None se não achar."""
+    tipo, _, valor = seletor.partition(":")
+    if tipo == "path":
+        return os.path.realpath(os.path.expanduser(valor))
+    try:
+        repos = orca("list", area="repo")["repos"]
+    except (RuntimeError, subprocess.TimeoutExpired, KeyError, ValueError) as e:
+        log(f"pasta_do_repo: orca repo list falhou para {seletor}: {type(e).__name__}: {e}")
+        return None
+    campo = {"id": "id", "name": "displayName"}.get(tipo)
+    return next((os.path.realpath(r["path"]) for r in repos if campo and r.get(campo) == valor and r.get("path")), None)
 
 
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False):
@@ -5366,9 +5399,17 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     """
     if prioridade is not None and prioridade not in (1, 2, 3):
         raise ValueError("--prioridade espera 1 (alta), 2 ou 3 (baixa)")
-    if not agente:  # --agente ganha; sem ele vale o harness do projeto (--projeto ou o do cwd), e sem projeto o claude de sempre
-        p = projeto_do_despacho(projeto)
-        agente = projetos()[p]["harness"] if p else "claude"
+    explicito = bool(projeto or (run and projeto_do_run(run)))
+    projeto = projeto_do_despacho(projeto, run)  # --projeto, o do Run, o do cwd; sem nenhum, o despacho é o de sempre
+    repo = projetos()[projeto]["repo"] if projeto else None
+    if not agente:  # --agente ganha; sem ele vale o harness do projeto, e sem projeto o claude de sempre
+        agente = projetos()[projeto]["harness"] if projeto else "claude"
+    if repo and worktree == "current":
+        if explicito:
+            raise ValueError(f"o projeto {projeto} sobe o worker em worktree nova do repo dele: --worktree current ficaria no cwd (o Orca só aceita --repo com new-top-level)")
+        repo = None  # projeto achado só pelo cwd: o worktree current já é do mesmo repo
+    elif repo:
+        worktree = "new-top-level"
     if agente not in HARNESS:
         raise ValueError(f"--agente {agente}: o orq só despacha {', '.join(HARNESSES)}")
     if effort not in HARNESS[agente]["efforts"]:
@@ -5410,7 +5451,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         if motivo and _drenando:
             raise SemVaga(motivo)
         if motivo:
-            return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente)
+            return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto)
         if spec is not None and not spec.lstrip().startswith("#"):
             spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
         if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
@@ -5418,10 +5459,11 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
                     f"{resto.lstrip(chr(10))}")
         ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
-        confiadas = confiar_codex(_raiz_do_repo(os.getcwd())) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
+        pasta = (pasta_do_repo(repo) if repo else None) or os.getcwd()  # a raiz do repo do projeto; seletor sem pasta conhecida cai no cwd, como antes
+        confiadas = confiar_codex(_raiz_do_repo(pasta) or pasta) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
         args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", titulo]),
                 "--agent", agente, "--model", modelo, "--effort", effort]
-        for flag, val in (("--worktree", worktree), ("--name", name), ("--base-branch", base_branch)):
+        for flag, val in (("--worktree", worktree), ("--repo", repo), ("--name", name), ("--base-branch", base_branch)):
             if val:
                 args += [flag, val]
         try:
@@ -5439,7 +5481,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
                 log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
         ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort, "terminal": terminal,
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entrada} if entrada else {}),
-              **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {})}
+              **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(ambiente)} if ambiente else {}), **({"prioridade": prioridade} if prioridade else {}),
+              **({"projeto": projeto} if projeto else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if agente == "codex":
@@ -5933,12 +5976,12 @@ def fila_despacho_rm(id_, op="removido", **extra):
     return achado
 
 
-def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente):
+def _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto=None):
     """O despacho que não coube: guarda o pedido (o spec numa cópia em ORQ_HOME) e devolve a resposta do `orq despachar` no lugar dos ids do worker."""
     import uuid
     id_ = "fd" + uuid.uuid4().hex[:6]
     item = {"id": id_, "tipo": "despacho", "run": run, "titulo": titulo, "modelo": modelo, "effort": effort, "agente": agente, "prioridade": prio,
-            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"])) if v}}
+            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entrada), ("ticket", tk and tk["num"]), ("projeto", projeto)) if v}}
     if os.environ.get("ORQ_MATE"):  # o Run é do mate e só o terminal dele o comanda: o gerente drena com esse handle (ticket 80)
         item.update(coord=os.environ.get("ORCA_TERMINAL_HANDLE"), mate=os.environ["ORQ_MATE"])
     copia = _path(os.path.join(FILA_DESPACHO_SPECS, id_ + ".md"))
@@ -5984,7 +6027,7 @@ def _sobe_da_fila(it):
     if it["tipo"] == "despacho":
         with _como_coordenador(it):
             r = despachar(it["run"], it.get("titulo") if not it.get("ticket") else None, it.get("spec_arquivo"), it["modelo"], it["effort"], it.get("worktree"), it.get("nome"),
-                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", _drenando=True)
+                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", it.get("projeto"), _drenando=True)
         return f"fila: {it['titulo']} subiu ({r.get('dispatchId')})"
     d = it["dispatch"]
     cp = _checkpoint(d)
@@ -7515,6 +7558,9 @@ def main(argv=None):
     de.add_argument("--base-branch")
     de.add_argument("--entrada")
     de.add_argument("--prioridade", type=int, choices=[1, 2, 3], help="1 alta a 3 baixa; sem ela vale a da frente do título (segurança e produção 1, failover, diagnóstico e painel 3)")
+    rp = sub.add_parser("run", help="o que o orq guarda de um Run").add_subparsers(dest="op", required=True).add_parser("projeto", help="liga o Run a um projeto de ORQ_HOME/projects: os despachos dele sobem no repo do projeto")
+    rp.add_argument("nome")
+    rp.add_argument("--run")
     pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo)")
     pj.add_argument("--json", action="store_true")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
@@ -7721,6 +7767,11 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+        elif a.cmd == "run":
+            run = run_padrao(a.run)
+            if not run:
+                raise ValueError("sem Run ligado: passe --run")
+            print(json.dumps(run_guardar_projeto(run, a.nome), ensure_ascii=False))
         elif a.cmd == "projetos":
             ps = projetos()
             if a.json:

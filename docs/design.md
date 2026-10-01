@@ -569,15 +569,17 @@ orq runs with either harness as coordinator and dispatches workers of either. Th
 - No `/away` slash command: the `away` skill (`$away on`) or `orq away on`.
 - A Codex coordinator or worker whose orq hooks are untrusted is invisible to the turn tracking, like any agent without hooks.
 
-## Projects (ticket 94)
+## Projects (tickets 94 and 95)
 
-First slice of per-project settings: the files and the harness. The plan notes hold the whole design (`firstmate-licoes-2.md`, section 4); this is what the code does.
+First slices of per-project settings: the files and the harness (94), the Run's project and `--repo` (95). The plan notes hold the whole design (`firstmate-licoes-2.md`, section 4); this is what the code does.
 
 - `projects()` reads `ORQ_HOME/projects/*.json` on every call. A project is `{repo, harness, grupo, erro}`; `erro` is set for a file that is not JSON, has no `repo`, or whose `harness` is not in `HARNESS`. Those stay in the listing with the reason and are never resolved.
-- `projeto_do_despacho(nome)`: `--projeto` wins and raises on an unknown or invalid name; otherwise `projeto_por_pasta` takes the project whose `repo: path:<dir>` contains the cwd (then the cwd's main checkout, for linked worktrees), longest path first. `id:` and `name:` selectors have no folder to compare, so only `--projeto` reaches them.
+- `projeto_do_despacho(nome, run)`: `--projeto` wins, then `projeto_do_run(run)`; an unknown or invalid name raises, whichever of the two it came from. Otherwise `projeto_por_pasta` takes the project whose `repo: path:<dir>` contains the cwd (then the cwd's main checkout, for linked worktrees), longest path first. `id:` and `name:` selectors have no folder to compare, so only `--projeto` and the Run reach them.
 - `despachar(agente=None)` resolves the harness as `--agente`, project harness, `claude`. The `despacho` event already stores `agente`, so resume, relaunch and hibernate read it as before. A queued dispatch (ticket 79) is queued with the harness already resolved.
-- Divergences from the plan notes: the order has no "task harness" step because tasks carry no harness; and the Run's project (`run_projeto`) is left to the next slice, so the order is `--projeto`, cwd, none.
-- Not in this slice: `run_projeto`, `worker-start --repo`, `confiar_codex` on the project root, `AMBIENTES`/`fila_e2e`/`TRANSCRITOS` from the file, `modelos`, `sem_cota`, `orq iniciar`.
+- `run_projeto` (`run`, `projeto`) is appended by `orq run projeto`; `projeto_do_run` reads the last one. The plan notes say "at `run-create` or in `orq run projeto`": orq has no `run-create` wrapper (the coordinator calls Orca's directly), so only the command exists. Validation at write time keeps a typo out of the log, and the check at dispatch time covers a file removed later.
+- `despachar` (ticket 95): with a project, `repo` goes to `worker-start --repo`, the worktree becomes `new-top-level` (Orca refuses `--repo` with `current`), and the `despacho` event gets `projeto`. `pasta_do_repo(seletor)` gives `confiar_codex` the repository root: `path:` directly, `id:`/`name:` through `orca repo list` (`displayName` for `name:`), None when unknown, and then the cwd root is trusted as before. `_enfileirar_despacho` stores the resolved `projeto` and `worktree`, and `_sobe_da_fila` passes `projeto` back, because the manager drains from its own cwd and a `--projeto` given once is in no event.
+- Divergences from the plan notes: the order has no "task harness" step because tasks carry no harness; `--worktree current` is not forced to `new-top-level` when the project was found only through the cwd (it would break a dispatch the user asked for explicitly, in the same repository); an explicit project or a Run project with `current` is refused instead of overridden.
+- Not yet: `AMBIENTES`/`fila_e2e`/`TRANSCRITOS` from the file, `modelos`, `sem_cota`, the project column in `orq agentes`, `orq iniciar`.
 
 ## Design decisions
 

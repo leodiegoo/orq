@@ -251,9 +251,12 @@ One file per project in `~/.claude/orq/projects/<name>.json` (under `ORQ_HOME`, 
 
 - `repo` is the only required key: the Orca repository selector (`path:`, `id:` or `name:`). `harness` is the default of `orq despachar` for that project's workers (`claude` when absent). `grupo` is free text that only groups the listing. Other keys are ignored for now.
 - `orq projetos [--json]` lists them. A file that is not JSON, has no `repo` or names a harness orq does not dispatch shows as `inválido: <why>` and is never picked on its own.
-- `orq despachar` takes the harness from `--agente`, then from the project, then `claude`. The project is `--projeto <name>` (refuses a name that does not exist or is invalid, before any task is created) or, without it, the project whose `repo: path:` contains the current directory (or its main checkout), the longest path winning. With no project file the behavior is the old one. There is still one coordinator for all projects.
+- `orq run projeto <name> [--run <id>]` ties a Run to a project: it writes a `run_projeto` event (the last one for the Run wins; a name with no file, or an invalid file, is refused and nothing is written). Orca keeps only the Run's `--objective`, so the link lives in orq's log.
+- `orq despachar` resolves the project as `--projeto <name>`, then the Run's project, then the project whose `repo: path:` contains the current directory (or its main checkout), the longest path winning. A name that no longer exists or is invalid refuses before any task is created, also when it comes from the Run: falling back to the cwd would start the worker in the wrong repository. The harness is `--agente`, then the project's, then `claude`.
+- With a project the dispatch calls `worker-start --repo <selector> --worktree new-top-level`, writes `projeto` in the `despacho` event, and for a Codex worker trusts the project's repository root (a `path:` selector is used as is; `id:` and `name:` are looked up with `orca repo list`; an unknown one falls back to the cwd root as before). `--worktree current` is refused when the project came from `--projeto` or the Run (it would stay in the cwd); when only the cwd matched, `current` still works and no `--repo` is sent. A dispatch queued for lack of a machine slot (ticket 79) keeps the project, so the manager starts it in the right repository from any directory.
+- With no project file the behavior is the old one. There is still one coordinator for all projects.
 
-Not done yet: a Run remembering its project, `--repo` on `worker-start`, per-project environments, E2E queue and transcripts, the quota policy and `orq iniciar`. See `docs/design.md`, "Projects".
+Not done yet: per-project environments, E2E queue and transcripts, the quota policy, a project column in `orq agentes` and `orq iniciar`. See `docs/design.md`, "Projects".
 
 ## Claude Code and Codex
 

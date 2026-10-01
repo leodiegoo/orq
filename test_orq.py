@@ -147,6 +147,8 @@ if sys.argv[1] == "terminal":
     if opt("--terminal") in ler("terminals.json", []):
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal")}}})); sys.exit(0)
     print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}})); sys.exit(0)
+if sys.argv[1] == "repo" and cmd == "list":
+    print(json.dumps({"ok": True, "result": {"repos": ler("repos.json", [])}})); sys.exit(0)
 if sys.argv[1] == "tab":
     # orca tab create --url <url>: só o calls.log guarda a chamada (FAKE_FAIL=create a recusa)
     print(json.dumps({"ok": True, "result": {"tab": {"id": "tab_1", "url": opt("--url")}}})); sys.exit(0)
@@ -10891,6 +10893,139 @@ def test_ticket94_projeto_por_pasta_pega_o_repo_que_contem_o_cwd_e_o_mais_especi
     assert orq_mod.projeto_por_pasta(ps, "/r/mono/api") == "geral"
     assert orq_mod.projeto_por_pasta(ps, "/r/monolito") is None, "prefixo de texto não é pasta contida"
     assert orq_mod.projeto_por_pasta(ps, "/fora") is None
+
+
+# ---- ticket 95: o Run guarda o projeto e o despacho usa --repo ----
+
+def _repo95(a, nome="alvo"):
+    """Um repositório git de verdade fora do cwd dos testes: o alvo do projeto."""
+    p = os.path.join(a.tmp.name, nome)
+    os.makedirs(p)
+    subprocess.run(["git", "-C", p, "init", "-q"], check=True)
+    return os.path.realpath(p)
+
+
+def _confiadas95(cfg):
+    import tomllib
+    return set(tomllib.loads(open(cfg).read()).get("projects", {})) if os.path.exists(cfg) else set()
+
+
+def test_ticket95_run_projeto_grava_o_evento_e_recusa_projeto_que_nao_existe_ou_esta_invalido():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p"})
+    _projeto(a, "ruim", {"harness": "codex"})
+    r = a.orq("run", "projeto", "p", "--run", "run_a")
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "run_projeto"]
+    assert (ev["run"], ev["projeto"]) == ("run_a", "p"), ev
+    for nome in ("nao-existe", "ruim"):
+        r = a.orq("run", "projeto", nome, "--run", "run_a")
+        assert r.returncode != 0 and nome in r.stderr, (nome, r.stderr)
+    assert len([e for e in a.events() if e["tipo"] == "run_projeto"]) == 1, "o recusado não grava"
+
+
+def test_ticket95_despachar_no_run_com_projeto_passa_repo_e_worktree_nova_e_grava_o_projeto_no_evento():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p", "harness": "codex"})
+    assert a.orq("run", "projeto", "p", "--run", "run_a").returncode == 0
+    r = _despachar(a)
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
+    assert arg[arg.index("--agent") + 1] == "codex", "o harness também vem do projeto do Run"
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["projeto"] == "p" and ev["worktree"] == "new-top-level", ev
+
+
+def test_ticket95_projeto_explicito_ganha_do_projeto_do_run_e_o_ultimo_run_projeto_vale():
+    a = Amb(run="run_a")
+    for nome in ("um", "dois", "tres"):
+        _projeto(a, nome, {"repo": f"path:/r/{nome}"})
+    assert a.orq("run", "projeto", "um", "--run", "run_a").returncode == 0
+    assert a.orq("run", "projeto", "dois", "--run", "run_a").returncode == 0
+    assert _despachar(a).returncode == 0
+    assert _despachar(a, "--projeto", "tres").returncode == 0
+    assert [c[c.index("--repo") + 1] for c in _log(a, "started.log")] == ["path:/r/dois", "path:/r/tres"]
+
+
+def test_ticket95_projeto_de_outro_run_e_run_sem_projeto_despacham_como_hoje():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p"})
+    assert a.orq("run", "projeto", "p", "--run", "run_b").returncode == 0
+    assert _despachar(a).returncode == 0
+    (arg,) = _log(a, "started.log")
+    assert "--repo" not in arg and "--worktree" not in arg, arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert "projeto" not in ev, ev
+
+
+def test_ticket95_run_com_projeto_recusa_worktree_current_e_arquivo_que_sumiu_sem_subir_worker():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:/r/p"})
+    assert a.orq("run", "projeto", "p", "--run", "run_a").returncode == 0
+    r = _despachar(a, "--worktree", "current")
+    assert r.returncode != 0 and "new-top-level" in r.stderr, r.stderr
+    os.remove(os.path.join(a.home, "projects", "p.json"))
+    r = _despachar(a)
+    assert r.returncode != 0 and "run_a" in r.stderr, "o Run aponta para um projeto que não existe mais: não cai no cwd"
+    assert not _log(a, "started.log"), "nada subiu"
+
+
+def test_ticket95_codex_confia_a_raiz_do_repo_do_projeto_e_nao_a_do_cwd():
+    a = Amb(run="run_a")
+    alvo = _repo95(a)
+    _projeto(a, "p", {"repo": "path:" + os.path.join(alvo, "sub", ".."), "harness": "codex"})
+    cfg = os.path.join(a.tmp.name, "config.toml")
+    assert a.orq("run", "projeto", "p", "--run", "run_a").returncode == 0
+    r = _despachar(a, ORQ_CODEX_CONFIG=cfg)
+    assert r.returncode == 0, r.stderr
+    confiadas = _confiadas95(cfg)
+    assert alvo in confiadas, confiadas
+    raiz_cwd = os.path.realpath(os.path.dirname(subprocess.run(["git", "-C", AQUI, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                                                capture_output=True, text=True).stdout.strip()))
+    assert raiz_cwd not in confiadas, "a pasta do cwd não é o repositório do worker"
+
+
+def test_ticket95_seletor_id_ou_name_acha_a_pasta_pelo_orca_repo_list_para_confiar_no_codex():
+    a = Amb(run="run_a")
+    alvo = _repo95(a)
+    a.set("repos.json", [{"id": "rid1", "path": alvo, "displayName": "alvo"}, {"id": "rid2", "path": "/outro", "displayName": "outro"}])
+    cfg = os.path.join(a.tmp.name, "config.toml")
+    for sel in ("id:rid1", "name:alvo"):
+        _projeto(a, "p", {"repo": sel, "harness": "codex"})
+        assert a.orq("run", "projeto", "p", "--run", "run_a").returncode == 0
+        if os.path.exists(cfg):
+            os.remove(cfg)
+        assert _despachar(a, ORQ_CODEX_CONFIG=cfg).returncode == 0
+        assert alvo in _confiadas95(cfg), (sel, _confiadas95(cfg))
+    assert [c[c.index("--repo") + 1] for c in _log(a, "started.log")] == ["id:rid1", "name:alvo"]
+    _projeto(a, "p", {"repo": "id:inexistente", "harness": "codex"})
+    assert _despachar(a, ORQ_CODEX_CONFIG=cfg).returncode == 0, "seletor sem pasta não derruba o despacho"
+
+
+def test_ticket95_worker_claude_com_projeto_nao_mexe_no_config_do_codex():
+    a = Amb(run="run_a")
+    _projeto(a, "p", {"repo": "path:" + _repo95(a)})
+    cfg = os.path.join(a.tmp.name, "config.toml")
+    assert a.orq("run", "projeto", "p", "--run", "run_a").returncode == 0
+    assert _despachar(a, ORQ_CODEX_CONFIG=cfg).returncode == 0 and not os.path.exists(cfg)
+
+
+def test_ticket95_pedido_enfileirado_leva_o_projeto_e_o_worktree_para_o_gerente_subir_no_repo_certo():
+    a = _painel79()
+    _gerente(a)
+    _projeto(a, "p", {"repo": "path:/r/p"})
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(4)])
+    out = json.loads(a.orq("despachar", "--run", "run_a", "--titulo", "Ticket 05", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium",
+                           "--projeto", "p").stdout)
+    assert out["estado"] == "enfileirado", out
+    (it,) = _fila79(a)
+    assert (it["projeto"], it["worktree"]) == ("p", "new-top-level"), it
+    _libera79(a, "term_v0")
+    r = a.orq("gerente", "absorver")  # o gerente roda sem o --projeto e fora do repo: o projeto vem do item
+    assert r.returncode == 0 and "Ticket 05 subiu" in r.stdout, r.stdout + r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
 
 
 if __name__ == "__main__":
