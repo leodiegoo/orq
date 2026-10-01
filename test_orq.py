@@ -16,6 +16,7 @@ ORQ = os.path.join(AQUI, "orq.py")
 LIMPAR = os.path.join(AQUI, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
+os.environ["ORQ_AVISO_GAP_S"] = "0"  # a segunda leitura da caixa não espera nos testes
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")  # nenhum teste grava no ~/.codex/config.toml de verdade
 
@@ -401,7 +402,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.maquina()
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
@@ -8317,6 +8318,150 @@ def test_it_should_retry_the_pr_notice_when_the_coordinator_was_busy():
             assert orq_mod.pr_avisar() == [] and len(orq_mod.pr_avisar()) == 1
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+# ---------- ticket 82: o aviso não cai no meio do que o usuário digita ----------
+
+def _usuario_falou(home, minutos):
+    """Grava o prompt do usuário `minutos` atrás no events.jsonl."""
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(os.path.join(home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": ts, "tipo": "entrada", "origem": "usuario", "id": "e1", "texto": "oi"}) + "\n")
+
+
+def _fila_presa(fila):
+    _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=0)
+    return orq_mod.fila_e2e(fila, agora=40 * 60)
+
+
+def test_it_should_not_type_the_notices_while_the_user_talks_to_the_coordinator():
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append(t) or "enviado"
+        try:
+            _prs_avisar(home)
+            _usuario_falou(home, 2)
+            assert len(orq_mod.pr_avisar()) == 1 and orq_mod.avisa_fila_e2e(_fila_presa(fila)), "adiado já é entrega: o estado marca avisado"
+            assert enviados == [], f"o coordenador tem gente: {enviados}"
+            assert orq_mod.pr_avisar() == [] and orq_mod.avisos_entregar() == [] and enviados == []
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def test_it_should_show_the_untyped_notices_once_in_the_next_prompt_context():
+    a = Amb()
+    with tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        orq_mod.HOME, orq_mod.digita = a.home, lambda h, t: _nao_digita()
+        try:
+            os.makedirs(a.home, exist_ok=True)
+            json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(a.home, "gerente.json"), "w"))
+            _prs_avisar(a.home)
+            _usuario_falou(a.home, 1)
+            assert orq_mod.avisa_fila_e2e(_fila_presa(fila)) and len(orq_mod.pr_avisar()) == 1
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+    ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "não foram digitados" in ctx and "PRESA" in ctx, ctx
+    assert "PR #1216" not in ctx, "o PR aparece na linha PR: do resumo (a entrada), a fila não o repete"
+    ctx2 = json.loads(a.prompt("mais uma").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "não foram digitados" not in ctx2 and "PRESA" not in ctx2, "o aviso sai uma vez só"
+
+
+def _nao_digita():
+    raise AssertionError("o coordenador tem gente: nada é digitado")
+
+
+def test_it_should_type_a_queued_notice_only_after_the_coordinator_is_idle_for_n_minutes():
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        enviados = []
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: enviados.append(t) or "enviado"
+        try:
+            json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _usuario_falou(home, 2)
+            assert orq_mod.avisa_fila_e2e(_fila_presa(fila)) and enviados == []
+            assert orq_mod.avisos_entregar() == [] and enviados == [], "2 min: ainda tem gente"
+            os.remove(os.path.join(home, "events.jsonl"))
+            _usuario_falou(home, 30)
+            assert orq_mod.avisos_entregar() and len(enviados) == 1 and "PRESA" in enviados[0], enviados
+            assert orq_mod.avisos_entregar() == [] and len(enviados) == 1, "o aviso digitado sai da fila"
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def test_it_should_keep_the_queued_notice_when_the_idle_coordinator_is_busy_or_has_a_draft():
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fila:
+        antes, dig = orq_mod.HOME, orq_mod.digita
+        respostas = iter(["rascunho", "enviado"])
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: next(respostas)
+        try:
+            json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+            _usuario_falou(home, 2)
+            orq_mod.avisa_fila_e2e(_fila_presa(fila))
+            os.remove(os.path.join(home, "events.jsonl"))
+            _usuario_falou(home, 30)
+            assert orq_mod.avisos_entregar() == [] and len(orq_mod.avisos_entregar()) == 1
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+
+
+def test_it_should_not_type_when_the_second_read_finds_text_in_the_box():
+    antes, orca_ = orq_mod.terminal_livre, orq_mod.orca
+    chamadas, envios = [], []
+    orq_mod.orca = lambda *a, **k: envios.append(a) or {"send": {"prompt": {"observation": "unsupported"}}}
+    try:
+        respostas = iter([None, "rascunho"])
+        orq_mod.terminal_livre = lambda h: chamadas.append(h) or next(respostas)
+        assert orq_mod.digita("term_c", "orq: PR #1") == "rascunho" and len(chamadas) == 2 and envios == [], "o usuário começou a digitar entre as leituras"
+        respostas = iter([None, None])
+        assert orq_mod.digita("term_c", "orq: PR #1") == "enviado" and len(envios) == 1
+    finally:
+        orq_mod.terminal_livre, orq_mod.orca = antes, orca_
+
+
+def test_it_should_not_type_into_a_busy_worker_when_the_second_read_finds_a_draft():
+    orca_ = orq_mod.orca
+    telas = iter([{"tail": ["esc to interrupt"]}, {"tail": ["esc to interrupt"], "draft": "estou escrevendo"}])
+    envios = []
+    orq_mod.orca = lambda *a, **k: envios.append(a) or {"terminal": next(telas)} if a[0] == "read" else envios.append(a) or {}
+    try:
+        assert orq_mod.digita_ocupado("term_w", "orq: ajuste") == "ocupado" and not any(x[0] == "send" for x in envios)
+        telas = iter([{"tail": ["esc to interrupt"]}, {"tail": ["esc to interrupt"]}])
+        assert orq_mod.digita_ocupado("term_w", "orq: ajuste") == "ocupado_digitado"
+    finally:
+        orq_mod.orca = orca_
+
+
+def test_it_should_not_record_the_typed_orq_notices_as_user_prompts():
+    for t in ("orq: PR #1 entrou em staging", "orq: Fila do E2E: x PRESA", "orq: uso do plano, semana em 93%", "orq: worker task_a pergunta na tela"):
+        assert orq_mod.origem(t) == "aviso_orq", t
+    assert orq_mod.origem("orq: faça isso") == "usuario"
+
+
+def test_it_should_notify_on_macos_only_when_the_config_turns_it_on():
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fila:
+        antes, dig, env = orq_mod.HOME, orq_mod.digita, os.environ.get("ORQ_OSASCRIPT")
+        log = os.path.join(home, "osascript.log")
+        fake = os.path.join(home, "osascript")
+        open(fake, "w").write(f"#!/bin/sh\necho \"$@\" >> {log}\n")
+        os.chmod(fake, 0o755)
+        os.environ["ORQ_OSASCRIPT"] = fake
+        orq_mod.HOME, orq_mod.digita = home, lambda h, t: _nao_digita()
+        try:
+            _usuario_falou(home, 1)
+            cfg = {"coordenador": "term_c", "gerente": "term_g", "runs": []}
+            json.dump(cfg, open(os.path.join(home, "gerente.json"), "w"))
+            orq_mod.avisa_fila_e2e(_fila_presa(fila))
+            assert not os.path.exists(log), "desligada por padrão"
+            os.remove(os.path.join(home, "e2e-aviso.json"))
+            json.dump({**cfg, "notificar_macos": True}, open(os.path.join(home, "gerente.json"), "w"))
+            orq_mod.avisa_fila_e2e(orq_mod.fila_e2e(fila, agora=40 * 60))
+            assert "display notification" in open(log).read() and "PRESA" in open(log).read()
+        finally:
+            orq_mod.HOME, orq_mod.digita = antes, dig
+            os.environ.pop("ORQ_OSASCRIPT", None) if env is None else os.environ.__setitem__("ORQ_OSASCRIPT", env)
 
 
 # ---------- ticket 51: orçamento de uso do plano e pausa por prioridade ----------

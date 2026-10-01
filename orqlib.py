@@ -148,6 +148,9 @@ PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.
 
 # ---------- puras ----------
 
+AVISOS_ORQ = ("orq: PR ", "orq: Fila do E2E", "orq: uso do plano", "orq: worker ")  # o que o painel digita no coordenador (avisa_coordenador)
+
+
 def origem(prompt):
     """usuario | notificacao | orca | comando | resumo | despacho | aviso_orq (a linha que o painel digita quando um PR ligado é resolvido)."""
     p = (prompt or "").lstrip()
@@ -159,7 +162,7 @@ def origem(prompt):
         return "comando"
     if p.startswith("This session is being continued"):
         return "resumo"
-    if p.startswith("orq: PR "):
+    if p.startswith(AVISOS_ORQ):
         return "aviso_orq"
     if p.startswith("Please carry out this task from my Orca coordinator") or DESPACHO_SEM_ABERTURA.match(p):
         return "despacho"
@@ -2171,7 +2174,7 @@ def avisa_fila_e2e(f=None):
     arq = _path("e2e-aviso.json")
     if _dict(_read_json(arq)).get("ticket") == f["ticket"]:
         return []
-    if digita(g["coordenador"], f"orq: {linha_e2e(f)}.") != "enviado":
+    if avisa_coordenador(g["coordenador"], f"orq: {linha_e2e(f)}.") not in ("enviado", "adiado"):
         return []
     _write_json(arq, {"ticket": f["ticket"]})
     return [f"fila do E2E presa ({f['ticket']}): aviso digitado no coordenador"]
@@ -2251,7 +2254,7 @@ def pr_avisar():
         # reserva antes de digitar: dois painéis (ou um restart no meio da volta) não digitam o mesmo aviso duas vezes
         if not _mutar_prs(reserva):
             continue
-        if digita(g["coordenador"], f"orq: {i['texto']}. Entrada {i['entrada']}.") != "enviado":
+        if avisa_coordenador(g["coordenador"], f"orq: {i['texto']}. Entrada {i['entrada']}.", contexto=False) not in ("enviado", "adiado"):  # o "PR: …" do resumo já mostra
             _mutar_prs(lambda d, f=reserva: f(d, valor=False))  # nada foi digitado: a próxima volta tenta
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
@@ -2291,7 +2294,7 @@ def telas_avisar():
             continue
         ops = " ".join(f"{n}) {r}" for n, r in p["opcoes"])
         aviso = f"orq: worker {w.get('taskId')} pergunta na tela ({p['tipo']}): {p['texto']} Opções: {ops}. Responda com: orq responder-tela {w.get('taskId')} <opção>."
-        if digita(g["coordenador"], re.sub(r"\s+", " ", aviso)) != "enviado":
+        if avisa_coordenador(g["coordenador"], re.sub(r"\s+", " ", aviso)) not in ("enviado", "adiado"):
             break
         append_event({"tipo": "pergunta_tela", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": w.get("agentTerminalHandle"), "menu": p["tipo"], "texto": p["texto"], "opcoes": p["opcoes"]})
         linhas.append(f"{w.get('taskId')}: pergunta na tela ({p['tipo']}) avisada ao coordenador")
@@ -3261,6 +3264,8 @@ def hook_prompt(ev, run):
                             **({"com_aviso": True} if com_aviso else {})}, novo_id=True)
     checar_gerente_bg()
     ctx = estado(entrada)
+    if adiados := avisos_do_contexto():
+        ctx += "\n" + adiados
     refresh_bg()
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
 
@@ -3791,6 +3796,8 @@ def lavish_resposta(caminho):
 
 
 OCIOSO_MS = int(os.environ.get("ORQ_OCIOSO_MS") or 2000)  # quanto esperar o tui-idle de um terminal antes de dizer que ele está ocupado
+AVISO_GAP_S = float(os.environ.get("ORQ_AVISO_GAP_S") or 3)  # entre a leitura da caixa e a que vem logo antes do send: quem começou a digitar nesse meio-tempo barra o aviso (ticket 82)
+COORD_OCIOSO_MIN = float(os.environ.get("ORQ_COORD_OCIOSO_MIN") or 10)  # prompt do usuário mais novo que isso: o coordenador tem gente e nenhum aviso é digitado nele (ticket 82)
 STEER_ESPERA_S = float(os.environ.get("ORQ_STEER_ESPERA_S") or 2)  # o Orca digita o próprio aviso no worker ocupado: dá-lhe tempo antes de achar que ninguém avisou
 
 
@@ -3812,9 +3819,13 @@ def terminal_livre(handle):
 
 def digita(handle, texto):
     """Digita `texto` + Enter no agente do terminal, uma vez. Devolve `enviado`, `ocupado`/`rascunho` (nada foi digitado: repita depois) ou
-    `falhou` (o Orca recusou: nada foi digitado). O tui-idle sozinho engana (satisfeito no começo do turno e por uns 20 s de turno, conferido
+    `falhou` (o Orca recusou: nada foi digitado). A caixa é lida duas vezes, com AVISO_GAP_S entre elas (ticket 82: o usuário que começa a digitar
+    entre a leitura e o send tinha o aviso por cima do texto). O tui-idle sozinho engana (satisfeito no começo do turno e por uns 20 s de turno, conferido
     no Orca real em 29/09): quem barra de verdade é o `agent_prompt_blocked` do send, que o Orca devolve com o agente no meio do turno. Se o Orca observa a submissão e não viu o turno começar, manda um Enter sozinho (numa caixa
     vazia não faz nada); timeout do send conta como enviado, porque o texto pode ter saído e repetir empilharia."""
+    if motivo := terminal_livre(handle):
+        return motivo
+    time.sleep(AVISO_GAP_S)
     if motivo := terminal_livre(handle):
         return motivo
     espera = ("--wait-submit", "3")
@@ -3834,17 +3845,25 @@ def digita(handle, texto):
 STEER_AVISO_MAX = 300  # caracteres do ajuste que o aviso digitado no worker ocupado carrega
 
 
-def digita_ocupado(handle, texto):
-    """Digita `texto` + Enter num agente no meio do turno, para o Claude Code pôr na fila e injetar no próximo resultado de ferramenta (01/10).
-
-    Só com o spinner (`esc to interrupt`, igual nos dois agentes) na tela, sem rascunho na caixa e sem menu esperando resposta humana: nos três casos
-    devolve `ocupado` sem digitar. Devolve `ocupado_digitado`, ou `ocupado` se o Orca barrou o send (agent_prompt_blocked) ou falhou."""
+def _tela_de_turno_sem_rascunho(handle):
+    """True com o spinner (`esc to interrupt`, igual nos dois agentes) na tela, sem rascunho na caixa e sem menu esperando resposta humana."""
     try:
         t = orca("read", "--terminal", handle, "--screen", "--limit", str(TELA_LINHAS), area="terminal").get("terminal") or {}
     except (RuntimeError, subprocess.TimeoutExpired):
-        return "ocupado"
+        return False
     tail = t.get("tail") or []
-    if (t.get("draft") or "").strip() or any(tela_pergunta(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])):
+    return not ((t.get("draft") or "").strip() or any(tela_pergunta(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])))
+
+
+def digita_ocupado(handle, texto):
+    """Digita `texto` + Enter num agente no meio do turno, para o Claude Code pôr na fila e injetar no próximo resultado de ferramenta (01/10).
+
+    Só com o spinner na tela, sem rascunho na caixa e sem menu esperando resposta humana, nas duas leituras (AVISO_GAP_S entre elas, ticket 82):
+    nos três casos devolve `ocupado` sem digitar. Devolve `ocupado_digitado`, ou `ocupado` se o Orca barrou o send (agent_prompt_blocked) ou falhou."""
+    if not _tela_de_turno_sem_rascunho(handle):
+        return "ocupado"
+    time.sleep(AVISO_GAP_S)
+    if not _tela_de_turno_sem_rascunho(handle):
         return "ocupado"
     try:
         orca("send", "--terminal", handle, "--text", texto, "--enter", area="terminal", timeout=TIMEOUT_ORCA)
@@ -3853,6 +3872,58 @@ def digita_ocupado(handle, texto):
     except RuntimeError:
         return "ocupado"
     return "ocupado_digitado"
+
+
+def coordenador_ativo(agora=None):
+    """True se o último prompt do usuário é mais novo que COORD_OCIOSO_MIN: o coordenador tem gente, e digitar nele cai no meio do que ela escreve."""
+    agora = agora or datetime.now(timezone.utc)
+    ult = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts")), None)
+    return bool(ult) and (agora - _dt(ult)).total_seconds() < COORD_OCIOSO_MIN * 60
+
+
+def _notifica_mac(texto):
+    """Notificação nativa do macOS para o aviso que não foi digitado; desligada, só com `"notificar_macos": true` no gerente.json (ticket 82)."""
+    if not _gerente_cfg().get("notificar_macos"):
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([os.environ.get("ORQ_OSASCRIPT") or "osascript", "-e", f"display notification {json.dumps(texto, ensure_ascii=False)} with title \"orq\""],
+                       capture_output=True, timeout=3, check=False)
+
+
+def avisa_coordenador(handle, texto, contexto=True):
+    """Leva um aviso ao coordenador sem digitar por cima de quem escreve (ticket 82). Devolve `enviado` (coordenador ocioso: digitado), `adiado`
+    (coordenador com gente: o aviso espera na fila `avisos` do cursor, sai no contexto do próximo prompt, `contexto` False para o que o resumo já
+    mostra, e `avisos_entregar` o digita se o coordenador ficar ocioso) ou o motivo do `digita` (nada saiu: repita depois). `adiado` já é entrega."""
+    if not coordenador_ativo():
+        return digita(handle, texto)
+    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": texto, "ts": now(), "contexto": contexto}))
+    _notifica_mac(texto)
+    return "adiado"
+
+
+def avisos_entregar():
+    """Uma volta do painel: com o coordenador ocioso há mais de COORD_OCIOSO_MIN, digita o aviso mais antigo da fila (um por volta; o seguinte
+    encontra o coordenador ocupado). Devolve as linhas do painel."""
+    g, fila = _gerente_cfg(), _cursor_ro().get("avisos")
+    if not g.get("coordenador") or not isinstance(fila, list) or not fila or coordenador_ativo():
+        return []
+    a = fila[0]
+    if digita(g["coordenador"], a["texto"]) != "enviado":
+        return []
+    _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))
+    return ["aviso adiado digitado no coordenador, ocioso"]
+
+
+def avisos_do_contexto():
+    """Esvazia a fila `avisos` e devolve a linha do contexto do prompt do usuário com os avisos que não foram digitados (vazia sem nenhum)."""
+    pegos = []
+
+    def pega(c):
+        pegos.extend(c.pop("avisos", None) or [])
+    if _cursor_ro().get("avisos"):
+        _cursor_mut(pega)
+    textos = [re.sub(r"^orq: ", "", a["texto"]) for a in pegos if isinstance(a, dict) and a.get("contexto") and a.get("texto")]
+    return "[orq] Avisos que não foram digitados (você estava escrevendo): " + " | ".join(textos) if textos else ""
 
 
 def _aviso_ajuste(handle, ajuste):
@@ -5842,7 +5913,7 @@ def uso_avisar(agora=None, agente="claude"):
     if _dict(_cursor_ro().get(k)).get("chave") == chave:
         return []
     acao = {"pausa": "orq despachar recusa; rode orq pausar", "segura": "orq despachar recusa até a janela virar", "avisa": "evite despachar o que não for urgente"}[nivel]
-    if digita(g["coordenador"], f"orq: uso do plano{_do_harness(agente)}, {motivo}. {acao[0].upper() + acao[1:]}.") != "enviado":
+    if avisa_coordenador(g["coordenador"], f"orq: uso do plano{_do_harness(agente)}, {motivo}. {acao[0].upper() + acao[1:]}.") not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__(k, {"chave": chave, "ts": now()}))
     append_event({"tipo": "uso_aviso", "nivel": nivel, "motivo": motivo, **({"agente": agente} if agente != "claude" else {})})
@@ -6111,7 +6182,7 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - a tela ilegível não derruba o painel; a próxima volta tenta
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex")]
+        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex"), *avisos_entregar()]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     try:

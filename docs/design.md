@@ -426,7 +426,7 @@ flowchart LR
     P -->|"gh pr view, open items only"| S{"merged or closed?"}
     S -->|no| N["stays aberto"]
     S -->|yes| E["events: pr entrou/fechou<br/>entry origem pr, once"]
-    E --> A["pr_avisar()<br/>types one line into the coordinator"]
+    E --> A["pr_avisar()<br/>avisa_coordenador: types only into an idle coordinator"]
 ```
 
 The poll runs outside every hook (`orq hook prompt`, `stop`, `session` never call `gh`). The manager loop calls it on each lap and `orq pr poll` calls it by hand. It spaces `gh` calls by `PR_POLL_S` (120 s, `ORQ_PR_POLL_S`; `--forcar` skips the wait), does nothing when no request is open, holds a non-blocking `pr-poll.lock` so only one poll runs, and asks `gh` once per repository (`gh pr list --state all --json …`) for every linked request, never once per request; a request the list does not carry falls back to `gh pr view`. Besides the state, the answer gives `mergeable` and the check rollup, which the poll keeps on each open request as `ci` (`mergeable`, `falhas`, `rodando`, `lido_em`) and its branch as `head`. A `gh` that fails or is missing leaves the request open for the next round.
@@ -564,6 +564,25 @@ Measured with `Amb` (fake Orca, isolated `ORQ_HOME`), median of 15 runs, machine
 | coordinator `prompt` | 129 ms | 82 ms |
 
 The coordinator `prompt` hook was never under the ceiling (it calls Orca); the tests that hold 100 ms are the worker, `lugar` and `externas` ones.
+
+## Notices to the coordinator
+
+The manager types notices into the coordinator's terminal (a PR merged or closed, a stuck E2E queue, plan usage, a worker menu on screen). On 01/10 one of them landed in the middle of a sentence the user was typing: the box was read empty, the user started typing, and the `send` with Enter arrived after. Two changes close that race.
+
+**One channel per state.** `avisa_coordenador(handle, texto, contexto)` is the only way those four notices reach the coordinator.
+
+| Coordinator | What happens | Returns |
+|---|---|---|
+| user prompt less than `COORD_OCIOSO_MIN` minutes ago (10, `ORQ_COORD_OCIOSO_MIN`; read from the last `entrada` with `origem: usuario`) | nothing is typed; the notice goes to the `avisos` list in `cursor.json` | `adiado` |
+| idle longer than that | `digita`, with two reads of the box | `enviado`, or the reason (`ocupado`, `rascunho`): nothing was typed, the lap retries |
+
+`adiado` counts as delivered, so the callers mark their state (`e2e-aviso.json`, the PR's `avisado`, the usage key, the `pergunta_tela` event) and never repeat it. The next user prompt drains the list: `hook_prompt` appends `[orq] Avisos que não foram digitados (você estava escrevendo): …` to the context, once. The PR notice carries `contexto: false` because its entry is already in the summary's `PR: … [eN]` line; the other three show up in the context. If the user goes quiet instead, `avisos_entregar()` (every manager lap, after the notices) types the oldest queued notice once the coordinator has been idle for `COORD_OCIOSO_MIN`, one per lap; the next one finds the coordinator busy and waits. The lines the manager types start with `orq: PR `, `orq: Fila do E2E`, `orq: uso do plano` or `orq: worker ` (`AVISOS_ORQ`), and `origem()` classifies them as `aviso_orq`, so they never count as a user prompt and never keep the coordinator "active".
+
+**Two reads of the box.** `digita` and `digita_ocupado` read the box (or screen), wait `AVISO_GAP_S` (3 s, `ORQ_AVISO_GAP_S`) and read again right before the `send`; a draft in either read means nothing is typed. This covers workers too (ticket 74): nobody types there on purpose, but a user can.
+
+**macOS notification.** `"notificar_macos": true` in `gerente.json` also runs `osascript -e 'display notification …'` for each deferred notice (`ORQ_OSASCRIPT` replaces the binary in tests). It is off by default and never touches the terminal.
+
+Left as it was: the `You have N orchestration messages` line (`gerente_absorver`). It is how a `worker_done` wakes the coordinator, so it is not deferred by the 10-minute rule; it only gained the second read. Limit: the user can still type between the second read and the `send` (the gap closes to milliseconds, not to zero).
 
 ## E2E queue in `orq status`
 
