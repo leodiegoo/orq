@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10163,6 +10164,103 @@ def test_statusline_sai_0_e_imprime_o_hud_se_o_marcador_estiver_ilegivel():
     os.mkdir(os.path.join(a.home, "estado", "away"))  # diretório no lugar do arquivo: cat falha
     r = _statusline(a)
     assert r.returncode == 0 and r.stdout == "X\n", r
+
+
+def _repo_vivo55(branches):
+    """Repositório temporário no formato da instalação (orq.py, orqlib.py, scripts/integrar.py) com um branch por item de `branches`
+    ({nome: {arquivo: texto}}). Devolve (vivo, ambiente) com o ORQ_WT_DIR de teste."""
+    t = tempfile.mkdtemp()
+    vivo = os.path.join(t, "orq")
+    os.makedirs(os.path.join(vivo, "scripts"))
+    for f in ("orq.py", "orqlib.py", "falha_segura.py"):
+        shutil.copy(os.path.join(AQUI, f), vivo)
+    shutil.copy(os.path.join(AQUI, "scripts", "integrar.py"), os.path.join(vivo, "scripts"))
+    open(os.path.join(vivo, "nota.txt"), "w").write("a\nb\nc\n")
+    env = {**os.environ, "ORQ_WT_DIR": os.path.join(t, "orq-wt"), "ORQ_TESTES": "true", "ORQ_LOG": os.path.join(t, "orq.log"),
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    g = lambda *a, cwd=vivo: subprocess.run(["git", *a], cwd=cwd, env=env, capture_output=True, text=True, check=True)  # noqa: E731
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    for nome, arquivos in branches.items():
+        g("checkout", "-qb", nome, "main")
+        for arq, txt in arquivos.items():
+            open(os.path.join(vivo, arq), "w").write(txt)
+        g("add", "-A")
+        g("commit", "-qm", nome)
+    g("checkout", "-q", "main")
+    return vivo, env, g
+
+
+def test_ticket55_conflito_na_integracao_nao_toca_o_orq_instalado():
+    vivo, env, g = _repo_vivo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
+    antes = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, os.path.join(vivo, "scripts", "integrar.py"), "um", "dois"], cwd=vivo, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "conflito" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert g("rev-parse", "HEAD").stdout == antes and g("status", "--porcelain").stdout == "", "a main viva não anda nem suja"
+    wt = os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
+    assert "<<<<<<<" in open(os.path.join(wt, "nota.txt")).read(), "o conflito vive só na worktree"
+    # o conflito simulado também no orqlib.py da worktree: o orq instalado segue importando
+    open(os.path.join(wt, "orqlib.py"), "a").write("\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> dois\n")
+    ok = subprocess.run([sys.executable, os.path.join(vivo, "orq.py"), "--help"], capture_output=True, text=True)
+    assert ok.returncode == 0 and "SyntaxError" not in ok.stderr, ok.stderr
+    assert subprocess.run([sys.executable, "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())", os.path.join(wt, "orqlib.py")],
+                          capture_output=True).returncode != 0, "a worktree de fato quebrou"
+
+
+def test_ticket55_main_so_avanca_por_fast_forward_depois_dos_testes():
+    vivo, env, g = _repo_vivo55({"um": {"um.txt": "1\n"}, "dois": {"dois.txt": "2\n"}})
+    integrar = os.path.join(vivo, "scripts", "integrar.py")
+    antes = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrar, "um", "dois"], cwd=vivo, env={**env, "ORQ_TESTES": "false"}, capture_output=True, text=True)
+    assert r.returncode != 0 and g("rev-parse", "HEAD").stdout == antes, "teste vermelho: a main fica onde estava"
+    shutil.rmtree(os.path.join(env["ORQ_WT_DIR"], "integra-um-dois"))
+    g("worktree", "prune")
+    g("branch", "-D", "integra/um-dois")
+    r = subprocess.run([sys.executable, integrar, "um", "dois"], cwd=vivo, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert os.path.exists(os.path.join(vivo, "um.txt")) and os.path.exists(os.path.join(vivo, "dois.txt")), "a main viva recebeu os dois"
+    assert g("rev-list", "--merges", "-n1", "HEAD").stdout.strip(), "o merge foi feito na worktree e chegou por fast-forward"
+    assert not os.path.exists(os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")), "worktree removida depois de entrar"
+
+
+def test_ticket55_avancar_recusa_marcador_de_conflito_esquecido():
+    vivo, env, g = _repo_vivo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
+    integrar = os.path.join(vivo, "scripts", "integrar.py")
+    subprocess.run([sys.executable, integrar, "um", "dois"], cwd=vivo, env=env, capture_output=True, text=True)
+    wt = os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
+    g("add", "nota.txt", cwd=wt)  # "resolveu" sem tirar os marcadores
+    g("commit", "-qm", "merge", cwd=wt)
+    antes = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrar, "--avancar", wt], cwd=vivo, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "marcador" in r.stdout + r.stderr and g("rev-parse", "HEAD").stdout == antes, r.stdout + r.stderr
+    open(os.path.join(wt, "nota.txt"), "w").write("a\num e dois\nc\n")
+    g("commit", "-qam", "resolve", cwd=wt)
+    r = subprocess.run([sys.executable, integrar, "--avancar", wt], cwd=vivo, env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and open(os.path.join(vivo, "nota.txt")).read() == "a\num e dois\nc\n", r.stdout + r.stderr
+
+
+def test_ticket55_hook_com_import_falho_sai_0_sem_saida_e_grava_o_log():
+    t = tempfile.mkdtemp()
+    for f in ("orq.py", "precompact.py", "falha_segura.py"):
+        shutil.copy(os.path.join(AQUI, f), t)
+    open(os.path.join(t, "orqlib.py"), "w").write("<<<<<<< HEAD\nx = 1\n=======\nx = 2\n>>>>>>> outro\n")
+    log = os.path.join(t, "orq.log")
+    env = {**os.environ, "ORQ_LOG": log, "ORCA_TERMINAL_HANDLE": "term_x"}
+    for cmd in (["orq.py", "hook", "session"], ["orq.py", "hook", "prligar"], ["precompact.py"], ["precompact.py", "retomar"]):
+        r = subprocess.run([sys.executable, os.path.join(t, cmd[0]), *cmd[1:]], input="{}", env=env, capture_output=True, text=True)
+        assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), (cmd, r.returncode, r.stdout, r.stderr)
+    assert open(log).read().count("import falhou") == 4, open(log).read()
+    # o hook de limpeza importa o orq da instalação (HOME/.claude/orq)
+    casa = os.path.join(t, "casa")
+    os.makedirs(os.path.join(casa, ".claude", "orq"))
+    for f in ("orq.py", "orqlib.py", "falha_segura.py"):
+        shutil.copy(os.path.join(t, f), os.path.join(casa, ".claude", "orq"))
+    r = subprocess.run([sys.executable, LIMPAR], input="{}", env={**env, "HOME": casa}, capture_output=True, text=True)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), (r.returncode, r.stdout, r.stderr)
+    # fora de um hook o erro continua alto: quem digita `orq status` precisa ver a causa
+    r = subprocess.run([sys.executable, os.path.join(t, "orq.py"), "status"], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "SyntaxError" in r.stderr, r.stderr
 
 
 if __name__ == "__main__":

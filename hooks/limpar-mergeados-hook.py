@@ -11,7 +11,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.expanduser("~/.claude/orq"))
-from orq import coordenador, origem
+try:
+    from orq import coordenador, origem
+except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver falha_segura.py)
+    import falha_segura
+    falha_segura.sair("limpar-mergeados-hook.py", e)
 
 try:
     event = json.load(sys.stdin)

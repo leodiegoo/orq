@@ -15,7 +15,11 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import orq  # noqa: E402
+try:
+    import orq  # noqa: E402
+except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver falha_segura.py)
+    import falha_segura
+    falha_segura.sair("precompact.py", e)
 
 TETO_S = 20  # PreCompact: o hook tem o timeout do settings (30 s); o script para de coletar aos 20 s
 LINHAS_RETOMADA = 60  # o montar respeita orçamentos por seção que cabem aqui (M12); passou disso, a retomada avisa que cortou

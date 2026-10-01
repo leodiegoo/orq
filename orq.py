@@ -5,7 +5,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import orqlib  # noqa: E402
+try:
+    import orqlib  # noqa: E402
+except Exception as e:  # noqa: BLE001 - orqlib quebrado (conflito aberto, edição pela metade): o hook sai mudo, o comando mostra a causa
+    if sys.argv[1:2] != ["hook"]:
+        raise
+    import falha_segura
+    falha_segura.sair("orq.py hook", e)
 
 if __name__ == "__main__":
     sys.exit(orqlib.main())

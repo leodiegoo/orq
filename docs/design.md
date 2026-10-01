@@ -340,6 +340,17 @@ Three bugs seen on 2026-09-30.
 
 **`prligar` with several PRs from different branches.** A loop creating four PRs from two branches (`--head "$h"`) linked all four to the first branch. The hook now keeps a head only when it is sure: one literal `--head` for every URL (a loop over `--base`), one `--head` per URL in order, or the cwd's branch. A variable (`$h`) or a count that does not match leaves that URL without a head, and `orq pr auto <url> --cwd <dir>` asks `gh pr view <url> --json headRefName` (outside the hook, same 15 s ceiling as the poll) and finds the worktree of that branch from `<dir>`. If `gh` cannot answer, the PR lands in `sem_task` as before.
 
+## Integrating branches outside the live checkout (ticket 55)
+
+`~/.claude/orq` is the repository and the installation at once: the hooks, `orq` and the manager panel run whatever is checked out there. A `git merge` with open conflicts in it leaves `<<<<<<<` in `orqlib.py`, and then `orq` dies with a `SyntaxError` on every command, every worker's PreToolUse and PostToolUse hooks fail, and the panel and the digest stop.
+
+Two rules, one for each side of that failure:
+
+- **Integration happens in a worktree.** `scripts/integrar.py <branch>...` adds `~/.claude/orq-wt/integra-<branches>` (branch `integra/<branches>`, from the live `main`; `ORQ_WT_DIR` moves the directory), merges each branch there, runs the tests (`ORQ_TESTES`, default `python3 test_orq.py && python3 test_precompact.py`) and only then runs `git merge --ff-only` in the live checkout, which is the only way `main` moves. It then removes the worktree and the branch. On a conflict it stops with the live checkout untouched; the worker resolves in the worktree, commits, and runs `integrar.py --avancar <worktree>`, which refuses uncommitted changes, leftover conflict markers and red tests before it advances. If `main` moved meanwhile the fast-forward fails and the message says to merge `main` into the worktree and run `--avancar` again. Nobody runs `git merge`, `git pull` or `git checkout <branch>` in `~/.claude/orq`.
+- **A hook never breaks a turn.** The entry points `orq.py hook ...`, `precompact.py` and `hooks/limpar-mergeados-hook.py` wrap the import of `orqlib`; if it fails for any reason they call `falha_segura.sair`: exit 0, nothing on stdout or stderr, one line in `ORQ_LOG` (`~/.claude/logs/orq.log`). `falha_segura.py` imports nothing from orq, so it survives a broken `orqlib.py`. A command typed by hand (`orq status`) still raises, so the cause is visible. A silent hook means no guard for that call, so a line in `orq.log` with `import falhou` is the signal to look.
+
+Limits: the fast-forward rewrites the live files one by one, so a process that starts in that instant can read a mix of old and new (milliseconds, and both are green). The hooks outside the orq repo (`worker-routing-guard.py`) do not import the orq and are not wrapped.
+
 ## Worker idle state
 
 Orca reports a working state for a dispatch (`projection.stage.activity` in `worker-list` and `worker-show`, fed by the terminal title), but it stays `working` from the moment the input is accepted until `worker_done`. Measured on a live worker sitting at its prompt for 100 s, with the terminal title already showing the idle glyph, the field never changed. It cannot tell a working worker from one that stopped, so orq records the turns itself.
