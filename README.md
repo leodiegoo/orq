@@ -236,7 +236,7 @@ The coordinator can be a Claude Code or a Codex session, and each worker can be 
 - `orq uso [--agente codex]` reads each plan from `orca account list`, because the quotas are separate (Claude reads the HUD frame first);
 - `orq despachar` refuses a dispatch when the quota of the chosen harness is over the limit.
 
-The `worker-routing` skill maps the Claude roles to Codex models (Luna for clear, repeatable work, Sol for ambiguous or hard work, no Astra or Terra). OpenAI publishes no equivalence with Claude models; the table follows OpenAI's own model guidance (<https://learn.chatgpt.com/docs/models>) and independent benchmarks cited in the skill.
+The `worker-routing` skill maps the Claude roles to Codex models (Luna for clear, repeatable work, Sol for ambiguous or hard work, Astra low and medium only in place of Opus xhigh and max, no Terra). OpenAI publishes no equivalence with Claude models; the table follows OpenAI's own model guidance (<https://learn.chatgpt.com/docs/models>) and independent benchmarks cited in the skill.
 
 Weaker on Codex: there is no AskUserQuestion, so decisions go through text or the Lavish page and stay open until `orq pend done`; `/away` becomes the `away` skill; and an untrusted Codex hook does not run, which leaves that session invisible to orq's turn tracking. The details are in [`docs/design.md`](docs/design.md#harnesses-claude-code-and-codex-ticket-73).
 
