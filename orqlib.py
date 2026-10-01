@@ -6998,6 +6998,17 @@ def _do_harness(agente):
     return "" if agente == "claude" else f" do {agente.capitalize()}"
 
 
+def _propor_passagem(agente, agora=None):
+    """" Em vez de pausar, passe: orq passar <dispatch> --para <outro>; …" para cada worker de `agente` que o `orq pausar` escolheria, se o outro
+    harness está em `ok` (semana abaixo do `semana_avisa`). Vazio sem worker a pausar, sem número do outro ou com o outro também apertado."""
+    outro = next((h for h in HARNESSES if h != agente), None)
+    if not outro or uso_nivel(uso_plano(agora, outro), agora)[0] != "ok":
+        return ""
+    alvo, _ = _lista_pausa(agentes(), read_events(), set(), None, _dict(_cursor_ro().get("pausados")))
+    linhas = [f"orq passar {a['dispatch']} --para {outro}" for a in alvo if (a.get("agente") or "claude") == agente]
+    return f" Em vez de pausar, passe para o {outro.capitalize()}: {'; '.join(linhas)}." if linhas else ""
+
+
 def uso_avisar(agora=None, agente="claude"):
     """Digita no coordenador um aviso por (nível, janela): a primeira volta do painel depois de cruzar o limiar, e de novo só se o nível subir ou a
     janela virar. Coordenador ocupado: a próxima volta tenta. Devolve as linhas do painel."""
@@ -7014,7 +7025,10 @@ def uso_avisar(agora=None, agente="claude"):
     if _dict(_cursor_ro().get(k)).get("chave") == chave:
         return []
     acao = {"pausa": "orq despachar recusa; rode orq pausar", "segura": "orq despachar recusa até a janela virar", "avisa": "evite despachar o que não for urgente"}[nivel]
-    if avisa_coordenador(g["coordenador"], f"orq: uso do plano{_do_harness(agente)}, {motivo}. {acao[0].upper() + acao[1:]}.") not in ("enviado", "adiado"):
+    texto = f"orq: uso do plano{_do_harness(agente)}, {motivo}. {acao[0].upper() + acao[1:]}."
+    if nivel == "pausa":
+        texto += _propor_passagem(agente, agora)
+    if avisa_coordenador(g["coordenador"], texto) not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__(k, {"chave": chave, "ts": now()}))
     append_event({"tipo": "uso_aviso", "nivel": nivel, "motivo": motivo, **({"agente": agente} if agente != "claude" else {})})

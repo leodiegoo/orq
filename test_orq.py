@@ -11537,6 +11537,31 @@ def test_it_should_refuse_a_passagem_to_the_same_harness_or_without_worktree_han
         assert r.returncode == 1 and "worktree" in r.stderr, r
 
 
+def test_ticket91_aviso_de_pausa_propoe_passar_cada_worker_a_pausar_quando_o_outro_harness_tem_folga():
+    a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _pausa51(a)
+    _gerente(a)
+    _uso51(a, semana=93)
+    _conta73(a, codex_semana=40)
+    assert a.orq("gerente", "absorver").returncode == 0
+    (env,) = _log(a, "send.log")
+    txt = env[env.index("--text") + 1]
+    assert "orq passar ctx_term_f --para codex" in txt and "orq passar ctx_term_i --para codex" in txt, txt
+    assert "ctx_term_s" not in txt and "ctx_term_p" not in txt, "alta e em review não seriam pausados"
+
+
+def test_ticket91_aviso_de_pausa_sem_folga_no_outro_harness_ou_sem_numero_dele_segue_so_pausar():
+    for conta in (dict(codex_semana=86), dict(codex_semana=40, codex_5h=95), {}):
+        a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+        _pausa51(a)
+        _gerente(a)
+        _uso51(a, semana=93)
+        _conta73(a, **conta)
+        a.orq("gerente", "absorver")
+        env = _log(a, "send.log")[0]  # o do Claude vem primeiro; o do Codex, se houver, é outro aviso
+        assert "orq passar" not in env[env.index("--text") + 1] and "orq pausar" in env[env.index("--text") + 1], conta
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
