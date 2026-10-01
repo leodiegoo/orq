@@ -10773,13 +10773,17 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     a = Amb()
     _grupo(a, regras="/h/regras-orq.md")
     a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"], "term_ret2": ["esc to interrupt"]})
     r = a.orq("mate", "abrir", "orq")
     assert r.returncode == 0, r.stderr
     cria = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
     cmd = cria[0][cria[0].index("--command") + 1]
-    # o Orca só cria terminal em worktree que conhece (o ~/.claude/orq não é uma): abre no checkout atual e entra na pasta do grupo
-    assert cmd.startswith(f"cd {a.home}; env ORQ_MATE=orq claude --model claude-sonnet-5-5") and "/h/regras-orq.md" in cmd and "orq mate subir" in cmd, cmd
+    # o Orca só cria terminal em worktree que conhece (o ~/.claude/orq não é uma): abre no checkout atual e entra na pasta do grupo. O `claude '<prompt>'`
+    # num terminal do Orca roda não interativo e sai depois do turno (sdk-cli, visto em 01/10): o claude abre sem prompt e o charter é digitado
+    assert cmd == f"cd {a.home}; env ORQ_MATE=orq claude --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     assert "--worktree" not in cria[0], cria[0]
+    texto = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
+    assert "secondmate do grupo orq" in texto and "/h/regras-orq.md" in texto and "orq mate subir" in texto and "\n" not in texto, texto
     assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
     r = a.orq("mate", "abrir", "orq")
     assert r.returncode != 0 and "aberto" in r.stderr  # um mate por grupo
@@ -10791,7 +10795,9 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert a.orq("mate", "abrir", "orq").returncode == 0
     cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
     cmd = cmd[cmd.index("--command") + 1]
-    assert cmd.startswith(f"cd {a.home}; env ORQ_MATE=orq claude --resume sess-mate"), cmd
+    assert cmd == f"cd {a.home}; env ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
+    textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert len(textos) == 2 and "terminal caiu" in textos[1], textos
 
 
 def test_mate_nao_abre_pergunta_no_terminal():
@@ -10868,9 +10874,14 @@ def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
     assert "term_ret1" in open(os.path.join(a.fake, "close.log")).read()  # o shell que sobrou não recebe pedido
     m = _cursor(a)["mates"]["orq"]
     assert m.get("terminal") is None and m.get("sessao") is None, m
+    a.set("screens.json", {"term_ret2": ["⏵⏵ bypass permissions on"]})
     assert a.orq("mate", "abrir", "orq").returncode == 0
     cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
     assert "--resume" not in cmd[cmd.index("--command") + 1]  # o segundo abre com o charter
+    a.set("terminals.json", ["term_coord"])
+    r = a.orq("mate", "abrir", "orq")  # o claude não chega ao prompt (term_ret3 sem a caixa na tela): fecha em vez de deixar um shell
+    assert r.returncode != 0 and "não chegou ao prompt" in r.stderr, r.stderr
+    assert "term_ret3" in open(os.path.join(a.fake, "close.log")).read()
 
 
 def test_mate_pedir_responde_invalido_nao_grava_e_texto_vai_numa_linha():

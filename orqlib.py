@@ -135,8 +135,11 @@ HARNESS = {
     "claude": {
         "resume": lambda sessao, modelo, effort, msg: ["claude", "--resume", sessao, *(["--model", modelo] if modelo else []),
                                                        "--dangerously-skip-permissions", msg],
-        "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA},
+        "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA,
+                 "pronto": re.compile(r"bypass permissions|\? for shortcuts|esc to interrupt")},  # a caixa do claude está na tela: dá para digitar
         "abrir": lambda modelo, effort, msg: ["claude", *(["--model", modelo] if modelo else []), "--dangerously-skip-permissions", msg],  # o mate (ticket 80)
+        # `claude '<prompt>'` num terminal do Orca roda não interativo (sdk-cli) e sai depois do turno (visto em 01/10): o mate abre sem prompt e o texto é digitado
+        "digita_prompt": True,
         "efforts": ("low", "medium", "high", "xhigh", "max"),
         "filho": re.compile(r"/shell-snapshots/"),  # o comando do Bash tool (E2E, teste, build, shell em segundo plano) sobe como `zsh -c source ~/.claude/shell-snapshots/…`, filho do claude
     },
@@ -4223,19 +4226,37 @@ def mate_subir(tipo, texto, corr=None, link=None, grupo=None):
 
 
 def _comando_mate(grupo, cfg, sessao, cwd=None):
+    """(comando do terminal, texto a digitar depois que o agente subir, ou None se o texto vai na linha de comando)."""
     agente, modelo = cfg.get("harness") or "claude", cfg.get("modelo")
     if agente not in HARNESS:
         raise ValueError(f"harness {agente} do grupo {grupo}: o orq só abre {', '.join(HARNESSES)}")
     if sessao:
-        cmd = HARNESS[agente]["resume"](sessao, modelo, cfg.get("effort"), MSG_MATE_VOLTA.format(grupo=grupo))
+        texto = MSG_MATE_VOLTA.format(grupo=grupo)
     else:
         regras = f"\nLeia antes as regras do grupo em {cfg['regras']}." if cfg.get("regras") else ""
-        charter = CHARTER_MATE.format(grupo=grupo, projetos=", ".join(cfg.get("projetos") or []) or "nenhum", regras=regras)
-        cmd = HARNESS[agente]["abrir"](modelo, cfg.get("effort"), charter)
-    comando = shlex.join(["env", f"ORQ_MATE={grupo}", *cmd])
+        texto = CHARTER_MATE.format(grupo=grupo, projetos=", ".join(cfg.get("projetos") or []) or "nenhum", regras=regras)
+    digitado = HARNESS[agente].get("digita_prompt")
+    msg = None if digitado else texto
+    cmd = HARNESS[agente]["resume"](sessao, modelo, cfg.get("effort"), msg) if sessao else HARNESS[agente]["abrir"](modelo, cfg.get("effort"), msg)
+    comando = shlex.join(["env", f"ORQ_MATE={grupo}", *(x for x in cmd if x is not None)])
     # o Orca só cria terminal numa worktree que conhece, e a pasta do grupo (o ~/.claude/orq) não é uma: o terminal abre no checkout atual e entra nela.
     # `cd x; y` vale no fish, no zsh e no bash; o resume do claude só acha a sessão no cwd onde ela nasceu
-    return f"cd {shlex.quote(cwd)}; {comando}" if cwd else comando
+    return (f"cd {shlex.quote(cwd)}; {comando}" if cwd else comando), (" ".join(texto.split()) if digitado else None)  # a quebra de linha submeteria no meio
+
+
+def _agente_pronto(handle, agente):
+    """Espera, até RETOMAR_ESPERA_S, a caixa do agente aparecer no terminal novo (HARNESS tela pronto). False com a tela de falha (sessão que não existe) ou sem
+    a caixa no prazo: digitar antes cairia no shell."""
+    fim, tela_ = time.time() + RETOMAR_ESPERA_S, HARNESS[agente]["tela"]
+    while True:
+        tela = "\n".join(orca("read", "--terminal", handle, "--screen", area="terminal")["terminal"].get("tail") or [])
+        if any(f in tela for f in tela_["falha"]):
+            return False
+        if tela_.get("pronto") and tela_["pronto"].search(tela):
+            return True
+        if time.time() >= fim:
+            return False
+        time.sleep(1)
 
 
 def mate_abrir(grupo):
@@ -4250,14 +4271,19 @@ def mate_abrir(grupo):
         raise ValueError(f"o mate {grupo} já está aberto no terminal {m['terminal']}")
     cwd = m.get("cwd") or cfg.get("cwd") or next(iter(cfg.get("projetos") or []), None)
     cwd = cwd and os.path.expanduser(cwd)
-    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", _comando_mate(grupo, cfg, m.get("sessao"), cwd))
-    if m.get("sessao") and not _voltou(novo, cfg.get("harness") or "claude"):
-        # sessão que não volta deixa um shell: o gerente digitaria o pedido nele. Fecha, esquece a sessão, e o próximo abrir sobe com o charter
+    agente = cfg.get("harness") or "claude"
+    comando, texto = _comando_mate(grupo, cfg, m.get("sessao"), cwd)
+    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", comando)
+    ok = _agente_pronto(novo, agente) and digita(novo, texto) == "enviado" if texto else not m.get("sessao") or _voltou(novo, agente)
+    if not ok:
+        # sessão que não volta, ou agente que não subiu, deixa um shell: o gerente digitaria o pedido nele. Fecha e, se era resume, esquece a sessão
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
             orca("close", "--terminal", novo, area="terminal")
-        _mate_mut(grupo, terminal=None, sessao=None)
-        append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": False, "falhou": "a sessão não voltou"})
-        raise ValueError(f"a sessão {m['sessao']} do mate {grupo} não voltou; terminal fechado. Rode orq mate abrir {grupo} de novo para abrir com o charter")
+        _mate_mut(grupo, terminal=None, **({"sessao": None} if m.get("sessao") else {}))
+        motivo = "a sessão não voltou" if m.get("sessao") else "o agente não chegou ao prompt"
+        append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": False, "falhou": motivo})
+        raise ValueError(f"mate {grupo}: {motivo} em {RETOMAR_ESPERA_S:.0f} s; terminal fechado. Rode orq mate abrir {grupo} de novo"
+                         + (" para abrir com o charter" if m.get("sessao") else ""))
     _mate_mut(grupo, terminal=novo, morto=None, **({"cwd": cwd} if cwd else {}))
     append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao")), "anterior": m.get("terminal")})
     return {"grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao"))}
