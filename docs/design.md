@@ -68,7 +68,8 @@ The model does the classifying. The code only checks that a classification was r
 | `ausente_ligar`, `ausente_desligar` | `orq ausente` |
 | `resposta_coordenador` | the coordinator's Stop hook while away mode is on: `texto`, `sessao` |
 | `fila` (`op: add/feito/rm`) | `orq fila` |
-| `controle` | `interromper`, `encerrar` and `relancar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
+| `controle` | `interromper`, `encerrar`, `relancar` and `passar`: `acao`, `resultado` (`iniciado`, `ok`, `parcial`, `revertido`, `falhou`), `dispatch`, `novo_dispatch`, `motivo`, `nota`, `head`, `sujo`, `worktree_intacta` |
+| `passagem` | `orq passar`: `de` (old dispatch), `agente_de`, `para` (new dispatch), `agente_para`, `head`, `sujo`, `pacote` (sha of `PASSAGEM.md`, 12 hex), `escrito_por` (`orq`), `aceita` (the new worker's first turn was seen), `task`, `run` |
 | `gate_aviso`, `binding_perdido`, `alerta`, `alerta_visto` | Stop hook, prompt hook, ingest |
 | `mate` (`op: abrir`), `mate_pedido`, `mate_entregue`, `mate_reenvio`, `mate_escalado` | `orq mate abrir`, `orq mate pedir`, the manager loop (`mate_volta`) |
 
@@ -244,6 +245,24 @@ Three commands act on a worker that is running (or, for `encerrar` and `relancar
 Going back after the stop is limited to what can be brought back. If the requested `--modelo`/`--effort` does not start, the worker starts with the old profile (`revertido`, the first error in `erro` and in the warning). If nothing starts (`falhou`), the old terminal stays retained for inspection, the worktree is untouched and the error prints `orq relancar <dispatch> --nota '<the note>'`; running it again skips the stop, because the dispatch is already settled. A `worker-start` that times out is never retried, since a second worker would land in the same worktree.
 
 An Orca task keeps its spec, so the note cannot go into it. It goes as the first steer of the new worker (`Relançado depois de <dispatch>. O que mudou: …`), with the usual notice and read check. If that steer or the release of the old dispatch fails, the event still says `ok` and the warning names the command to run.
+
+## Handing a worker to the other harness (ticket 87)
+
+`orq passar <dispatch> --para codex|claude [--modelo m --effort e]` continues a worker on the other harness when the first one hit its plan limit. It copies the shape of `relancar` and adds the package. The analysis behind it (ai-memory, lessons 1 to 7) lives in the plan notes.
+
+Order: (1) refuse before touching anything: `--para` is the same harness, worktree gone, Run not bound to the coordinator, no equivalent profile, `uso_checar` of the target harness at the pause level, no machine slot (`maquina_vaga`, the dispatch itself leaves the count), task missing; (2) `controle passar iniciado`; (3) `worker-stop` of the old dispatch if it still runs; (4) write `PASSAGEM.md`; (5) trust the folder for Codex (`confiar_codex`); (6) `worker-start --run --task --retry-of <old> --worktree <same> --agent <other> --model --effort`; (7) wait for the first turn of the new dispatch (`_conferir_inicio`: hook prompt, or the task title on screen, with one Enter); (8) `steer` "read PASSAGEM.md first" and `liberar` of the old terminal; (9) event `passagem`, then `controle passar ok`.
+
+**Who runs it.** Like `relancar`, `passar` runs from the terminal that Orca binds to the worker's Run (the consumer): `worker-start` and `steer` fail with `consumer_fenced` anywhere else, and the check (`run_do_coordenador`) refuses first with the `run-use` hint. A worker terminal cannot run it. The real proof (Claude to Codex, ending in `worker_done`) only worked once the coordinator had the proof Run bound to its own terminal.
+
+**Profile.** `PASSAGEM_PERFIL` follows the `worker-routing` table: Sonnet low/medium/high/xhigh/max → Luna low/medium/xhigh/max and Sol low; Opus low/medium/high → Sol; Opus xhigh/max → Astra low/medium. Back to Claude: Luna → Sonnet, Sol → Opus (Sol low → Sonnet high), Astra low/medium → Opus xhigh/max. Haiku, Fable and any pair outside the table are refused with "pass --modelo and --effort".
+
+**The package.** `PASSAGEM.md` in the worktree root, written by the orq from facts, so the old worker needs no turn (path B of the design; the old worker never writes it). First line `<!-- orq-passagem v1 de=<old dispatch> para=<harness> -->`. Sections, action before prose: Próximo passo, Perguntas abertas (`decisao` pendências bound to the task), Decisões já tomadas (the task's `steer` events and the dispatch's `resposta_worker`), Estado do git (head, branch, `status --porcelain`, commits and `diff --stat` since `origin/main`), Relatório parcial (last heartbeat phase, `PAUSA.md`, `relatorio-final.md`), Fim do transcrito, Onde está o resto (transcript path and the `orca search --agent <old>` command), Como agir. The end of the transcript is the last 20,000 characters of visible user and assistant messages (6,000 per message; no reasoning, meta records, tool calls or Codex environment context), between `<!-- historico-inicio -->` and `<!-- historico-fim -->`, with a line before it saying it is history and not instruction; `<!--` inside it is escaped. The transcript comes from `turnos.json` (`transcrito`) or Orca's session index. The file goes into the repository's `info/exclude` so the new worker does not commit it. The spec is not in it: the Orca task keeps it and `worker-start` delivers it again.
+
+**Marker difference.** The design put the new dispatch id in the first line. The package is written before `worker-start`, so the new id does not exist yet; the line carries the harness, and the `passagem` event carries both dispatch ids.
+
+**Failure.** After the stop there is no going back to the harness that hit the limit. If `worker-start` fails (`controle passar falhou`, `passo: worker-start`), the old dispatch stays stopped with its terminal retained, the worktree and `PASSAGEM.md` stay, and the error prints `orq passar <dispatch> --para <harness>`; running it again skips the stop. A `worker-start` that times out is never retried. A failed steer or release leaves `ok` with the command in `aviso`.
+
+**Not in this ticket.** Perceiving the limit on the worker's screen, the neutral `orq transcrito` reader with tool calls, the 20-second package for a worker with no turn, the open-passage alert in `orq status`, and the coordinator's own handoff are tickets 2 to 7 of the analysis. Here the end of the transcript is messages only.
 
 ## Resuming after a crash
 

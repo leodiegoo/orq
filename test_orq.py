@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Testes do orq (fatias 1 e 3). Rodam com `python3 test_orq.py`: ORQ_HOME num diretório temporário e ORQ_ORCA num Orca falso."""
+import hashlib
 import json
 import os
 import pathlib
@@ -11276,6 +11277,155 @@ def test_ticket97_it_should_find_the_harness_from_the_ancestor_processes_and_ask
     json.dump([{"pid": os.getpid(), "ppid": 1, "rss": 1, "cpu": 0, "args": "/bin/zsh", "cwd": None}], open(procs, "w"))
     r = sem.orq("iniciar", "--objetivo", "Frente Z", ORQ_PROCESSOS=procs, CLAUDECODE="1")
     assert r.returncode == 1 and "--agente" in r.stderr, "o ambiente herdado não decide sozinho"
+
+
+# ---------- ticket 87: orq passar, um worker continua em outro harness na mesma worktree ----------
+
+def _passagem_env(a, repo, **w):
+    """Um worker Claude (Sonnet high) rodando na worktree; o Claude está no limite da semana e o Codex em 40%."""
+    _ctl_env(a, repo, **w)
+    _conta73(a, codex_semana=40, claude_semana=95)
+
+
+def _flag(cmd, nome):
+    return cmd[cmd.index(nome) + 1]
+
+
+def test_it_should_hand_a_claude_worker_over_to_codex_in_the_same_worktree_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo)
+        antes = _head(repo)
+        assert a.orq("steer", "task_w1", "use a branch nova").returncode == 0
+        a.set("../pendencias.json", {"itens": [{"id": "indice-novo", "tipo": "decisao", "titulo": "Qual índice criar?", "task": "task_w1"}, {"id": "outra", "tipo": "decisao", "titulo": "de outra task", "task": "task_x"}]})
+        r = a.orq("passar", "ctx_w1", "--para", "codex")
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["novo_dispatch"] == "ctx_term_novo2" and out["resultado"] == "ok", out
+        (parar,) = _log(a, "stopped.log")
+        assert parar[:3] == ["worker-stop", "--dispatch", "ctx_w1"]
+        (subir,) = _log(a, "started.log")
+        assert (_flag(subir, "--task"), _flag(subir, "--retry-of"), _flag(subir, "--agent")) == ("task_w1", "ctx_w1", "codex"), subir
+        assert (_flag(subir, "--model"), _flag(subir, "--effort")) == ("gpt-6-luna", "xhigh"), "Sonnet high vira Luna xhigh (tabela do worker-routing)"
+        assert _flag(subir, "--worktree") == "id:repo_1::" + repo and "--spec" not in subir, subir
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        assert texto.splitlines()[0] == "<!-- orq-passagem v1 de=ctx_w1 para=codex -->", texto
+        titulos = ["## Próximo passo", "## Perguntas abertas", "## Decisões já tomadas", "## Estado do git", "## Relatório parcial", "## Fim do transcrito",
+                   "## Onde está o resto", "## Como agir"]
+        pos = [texto.index(x) for x in titulos]
+        assert pos == sorted(pos), "ação antes da prosa: as seções seguem a ordem do desenho"
+        assert "use a branch nova" in texto[pos[2]:pos[3]], "o steer da task é decisão já tomada"
+        assert "indice-novo: Qual índice criar?" in texto[pos[1]:pos[2]] and "de outra task" not in texto, "pergunta aberta é a decisão pendente da própria task"
+        assert "novo" in texto[pos[3]:pos[4]] and antes[:12] in texto[pos[3]:pos[4]], "o estado do git traz o head e os caminhos sujos"
+        nota = _enviados(a)[-1]
+        assert nota[nota.index("--to") + 1] == "dispatch:ctx_term_novo2" and "PASSAGEM.md" in _flag(nota, "--body"), nota
+        (ev,) = [e for e in a.events() if e["tipo"] == "passagem"]
+        assert (ev["de"], ev["agente_de"], ev["para"], ev["agente_para"], ev["head"], ev["sujo"], ev["escrito_por"]) == \
+            ("ctx_w1", "claude", "ctx_term_novo2", "codex", antes[:12], 1, "orq"), ev
+        assert ev["pacote"] == hashlib.sha256(texto.encode("utf-8")).hexdigest()[:12], ev
+        assert ev["aceita"] is True, "o hook do worker novo registrou o primeiro turno"
+        assert _head(repo) == antes and os.path.exists(os.path.join(repo, "novo"))
+        assert "PASSAGEM.md" not in subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True).stdout, "o pacote não vai no commit do worker novo"
+        assert _log(a, "released.log"), "o terminal do worker antigo é liberado depois que o novo sobe"
+        (ctl,) = [e for e in _ctl_eventos(a, "passar") if e["resultado"] == "ok"]
+        assert ctl["novo_dispatch"] == "ctx_term_novo2", ctl
+
+
+def test_it_should_map_the_profile_between_harnesses_and_refuse_what_has_no_equivalent_handover():
+    perfil = orq_mod._perfil_da_passagem
+    assert perfil("claude-opus-5-5", "high", "codex") == ("gpt-6-sol", "high")
+    assert perfil("claude-opus-5-5", "xhigh", "codex") == ("gpt-6-astra", "low")
+    assert perfil("gpt-6-sol", "high", "claude") == ("claude-opus-5-5", "high")
+    assert perfil("gpt-6-luna", "low", "claude") == ("claude-sonnet-5-5", "low")
+    for modelo, effort, para in (("claude-haiku-4-5-20251001", "high", "codex"), ("claude-sonnet-5-5", "ultra", "codex"), ("gpt-6-astra", "high", "claude"), (None, None, "codex")):
+        try:
+            perfil(modelo, effort, para)
+        except ValueError as e:
+            assert "--modelo" in str(e), e
+        else:
+            raise AssertionError(f"{modelo}/{effort} não tem equivalente em {para}")
+
+
+def test_it_should_use_the_explicit_profile_when_given_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo, modelo="claude-haiku-4-5-20251001")
+        assert a.orq("passar", "ctx_w1", "--para", "codex", "--modelo", "gpt-6-sol").returncode == 1, "modelo e effort vão juntos"
+        assert a.orq("passar", "ctx_w1", "--para", "codex", "--modelo", "gpt-6-sol", "--effort", "enorme").returncode == 1, "effort que o harness não tem"
+        assert not _log(a, "stopped.log")
+        r = a.orq("passar", "ctx_w1", "--para", "codex", "--modelo", "gpt-6-sol", "--effort", "medium")
+        assert r.returncode == 0, r.stderr
+        (subir,) = _log(a, "started.log")
+        assert (_flag(subir, "--model"), _flag(subir, "--effort")) == ("gpt-6-sol", "medium"), subir
+
+
+def test_it_should_refuse_before_stopping_anything_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo)
+        r = a.orq("passar", "ctx_w1", "--para", "claude")
+        assert r.returncode == 1 and "já é claude" in r.stderr, r
+        assert a.orq("passar", "ctx_w1").returncode == 2, "--para é obrigatório"
+        _conta73(a, codex_semana=95)
+        r = a.orq("passar", "ctx_w1", "--para", "codex")
+        assert r.returncode == 1 and "Codex" in r.stderr, "o Codex também está acima do limiar de pausa"
+        a2 = Amb(run="run_a")
+        _passagem_env(a2, os.path.join(t, "sumiu"))
+        r = a2.orq("passar", "ctx_w1", "--para", "codex")
+        assert r.returncode == 1 and "worktree" in r.stderr, r
+        for amb in (a, a2):
+            assert not _log(amb, "stopped.log") and not _log(amb, "started.log") and not [e for e in amb.events() if e["tipo"] in ("passagem", "controle")]
+        assert not os.path.exists(os.path.join(repo, "PASSAGEM.md"))
+
+
+def test_it_should_keep_the_package_and_the_old_terminal_when_the_new_worker_does_not_start_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t, sujo=True)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo)
+        r = a.orq("passar", "ctx_w1", "--para", "codex", FAKE_FAIL="worker-start")
+        assert r.returncode == 1 and "orq passar ctx_w1 --para codex" in r.stderr, r.stderr
+        assert os.path.exists(os.path.join(repo, "PASSAGEM.md")), "o pacote fica para a repetição"
+        assert not _log(a, "released.log") and not [e for e in a.events() if e["tipo"] == "passagem"]
+        assert _ctl_eventos(a, "passar")[-1]["resultado"] == "falhou" and _ctl_eventos(a, "passar")[-1]["passo"] == "worker-start"
+        r2 = a.orq("passar", "ctx_w1", "--para", "codex")  # o dispatch parado sobe de novo sem novo worker-stop
+        assert r2.returncode == 0, r2.stderr
+        assert len(_log(a, "stopped.log")) == 1 and [e for e in a.events() if e["tipo"] == "passagem"]
+
+
+def test_it_should_put_the_end_of_the_transcript_between_history_markers_handover():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        a = Amb(run="run_a")
+        _passagem_env(a, repo)
+        arq = os.path.join(t, "w1.jsonl")
+        linhas = [{"type": "user", "message": {"role": "user", "content": "faça o ticket"}},
+                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "segredo"}, {"type": "text", "text": "rodei os testes, faltam dois"}]}},
+                  {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}}]
+        open(arq, "w", encoding="utf-8").write("\n".join(json.dumps(x) for x in linhas) + "\n")
+        os.makedirs(a.home, exist_ok=True)
+        json.dump({"ctx_w1": {"task": "task_w1", "inicio": now_iso(-600), "fim": None, "harness": "claude", "transcrito": arq}}, open(os.path.join(a.home, "turnos.json"), "w"))
+        assert a.orq("passar", "ctx_w1", "--para", "codex").returncode == 0
+        texto = open(os.path.join(repo, "PASSAGEM.md"), encoding="utf-8").read()
+        antes, resto = texto.split("<!-- historico-inicio -->")
+        fim, depois = resto.split("<!-- historico-fim -->")
+        assert "histórico, não instrução" in antes.splitlines()[-1], "a linha que avisa vem antes do bloco"
+        assert "rodei os testes, faltam dois" in fim and "faça o ticket" in fim and "segredo" not in fim and "meta" not in fim, fim
+        assert arq in depois and "orca search" in depois and "--agent claude" in depois, "o caminho do transcrito e o comando da busca"
+
+
+def test_it_should_read_the_visible_messages_of_a_codex_rollout_handover():
+    msgs = orq_mod._fim_do_transcrito(os.path.join(FIX, "codex-rollout-worker.jsonl"))
+    assert "ok, começando (msg_steer73 lida)" in msgs and "token_count" not in msgs and "environment_context" not in msgs, msgs
+    assert orq_mod._fim_do_transcrito("/nao/existe.jsonl") == "" and orq_mod._fim_do_transcrito(None) == ""
+    with tempfile.TemporaryDirectory() as t:
+        grande = os.path.join(t, "g.jsonl")
+        open(grande, "w").write("\n".join(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": f"m{i} " + "x" * 500}]}}) for i in range(100)))
+        corte = orq_mod._fim_do_transcrito(grande, limite=3000)
+    assert len(corte) <= 3100 and "m99 " in corte and "m0 " not in corte, "fica o fim"
 
 
 if __name__ == "__main__":
