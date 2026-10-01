@@ -400,7 +400,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
             estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue" if feito else "encerrado"), None
         ag = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": det.get("titulo"), "modelo": det.get("modelo"),
-              "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
+              "effort": det.get("effort"), "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
               "desde": _z(det.get("desde")), "idade_s": idade, "agente": det.get("agente"), "turno": turno,
               "turno_inicio": _z(t.get("inicio")), "turno_fim": _z(t.get("fim"))}
         if espera:
@@ -3693,8 +3693,10 @@ def lido_no_transcrito(dispatch, msg_id):
     O `read` do inbox só vira 1 com o `check --ack`, e o worker que lê por `check --terminal` sem ack o deixa em 0 (conferido no Orca real em 29/09:
     o worker leu, respondeu "recebi" e a linha seguiu com read 0). O Orca não expõe a entrega em aberto (tabela `deliveries`), então a leitura
     se prova pelo id no fim do transcrito, achado pela sessão que o hook prompt gravou em turnos.json."""
-    sid = _dict(_turnos_ro().get(dispatch)).get("sessao")
-    for arq in glob.glob(os.path.join(PROJETOS, "*", f"{glob.escape(sid)}.jsonl")) if sid else []:
+    t = _dict(_turnos_ro().get(dispatch))
+    sid = t.get("sessao")
+    arqs = [t["transcrito"]] if t.get("transcrito") else glob.glob(os.path.join(PROJETOS, "*", f"{glob.escape(sid)}.jsonl")) if sid else []
+    for arq in arqs:
         try:
             with open(arq, "rb") as f:
                 f.seek(max(0, f.seek(0, 2) - STEER_TRANSCRITO_BYTES))
@@ -4103,6 +4105,7 @@ def _detalhes(ws):
         try:
             res = orca("worker-show", "--dispatch", w["dispatchId"], timeout=10)
             return w["dispatchId"], {"modelo": _fundo(res, "worker", "startOptions", "launch", "requested", "model"), "desde": _fundo(res, "dispatch", "dispatchedAt"),
+                                     "effort": _fundo(res, "worker", "startOptions", "launch", "requested", "effort"),
                                      "agente": _fundo(res, "worker", "startOptions", "agent")}
         except Exception as e:  # noqa: BLE001
             log(f"agentes: worker-show {w.get('dispatchId')}: {type(e).__name__}: {e}")
@@ -4273,6 +4276,9 @@ def _prompts_humanos_do_worker(dispatch):
     cita o dispatch. O Orca não sabe dizer se houve humano: ele marca `user_takeover` em qualquer entrada do xterm.
     ponytail: lê o arquivo do worker inteiro uma vez por `orq liberar`; transcrito de dezenas de MB custa alguns segundos.
     """
+    t = _dict(_turnos_ro().get(dispatch))
+    if t.get("harness") == "codex" and t.get("transcrito"):
+        return _prompts_humanos_codex(t["transcrito"])
     alvo, limite = dispatch.encode(), time.time() - TRANSCRITO_DIAS * 86400
     for arq in glob.glob(os.path.join(PROJETOS, "*", "*.jsonl")):
         try:
@@ -4311,6 +4317,31 @@ def _prompts_humanos_do_worker(dispatch):
         except OSError as e:
             log(f"transcrito {arq}: {type(e).__name__}: {e}")
     return None
+
+
+def _prompts_humanos_codex(arq):
+    """Prompts de usuário de um rollout do Codex (`response_item` com `role: user`) além do despacho, do Orca e do contexto que o próprio Codex injeta
+    (`<environment_context>`, o AGENTS.md); None se o arquivo não abre."""
+    humanos = 0
+    try:
+        with open(arq, encoding="utf-8", errors="replace") as f:
+            for linha in f:
+                if '"role":"user"' not in linha and '"role": "user"' not in linha:
+                    continue
+                try:
+                    p = _dict(json.loads(linha).get("payload"))
+                except ValueError:
+                    continue
+                if p.get("type") != "message" or p.get("role") != "user":
+                    continue
+                texto = "\n".join(c.get("text") or "" for c in p.get("content") or [] if isinstance(c, dict) and c.get("type") == "input_text").strip()
+                if texto and not texto.startswith(("<environment_context>", "# AGENTS.md instructions", "<user_instructions>")) and \
+                        origem(texto) not in ("despacho", "orca", "notificacao", "resumo"):
+                    humanos += 1
+    except OSError as e:
+        log(f"transcrito {arq}: {type(e).__name__}: {e}")
+        return None
+    return humanos
 
 
 def _pode_fechar(handle, run_id, dispatch):
@@ -4957,6 +4988,18 @@ def _gerente_a_religar(g, meu, vivos):
     return (morto, trocado) if morto or trocado else None
 
 
+def sessao_do_dispatch(dispatch, agente):
+    """{sessao, cwd, transcrito} da sessão do worker no índice de sessões do Orca (`orca search <dispatch>`): o primeiro hit do agente em que o dispatch
+    aparece num prompt de usuário (o preâmbulo), não em saída de ferramenta (o coordenador também o cita). {} sem hit ou com o Orca fora."""
+    try:
+        hits = orca(dispatch, "--agent", agente, "--scope", "conversation", "--limit", "20", area="search", timeout=15).get("hits") or []
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+        log(f"sessao_do_dispatch {dispatch}: {type(e).__name__}: {e}")
+        return {}
+    h = next((h for h in hits if _dict(h.get("evidence")).get("role") == "user" and h.get("sessionId")), None)
+    return {"sessao": h["sessionId"], "cwd": h.get("cwd"), "transcrito": _dict(h.get("source")).get("filePath")} if h else {}
+
+
 def _subir_sessao(linha, sessao, modelo, cp, dica, msg=MSG_CONTINUE, agente="claude", effort=None):
     """O resume do agente (HARNESS) da `sessao` num terminal novo na worktree `linha["cwd"]`, evento `retomada` e conferência da tela. Devolve `linha` com o
     estado (retomado, sem_atividade ou falhou)."""
@@ -5006,12 +5049,16 @@ def retomar(dry_run=False, run=None):
     for w in cand:
         d = w["dispatchId"]
         t = _dict(turnos.get(d))
-        modelo = (det.get(d) or {}).get("modelo") or (despachos.get(d) or {}).get("modelo")
-        titulo = (det.get(d) or {}).get("titulo") or (despachos.get(d) or {}).get("titulo") or d
+        dd, ev = det.get(d) or {}, despachos.get(d) or {}
+        modelo, effort = dd.get("modelo") or ev.get("modelo"), dd.get("effort") or ev.get("effort")
+        agente = dd.get("agente") or ev.get("agente") or t.get("harness") or "claude"
+        titulo = dd.get("titulo") or ev.get("titulo") or d
         cp = _checkpoint(d)  # do firstmate: a worktree tem de existir, e o head e os arquivos sujos ficam registrados antes de subir o agente
+        if not t.get("sessao") and agente in HARNESS:
+            t = {**t, **sessao_do_dispatch(d, agente)}  # o hook de turno não viu este worker: o índice de sessões do Orca pode ter visto
         cwd = t.get("cwd") or cp["caminho"]
-        linha = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": titulo, "modelo": modelo, "sessao": t.get("sessao"), "cwd": cwd,
-                 "terminal": w.get("agentTerminalHandle")}
+        linha = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": titulo, "agente": agente, "modelo": modelo, "effort": effort,
+                 "sessao": t.get("sessao"), "cwd": cwd, "terminal": w.get("agentTerminalHandle")}
         dica = f"suba outro worker do spec da task com: orq relancar {d} --nota 'a sessão não pôde ser retomada'"  # do firstmate: sem sessão, o brief em disco é a instrução durável
         if not linha["sessao"] or not cwd:
             res["workers"].append({**linha, "estado": "sem_sessao", "aviso": f"sem session_id ou cwd gravado (o hook de turno não viu este worker): {dica}"})
@@ -5022,7 +5069,7 @@ def retomar(dry_run=False, run=None):
         if dry_run:
             res["workers"].append({**linha, "estado": "a_retomar"})
             continue
-        res["workers"].append(_subir_sessao(linha, t["sessao"], modelo, cp, dica, msg_continuar(meu, w.get("taskId"), d, w.get("runId"))))
+        res["workers"].append(_subir_sessao(linha, t["sessao"], modelo, cp, dica, msg_continuar(meu, w.get("taskId"), d, w.get("runId")), agente, effort))
     return res
 
 
@@ -5208,7 +5255,8 @@ def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
         t = _dict(turnos.get(a["dispatch"]))
         cwd = t.get("cwd") or _checkpoint(a["dispatch"]).get("caminho")
         linha = {"dispatch": a["dispatch"], "task": a["task"], "run": a["run"], "titulo": a.get("titulo"), "prioridade": a["prioridade"], "fase": a.get("fase"),
-                 "modelo": a.get("modelo"), "sessao": t.get("sessao"), "cwd": cwd, "terminal": a["terminal"]}
+                 "agente": a.get("agente") or t.get("harness") or "claude", "modelo": a.get("modelo"), "effort": a.get("effort"), "sessao": t.get("sessao"), "cwd": cwd,
+                 "terminal": a["terminal"]}
         if not (linha["sessao"] and cwd and os.path.isdir(cwd) and a["terminal"]):
             saida.append({**linha, "estado": "sem_sessao", "aviso": "sem session_id, worktree ou terminal: sem como voltar, não foi pausado"})
         elif dry_run:
@@ -5242,7 +5290,7 @@ def _fechar_pausado(linha):
         orca("close", "--terminal", linha["terminal"], area="terminal")
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSA.md está escrito"}
-    guarda = {k: linha[k] for k in ("task", "run", "titulo", "prioridade", "modelo", "sessao", "cwd", "terminal")}
+    guarda = {k: linha[k] for k in ("task", "run", "titulo", "prioridade", "agente", "modelo", "effort", "sessao", "cwd", "terminal")}
     _cursor_mut(lambda c: c.setdefault("pausados", {}).__setitem__(linha["dispatch"], {**guarda, "desde": now()}))
     append_event({"tipo": "pausa_plano", "dispatch": linha["dispatch"], **guarda})
     return {**linha, "estado": "pausado"}
@@ -5269,7 +5317,8 @@ def retomar_pausados(run=None, forcar=False):
             cp = _checkpoint(d)
         except (RuntimeError, subprocess.TimeoutExpired):
             cp = {"head": None, "sujo": None}
-        r = _subir_sessao(linha, p["sessao"], p.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão pausada não pôde ser retomada'", MSG_VOLTA)
+        r = _subir_sessao(linha, p["sessao"], p.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão pausada não pôde ser retomada'", MSG_VOLTA,
+                          p.get("agente") or "claude", p.get("effort"))
         if r["estado"] != "falhou":
             _cursor_mut(lambda c, d=d: c.get("pausados", {}).pop(d, None))
             append_event({"tipo": "pausa_fim", "dispatch": d, "task": p["task"], "terminal": r.get("novo")})

@@ -77,6 +77,13 @@ def turno_comeca(dispatch):
     os.makedirs(os.path.dirname(p), exist_ok=True); json.dump(t, open(p, "w"))
 if (os.environ.get("FAKE_FAIL") == cmd and cmd != "send") or (os.environ.get("FAKE_FAIL_RUN") and run == os.environ["FAKE_FAIL_RUN"]):
     falha("falhou " + cmd)
+if sys.argv[1] == "search":
+    # orca search <query>: search.json traz os hits do índice de sessões (agent, sessionId, cwd, source.filePath, evidence.role), filtrados por --agent
+    hits = [h for h in ler("search.json", []) if not opt("--agent") or h.get("agent") == opt("--agent")]
+    print(json.dumps({"ok": True, "result": {"kind": "search", "hits": hits}})); sys.exit(0)
+if sys.argv[1] == "account":
+    # orca account list: account.json é o rateLimits ({claude|codex: {session, weekly}}) que o Orca lê de cada conta
+    print(json.dumps({"ok": True, "result": {"rateLimits": ler("account.json", {})}})); sys.exit(0)
 if sys.argv[1] == "terminal" and cmd == "create":
     # orca terminal create: grava no create.log, dá o handle term_ret<N> e o põe no terminals.json (ticket 48); FAKE_FAIL_CREATE_PATH falha nessa worktree
     if os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", ""):
@@ -8606,6 +8613,76 @@ def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_e_sem_astra_n
 def test_ticket73_mensagens_ao_worker_nao_citam_o_claude():
     for m in (orq_mod.MSG_ESCALAR, orq_mod.MSG_PAUSA, orq_mod.MSG_CONTINUE, orq_mod.MSG_VOLTA):
         assert "claude" not in m.lower(), m
+
+
+
+def _queda73(a, turno=True):
+    """Depois da queda: um worker Codex (gpt-6-sol xhigh) perdeu o terminal; `turno` diz se os hooks dele gravaram a sessão."""
+    os.makedirs(a.home, exist_ok=True)
+    a.wt = os.path.join(a.tmp.name, "wt")
+    os.makedirs(os.path.join(a.wt, "c1"))
+    a.set("workers.json", [_w48("term_c1", agente="codex", modelo="gpt-6-sol", effort="xhigh")])
+    a.set("tasks_run_a.json", [{"id": "task_term_c1", "task_title": "Ticket 73"}])
+    a.set("terminals.json", ["term_coord"])
+    if turno:
+        json.dump({"ctx_term_c1": {"task": "task_term_c1", "sessao": "thr-c1", "inicio": "2026-10-01T14:00:00Z", "fim": None, "harness": "codex", "cwd": a.wt + "/c1"}},
+                  open(os.path.join(a.home, "turnos.json"), "w"))
+
+
+def test_ticket73_retomar_worker_codex_sobe_com_codex_resume_modelo_e_effort():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="2")
+    _queda73(a)
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    res = json.loads(a.orq("retomar", "--json").stdout)
+    assert [(w["dispatch"], w["estado"]) for w in res["workers"]] == [("ctx_term_c1", "retomado")], res
+    (c,) = _log(a, "create.log")
+    comando = c[c.index("--command") + 1]
+    assert comando.startswith("codex resume thr-c1 -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"' --dangerously-bypass-approvals-and-sandbox 'Continue de onde parou."), comando
+
+
+def test_ticket73_retomar_sem_sessao_gravada_acha_a_sessao_pelo_indice_do_orca():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="2")
+    _queda73(a, turno=False)
+    a.set("search.json", [
+        {"agent": "claude", "sessionId": "coord", "cwd": "/x", "evidence": {"role": "tool"}, "source": {"filePath": "/x/coord.jsonl"}},  # o coordenador cita o dispatch
+        {"agent": "codex", "sessionId": "thr-achada", "cwd": a.wt + "/c1", "evidence": {"role": "user"}, "source": {"filePath": "/r/rollout-thr-achada.jsonl"}}])
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    (w,) = json.loads(a.orq("retomar", "--json").stdout)["workers"]
+    assert (w["estado"], w["sessao"], w["cwd"]) == ("retomado", "thr-achada", a.wt + "/c1"), w
+    assert any(x[:1] == ["ctx_term_c1"] and "--agent" in x for x in _log(a, "calls.log")), "a busca é pelo dispatch, no agente do worker"
+    b = Amb(run="run_a")
+    _queda73(b, turno=False)
+    (w,) = json.loads(b.orq("retomar", "--dry-run", "--json").stdout)["workers"]
+    assert w["estado"] == "sem_sessao", "sem hit no índice continua sem sessão"
+
+
+def test_ticket73_prompts_humanos_e_steer_lido_no_rollout_do_codex():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    arq = os.path.join(a.tmp.name, "rollout-thr_73.jsonl")
+    linhas = open(os.path.join(AQUI, "fixtures", "codex-rollout-worker.jsonl")).read()
+    open(arq, "w").write(linhas)
+    json.dump({"ctx_x73": {"task": "task_t73", "sessao": "thr_73", "inicio": "2026-10-01T15:08:39Z", "fim": None, "harness": "codex", "transcrito": arq}},
+              open(os.path.join(a.home, "turnos.json"), "w"))
+    with EmProcesso(a):
+        assert orq_mod._prompts_humanos_do_worker("ctx_x73") == 0, "contexto do ambiente, preâmbulo e aviso do Orca não são humanos"
+        assert orq_mod.lido_no_transcrito("ctx_x73", "msg_steer73") is True and orq_mod.lido_no_transcrito("ctx_x73", "msg_outra") is False
+        humano = {"timestamp": "2026-10-01T15:11:00.000Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "pare e me explique"}]}}
+        open(arq, "a").write(json.dumps(humano) + "\n")
+        assert orq_mod._prompts_humanos_do_worker("ctx_x73") == 1
+
+
+def test_ticket73_pausar_e_retomar_pausados_de_um_worker_codex_usam_o_resume_dele():
+    a = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="2")
+    _queda73(a)
+    _cursor_set = os.path.join(a.home, "cursor.json")
+    json.dump({"pausados": {"ctx_term_c1": {"task": "task_term_c1", "run": "run_a", "titulo": "Ticket 73", "prioridade": 2, "modelo": "gpt-6-sol",
+                                             "effort": "xhigh", "agente": "codex", "sessao": "thr-c1", "cwd": a.wt + "/c1", "terminal": "term_c1"}}}, open(_cursor_set, "w"))
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    r = a.orq("retomar", "--pausados", "--forcar", "--json")
+    assert r.returncode == 0, r.stderr
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--command") + 1].startswith("codex resume thr-c1 -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"'"), c
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
