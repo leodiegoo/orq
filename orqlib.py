@@ -132,7 +132,7 @@ HARNESS["codex"] = {
     "resume": lambda sessao, modelo, effort, msg: ["codex", "resume", sessao, *(["-m", modelo] if modelo else []),
                                                    *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
                                                    "--dangerously-bypass-approvals-and-sandbox", msg],
-    "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›",
+    "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›", "enter_separado": True,  # o número com Enter no mesmo send não confirma o menu (01/10)
              "perguntas": (("trust", re.compile(r"Trust this folder\?|Do you trust the contents of this directory", re.I)),
                            ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
              "espera": re.compile(r"\d+\s+background terminals?\s+running", re.I),  # `• Working (9s • esc to interrupt) · 1 background terminal running`
@@ -4517,7 +4517,12 @@ def responder_tela(task, opcao, run=None):
     if not alvo:
         raise ValueError(f"opção {opcao!r} não existe no menu ({' | '.join(f'{n}) {r}' for n, r in p['opcoes'])})")
     try:
-        orca("send", "--terminal", handle, "--text", str(alvo[0]), "--enter", area="terminal", timeout=10)
+        if HARNESS[agente]["tela"].get("enter_separado"):
+            orca("send", "--terminal", handle, "--text", str(alvo[0]), area="terminal", timeout=10)
+            time.sleep(0.3)
+            orca("send", "--terminal", handle, "--enter", area="terminal", timeout=10)
+        else:
+            orca("send", "--terminal", handle, "--text", str(alvo[0]), "--enter", area="terminal", timeout=10)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         _controle("responder-tela", w, "falhou", terminal=handle, erro=str(e), por=os.environ.get("ORCA_TERMINAL_HANDLE"))
         raise

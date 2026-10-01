@@ -8754,8 +8754,9 @@ def test_ticket73_responder_tela_de_worker_codex_digita_a_opcao_do_menu_dele():
     a.set("screens.json", {"term_x": _tela52("tela-codex-trust.txt")})
     r = a.orq("responder-tela", "task_x", "Trust")
     assert r.returncode == 0, r.stderr
-    (s,) = _log(a, "send.log")
-    assert s[s.index("--text") + 1] == "1" and "--enter" in s, s
+    (num, enter) = _log(a, "send.log")
+    assert num[num.index("--text") + 1] == "1" and "--enter" not in num and "--enter" in enter and "--text" not in enter, \
+        "o menu do Codex só confirma com o Enter num send separado (conferido no Orca real em 01/10)"
 
 
 
@@ -8792,8 +8793,8 @@ def test_ticket73_despachar_codex_confia_a_raiz_do_repositorio_no_config_do_code
 def test_ticket73_confiar_codex_grava_a_worktree_e_recusa_config_que_nao_e_toml():
     with tempfile.TemporaryDirectory() as d:
         cfg = os.path.join(d, "config.toml")
-        antes = orq_mod.CODEX_CONFIG
-        orq_mod.CODEX_CONFIG = cfg
+        antes, log_antes = orq_mod.CODEX_CONFIG, orq_mod.LOG
+        orq_mod.CODEX_CONFIG, orq_mod.LOG = cfg, os.path.join(d, "orq.log")
         try:
             assert orq_mod.confiar_codex(d + '/wt "x"') == [d + '/wt "x"']
             import tomllib
@@ -8801,7 +8802,7 @@ def test_ticket73_confiar_codex_grava_a_worktree_e_recusa_config_que_nao_e_toml(
             open(cfg, "w").write("isto = não é toml [")
             assert orq_mod.confiar_codex(d + "/outra") == [] and open(cfg).read() == "isto = não é toml [", "config quebrado fica como estava"
         finally:
-            orq_mod.CODEX_CONFIG = antes
+            orq_mod.CODEX_CONFIG, orq_mod.LOG = antes, log_antes
 
 
 def test_ticket73_auditar_respostas_de_coordenador_codex_diz_que_nao_ha_o_que_auditar():

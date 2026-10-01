@@ -464,7 +464,7 @@ orq runs with either harness as coordinator and dispatches workers of either. Th
 
 **Trust.** Codex keeps folder trust by the main repository root, and a linked worktree of a trusted repo does not ask again (checked with codex-cli 0.159.2). For a Codex worker, `orq despachar` writes `trust_level = "trusted"` into `~/.codex/config.toml` (`ORQ_CODEX_CONFIG`) for the coordinator's repository root before `worker-start`, and for the worktree Orca created after it. A config that does not parse as TOML is left alone.
 
-**Screen.** The Codex TUI uses `›` as the menu cursor, asks "Trust this folder?", and shows `N background terminal running` on the working line while a background command runs. Unknown session ids print "No saved session found". The fixtures `tela-codex-*.txt` are screens read from a real Codex terminal in Orca.
+**Screen.** The Codex TUI uses `›` as the menu cursor, asks "Trust this folder?", and shows `N background terminal running` on the working line while a background command runs. Unknown session ids print "No saved session found". `orq responder-tela` types the option number and then sends Enter on its own: in the Codex menu, the number and Enter in a single send do not confirm. The fixtures `tela-codex-*.txt` are screens read from a real Codex terminal in Orca.
 
 **What is weaker on Codex.**
 
