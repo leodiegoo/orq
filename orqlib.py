@@ -1076,8 +1076,9 @@ def manager_respawn_alone(dead, now_at=None):
         finally:
             _MANAGER_LOCK[0] = 0
     ev = append_event({"tipo": "gerente", "op": "subiu_sozinho", "terminal": res["terminal"], "anterior": dead})
-    with contextlib.suppress(Exception):
-        notify_coordinator(g["coordenador"], f"orq: agent manager came back up on its own (terminal {res['terminal']})")
+    text = f"orq: agent manager came back up on its own (terminal {res['terminal']})"
+    with contextlib.suppress(Exception):  # the line goes out with the next prompt's context (context_notices); nothing is typed over the coordinator
+        _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text, "ts": now(), "contexto": True}))
     return ev
 
 

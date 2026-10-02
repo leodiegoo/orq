@@ -18495,7 +18495,8 @@ def test_ticket230_stop_hook_brings_the_dead_manager_back_up_on_its_own():
     assert _read_state(os.path.join(a.home, "gerente.json")) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a"]}
     (e,) = [e for e in a.events() if e.get("tipo") == "gerente" and e.get("op") == "subiu_sozinho"]
     assert e["terminal"] == "term_ret1" and e["anterior"] == "term_ger", e
-    assert "came back up on its own (terminal term_ret1)" in json.dumps([_log(a, "send.log"), orq_mod._read_json(os.path.join(a.home, "cursor.json"))]), "the coordinator is told"
+    assert not os.path.exists(os.path.join(a.fake, "send.log")), "nothing is typed over the coordinator"
+    assert "agent manager came back up on its own (terminal term_ret1)" in _context(a), "the next prompt's context carries the line"
 
 
 def test_ticket230_session_start_and_prompt_hooks_do_the_same():
