@@ -4528,6 +4528,7 @@ def hook_prompt(ev, run):
             ln = [*ln, ob]  # o aviso do merge chega já com o que ele pede
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
+                            "terminal": os.environ["ORCA_TERMINAL_HANDLE"],
                             **({"com_aviso": True} if com_aviso else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, novo_id=True)
     if SO_COMANDO_ORQ.match(texto):  # `/away` e `/away status` não pedem efeito: fecham sozinhos
         intake(entrada["id"], "conversa", nota="comando do orq")
@@ -5589,6 +5590,23 @@ def intake(e, efeito, ref=None, run=None, nota=None):
     append_event(ev)
     # o eco diz qual entrada acabou de ser fechada: quem fecha pelo id errado vê o texto
     return {**ev, "origem": alvo_e.get("origem") or "usuario", "texto": _cita(alvo_e.get("texto")), **({"fonte": alvo_e["fonte"]} if alvo_e.get("fonte") else {})}
+
+
+def intake_implicito(efeito, ref=None, run=None):
+    """O intake que o comando do coordenador já implica (ticket 157). Só vale uma entrada do usuário aberta, digitada neste terminal: a sessão de
+    worker não tem entrada com o handle dela, então nunca grava. Com duas ou mais abertas não adivinha. Devolve a linha para o stderr, ou None."""
+    handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+    ds = [e["id"] for e in abertas(read_events()) if e.get("origem", "usuario") == "usuario" and handle and e.get("terminal") == handle]
+    if not ds:
+        return None
+    alvo = f"{efeito} {ref}" if ref else efeito
+    if len(ds) > 1:
+        return f"aviso: {len(ds)} entradas abertas ({', '.join(ds)}), não adivinho o efeito: rode orq intake <e> {alvo}" + (f" --run {run}" if run else "")
+    try:
+        intake(ds[0], efeito, ref, run)
+    except ValueError as e:
+        return f"aviso: intake implícito de {ds[0]} não gravado ({e}): rode orq intake {ds[0]} {alvo}"
+    return f"intake {ds[0]} → {alvo} (implícito)"
 
 
 def _itens_lavish(doc):
@@ -10798,6 +10816,12 @@ def revisao_texto(r):
     return f"revisão no-mistakes de {r['task']}: modelo {r['modelo']} (effort {r['effort']}), {r['achados'] if r['achados'] is not None else '?'} achado(s), {r['duracao_s']:g} s{toks}\n\n{r['saida']}"
 
 
+def _implicito(efeito, ref=None, run=None):
+    """Imprime no stderr o que `intake_implicito` fez ou avisou (o stdout fica só com o JSON do comando)."""
+    if linha := intake_implicito(efeito, ref, run):
+        print(linha, file=sys.stderr)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="orq")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -11151,6 +11175,7 @@ def main(argv=None):
         elif a.cmd == "pend":
             if a.op == "add":
                 print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate, a.run), ensure_ascii=False))
+                _implicito("decisao" if a.tipo == "decisao" else "pend", a.id)
             elif a.op == "lista":
                 print("\n".join(pend_lista(a.todas)) or "nenhuma pendência")
             elif a.op == "edit":
@@ -11183,7 +11208,10 @@ def main(argv=None):
         elif a.cmd == "devolver":
             print(json.dumps(devolver(a.alvo, a.motivo, a.run), ensure_ascii=False))
         elif a.cmd == "steer":
-            print(json.dumps(steer(a.task, a.texto, a.run, a.entrada), ensure_ascii=False))
+            ev = steer(a.task, a.texto, a.run, a.entrada)
+            print(json.dumps(ev, ensure_ascii=False))
+            if not a.entrada:
+                _implicito("steer", a.task, ev.get("run"))
         elif a.cmd == "steers":
             print("\n".join(reentrega_steers()) or "nenhum ajuste a reentregar")
         elif a.cmd == "responder":
@@ -11273,6 +11301,8 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
+            if not a.entrada and r.get("taskId"):  # enfileirado ainda não tem task
+                _implicito("tarefa", r["taskId"], r["run"])
         elif a.cmd == "run":
             run = run_padrao(a.run)
             if not run:
@@ -11330,7 +11360,9 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))
         elif a.cmd == "ticket":
             if a.op == "novo":
-                print(json.dumps(ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run), ensure_ascii=False))
+                r = ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run)
+                print(json.dumps(r, ensure_ascii=False))
+                _implicito("tarefa", r["task"], r["run"])
             elif a.op == "fechar":
                 r = ticket_fechar(a.numero, a.answer)
                 print(json.dumps(r, ensure_ascii=False))
@@ -11349,6 +11381,7 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"aviso: {x}", file=sys.stderr)
+            _implicito("decisao", a.id)
         elif a.cmd == "lavish-resposta":
             r = lavish_resposta(a.arquivo)
             print(json.dumps(r, ensure_ascii=False))
@@ -11413,7 +11446,10 @@ def main(argv=None):
         elif a.cmd == "mate" and a.op == "dormir":
             print(json.dumps(mate_dormir(a.grupo), ensure_ascii=False))
         elif a.cmd == "mate" and a.op == "pedir":
-            print(json.dumps(mate_pedir(a.grupo, a.texto, a.prazo, a.responde), ensure_ascii=False))
+            r = mate_pedir(a.grupo, a.texto, a.prazo, a.responde)
+            print(json.dumps(r, ensure_ascii=False))
+            if not a.responde:
+                _implicito("mate", r["corr"])
         elif a.cmd == "mate" and a.op == "subir":
             print(json.dumps(mate_subir(a.tipo, a.texto, a.corr, a.link, a.grupo), ensure_ascii=False))
         elif a.cmd == "mate":

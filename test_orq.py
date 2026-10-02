@@ -1328,11 +1328,13 @@ def test_steer_manda_o_send_e_grava_o_evento_e_o_intake():
     assert len(ints) == 1 and ints[0]["entrada"] == "e1" and ints[0]["efeito"] == "steer" and ints[0]["ref"] == "task_rodando"
 
 
-def test_steer_sem_entrada_nao_grava_intake():
+def test_steer_sem_entrada_grava_o_intake_implicito_da_unica_entrada_aberta():
     a = Amb()
-    _steer_env(a)
-    assert a.orq("steer", "task_rodando", "oi").returncode == 0
-    assert not [e for e in a.events() if e["tipo"] == "intake"] and len(_enviados(a)) == 1
+    _steer_env(a)  # deixa a entrada e1 aberta
+    r = a.orq("steer", "task_rodando", "oi")
+    assert r.returncode == 0 and len(_enviados(a)) == 1
+    (i,) = [e for e in a.events() if e["tipo"] == "intake"]
+    assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "steer", "task_rodando", "run_a") and "(implícito)" in r.stderr
 
 
 def test_steer_recusa_task_que_nao_esta_dispatched_ou_nao_existe():
@@ -15495,6 +15497,72 @@ def test_ticket170_erro_do_worker_start_avisa_o_coordenador_uma_vez_e_o_stop_do_
     assert out["decision"] == "block" and "desistiu" in out["reason"] and "orq despachar --run run_a --ticket 88 --modelo claude-sonnet-5-5 --effort medium" in out["reason"] and "None" not in out["reason"], out
     assert a.orq("despachar", "--run", "run_a", "--ticket", "88", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--worktree", "current").returncode == 0
     assert orq_mod.away_desistidos(orq_mod.tickets(), a.events()) is None
+
+
+# ---- ticket 157: intake implícito ----
+
+def _intakes(a):
+    return [e for e in a.events() if e["tipo"] == "intake"]
+
+
+def test_ticket157_uma_entrada_aberta_e_despachar_sem_entrada_grava_intake_tarefa():
+    a = Amb(run="run_a")
+    a.prompt("cria o ticket 05")
+    r = _despachar(a)
+    assert r.returncode == 0, r.stderr
+    (i,) = _intakes(a)
+    assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "tarefa", "task_novo1", "run_a"), i
+    assert "intake e1 → tarefa task_novo1 (implícito)" in r.stderr, r.stderr
+    json.loads(r.stdout)  # o stdout segue só com o JSON
+
+
+def test_ticket157_pend_add_decisao_grava_decisao_e_os_outros_tipos_gravam_pend():
+    a = Amb()
+    a.prompt("decide isso")
+    r = a.orq("pend", "add", "--id", "freio-x", "--tipo", "decisao", "--titulo", "Freio X")
+    assert r.returncode == 0, r.stderr
+    (i,) = _intakes(a)
+    assert (i["entrada"], i["efeito"], i["ref"]) == ("e1", "decisao", "freio-x") and "intake e1 → decisao freio-x (implícito)" in r.stderr, (i, r.stderr)
+    a.prompt("avisa o time")
+    a.orq("pend", "add", "--id", "avisar-y", "--tipo", "avisar", "--titulo", "Avisar Y")
+    assert [(i["entrada"], i["efeito"]) for i in _intakes(a)] == [("e1", "decisao"), ("e2", "pend")]
+
+
+def test_ticket157_duas_entradas_abertas_nao_gravam_e_avisam_com_os_ids_e_o_comando():
+    a = Amb(run="run_a")
+    a.prompt("um")
+    a.prompt("dois")
+    r = _despachar(a)
+    assert r.returncode == 0, r.stderr
+    assert not _intakes(a)
+    assert "e1, e2" in r.stderr and "orq intake <e> tarefa task_novo1" in r.stderr, r.stderr
+
+
+def test_ticket157_entrada_explicita_vence_e_nao_grava_o_implicito():
+    a = Amb(run="run_a")
+    a.prompt("um")
+    a.prompt("dois")
+    r = _despachar(a, "--entrada", "e2")
+    assert r.returncode == 0, r.stderr
+    assert [(i["entrada"], i["efeito"]) for i in _intakes(a)] == [("e2", "tarefa")] and "implícito" not in r.stderr
+
+
+def test_ticket157_sessao_de_worker_nunca_grava():
+    a = Amb(run="run_a")
+    a.prompt("cria o ticket 05")
+    r = _despachar(a, ORCA_TERMINAL_HANDLE="term_worker")
+    assert r.returncode == 0, r.stderr
+    assert not _intakes(a) and "implícito" not in r.stderr
+
+
+def test_ticket157_orq_intake_posterior_corrige_o_implicito():
+    a = Amb(run="run_a")
+    a.prompt("cria o ticket 05")
+    _despachar(a)
+    assert a.orq("intake", "e1", "conversa").returncode == 0
+    assert [(i["entrada"], i["efeito"]) for i in _intakes(a)] == [("e1", "tarefa"), ("e1", "conversa")]
+    assert {i["entrada"]: i["efeito"] for i in _intakes(a)} == {"e1": "conversa"}  # os leitores indexam por entrada: o último vale
+    assert _stop_gate(a, sessao="abcdef123456") == {}
 
 
 if __name__ == "__main__":
