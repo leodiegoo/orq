@@ -6247,6 +6247,7 @@ def test_it_should_not_list_control_lines_for_dispatches_without_history():
 def test_review8_m14_guard_com_gerente_ve_o_despacho_de_run_do_proprio_coordenador():
     a = Amb(run="run_a")
     _gerente(a)  # o gerente term_ger segura run_a; o coordenador term_coord criou run_b com run-create cru e o segura sozinho
+    json.dump({}, open(os.path.join(a.home, "cursor.json"), "w"))  # o guard é o do despacho ativo, não o do modo ausente (ticket 126): sem away
     a.set("runs.json", [{"id": "run_a", "coordinator_handle": "term_ger"}, {"id": "run_b", "coordinator_handle": "term_coord"}])
     a.set("terminals.json", ["term_ger", "term_coord"])
     _workers(a, ("w_b", "run_b", "dispatched"))
