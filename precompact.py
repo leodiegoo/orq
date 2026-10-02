@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Snapshot determinístico do coordenador no PreCompact e retomada no SessionStart(compact).
+"""Deterministic snapshot of the coordinator at PreCompact and resume at SessionStart(compact).
 
-  precompact.py            (stdin: JSON do PreCompact) grava handoff/<data>.md, atualiza ultimo.md e salva no engram
-  precompact.py retomar    (stdin: JSON do SessionStart) imprime o ultimo.md como additionalContext se source == compact
-  precompact.py passagem --de H --para H   (`orq passagem coordenador`) grava o mesmo snapshot sem compactar e handoff/passagem.json (quem o escreveu e quando);
-                           o `orq hook session` do outro harness o injeta (ticket 93). Imprime o registro em JSON; sem Run ligado, sai 1 com a causa no stderr
-Só no coordenador (regra de papel do orq.py, importada sem alterá-lo). Fail-open: qualquer erro vira exit 0 e uma linha no orq.log.
-Variáveis para teste: ORQ_HOME, ORQ_ORCA, ORQ_PENDENCIAS (as do orq.py), ORQ_CLI, ORQ_ENGRAM, ORQ_GH, ORQ_DESENHO.
+  precompact.py            (stdin: PreCompact JSON) writes handoff/<date>.md, updates ultimo.md and saves to engram
+  precompact.py retomar    (stdin: SessionStart JSON) prints ultimo.md as additionalContext if source == compact
+  precompact.py passagem --de H --para H   (`orq handoff coordinator`) writes the same snapshot without compacting and handoff/passagem.json (who wrote it and when);
+                           the other harness's `orq hook session` injects it (ticket 93). Prints the record as JSON; with no Run attached, exits 1 with the cause on stderr
+Coordinator only (orq.py's role rule, imported without changing it). Fail-open: any error becomes exit 0 and a line in orq.log.
+Variables for testing: ORQ_HOME, ORQ_ORCA, ORQ_PENDENCIAS (orq.py's), ORQ_CLI, ORQ_ENGRAM, ORQ_GH, ORQ_DESENHO.
 """
 import argparse
 import json
@@ -24,20 +24,20 @@ except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver f
     import fail_safe
     fail_safe.bail_out("precompact.py", e)
 
-CAP_S = 20  # PreCompact: o hook tem o timeout do settings (30 s); o script para de coletar aos 20 s
-RESUME_LINES = 60  # o montar respeita orçamentos por seção que cabem aqui (M12); passou disso, a retomada avisa que cortou
-OLD_S = 15 * 60  # ultimo.md mais velho que isso não é do compact que acabou de acontecer (B33)
+CAP_S = 20  # PreCompact: the hook has the settings timeout (30 s); the script stops collecting at 20 s
+RESUME_LINES = 60  # the build respects per-section budgets that fit in here (M12); past that, the resume notice says it cut
+OLD_S = 15 * 60  # ultimo.md older than this is not from the compact that just happened (B33)
 DESIGN_PATH = os.environ.get("ORQ_DESENHO") or os.path.expanduser("~/.claude/orquestrador-plan/desenho.md")
 CLI = shlex.split(os.environ.get("ORQ_CLI") or f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'orq.py')}")
 ENGRAM = os.environ.get("ORQ_ENGRAM") or "engram"
 GH = os.environ.get("ORQ_GH") or "gh"
 WAITER = os.path.expanduser("~/.claude/scripts/orca-wait-runs.py")
 HANDOFF = os.path.join(orq.HOME, "handoff")
-MAX_ALIVE, MAX_DELIVERED, MAX_PENDING, MAX_LIST = 5, 4, 5, 4  # orçamento de linhas por seção (M12)
+MAX_ALIVE, MAX_DELIVERED, MAX_PENDING, MAX_LIST = 5, 4, 5, 4  # line budget per section (M12)
 
 
 def run_it(cmd, timeout=5, cwd=None):
-    """Saída de um comando, ou '' se falhou: uma seção que falha não derruba as outras. O que passa do teto de TETO_S do hook fica sem rodar (B33)."""
+    """Output of a command, or '' if it failed: a section that fails doesn't take down the others. Whatever goes past the hook's CAP_S ceiling is left unrun (B33)."""
     remaining_pids = CAP_S - (time.monotonic() - T0)
     if remaining_pids <= 0.5:
         orq.log(f"precompact: {cmd[0]} skipped, {CAP_S} s budget exhausted")
@@ -74,7 +74,7 @@ def agents_section():
 
 def pending_section():
     try:
-        item_list = orq._pending_ro()["itens"]  # o pendencias.json, ou o backlog com ORQ_BACKLOG
+        item_list = orq._pending_ro()["itens"]  # pendencias.json, or the backlog with ORQ_BACKLOG
     except Exception:
         return "(pendencias.json unreadable)"
     if not item_list:
@@ -84,7 +84,7 @@ def pending_section():
 
 
 def cut(txt, n=MAX_LIST):
-    """As n primeiras linhas de txt e '+N' com o que ficou de fora."""
+    """The first n lines of txt and '+N' with what was left out."""
     ls = txt.splitlines()
     return "\n".join(ls[:n] + ([f"+{len(ls) - n}"] if len(ls) > n else []))
 
@@ -115,8 +115,8 @@ def entries_section():
 
 
 def build(run, cwd):
-    """O snapshot em markdown; cada seção é independente."""
-    # o que mais importa vem primeiro: a retomada corta o fim (M12). Sem "orq status": o `orq hook session` injeta um mais novo no compact (B29)
+    """The snapshot in markdown; each section is independent."""
+    # what matters most comes first: the resume cuts the end (M12). No "orq status": `orq hook session` injects a newer one on compact (B29)
     sections = [
         ("Bound Run", run["id"]),
         ("Last 10 user entries", entries_section()),
@@ -178,8 +178,8 @@ def resume(ev):
 
 
 def handoff(from_, to_):
-    """O snapshot do PreCompact sob demanda, para o coordenador que troca de harness. O registro (de, para, ts, Run) é o que o `orq hook session`
-    do outro lado confere: ele só injeta se o `ts` tem menos de 15 min e o `de` não é o harness dele. Sem Engram: o servidor é o mesmo nos dois harnesses."""
+    """The PreCompact snapshot on demand, for the coordinator switching harness. The record (de, para, ts, Run) is what the other side's `orq hook session`
+    checks: it only injects if `ts` is less than 15 min old and `from_` is not its own harness. No Engram: the server is the same in both harnesses."""
     run = orq.orca("run-current")["run"]
     if not run:
         print("orq: no Run bound to this terminal: there is no coordinator state to hand off (`orca orchestration run-use --id <run>`)", file=sys.stderr)
@@ -202,7 +202,7 @@ def main(argv):
         a = ap.parse_args(argv[2:])
         try:
             return handoff(a.from_, a.to_)
-        except Exception as e:  # noqa: BLE001 - comando, não hook: a causa vai para o stderr em vez de sumir no log
+        except Exception as e:  # noqa: BLE001 - command, not hook: the cause goes to stderr instead of vanishing in the log
             print(f"orq: coordinator handoff failed: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
     try:

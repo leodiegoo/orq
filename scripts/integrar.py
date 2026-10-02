@@ -28,7 +28,7 @@ def die(msg):
 
 
 def alive():
-    """A worktree principal do repositório: a instalação que roda."""
+    """The repository's main worktree: the installation that runs."""
     r = git(os.path.dirname(os.path.realpath(__file__)), "worktree", "list", "--porcelain")
     if r.returncode:
         die(r.stderr.strip())
@@ -36,12 +36,12 @@ def alive():
 
 
 def branches_file(wt):
-    """Onde a worktree guarda as branches que o ciclo integra (dentro do gitdir dela, para o `--avancar` achá-las depois de um conflito)."""
+    """Where the worktree keeps the branches the cycle integrates (inside its gitdir, so `--advance` can find them after a conflict)."""
     return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-branches")
 
 
 def conclude(viva, wt):
-    """Avisa o orq que a main andou. A main já avançou: falha aqui vira aviso, com o comando para repetir à mão."""
+    """Tells orq that main moved. Main has already advanced: a failure here becomes a notice, with the command to repeat by hand."""
     try:
         branches = open(branches_file(wt)).read().split()
     except OSError:
@@ -76,17 +76,17 @@ def advance(wt):
     if ff.returncode:
         die(f"the live main cannot fast-forward (it moved, or has local changes):\n{ff.stderr.strip()}\n"
                f"bring main into the worktree (`git -C {shlex.quote(wt)} merge main`), resolve there and run `integrar.py --avancar {wt}`")
-    conclude(viva, wt)  # antes de remover a worktree: o arquivo das branches vive no gitdir dela
+    conclude(viva, wt)  # before removing the worktree: the branches file lives in its gitdir
     git(viva, "worktree", "remove", "--force", wt)
     git(viva, "branch", "-d", branch)
     print(f"integrar: main at {git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}, worktree removed")
 
 
 def clean(viva):
-    """Começo do ciclo: se o push da main já saiu, remove as worktrees do orq-wt cujas branches a origin/main contém. Falha vira aviso."""
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # o orq.py roda dentro da main viva: nenhum __pycache__ suja a árvore
+    """Start of the cycle: if the main push already went out, removes the orq-wt worktrees whose branches origin/main contains. A failure becomes a notice."""
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # orq.py runs inside the live main: no __pycache__ dirties the tree
     if os.environ.get("ORQ_WT_DIR"):
-        env["ORQ_WT_ROOT"] = os.environ["ORQ_WT_DIR"]  # a pasta de worktrees que este ciclo usa é a que se limpa
+        env["ORQ_WT_ROOT"] = os.environ["ORQ_WT_DIR"]  # the worktrees folder this cycle uses is the one that gets cleaned
     r = subprocess.run([sys.executable, os.path.join(viva, "orq.py"), "worktrees", "clean"], capture_output=True, text=True, env=env)
     print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
 

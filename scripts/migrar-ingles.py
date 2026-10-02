@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Migra o estado do ORQ_HOME para o inglês (fase 2 da migração; plano em ~/.claude/orquestrador-plan/orq-ingles-plano.md).
+"""Migrates the ORQ_HOME state to English (phase 2 of the migration; plan in ~/.claude/orquestrador-plan/orq-ingles-plano.md).
 
-Recusa rodar com worker vivo no Orca (fora o terminal que chama), com o gerente rodando (`orq gerente serve` ou o painel do agent manager) ou
-com alguma trava do orq presa. Copia antes os arquivos que vai mexer para ORQ_HOME/backup-pt-<data>/, reescreve o events.jsonl linha a linha
-(a ilegível vai como está e entra no relatório), confere o número de linhas e troca por os.replace; depois traduz e renomeia cada .json.
-O digest/ fica em pt (contrato digest-v1). Rodar de novo não muda nada: sem nada em pt, não há backup nem gravação.
+Refuses to run with a live worker in Orca (other than the calling terminal), with the manager running (`orq manager serve` or the agent manager panel) or
+with any orq lock stuck. First copies the files it will touch to ORQ_HOME/backup-pt-<date>/, rewrites events.jsonl line by line
+(an unreadable one goes as is and enters the report), checks the line count and swaps with os.replace; then translates and renames each .json.
+digest/ stays in pt (digest-v1 contract). Running it again changes nothing: with nothing in pt, there is no backup and no write.
 
     python3 scripts/migrar-ingles.py [--dry-run]
 """
@@ -22,21 +22,21 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import orqlib as o  # noqa: E402
 
-FOLDERS = ("groups", "projects", "retro", "handoff")  # as pastas de estado com .json; digest/ fica em pt
+FOLDERS = ("groups", "projects", "retro", "handoff")  # the state folders with .json; digest/ stays in pt
 OLD_LOCKS = {"fila.lock": "merge-queue.lock", "fila-despacho.lock": "dispatch-queue.lock", "integrar-fila.lock": "integrate-queue.lock",
                   "turnos.lock": "turns.lock", "gerente.lock": "manager.lock", "despacho.lock": "dispatch.lock", "pend.lock": "pending.lock",
                   "passagem.lock": "handoff.lock", "revisao.lock": "review.lock"}
-# chave que sobrou em pt depois do para_en: acento, sufixo ou palavra que o inglês não tem
+# key left over in pt after to_en: accent, suffix or a word that English doesn't have
 PT = re.compile(r"[^\x00-\x7f]|(?:cao|coes|agem|ados?|idas?|idos?|ndo|eiro|ento)$|^(?:sem|com|por|para|de|em|na|no)_|_(?:em|de|do|da|na|no)$")
 
 
 def _live_blockers():
-    """O que impede a migração: workers vivos, gerente rodando, travas presas. Lista vazia é caminho livre."""
+    """What blocks the migration: live workers, manager running, stuck locks. An empty list is a clear path."""
     out = []
     eu = os.environ.get("ORCA_TERMINAL_HANDLE")
     try:
         ws = [w for w in o._all_workers() if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") != eu]
-    except Exception as e:  # noqa: BLE001 - sem o Orca não há como saber se há worker vivo: recusa
+    except Exception as e:  # noqa: BLE001 - without Orca there is no way to know whether a worker is alive: refuse
         return [f"não consegui listar os workers no Orca ({type(e).__name__}: {e})"]
     out += [f"worker vivo: {w.get('dispatchId')} (task {w.get('taskId')}, terminal {w.get('agentTerminalHandle')})" for w in ws]
     if pid := o.serve_owner():
@@ -49,7 +49,7 @@ def _live_blockers():
 
 @contextlib.contextmanager
 def _locks():
-    """Toma todas as travas do orq (nomes novos e antigos) sem esperar e as segura até o fim: append de hook espera a troca do events.jsonl."""
+    """Takes all of orq's locks (new and old names) without waiting and holds them until the end: a hook append waits for the events.jsonl swap."""
     open_entries, stuck_locks = [], []
     try:
         for item_name in sorted({os.path.basename(p) for p in glob.glob(os.path.join(o.HOME, "*.lock"))} | {"cursor.lock"}):
@@ -73,11 +73,11 @@ def _read_value(path):
 
 
 def _write_json_file(path, dado):
-    o._write_json(path, dado, indent=2)  # o _write_json passa pelo para_en: o que já está em inglês fica igual
+    o._write_json(path, dado, indent=2)  # _write_json goes through to_en: what is already in English stays the same
 
 
 def _leftovers(obj, found_labels):
-    """Junta em `achadas` as chaves que parecem pt depois do para_en."""
+    """Gathers into `found_labels` the keys that look like pt after to_en."""
     if isinstance(obj, list):
         for x in obj:
             _leftovers(x, found_labels)
@@ -89,7 +89,7 @@ def _leftovers(obj, found_labels):
 
 
 def plan():
-    """O que a migração faria: {eventos: (linhas, mudam, ilegíveis), arquivos: [(origem, destino)], travas: [...], sobras: {chave: n}}."""
+    """What the migration would do: {eventos: (lines, change, unreadable), arquivos: [(source, destination)], travas: [...], sobras: {key: n}}."""
     leftovers, files_set = {}, []
     ev = os.path.join(o.HOME, "events.jsonl")
     line_list = to_change = 0
@@ -141,7 +141,7 @@ def _backup(p):
 
 
 def _events():
-    """Reescreve o events.jsonl com para_en num tmp ao lado; confere as linhas e troca. A linha ilegível vai como está."""
+    """Rewrites events.jsonl with to_en into a tmp next to it; checks the lines and swaps. An unreadable line goes as is."""
     ev = os.path.join(o.HOME, "events.jsonl")
     tmp = f"{ev}.migrar-{os.getpid()}.tmp"
     entry = output = 0
@@ -165,7 +165,7 @@ def _events():
 
 
 def _file_path(a, b):
-    """Traduz e grava `a` em `b` (o nome novo), apaga `a`. Pasta (perguntar/ -> ask/) e arquivo que não é JSON (gerente-vivo) só trocam de nome."""
+    """Translates and writes `a` to `b` (the new name), deletes `a`. A folder (perguntar/ -> ask/) and a file that isn't JSON (gerente-vivo) are only renamed."""
     if os.path.isdir(a) or not a.endswith(".json"):
         if os.path.exists(b):
             return f"{os.path.basename(a)}: {os.path.basename(b)} já existe, ficou o novo (o antigo está no backup)"

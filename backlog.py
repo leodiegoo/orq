@@ -1,9 +1,9 @@
-"""Backlog do orq no formato do tasks-axi (ticket 101). Só stdlib.
+"""orq backlog in the tasks-axi format (ticket 101). stdlib only.
 
-Leitura em Python, porque um processo do tasks-axi leva de 74 a 120 ms e os hooks têm teto de 100 ms. Escrita só pela CLI, na versão `VERSAO`
-(a gramática ainda é 0.x), sempre com `TASKS_AXI_FILE` no ambiente e nunca `--file`. A gramática lida aqui é a de
-`tasks-axi/dist/src/backends/markdown-grammar.js`: o estado vem do cabeçalho da seção, e as tags de cauda da linha viram campo.
-O teste de contrato (test_orq.py, `contrato`) roda o tasks-axi de verdade e compara os dois lados.
+Reading is done in Python, because a tasks-axi process takes 74 to 120 ms and the hooks have a 100 ms ceiling. Writing only through the CLI, at version `VERSION`
+(the grammar is still 0.x), always with `TASKS_AXI_FILE` in the environment and never `--file`. The grammar read here is that of
+`tasks-axi/dist/src/backends/markdown-grammar.js`: the state comes from the section header, and the line's trailing tags become fields.
+The contract test (test_orq.py, `contrato`) runs the real tasks-axi and compares both sides.
 """
 import os
 import re
@@ -12,11 +12,11 @@ import subprocess
 from datetime import date
 
 VERSION = "0.2.6"
-TOML = '[markdown]\ndone_keep = 100000\n'  # o `.tasks.toml` de uma pasta de backlog: o arquivamento tiraria do arquivo ticket que o orq ainda consulta (numeração, Blocked by)
+TOML = '[markdown]\ndone_keep = 100000\n'  # the `.tasks.toml` of a backlog folder: archiving would take out of the file a ticket that orq still consults (numbering, Blocked by)
 CLI_TIMEOUT_S = 20
 HOLD_KINDS = ("captain", "external", "load", "parked", "future")
-META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # linhas `chave: valor` no topo do corpo da pendência
-META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera")  # idem no ticket; `orca: task_x run_y` é a ponte com o Orca
+META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # `key_name: value` lines at the top of the pending item's body
+META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera")  # same for the ticket; `orca: task_x run_y` is the bridge to Orca
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 ID_RE = re.compile(rf"^{_ID}$")
@@ -25,7 +25,7 @@ _BULLET = {"done": [re.compile(rf"^- \[x\] ({_ID}) - (.*)$")],
            "in_flight": [re.compile(rf"^- \*\*({_ID})\*\* - (.*)$"), re.compile(rf"^- \[ \] ({_ID}) - (.*)$")]}
 _DATA = r"\d{4}-\d{2}-\d{2}"
 _DEP = r"(?:blocked-by|parent|discovered-from)"
-# a ordem é a do extractTags do tasks-axi: cada volta tira uma tag do fim da linha, até nenhuma casar
+# the order is that of tasks-axi's extractTags: each pass strips one tag from the end of the line, until none matches
 _TAGS = (("dep", re.compile(rf"\s*({_DEP}):\s*({_ID})(?:\s+-\s+((?:(?!\s+{_DEP}:\s).)+?))?\s*$")),
          ("repo", re.compile(r"\s*\((?:[^()]*\+\s*)?repo:\s*([^)]+)\)\s*$")),
          ("kind", re.compile(r"\s*\(kind:\s*([^)]+)\)\s*$")),
@@ -39,7 +39,7 @@ _META = re.compile(r"^([a-z_]+):[ \t]?(.*)$")
 
 
 class BacklogError(RuntimeError):
-    """A CLI do tasks-axi recusou, está na versão errada ou não existe."""
+    """The tasks-axi CLI refused, is at the wrong version, or does not exist."""
 
 
 def _state(header):
@@ -67,10 +67,10 @@ def _tags(rest):
 
 
 def parse(src):
-    """Itens do texto de um backlog.md: [{id, titulo, estado, kind, repo, prioridade, since, closed, bloqueios, hold, corpo}], na ordem do arquivo.
+    """Items of a backlog.md text: [{id, titulo, estado, kind, repo, prioridade, since, closed, bloqueios, hold, corpo}], in file order.
 
-    `bloqueios` são os ids de `blocked-by` (os outros tipos de aresta não bloqueiam); `hold` é {motivo, kind, until} ou None; `corpo` é o
-    texto das linhas indentadas sem os 2 espaços. Item fora de uma seção conhecida não é item.
+    `blockers` are the `blocked-by` ids (the other edge types do not block); `hold` is {motivo, kind, until} or None; `body_text` is the
+    text of the indented lines without the 2 spaces. An item outside a known section is not an item.
     """
     item_list, state, current = [], None, None
     for line in src.split("\n"):
@@ -98,7 +98,7 @@ def parse(src):
 
 
 def read_value(path):
-    """Itens do backlog.md; arquivo ausente é vazio. Erro de leitura levanta OSError (nunca vira lista vazia calada)."""
+    """Items of the backlog.md; a missing file is empty. A read error raises OSError (it never becomes a silent empty list)."""
     try:
         with open(path, encoding="utf-8") as f:
             return parse(f.read())
@@ -107,11 +107,11 @@ def read_value(path):
 
 
 def body_meta(body_text, keys):
-    """(meta, resto): as linhas `chave: valor` do topo do corpo cujas chaves estão em `chaves`, e o texto que sobra.
+    """(meta, rest): the `key_name: value` lines at the top of the body whose keys are in `keys`, and the remaining text.
 
-    A primeira linha que não é meta termina a meta; uma linha em branco logo depois dela (ou no começo, sem meta) é o separador e não entra no resto.
-    ponytail: um texto livre que comece com uma linha `link: x` e nenhuma meta antes vira meta; `corpo_com_meta` põe uma linha em branco na frente
-    nesse caso, mas um corpo escrito à mão com essa forma será lido como meta.
+    The first line that is not meta ends the meta; a blank line right after it (or at the start, with no meta) is the separator and is not part of the rest.
+    ponytail: a free text that starts with a `link: x` line and has no meta before it becomes meta; `body_with_meta` puts a blank line in front
+    in that case, but a hand-written body with that shape will be read as meta.
     """
     line_list, meta = body_text.split("\n") if body_text else [], {}
     while line_list and (m := _META.match(line_list[0])) and m.group(1) in keys:
@@ -123,7 +123,7 @@ def body_meta(body_text, keys):
 
 
 def body_with_meta(meta, text_value, keys):
-    """O inverso de meta_corpo: as linhas de `meta` (só as de `chaves` com valor, numa linha cada), uma linha em branco e o texto."""
+    """The inverse of body_meta: the `meta` lines (only those of `keys` that have a value, one per line), a blank line and the text."""
     line_list = [f"{k}: {' '.join(str(meta[k]).split())}" for k in keys if meta.get(k)]
     text_value = text_value or ""
     first = text_value.split("\n", 1)[0]
@@ -133,27 +133,27 @@ def body_with_meta(meta, text_value, keys):
 
 
 def active_hold(item, today=None):
-    """O hold segura o item que não está Done: sem `until` vale sempre, com `until` vale enquanto a data for futura (no dia dela já solta)."""
+    """The hold holds back an item that is not Done: without `until` it always applies, with `until` it applies while the date is in the future (on the day itself it already lets go)."""
     h = item.get("hold")
     return bool(h) and item["estado"] != "done" and (not h.get("until") or h["until"] > (today or date.today()).isoformat())
 
 
 def is_blocked(item, by_id):
-    """O item não está Done e algum `blocked-by` aponta para um item que existe e não está Done; bloqueador que não existe conta como resolvido."""
+    """The item is not Done and some `blocked-by` points to an item that exists and is not Done; a blocker that does not exist counts as resolved."""
     return item["estado"] != "done" and any(by_id.get(b) and by_id[b]["estado"] != "done" for b in item["bloqueios"])
 
 
 def ready(item_list, today=None, repo=None):
-    """O `tasks-axi ready`: Queued, sem bloqueio aberto e sem hold ativo; `repo` filtra como o --repo."""
+    """The `tasks-axi ready`: Queued, with no open blocker and no active hold; `repo` filters like --repo."""
     by_id = {i["id"]: i for i in item_list}
     return [i for i in item_list if i["estado"] == "queued" and not is_blocked(i, by_id) and not active_hold(i, today) and (repo is None or i["repo"] == repo)]
 
 
 def emit(item_list, header="# Backlog"):
-    """O texto de um backlog.md com `itens` na gramática canônica (a mesma que `tasks-axi render` devolve): uma linha por item e o corpo indentado.
+    """The text of a backlog.md with `item_list` in the canonical grammar (the same one `tasks-axi render` returns): one line per item and the indented body.
 
-    O item é {id, titulo, estado, kind?, repo?, prioridade?, since?, closed?, bloqueios?, hold?, corpo?}; a data de criação e a de fechamento vêm
-    do chamador (a CLI só sabe carimbar "hoje").
+    The item is {id, titulo, estado, kind?, repo?, prioridade?, since?, closed?, bloqueios?, hold?, corpo?}; the creation and closing dates come
+    from the caller (the CLI only knows how to stamp "today").
     """
     sections = {"in_flight": [], "queued": [], "done": []}
     for i in item_list:
@@ -179,8 +179,8 @@ def emit(item_list, header="# Backlog"):
 
 
 def pending_to_item(p):
-    """O item de backlog de uma pendência do pendencias.json: kind = tipo, repo `pend`, meta no topo do corpo e o detalhe depois. O hold segura a
-    pendência fora do `ready` (kind `external` se espera alguém, `captain` se é do usuário) e leva o `ate` como until; o motivo não aceita parênteses."""
+    """The backlog item for a pending item from pendencias.json: kind = type, repo `pending`, meta at the top of the body and the detail after it. The hold keeps the
+    pending item out of `ready` (kind `external` if it waits on someone, `captain` if it belongs to the user) and carries `until_at` as until; the reason does not accept parentheses."""
     reason = f"waiting on {p['espera']}" if p.get("espera") else "pending user decision" if p.get("tipo") == "decisao" else "pending user item"
     return {"id": p["id"], "titulo": " ".join(p["titulo"].split()), "estado": "queued", "kind": p["tipo"], "repo": "pend", "since": p.get("desde"),
             "hold": {"motivo": " ".join(re.sub(r"[()]", " ", reason).split()), "kind": "external" if p.get("espera") else "captain", "until": p.get("ate")},
@@ -188,19 +188,19 @@ def pending_to_item(p):
 
 
 def pending_from_item(i):
-    """A pendência (formato do pendencias.json) de um item `pend` do backlog; chaves na ordem em que `pend add` as grava."""
+    """The pending item (pendencias.json format) from a `pending` item of the backlog; keys in the order in which `pending add` writes them."""
     meta, detail = body_meta(i["corpo"], META_PENDING)
     fields = (("detalhe", detail), ("frente", meta.get("frente")), ("desde", i["since"]), ("link", meta.get("link")), ("comando", meta.get("comando")),
               ("espera", meta.get("espera")), ("ate", (i["hold"] or {}).get("until")), ("gate", meta.get("gate")), ("gate_run", meta.get("gate_run")), ("task", meta.get("task")))
     return {"id": i["id"], "tipo": i["kind"], "titulo": i["titulo"], **{k: v for k, v in fields if v}}
 
 
-TICKET_STATE = {"queued": "ready-for-agent", "in_flight": "claimed", "done": "resolved"}  # o `Status:` do cabeçalho do ticket
+TICKET_STATE = {"queued": "ready-for-agent", "in_flight": "claimed", "done": "resolved"}  # the ticket header's `Status:`
 
 
 def ticket_of_item(i, by_id, root):
-    """O ticket (formato de `tickets()` do orq) de um item `tNN` kind `ticket`, ou None se o item é outra coisa. `blocked_by` traz só os bloqueadores ainda
-    abertos (num ticket Done, todos: é o histórico que `orq ticket lista` mostra); `run` e `task` vêm da linha `orca: <task> <run>`; `arquivo` é o `spec:` relativo a `raiz`."""
+    """The ticket (format of orq's `tickets()`) from a `tNN` item of kind `ticket`, or None if the item is something else. `blocked_by` brings only the blockers that are still
+    open (in a Done ticket, all of them: it is the history that `orq ticket listing` shows); `run` and `task` come from the `orca: <task> <run>` line; `file_name` is the `spec:` relative to `root`."""
     m = re.fullmatch(r"t(\d+)", i["id"])
     if not m or i["kind"] != "ticket":
         return None
@@ -210,18 +210,18 @@ def ticket_of_item(i, by_id, root):
     return {"num": m.group(1).zfill(2), "arquivo": os.path.join(root, meta["spec"]) if meta.get("spec") else None, "titulo": i["titulo"], "status": TICKET_STATE[i["estado"]],
             "blocked_by": [b[1:].zfill(2) for b in i["bloqueios"] if re.fullmatch(r"t\d+", b) and (i["estado"] == "done" or by_id.get(b, {}).get("estado") not in (None, "done"))],
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
-            "despacho": meta.get("despacho"), "espera": meta.get("espera"),  # os cabeçalhos `Despacho:` e `Espera:` (ticket 142)
+            "despacho": meta.get("despacho"), "espera": meta.get("espera"),  # the `Despacho:` and `Espera:` headers (ticket 142)
             "fechado_em": i["closed"]}
 
 
 def repo_from_title(title):
-    """O `repo` de um ticket: o prefixo do título antes de `:` ("orq: x" -> "orq"), ou None."""
+    """A ticket's `repo`: the title prefix before `:` ("orq: x" -> "orq"), or None."""
     m = re.match(r"^([a-z][a-z0-9-]{1,15}):\s", title)
     return m.group(1) if m else None
 
 
 def problem_title(title):
-    """Por que a CLI não guardaria este título como está (a gramática leria o fim como tag, ou a CLI leria o começo como opção), ou None."""
+    """Why the CLI would not store this title as is (the grammar would read the end as a tag, or the CLI would read the start as an option), or None."""
     if _tags(title)[0] != title:
         return f"the title ends in a backlog tag (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): rewrite {title!r}"
     if title.startswith("-"):
@@ -237,7 +237,7 @@ _VERSIONS = {}
 
 
 def check_version(exe):
-    """Recusa, com a instrução de instalar, um tasks-axi que não seja o `VERSAO`; a conferência vale uma vez por processo."""
+    """Refuses, with the install instruction, a tasks-axi that is not `VERSION`; the check holds once per process."""
     if exe not in _VERSIONS:
         try:
             r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
@@ -249,10 +249,10 @@ def check_version(exe):
 
 
 def cli(path, *args):
-    """Roda `tasks-axi <args>` sobre o backlog `caminho` (TASKS_AXI_FILE, cwd na pasta dele, onde mora o .tasks.toml) e devolve o stdout.
+    """Runs `tasks-axi <args>` on the backlog `path` (TASKS_AXI_FILE, cwd in its folder, where .tasks.toml lives) and returns the stdout.
 
-    Recusa `--file` e backlog que seja symlink (o rename da CLI o trocaria por arquivo comum). Código de saída diferente de zero levanta BacklogErro
-    com o que a CLI disse.
+    Refuses `--file` and a backlog that is a symlink (the CLI's rename would replace it with a regular file). A non-zero exit code raises BacklogErro
+    with what the CLI said.
     """
     if any(a == "--file" or a.startswith("--file=") for a in args):
         raise ValueError("the backlog is chosen by ORQ_BACKLOG, never by --file")

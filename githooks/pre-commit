@@ -1,8 +1,8 @@
 #!/bin/sh
-# ativado por `git config core.hooksPath githooks`
-# O checkout vivo (o que não é worktree ligada) não recebe commit na main: o integrador, ORQ_INTEGRADOR=1, é a exceção.
+# enabled by `git config core.hooksPath githooks`
+# The live checkout (the one that is not a linked worktree) takes no commit on main: the integrator, ORQ_INTEGRADOR=1, is the exception.
 if [ -z "$ORQ_INTEGRADOR" ] && [ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ] && [ "$(git symbolic-ref -q --short HEAD)" = main ]; then
-  echo "pre-commit: commit na main do checkout vivo recusado. Crie a worktree: git worktree add -b <tipo>/<descrição> ~/.claude/orq-wt/<ticket> origin/main" >&2
+  echo "pre-commit: commit on main of the live checkout refused. Create a worktree: git worktree add -b <type>/<description> ~/.claude/orq-wt/<ticket> origin/main" >&2
   exit 1
 fi
 exec python3 "$(git rev-parse --show-toplevel)/scripts/audiencia-check.py"

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Converte os tickets (ORQ_ISSUES) e o pendencias.json (ORQ_PENDENCIAS) num backlog.md do tasks-axi (ticket 101, M2). Só lê as fontes.
+"""Converts the tickets (ORQ_ISSUES) and pendencias.json (ORQ_PENDENCIAS) into a tasks-axi backlog.md (ticket 101, M2). Only reads the sources.
 
     converte-backlog.py [--saida ORQ_BACKLOG] [--issues D] [--pendencias F] [--eventos F] [--forcar | --completa [--outros B]]
 
-Escreve só em arquivo novo (recusa um que exista, a não ser com --forcar), então rodar de novo na cópia é seguro. Um ticket vira `tNN`
-(kind `ticket`, `repo` do prefixo do título antes de `:`), com `spec:` para o arquivo, `orca: <task> <run>` e `modelo:`/`effort:`/`issue:`/`despacho:`/`espera:`
-quando o cabeçalho os tem; uma pendência vira o item `repo: pend` que `orq pend add` cria. As datas vêm do events.jsonl (`ticket novo|fechar`),
-com o mtime do arquivo na falta. O `Blocked by` lê só os números do começo do campo ("none (… 30/09)" não bloqueia ninguém).
-Depois de escrever, roda o `tasks-axi render` (confere que a gramática foi aceita e que nada de fundo mudou) e compara as contagens
-(Done, arestas de bloqueio, prontos) com as das fontes; qualquer diferença sai com código 1.
+Writes only to a new file (refuses one that exists, unless --forcar), so running it again on the copy is safe. A ticket becomes `tNN`
+(kind `ticket`, `repo` from the title prefix before `:`), with `spec:` for the file, `orca: <task> <run>` and `model:`/`effort:`/`issue:`/`dispatch_mode:`/`waiting:`
+when the header has them; a pending item becomes the `repo: pending` item that `orq pending add` creates. Dates come from events.jsonl (`ticket new|fechar`),
+with the file's mtime as a fallback. `Blocked by` reads only the numbers at the start of the field ("none (… 30/09)" blocks nobody).
+After writing, it runs `tasks-axi render` (checks that the grammar was accepted and that nothing underneath changed) and compares the counts
+(Done, blocking edges, ready) with the sources'; any difference exits with code 1.
 
-`--completa` (ticket 102) não reescreve nada: acrescenta, pela CLI, os tickets de `issues/` que o backlog ainda não tem (os criados depois da migração, antes de `ticket novo` escrever
-no backlog), imprime a contagem antes e depois e sai com 1 se o `depois` não fechar. Os backlogs de `grupos/*/backlog.md` ao lado da saída contam como já migrados.
+`--complete` (ticket 102) rewrites nothing: it appends, through the CLI, the tickets in `issues/` that the backlog doesn't have yet (the ones created after the migration, before `ticket new` wrote
+to the backlog), prints the count before and after and exits 1 if `after` doesn't add up. The `groups/*/backlog.md` backlogs next to the output count as already migrated.
 """
 import argparse
 import glob
@@ -33,7 +33,7 @@ def _campo(cab, item_name):
 
 
 def blockers_of(campo):
-    """Os números que abrem o campo `Blocked by` ("125, 126 e 128"), sem pegar data nem número solto de um comentário depois."""
+    """The numbers that open the `Blocked by` field ("125, 126 e 128"), without picking up a date or a stray number from a comment afterwards."""
     m = re.match(r"\s*(\d+(?:\s*(?:,|;|e|and)\s*\d+)*)", campo or "")
     return re.findall(r"\d+", m.group(1)) if m else []
 
@@ -53,7 +53,7 @@ def read_ticket(path):
 
 
 def event_dates(path):
-    """({num: data do `ticket novo`}, {num: data do `ticket fechar`}), a primeira de cada; arquivo ausente é vazio."""
+    """({num: date of `ticket new`}, {num: date of `ticket fechar`}), the first of each; a missing file is empty."""
     new, did_close = {}, {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -70,7 +70,7 @@ def event_dates(path):
 
 
 def convert(issues, pending_items, event_list):
-    """(texto do backlog, resumo esperado {done, bloqueios, prontos, tickets, pendencias}) das fontes."""
+    """(backlog text, expected summary {done, bloqueios, prontos, tickets, pendencias}) from the sources."""
     names = sorted((n for n in os.listdir(issues) if re.match(r"^\d+-.+\.md$", n)), key=lambda n: int(n.split("-")[0]))
     ts = [read_ticket(os.path.join(issues, n)) for n in names]
     numbers = {t["num"].zfill(2) for t in ts}
@@ -100,8 +100,8 @@ def convert(issues, pending_items, event_list):
 
 
 def complete(output, issues, pending_items, event_list, others=()):
-    """Acrescenta ao backlog que existe os tickets de `issues` que nem ele nem os `outros` backlogs (os dos grupos) têm, pela CLI: travada e atômica, e a data de criação
-    vira a de hoje (são os criados depois da migração). Devolve (tickets antes, tickets depois, ids acrescentados, avisos); `depois` só confere se tudo entrou."""
+    """Appends to the existing backlog the tickets from `issues` that neither it nor the `others` backlogs (the groups' ones) have, through the CLI: locked and atomic, and the creation date
+    becomes today's (they are the ones created after the migration). Returns (tickets before, tickets after, appended ids, notices); `after` only checks that everything went in."""
     _, _, item_list = convert(issues, pending_items, event_list)
     tickets = [i for i in item_list if i["kind"] == "ticket"]
     mine = {i["id"] for i in backlog.read_value(output)}
@@ -130,7 +130,7 @@ def complete(output, issues, pending_items, event_list, others=()):
 
 
 def ready_ids(cli_output):
-    """Os ids da tabela `ready[N]{...}:` do tasks-axi."""
+    """The ids in tasks-axi's `ready[N]{...}:` table."""
     return re.findall(r"^  ([^,\s]+),", cli_output.split("ready[", 1)[-1], re.M) if "ready[" in cli_output else []
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit: prompt do usuário com a palavra "merged" dispara limpar-mergeados.py destacado, com 20 s de atraso.
+"""UserPromptSubmit: a user prompt with the word "merged" triggers limpar-mergeados.py, detached, with a 20 s delay.
 
-Só no coordenador, com a mesma detecção do orq (Run ligado e terminal que não é de worker). Notificação, comando, resumo de sessão
-e preâmbulo de despacho não disparam (origem do orq), nem mensagem que termina com "?". Sem confirmar o papel, não limpa."""
+Only in the coordinator, with the same detection as orq (Run attached and a terminal that is not a worker's). Notification, command, session summary
+and dispatch preamble do not trigger it (orq origin), nor does a message that ends with "?". Without confirming the role, it does not clean."""
 import json
 import os
 import re
@@ -22,7 +22,7 @@ try:
 except ValueError:
     sys.exit(0)
 if not isinstance(event, dict):
-    sys.exit(0)  # entrada ruim: sem prompt, nada a limpar
+    sys.exit(0)  # bad input: no prompt, nothing to clean
 cwd = event.get("cwd") if isinstance(event.get("cwd"), str) and event.get("cwd") else os.getcwd()
 prompt = event.get("prompt") if isinstance(event.get("prompt"), str) else ""
 if origin_name(prompt) != "usuario" or prompt.rstrip().endswith("?"):
@@ -33,17 +33,17 @@ if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=cwd, capture_output=Tru
     sys.exit(0)
 
 signal.signal(signal.SIGALRM, lambda *_: sys.exit(0))
-signal.alarm(3)  # o mesmo teto dos hooks do orq
+signal.alarm(3)  # the same ceiling as the orq hooks
 try:
     if coordinator(event) is None:
         sys.exit(0)
-except Exception:  # noqa: BLE001 - sem confirmar que é o coordenador, não limpa
+except Exception:  # noqa: BLE001 - without confirming it is the coordinator, it does not clean
     sys.exit(0)
 signal.alarm(0)
 
 home = os.path.expanduser("~")
 log = open(f"{home}/.claude/logs/limpar-mergeados.log", "a")
-# atraso para o GitHub marcar o PR como mergeado
+# delay for GitHub to mark the PR as merged
 subprocess.Popen(["sh", "-c", f'sleep 20; exec python3 "{home}/.claude/scripts/limpar-mergeados.py" --repo "$0"', cwd],
                  cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 print(json.dumps({"hookSpecificOutput": {

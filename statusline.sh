@@ -1,16 +1,16 @@
 #!/bin/sh
-# Statusline do usuário: repassa o stdin ao launcher do HUD do OMC e, com o modo ausente ligado, acrescenta
-# "away desde HH:MM" em amarelo à primeira linha. Caminho quente sem Python: o marcador estado/away é escrito
-# por `orq ausente ligar` e apagado por `orq ausente desligar`. Desligado (ou marcador ilegível) a saída é a do HUD.
+# The user's statusline: passes stdin to the OMC HUD launcher and, with away mode on, appends
+# "away since HH:MM" in yellow to the first line. Hot path with no Python: the estado/away marker is written
+# by `orq away on` and deleted by `orq away off`. Off (or an unreadable marker) the output is the HUD's.
 HUD=${ORQ_HUD:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hud/omc-hud-cache.sh}
-case "$0" in */*) AQUI=${0%/*} ;; *) AQUI=. ;; esac
-MARCA=${ORQ_HOME:-$AQUI}/estado/away
-desde=
-[ -r "$MARCA" ] && desde=$(cat "$MARCA" 2>/dev/null)
-if [ -z "$desde" ]; then
+case "$0" in */*) HERE=${0%/*} ;; *) HERE=. ;; esac
+MARK=${ORQ_HOME:-$HERE}/estado/away
+since=
+[ -r "$MARK" ] && since=$(cat "$MARK" 2>/dev/null)
+if [ -z "$since" ]; then
   exec sh "$HUD" "$@"
 fi
-seg=$(printf ' \033[33maway since %s\033[0m' "$desde")
+seg=$(printf ' \033[33maway since %s\033[0m' "$since")
 out=$(sh "$HUD" "$@")
 nl='
 '

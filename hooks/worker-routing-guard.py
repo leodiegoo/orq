@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse: bloqueia despacho de worker sem modelo explícito (skill worker-routing)."""
+"""PreToolUse: blocks a worker dispatch without an explicit model (worker-routing skill)."""
 import json
 import re
 import sys
@@ -24,7 +24,7 @@ def deny(extra):
 try:
     event = json.load(sys.stdin)
 except ValueError:
-    sys.exit(0)  # entrada ruim: o hook não decide nada (o erro que não bloqueia só faz ruído)
+    sys.exit(0)  # bad input: the hook decides nothing (an error that does not block only makes noise)
 if not isinstance(event, dict):
     sys.exit(0)
 tool = event.get("tool_name")
@@ -33,19 +33,19 @@ params = event.get("tool_input") if isinstance(event.get("tool_input"), dict) el
 if tool == "Bash":
     cmd = params.get("command") if isinstance(params.get("command"), str) else ""
     if re.search(r"orchestration\s+worker-start\b", cmd) and "--help" not in cmd:
-        # --terminal reaproveita um terminal vivo, e o orca não aceita --model junto
+        # --terminal reuses a live terminal, and orca does not accept --model together with it
         if "--terminal" not in cmd:
             missing = [f for f in ("--model", "--effort") if f not in cmd]
             if missing:
                 deny(" (missing " + " and ".join(missing) + " in worker-start)")
-    # o orq despachar chama o worker-start por dentro: sem --modelo e --effort ele nem sobe, mas a recusa vem aqui com o texto da skill
-    # só em posição de comando (início, ou depois de ; & | ( , e então um python3 opcional): o mesmo texto dentro de aspas (um --body, um echo, um commit) não conta
+    # orq despachar calls worker-start internally: without --modelo and --effort it does not even start, but the refusal comes from here with the skill's text
+    # only in command position (start, or after ; & | ( , and then an optional python3): the same text inside quotes (a --body, an echo, a commit) does not count
     without_quotes = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
     if re.search(r"(?:^|[;&|(]\s*)(?:python3?\s+)?(?:\S*/)?orq(?:\.py)?\s+(?:dispatch|despachar)\b", without_quotes) and "--help" not in cmd:
         missing = [f for f in ("--model", "--effort") if f not in cmd]
         if missing:
             deny(" (missing " + " and ".join(missing) + " in orq dispatch)")
-    # sem --run-hooks o archive do orca.yaml não roda, e o que ele devolve ao checkout principal (o .scratch, por exemplo) se perde
+    # without --run-hooks the orca.yaml archive does not run, and what it returns to the main checkout (the .scratch, for example) is lost
     if re.search(r"\borca\s+worktree\s+rm\b", cmd) and "--help" not in cmd and "--run-hooks" not in cmd:
         print(json.dumps({
             "hookSpecificOutput": {
@@ -56,10 +56,10 @@ if tool == "Bash":
         }))
         sys.exit(0)
 elif tool == "Agent":
-    # fork herda o modelo do pai e ignora model
+    # fork inherits the parent's model and ignores model
     if params.get("subagent_type") != "fork" and not params.get("model"):
         deny(" (pass model in the Agent call)")
-    # subagente não aparece no Run do Orca sozinho; lembrete, sem bloquear
+    # a subagent does not show up in the Orca Run by itself; reminder, without blocking
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

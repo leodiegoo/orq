@@ -1,7 +1,7 @@
-"""Saída dos pontos de entrada de hook quando o import do orqlib falha (marcador de conflito, SyntaxError, arquivo pela metade).
+"""Exit path of the hook entry points when the orqlib import fails (conflict marker, SyntaxError, half-written file).
 
-Um hook que quebra derruba o turno de todo worker; um hook mudo só deixa de ajudar. Por isso: exit 0, nada em stdout/stderr e a causa em ORQ_LOG.
-Este arquivo é mínimo e não importa o orq: precisa continuar de pé quando o resto não está."""
+A hook that breaks takes down every worker's turn; a silent hook just stops helping. Hence: exit 0, nothing on stdout/stderr and the cause in ORQ_LOG.
+This file is minimal and does not import orq: it has to stay up when the rest is not."""
 import os
 import sys
 from datetime import datetime, timezone

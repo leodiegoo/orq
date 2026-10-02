@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Testes do precompact.py: Orca, orq, gh e engram falsos, tudo em diretório temporário. Rodam com `python3 test_precompact.py`."""
+"""Tests for precompact.py: fake Orca, orq, gh and engram, all in a temporary directory. Run with `python3 test_precompact.py`."""
 import json
 import os
 import subprocess
@@ -50,38 +50,38 @@ def run_it(arg, ev, **env):
 
 last_item = os.path.join(HOME, "handoff", "ultimo.md")
 
-# sem Run ligado: não grava nada, não salva no engram
+# no Run bound: writes nothing, saves nothing to engram
 open(os.path.join(T, "run.json"), "w").write("null")
 run_it([], {"session_id": "s1", "cwd": REPO})
 assert not os.path.exists(last_item) and not os.path.exists(ENV["FAKE_ENG"])
 assert run_it(["retomar"], {"session_id": "s1", "source": "compact"}) == ""
 
-# coordenador: todas as seções, arquivo com data, link fixo e engram pela CLI
+# coordinator: all sections, dated file, fixed link and engram through the CLI
 open(os.path.join(T, "run.json"), "w").write('{"id": "run_1"}')
 run_it([], {"session_id": "s1", "cwd": REPO, "trigger": "manual"})
 md = open(last_item).read()
 for snippet in ["run_1", "task_a", "task_b", "python3 " + os.path.expanduser("~/.claude/scripts/orca-wait-runs.py") + " run_1 run_2",
                "12 orq: snapshot", "freio", "time de dados", "https://github.com/o/r/pull/7", "e1", "-> tarefa task_z", "-> no effect", "/x/desenho.md"]:
     assert snippet in md, snippet
-assert "task_c" not in md  # agente liberado não entra
-assert "orq status" not in md and "Aberto: backlog" not in md  # B29: o status vem do hook session, não daqui
+assert "task_c" not in md  # released agent is left out
+assert "orq status" not in md and "Aberto: backlog" not in md  # B29: the status comes from the session hook, not from here
 assert os.path.islink(last_item) and os.readlink(last_item).endswith(".md") and len(os.listdir(os.path.dirname(last_item))) == 2
 eng = open(ENV["FAKE_ENG"]).read().splitlines()
 assert eng[0] == "save" and eng[1].startswith("Handoff ") and "--project" in eng and "repo" in eng
 assert eng[eng.index("--topic") + 1] == "sessao/handoff" and eng[eng.index("--type") + 1] == "decision"
 
-# fora de repo git: seção de PRs avisa em vez de falhar
+# outside a git repo: the PRs section warns instead of failing
 run_it([], {"session_id": "s1", "cwd": T})
 assert "outside a git repo" in open(last_item).read()
 
-# retomada: só com source compact, no máximo 40 linhas, JSON de SessionStart
+# resume: only with source compact, at most 40 lines, SessionStart JSON
 assert run_it(["retomar"], {"session_id": "s1", "source": "startup"}) == ""
 out = json.loads(run_it(["retomar"], {"session_id": "s1", "source": "compact"}))["hookSpecificOutput"]
 assert out["hookEventName"] == "SessionStart" and "Handoff" in out["additionalContext"] and len(out["additionalContext"].splitlines()) <= 41
-# retomada em worker (sem handle): calada
+# resume in a worker (no handle): silent
 assert run_it(["retomar"], {"session_id": "s1", "source": "compact"}, ORCA_TERMINAL_HANDLE="") == ""
 
-# fail-open: entrada inválida, Orca quebrado
+# fail-open: invalid input, broken Orca
 p = subprocess.run([sys.executable, SCRIPT], input="não é json", capture_output=True, text=True, env=ENV)
 assert p.returncode == 0 and p.stdout == ""
 run_it([], {"session_id": "s1"}, ORQ_ORCA="/nao/existe")

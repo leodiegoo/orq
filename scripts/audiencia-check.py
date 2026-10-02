@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Procura termos proibidos nos arquivos versionados do repositório público.
+"""Looks for forbidden terms in the versioned files of the public repository.
 
-A lista fica fora do repositório (ORQ_TERMOS, padrão ~/.claude/orquestrador-plan/termos-proibidos.txt): um termo por linha,
-sem diferenciar maiúsculas; `re:` no começo da linha vira expressão regular; `#` comenta. Sem a lista, avisa e sai 0.
-Falha (1) com arquivo:linha. Uso: audiencia-check.py [raiz-do-repositório]"""
+The list lives outside the repository (ORQ_TERMOS, default ~/.claude/orquestrador-plan/termos-proibidos.txt): one term per line,
+case-insensitive; `re:` at the start of a line makes it a regular expression; `#` comments. Without the list, it warns and exits 0.
+Fails (1) with file:line. Usage: audiencia-check.py [repository-root]"""
 import os
 import re
 import subprocess
@@ -26,7 +26,7 @@ def findings(root, defaults):
         try:
             text_value = open(os.path.join(root, item_name), encoding="utf-8").read()
         except (OSError, UnicodeDecodeError):
-            continue  # binário (png) ou apagado no índice
+            continue  # binary (png) or deleted in the index
         for n, line in enumerate(text_value.splitlines(), 1):
             for p in defaults:
                 if p.search(line):
