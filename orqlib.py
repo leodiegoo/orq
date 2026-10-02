@@ -4003,7 +4003,32 @@ def _sem_push():
         return None
 
 
-def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push):
+CICLOS_LOG = os.environ.get("ORQ_CICLOS_LOG") or os.path.expanduser("~/.claude/orq-wt/integracao/ciclos.log")
+
+
+def _pendente_do_integrador(events):
+    """A primeira linha `[PENDENTE` do ciclos.log do integrador que o coordenador ainda não recebeu, com os arquivos sujos do checkout vivo; None se não há.
+    Vale só a pendência mais nova que o último ciclo concluído (qualquer linha não vazia sem `[PENDENTE`). Log ausente ou ilegível: None."""
+    try:
+        with open(CICLOS_LOG, encoding="utf-8") as f:
+            linhas = [x.strip() for x in f if x.strip()]
+    except OSError:
+        return None
+    pend = []
+    for x in linhas:
+        pend = pend + [x] if x.startswith("[PENDENTE") else []
+    avisadas = {e.get("linha") for e in events if e.get("tipo") == "pendente_avisado"}
+    linha = next((x[:300] for x in pend if x[:300] not in avisadas), None)
+    if not linha:
+        return None
+    try:
+        sujo = subprocess.run(["git", "-C", ORQ_INSTALL, "status", "--short"], capture_output=True, text=True, timeout=2).stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        sujo = []
+    return {"linha": linha, "motivo": f"orq: integrador parado: main não avançou, árvore viva suja ({_cita(linha, 160)})" + (f"; arquivos sujos: {'; '.join(sujo[:10])}" if sujo else "")}
+
+
+def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pendente=None):
     """O próximo passo do coordenador que não depende do usuário, ou None (pura; o Stop com away ligado barra o fim do turno enquanto houver um).
 
     Na ordem: entrega (worker `entregue` de ticket aberto) fora da fila do integrador; ciclo do integrador com commits sem push (`sem_push` > 0); ticket
@@ -4013,6 +4038,8 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push):
         n = de_dispatch.get(a.get("dispatch")) or de_dispatch.get(a.get("task"))
         if a.get("estado") == "entregue" and n and n not in integracao and (por_num.get(n) or {}).get("status") != STATUS_FECHADO:
             return f"o worker {a['dispatch']} entregou o ticket {n} e a entrega não foi integrada: `orq integrar fila add <branch> {n}`, depois libere o worker"
+    if pendente:
+        return pendente
     ciclo = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
     if ciclo and sem_push:
         return f"o ciclo do integrador ({str(ciclo.get('hash'))[:8]}) deixou {sem_push} commit(s) sem push: audite o diff e dê o push"
@@ -4034,7 +4061,8 @@ def away_bloqueio(events, agora):
     try:
         ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
         sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
-        proximo = proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push)
+        pend = _pendente_do_integrador(events)
+        proximo = proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push, pend and pend["motivo"])
     except Exception as e:  # noqa: BLE001 - hook falha aberto
         log(f"away_bloqueio: {type(e).__name__}: {e}")
         return None
@@ -4042,6 +4070,8 @@ def away_bloqueio(events, agora):
     if not proximo or sum(e.get("tipo") == "away_bloqueio" and e.get("motivo") == proximo and (_ts(e.get("ts")) or corte) > corte for e in events) >= AWAY_BLOQUEIOS:
         return None
     append_event({"tipo": "away_bloqueio", "motivo": proximo})
+    if pend and proximo == pend["motivo"]:  # a mesma linha do log avisa uma vez
+        append_event({"tipo": "pendente_avisado", "linha": pend["linha"]})
     return f"{MARCA} away ligado e ainda há trabalho que não depende do usuário: {proximo}. Faça isso antes de encerrar o turno."
 
 

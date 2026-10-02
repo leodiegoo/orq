@@ -435,7 +435,7 @@ class Amb:
         os.chmod(self.bin, 0o755)
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
-                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
+                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
                     "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.maquina()
@@ -12901,6 +12901,47 @@ def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_pri
     assert out.index("badge") < out.index("aviso-1"), "decisões primeiro"
     assert "freio-prod" not in out and "feita" not in out, "só o aberto desde que ligou"
     assert "pendência" not in a.orq("away", "off").stdout, "desligado de novo: sem lista"
+
+PEND137 = "[PENDENTE: main NÃO avançou, árvore viva suja] 2026-10-01 21:39 t118 a1ba4b5 841/841"
+
+
+def _ciclos137(a, *linhas):
+    with open(a.env["ORQ_CICLOS_LOG"], "w") as f:
+        f.write("\n".join(linhas) + "\n")
+
+
+def test_ticket137_stop_com_away_bloqueia_com_linha_pendente_do_ciclos_log_e_cita_o_motivo():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    _ciclos137(a, "ciclo ok 2026-10-01 21:00 t117 abc1234", PEND137)
+    out = _stop126(a)
+    assert out["decision"] == "block" and "integrador parado: main não avançou, árvore viva suja" in out["reason"] and "t118" in out["reason"], out
+
+
+def test_ticket137_linha_pendente_ja_avisada_nao_repete_e_a_nova_avisa_de_novo():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    _ciclos137(a, PEND137)
+    assert _stop126(a).get("decision") == "block"
+    assert _stop126(a) == {}, "a mesma linha avisa uma vez"
+    _ciclos137(a, PEND137, PEND137.replace("t118", "t119"))
+    assert "t119" in _stop126(a)["reason"], "linha nova avisa"
+
+
+def test_ticket137_log_sem_pendencia_ou_com_ciclo_concluido_depois_nao_avisa():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    assert _stop126(a) == {}, "sem log"
+    _ciclos137(a, "ciclo ok 2026-10-01 21:00 t117 abc1234")
+    assert _stop126(a) == {}
+    _ciclos137(a, PEND137, "ciclo ok 2026-10-01 22:00 t120 def5678")
+    assert _stop126(a) == {}, "o ciclo concluído depois encerra a pendência"
+
+
+def test_ticket137_pendente_so_bloqueia_com_away_ligado():
+    a = Amb(run="run_a")
+    _ciclos137(a, PEND137)
+    assert _stop126(a) == {}
 
 
 # ---- ticket 125: orq projeto add registra no Orca com o orca.yaml gerado; o mate roda no projeto do Orca
