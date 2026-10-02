@@ -18,18 +18,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORQ = os.path.join(HERE, "orq.py")
 CLEAN_SCRIPT = os.path.join(HERE, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, HERE)
-import orq as orq_mod  # noqa: E402
-import orqlib  # noqa: E402
-if "ORQ_BACKLOG" not in os.environ:
-    orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
-if "ORQ_BACKLOG_TICKETS" not in os.environ:
-    orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
+for _k in [k for k in os.environ if k.startswith("ORQ_") and k not in ("ORQ_BACKLOG", "ORQ_BACKLOG_TICKETS")]:
+    del os.environ[_k]  # the session's own tuning (a worker's ORQ_HOOK_TIMEOUT=15 turned the 3 s alarm into 15 s) never reaches the tests (ticket 328)
+# before the import: orqlib reads ORQ_LINK and ORQ_AVISO_GAP_S at load, and in-process tests saw the real link and a 3 s gap per notice (ticket 328)
 os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
 os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
 os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
 os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
+import orq as orq_mod  # noqa: E402
+import orqlib  # noqa: E402
+if "ORQ_BACKLOG" not in os.environ:
+    orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
+if "ORQ_BACKLOG_TICKETS" not in os.environ:
+    orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
 orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")  # likewise: the real hooks.json has an orq hook and may be untrusted  # no test writes to the real ~/.codex/config.toml
 
@@ -1756,11 +1759,11 @@ def test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm():
     p = subprocess.Popen([sys.executable, ORQ, "hook", "stop"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=a.env)
     try:
-        assert p.wait(timeout=8) == 0
+        assert p.wait(timeout=15) == 0
     finally:
         p.stdin.close()
     dt = time.time() - t
-    assert 2.7 < dt < 3.6 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
+    assert 2.7 < dt < 8 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
     assert "TimeoutError: hook stop passou de 3s" in a.log()
 
 
@@ -1772,7 +1775,7 @@ def test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm():
         t = time.time()
         r = a.prompt("oi")
         dt = time.time() - t
-    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 3.6, (dt, r)
+    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 8, (dt, r)  # the ceiling only proves the cut: under load the start alone takes seconds (ticket 328)
     assert "TimeoutError: hook prompt passou de 3s" in a.log()
     assert a.events() == []
 
@@ -2175,9 +2178,10 @@ def test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pen
     a = Env()
     q = _gate_pending(a)
     t = time.time()
-    # run-current + inbox take 2.4 s; the pending item is written; gate-resolve starts and the 3 s ceiling wins inside it
-    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP="1.2")
-    assert r.returncode == 0 and time.time() - t < 4.5, r
+    # the pending item is written; gate-resolve hangs and the hook's ceiling wins inside it. Only gate-resolve is slow, with a 6 s ceiling: under load
+    # the calls before it take seconds, and a sleep on every call would let the alarm land before the write (ticket 328)
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP_CMD="gate-resolve:30", ORQ_HOOK_TIMEOUT="6")
+    assert r.returncode == 0 and time.time() - t < 12, r
     assert "gate-resolve gate_1: TimeoutError" in a.log(), a.log()
     assert "gate-dec" not in _pending_ids(a), "a pendência foi fechada"
     assert not [g for g in _gates_log(a) if g[0] == "gate-resolve"], "o gate ficou pendente"
@@ -2630,8 +2634,8 @@ def test_guard_fails_open_and_logs():
     b = Env(run="run_a")
     _workers(b, ("w1", "run_b", "dispatched"))
     t = time.time()
-    r = _guard(b, FAKE_SLEEP="6")
-    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 4.5 and "hook guard" in b.log()
+    r = _guard(b, FAKE_SLEEP="30")  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
+    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 9 and "hook guard" in b.log()
     c = Env(run="run_a")
     _workers(c, ("w1", "run_b", "dispatched"))
     c.env["ORQ_ORCA"] = "/nao/existe/orca"
@@ -2760,12 +2764,12 @@ def test_heartbeat_notice_without_run_passes():
 
 
 def test_heartbeat_orca_down_passes():
-    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:6"}):
+    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:30"}):  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
         a = Env(**failure)
         a.inbox(_hb("lendo"))
         t = time.time()
         r = a.prompt(NOTICE_A)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 4.5, (failure, r)
+        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 9, (failure, r)
         assert set(a.states().values()) == {"unread"}, failure
         assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
 
@@ -5500,7 +5504,7 @@ def test_ticket134_round_with_ten_unchanged_runs_queries_orca_only_on_first():
 
 
 def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
-    a = Env(ORCA_TERMINAL_HANDLE="term_ger", ORQ_RUN_PARADO_CACHE_S="0.5")
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
     a.set("runs.json", [_active_run(a), _active_run(a, "run_b")])
     a.orq("gerente", "absorver")
@@ -5508,7 +5512,8 @@ def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
     a.set("tasks_run_b.json", [{"id": "task_x", "status": "completed", "created_at": OLD, "completed_at": "2026-09-01T10:05:00Z"}])
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a", "run_b"], "dentro da validade o cache segura a soltura"
-    time.sleep(0.6)
+    cache = os.path.join(a.home, "run-parado.json")
+    _write_state(cache, {r: t - 600 for r, t in _read_state(cache).items()})  # the validity runs out in the cache's clock, not in a 0.5 s sleep a loaded machine overruns (ticket 328)
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a"], "vencida a validade, o Run parado é solto"
 
@@ -11586,7 +11591,7 @@ def test_mate_return_does_not_renotify_old_escalation_over_fifty():
         f.write("".join(json.dumps({"tipo": "entrada", "id": f"e{i}", "origem": "mate", "mate": "orq", "tipo_mate": "resumo", "texto": f"r{i}", "ts": _z(i)}) + "\n"
                         for i in range(1, 56)))
     with InProcess(a):
-        for _ in range(55):
+        for _ in range(2):  # one lap notifies the 55 and the next ones must notify nothing: a list capped at 50 re-notifies on the second (ticket 328: 55 laps took 175 s)
             orq_mod.mate_lap()
         assert orq_mod.mate_lap() == []
     texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
@@ -17173,6 +17178,12 @@ def test_it_should_give_the_same_segments_for_a_command_with_and_without_rtk_or_
     assert cmdnorm.segments("echo 'git push'") == ["echo \"\""] and cmdnorm.segments("git commit -F - <<'EOF'\nx\ngit push\nEOF") == ["git commit -F -"]
 
 
+def _hook_in_process(a, fn, cmd, cwd):
+    """A PreToolUse Bash hook's verdict computed in this process (ticket 328: hundreds of subprocesses only to parse commands); the routing has its own tests."""
+    with InProcess(a):
+        return (fn({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": "s1", "cwd": cwd}, None) or {}).get("hookSpecificOutput")
+
+
 def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     _night(a)
@@ -17180,22 +17191,25 @@ def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
         bare = cmd.removeprefix("rtk ")
         for pre in PREFIXES_250:
             for wrapped in (pre + bare, f"for b in a b; do {pre}{bare}; done", f"if true; then {pre}{bare}; fi"):
-                out = _external(a, wrapped)
+                out = _hook_in_process(a, orq_mod.hook_external, wrapped, a.tmp.name)
                 assert out and out["permissionDecision"] == "deny", wrapped
     for cmd in ("git status", "gh pr view 12", "git commit -m x"):
         for pre in PREFIXES_250:
-            assert _external(a, pre + cmd) is None, pre + cmd
+            assert _hook_in_process(a, orq_mod.hook_external, pre + cmd, a.tmp.name) is None, pre + cmd
+    assert _external(a, "rtk git push")["permissionDecision"] == "deny", "and through the hook"
 
 
 def test_it_should_give_place_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     a.prompt("oi")
     p, _ = _repo(a.tmp.name, branch="feat/outra")
+    place = lambda cmd: (_hook_in_process(a, orq_mod.hook_place, cmd, p) or {}).get("additionalContext", "")  # noqa: E731
     for pre in PREFIXES_250:
         for cmd in ("git commit -m x", "git push", "git -C /r commit"):
-            assert "wrong place" in _notice(_place(a, p, cmd=pre + cmd)), pre + cmd
-            assert "wrong place" in _notice(_place(a, p, cmd=f"for b in a; do {pre}{cmd}; done")), pre + cmd
-        assert _notice(_place(a, p, cmd=pre + "git status")) == "", pre
+            assert "wrong place" in place(pre + cmd), pre + cmd
+            assert "wrong place" in place(f"for b in a; do {pre}{cmd}; done"), pre + cmd
+        assert place(pre + "git status") == "", pre
+    assert "wrong place" in _notice(_place(a, p, cmd="rtk git push")), "and through the hook"
 
 
 def test_it_should_give_the_worker_routing_guard_the_same_verdict_with_and_without_rtk():
