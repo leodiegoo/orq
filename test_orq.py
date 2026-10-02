@@ -2676,7 +2676,7 @@ def _no_tip(output):
     if not (output or "").strip():
         return ""
     ctx = json.loads(output).get("hookSpecificOutput", {}).get("additionalContext", "")
-    rest = [l for l in ctx.splitlines() if not l.startswith("orq: read and confirm the inbox with `orq inbox ")]
+    rest = [l for l in ctx.splitlines() if not l.startswith("orq: read the inbox with `orq inbox ")]
     return "\n".join(rest)
 
 
@@ -2747,9 +2747,10 @@ def test_heartbeat_unknown_kind_passes():
 def test_heartbeat_run_different_from_the_linked_passes_and_the_hook_confirms_only_the_heartbeat():
     a = Env(run="run_a")
     a.inbox(_hb("lendo"), run="run_b")
+    _global_box336(a)
     r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`.")
     assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
-    assert a.states() == {"msg_1": "acked"}, "ticket 182: the hook binds the coordinator to the Run, reads and confirms; heartbeats alone do not become context"
+    assert a.states() == {"msg_1": "unread"}, "ticket 336: the hook does not bind the coordinator to a Run it does not command; heartbeats alone do not become context"
 
 
 def test_heartbeat_notice_without_run_passes():
@@ -3929,7 +3930,8 @@ def test_notice_from_other_run_with_other_message_passes():
         a = Env(run="run_a")
         _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900), _hb_inbox(a, "ctx_9", "x", -3, 901, type_name=type_name))
         r = a.prompt(NOTICE_B)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
+        assert r.returncode == 0 and not _blocked(r) and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
+        assert "msg_hb901" in _hook_ctx(r), "ticket 336: it passes with the message read from the global inbox, no Run bound"
 
 
 def test_notice_from_other_run_without_recent_message_passes():
@@ -3970,8 +3972,8 @@ def test_heartbeat_from_blocked_other_run_does_not_lose_the_worker_done_that_arr
     a.inbox(("worker_done", {"taskId": "t", "dispatchId": "ctx_9"}), run="run_b")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -8, 900), {**_hb_inbox(a, "ctx_9", "", -2, 901, type_name="worker_done")})
     r = a.prompt(NOTICE_B)
-    assert "msg_2 worker_done" in _hook_ctx(r), "the worker_done wakes, already read (ticket 182)"
-    assert set(a.states().values()) == {"acked"}, "the hook confirmed the Run's inbox"
+    assert "msg_hb901 worker_done" in _hook_ctx(r), "the worker_done wakes, already read (ticket 182)"
+    assert set(a.states().values()) == {"unread"}, "ticket 336: the hook reads the global inbox and confirms nothing in a Run the coordinator does not command"
     a.set("run.json", {"id": "run_b"})  # o coordenador faz run-use no Run: a caixa sai inteira, lote a lote
     got = subprocess.run([a.bin, "orchestration", "check", "--run", "run_b", "--all", "--json"], env=a.env, capture_output=True, text=True)
     assert [m["type"] for m in json.loads(got.stdout)["result"]["messages"]] == ["heartbeat", "worker_done"]
@@ -4603,7 +4605,7 @@ def test_review5_m11_notice_from_other_run_with_old_unread_worker_done_passes_ev
     a = Env(run="run_a")
     _inbox(a, _hb_inbox(a, "ctx_9", "", -200, 900, type_name="worker_done"), _hb_inbox(a, "ctx_9", "fase-4", -30, 901))
     r = a.prompt(NOTICE_B)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
+    assert r.returncode == 0 and not _blocked(r) and "msg_hb900 worker_done" in _hook_ctx(r), r
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_visto"]
     b = Env(run="run_a")  # a worker_done already read does not hold: the notice was its own and it was confirmed
     _inbox(b, {**_hb_inbox(b, "ctx_9", "", -200, 900, type_name="worker_done"), "read": 1}, _hb_inbox(b, "ctx_9", "fase-4", -30, 901))
@@ -15025,6 +15027,13 @@ def _box140(a, runs=("run_a", "run_b"), bound="run_a"):
     a.env["ORCA_TERMINAL_HANDLE"] = "term_outro"  # the coordinator's terminal comes from orq's state, not from the env
 
 
+def _global_box336(a):
+    """Mirrors the fake mailbox into Orca's global inbox (`inbox --full`): the unread messages of every Run, as the real Orca lists them."""
+    box = json.load(open(os.path.join(a.fake, "mailbox.json")))["msgs"]
+    a.set("inbox.json", {"result": {"messages": [{k: v for k, v in m.items() if k not in ("status", "delivery", "gen")} | {"sequence": i + 1, "read": int(m["status"] == "acked")}
+                                                   for i, m in enumerate(box)]}})
+
+
 def test_ticket140_inbox_reads_and_acks_in_same_generation():
     a = Env()
     _box140(a)
@@ -15066,13 +15075,14 @@ def test_ticket171_inbox_with_ack_ingests_worker_done_and_manager_does_not_dupli
 
 
 
-def test_ticket140_inbox_of_other_run_restores_binding_to_previous():
+def test_ticket140_inbox_of_other_run_reads_without_binding_it():
     a = Env()
     _box140(a, bound="run_a")
     a.inbox(("worker_done", {"taskId": "task_b"}), run="run_b")
+    _global_box336(a)
     r = a.orq("caixa", "run_b", "--ack")
     assert r.returncode == 0 and "msg_1 worker_done" in r.stdout, (r.stdout, r.stderr)
-    assert _binds(a) == {"run_a": "term_coord", "run_b": None}, "o vínculo voltou ao Run em que o coordenador estava"
+    assert _binds(a) == {"run_a": "term_coord", "run_b": None} and not _log(a, "binds.log"), "ticket 336: o Run alheio não é ligado, nem para voltar"
 
 
 def test_ticket140_inbox_all_walks_runs_with_message():
@@ -15081,11 +15091,11 @@ def test_ticket140_inbox_all_walks_runs_with_message():
     a.inbox(("worker_done", {"taskId": "task_a"}), run="run_b")
     a.inbox(("escalation", {"taskId": "task_c"}), run="run_c")
     a.set("inbox.json", {"result": {"messages": [
-        {"id": "msg_1", "to_handle": "run:run_b", "read": 0, "sequence": 1}, {"id": "msg_2", "to_handle": "run:run_c", "read": 0, "sequence": 2}]}})
+        {"id": "msg_1", "to_handle": "run:run_b", "type": "worker_done", "read": 0, "sequence": 1}, {"id": "msg_2", "to_handle": "run:run_c", "type": "escalation", "read": 0, "sequence": 2}]}})
     r = a.orq("caixa", "--todas", "--ack")
     assert r.returncode == 0, r.stderr
     assert "run_b: 1" in r.stdout and "run_c: 1" in r.stdout and "run_a" not in r.stdout, r.stdout
-    assert set(a.states().values()) == {"acked"} and _binds(a)["run_a"] == "term_coord"
+    assert _binds(a) == {"run_a": "term_coord", "run_b": None, "run_c": None} and not _log(a, "binds.log")
 
 
 def test_ticket140_inbox_counts_heartbeat_without_listing_body():
@@ -17346,14 +17356,30 @@ def test_ticket182_worker_question_carries_the_msg_id_and_the_reply_command():
     assert "uso a coluna a ou b?" in ctx and 'orq reply msg_1 "' in ctx, ctx
 
 
-def test_ticket182_notice_from_another_run_reads_and_restores_the_link():
+def test_ticket182_notice_from_another_run_reads_without_taking_the_link():
     a = Env()
     _multi(a, {"run_a": "term_coord", "run_b": None})
     a.inbox(("escalation", {"taskId": "task_b"}), run="run_b")
     _body182(a, "msg_1", "travei no merge")
+    _global_box336(a)
     ctx = _ctx182(a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`."))
     assert "msg_1 escalation" in ctx and "travei no merge" in ctx, ctx
-    assert a.states() == {"msg_1": "acked"} and _binds(a)["run_a"] == "term_coord", _binds(a)
+    assert a.states() == {"msg_1": "unread"} and _binds(a) == {"run_a": "term_coord", "run_b": None}, _binds(a)
+
+
+def test_ticket336_notice_for_the_run_the_manager_holds_does_not_steal_it():
+    """02/10: the manager terminal held run_a (not yet in gerente.json) and the hook's `orq inbox run_a --ack` did `run-use` as the coordinator, so the
+    dispatch queue failed with "the dispatch is for Run run_a, which the coordinator does not command"."""
+    a = Env(run=None)
+    _multi(a, {"run_a": "term_ger", "run_b": None}, runs=[])
+    a.inbox(("worker_done", {"taskId": "task_1", "outcome": "succeeded"}), ("question", {"taskId": "task_1"}))
+    _body182(a, "msg_2", "uso a coluna a ou b?")
+    _global_box336(a)
+    ctx = _ctx182(a.prompt(NOTICE_A))
+    assert "msg_2 question" in ctx and "uso a coluna a ou b?" in ctx and 'orq reply msg_2 "' in ctx, ctx
+    assert _binds(a) == {"run_a": "term_ger", "run_b": None}, "o gerente continua com o Run"
+    assert not _log(a, "binds.log") and a.states() == {"msg_1": "unread", "msg_2": "unread"}, "nenhum run-use, nada confirmado por quem não comanda o Run"
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_1"], "o ingest do worker_done roda mesmo assim"
 
 
 def test_ticket182_read_failure_keeps_the_command_hint():
