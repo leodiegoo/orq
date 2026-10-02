@@ -6263,6 +6263,10 @@ def _repo_git(tmp, dirty=False):
     open(os.path.join(repo, "f"), "w").write("x")
     g("add", "f")
     g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    for i in range(50):  # a short sha of only digits (1 in 27) is not a sha to SHA_RE: the PR test went red at random (ticket 328)
+        if orq_mod.SHA_RE.fullmatch(g("rev-parse", "--short=7", "HEAD")):
+            break
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--amend", "-qm", f"c{i}")
     if dirty:
         open(os.path.join(repo, "novo"), "w").write("y")
     return repo, g("rev-parse", "--short=7", "HEAD")
