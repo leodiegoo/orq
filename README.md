@@ -43,6 +43,8 @@ flowchart LR
 
 The Runs are bound to the agent manager's terminal instead of the coordinator's, so Orca sends every notice there. The manager loop (`painel-agent-manager.sh`, which runs `orq manager absorb` every 10 s, or up to 30 s after a slow round: see `orq manager interval`) acknowledges batches that contain only heartbeats and types a single notice into the coordinator when something else arrives.
 
+When the coordinator takes a Run the manager holds with `run-use` (Orca binds one Run per terminal), the coordinator's Stop at the end of the turn gives it back: `orq manager bind --terminal <manager>` for that Run, plus a `gerente` event with `op: devolver`. The manager's queue never stays without commanding the Run.
+
 Intake runs through hooks:
 
 ```mermaid

@@ -5178,6 +5178,16 @@ def test_manager_absorb_drops_the_notice_run_after_the_deadline():
     assert a.states()["msg_2"] == "acked" and len(_log(a, "send.log")) == 1, "a entrega em aberto não é avisada de novo"
 
 
+def test_ticket347_coordinator_stop_gives_the_run_bound_by_run_use_back_to_the_manager():
+    a = Env()
+    _multi(a, {"run_a": "term_coord", "run_b": "term_ger"}, ["run_a", "run_b"])  # the coordinator ran run-use on run_a, which the manager held
+    assert _stop_gate(a) == {}
+    assert _binds(a)["run_a"] == "term_ger", "Orca binds the manager to one Run at a time: it comes back to the one the coordinator took"
+    assert [(e["op"], e["run"]) for e in a.events() if e["tipo"] == "gerente" and e["op"] == "devolver"] == [("devolver", "run_a")]
+    n = len(a.events())
+    assert _stop_gate(a) == {} and len(a.events()) == n, "with the manager back on the Run the next Stop does nothing"
+
+
 def test_manager_unlink_gives_back_one_run_or_all():
     a = Env()
     _multi(a, {"run_a": None, "run_b": "term_ger", "run_c": None}, ["run_a", "run_b", "run_c"])

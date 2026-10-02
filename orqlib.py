@@ -5970,7 +5970,26 @@ def hook_stop(ev, run):
             raise
         except Exception as e:  # noqa: BLE001 - fail-open like the digest
             log(f"coordenador_parou: {type(e).__name__}: {e}")
+    if not os.environ.get("ORQ_MATE") and not (out or {}).get("decision") == "block":
+        try:
+            give_run_back_to_manager()
+        except TimeoutError:
+            raise
+        except Exception as e:  # noqa: BLE001 - fail-open like the digest
+            log(f"devolver_run: {type(e).__name__}: {e}")
     return out
+
+
+def give_run_back_to_manager():
+    """The Stop that ends the turn gives the manager back the Run the coordinator took with `run-use` (dispatch, `ticket new`, steer on a Run of the manager's):
+    Orca binds one Run per terminal, so without this the manager's queue stays without commanding it (ticket 347)."""
+    g = _manager_cfg()
+    if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return
+    own = _own_run()
+    if own in g["runs"]:
+        manager_bind(g["gerente"], [own])
+        append_event({"tipo": "gerente", "op": "devolver", "terminal": g["gerente"], "run": own})
 
 
 def _hook_stop(ev, run):
