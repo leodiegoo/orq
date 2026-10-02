@@ -21345,6 +21345,88 @@ def test_ticket337_machine_under_pressure_notice_closes_itself_in_the_hook():
     assert [e["texto"] for e in orq_mod.open_entries(a.events())] == ["segue o jogo"]
 
 
+# ---- ticket 183: a entrega na fila ou com PR libera o worker sozinho ----
+
+def _delivery183(a, release="retained", **kw):
+    """Como a entrega do 141, com o terminal do worker `term_w1` retido pelo Orca (o liberar fecha o `retained` do worker)."""
+    _delivery141(a, **kw)
+    ws = _log_json(a, "workers.json", [])
+    for w in ws:
+        if w["handle"] == "term_w1":
+            w["release"] = release
+    a.set("workers.json", ws)
+
+
+def _released183(a):
+    return [e for e in a.events() if e["tipo"] == "liberar" and e["dispatch"] == "ctx_term_w1"]
+
+
+def test_ticket183_orq_delivery_in_queue_releases_worker_and_closes_terminal():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery183(a)
+    assert a.orq("ingest").returncode == 0
+    assert [i["ticket"] for i in _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]] == ["141"]
+    (ev,) = _released183(a)
+    assert (ev["estado"], ev["fechado"]) == ("retained", True), ev
+    assert _log(a, "close.log") == [["close", "--terminal", "term_w1", "--json"]]
+    a.orq("ingest")
+    assert len(_log(a, "released.log")) == 1, "o cursor não libera duas vezes"
+
+
+def test_ticket183_orq_delivery_without_branch_stays_open():
+    a = Env(run="run_a")
+    _delivery183(a, body="pronto, sem nada citado")
+    a.orq("ingest")
+    assert not _released183(a) and not _log(a, "released.log") and not _log(a, "close.log")
+
+
+def test_ticket183_service_worker_is_never_released():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery183(a)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "titulo": "orq: secondmate", "servico": True})
+    a.orq("ingest")
+    assert not _released183(a) and not _log(a, "released.log") and not _log(a, "close.log")
+
+
+def test_ticket183_returned_delivery_stays_open():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery183(a)
+    inbox = _log_json(a, "inbox.json", {})
+    inbox["result"]["messages"][0]["created_at"] = "2020-01-01T00:00:00Z"
+    a.set("inbox.json", inbox)
+    _evs(a, {"tipo": "devolver", "dispatch": "ctx_term_w1", "ts": _iso(-60)})
+    a.orq("ingest")
+    assert not _released183(a) and not _log(a, "released.log")
+
+
+def test_ticket183_delivery_with_open_question_stays_open():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery183(a)
+    inbox = _log_json(a, "inbox.json", {})
+    inbox["result"]["messages"].append({"id": "msg_q", "run_id": "run_a", "type": "question", "subject": "posso?", "body": "", "from_handle": "dispatch:ctx_term_w1",
+                                         "to_handle": "run:run_a", "sequence": 4, "read": 0, "created_at": "2099-01-01T00:00:00Z", "payload": "{}"})
+    a.set("inbox.json", inbox)
+    a.orq("ingest")
+    assert not _released183(a) and not _log(a, "released.log")
+
+
+def test_ticket183_project_ticket_with_pr_releases_and_without_pr_stays():
+    for com_pr in (True, False):
+        a = Env(run="run_a")
+        _delivery183(a, task="task_produto")
+        os.remove(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"))
+        if com_pr:
+            json.dump({"itens": [{"task": "task_produto", "url": "https://github.com/o/r/pull/9", "numero": 9, "base": "development", "estado": "aberto"}]},
+                      open(os.path.join(a.home, "prs.json"), "w"))
+        a.orq("ingest")
+        assert bool(_released183(a)) == com_pr, (com_pr, a.events())
+        assert bool(_log(a, "close.log")) == com_pr
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
