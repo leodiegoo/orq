@@ -552,14 +552,20 @@ An obligation of the coordinator or a worker that depends on someone remembering
 ## Development
 
 ```sh
-python3 test_orq.py              # fake Orca, temporary ORQ_HOME
+orq test --affected              # only the tests your diff touches (what a worker runs)
+python3 test_orq.py              # the full suite: fake Orca, temporary ORQ_HOME, -j min(4, CPUs/2)
+python3 test_orq.py -j 1 ticket328 test_x   # one process at a time; a test's exact name, or a substring
 python3 test_precompact.py
 python3 scripts/limpar-mergeados.py --self-test
 ```
 
 The test runner fails on any `def test_` placed after `if __name__ == "__main__":` (it would never run); define tests above that block.
 
-Editing orq: hooks and the manager panel execute `orq.py` while it runs, so a half-edited file stops them. Work in a separate worktree (`git worktree add .worktrees/<topic>`), run the tests there, and move the live copy only through `scripts/integrar.py <branch>...`, never `git merge`, `git pull` or `git checkout` inside the live checkout. It merges in a separate worktree, runs the tests there and advances `main` by fast-forward only when they pass; on a conflict you resolve in that worktree, commit, and run `integrar.py --avancar <worktree>`. Right after the fast-forward it runs `orq integrate conclude --hash <new main> <branch>...`. The `githooks/pre-commit` hook refuses a commit on `main` of the live checkout (a checkout that is not a linked worktree) and says to create a worktree; `ORQ_INTEGRADOR=1` is the explicit bypass. If `orqlib.py` fails to import, the hooks exit 0 with no output and log the failure instead of breaking the worker's turn. See `docs/design.md`, "Integrating branches outside the live checkout".
+Each test runs in a forked process of its own, `-j` at a time, so no test sees another's globals or environment; the runner prints only the failures with their output, then the 15 slowest tests (wall and CPU) and the totals. The suite drops the `ORQ_*` variables of the session that runs it (a worker's `ORQ_HOOK_TIMEOUT` would change the hooks under test), except `ORQ_BACKLOG` and `ORQ_BACKLOG_TICKETS`. A run with no test names is a full suite and waits its turn in `~/.cache/orq-suite/queue` (`ORQ_SUITE_QUEUE`): one full suite at a time on the machine, in order of arrival, under `nice`, printing who is ahead while it waits.
+
+`orq test --affected [--base <ref>]` diffs the worktree (uncommitted changes included) against the merge-base with `origin/main` and runs the tests that ran a changed function, plus every test changed or added in `test_orq.py`, plus `test_precompact.py` when precompact changed. Which test ran which function comes from `plan/test-map.json` (`ORQ_TEST_MAP`), which the integrator's full run writes with `test_orq.py --map`. With no map, an import or other loose module-level line changed, or a changed `.py` the map does not know and no test mentions, it runs the full suite and says why. `--dry-run` prints the commands. A worker that runs a bare `python3 test_orq.py` gets a notice (not a block) pointing at `orq test --affected`.
+
+Editing orq: hooks and the manager panel execute `orq.py` while it runs, so a half-edited file stops them. Work in a separate worktree (`git worktree add .worktrees/<topic>`), run the tests there, and move the live copy only through `scripts/integrar.py <branch>...`, never `git merge`, `git pull` or `git checkout` inside the live checkout. It merges in a separate worktree, runs the full suite there once, on the final tree (writing the test map), and advances `main` by fast-forward only when it passes; on a conflict you resolve in that worktree, commit, and run `integrar.py --avancar <worktree>`, which runs only `orq test --affected` when the conflict was in `test_orq.py`, `README.md` or `docs/design.md` alone (the next cycle runs the full suite). Right after the fast-forward it runs `orq integrate conclude --hash <new main> <branch>...`. The `githooks/pre-commit` hook refuses a commit on `main` of the live checkout (a checkout that is not a linked worktree) and says to create a worktree; `ORQ_INTEGRADOR=1` is the explicit bypass. If `orqlib.py` fails to import, the hooks exit 0 with no output and log the failure instead of breaking the worker's turn. See `docs/design.md`, "Integrating branches outside the live checkout".
 
 ## Portability and lock-in
 
