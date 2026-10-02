@@ -5671,7 +5671,22 @@ def _integrator_pending(events):
     return {"linha": line, "motivo": f"orq: integrator stopped: main did not advance, live tree dirty ({_quote(line, 160)})" + (f"; dirty files: {'; '.join(dirty[:10])}" if dirty else "")}
 
 
-def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_push, pending_item=None, mate_to_open=None):
+STALLED = {"travado": "stuck", "nao_comecou": "not started", "parado": "stopped at the prompt"}  # in the order the coordinator is told about them
+
+
+def _stalled_worker(agent_rows, events, now_at):
+    """The reason to steer the first stuck, not-started or stopped worker (that order, the oldest first), or None. `reassess` already leaves out asking, hibernated, waiting for
+    integration, service, plan limit and declared wait. A dispatch with a steer still inside STEER_READ_S is out too: the coordinator has just handled it. The text carries no
+    minutes: the reason is the key of the wake-up count and of the away blocker, and it must not change while the worker stays in the same state."""
+    handled = {s["steer"].get("dispatch") for s in open_steers(events, now_at).values() if (now_at - s["ultima"]).total_seconds() < STEER_READ_S}
+    rows = [a for a in agent_rows if a.get("estado") in STALLED and a.get("dispatch") not in handled]
+    if not rows:
+        return None
+    a = min(rows, key=lambda a: (list(STALLED).index(a["estado"]), -(a.get("idade_s") or 0)))
+    return f"worker {a.get('task')} {STALLED[a['estado']]}{' (' + a['motivo'] + ')' if a.get('motivo') else ''}: orq steer {a.get('task')} \"<adjustment>\" --run {a.get('run')}"
+
+
+def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_push, pending_item=None, mate_to_open=None, now_at=None):
     """The coordinator's next step that does not depend on the user, or None (pure; the Stop with away on blocks the end of the turn while there is one).
 
     In order: delivery (`delivered` worker of an open ticket) outside the integrator queue; integrator cycle with commits without push (`without_push` > 0); `ready-for-agent`
@@ -5693,6 +5708,8 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
         cycle = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
         hash_ = f" ({str(cycle.get('hash'))[:8]})" if cycle else ""
         return f"the integrator cycle{hash_} left {without_push} commit(s) unpushed: audit the diff and push"
+    if stalled := _stalled_worker(agent_rows, events, now_at or datetime.now(timezone.utc)):
+        return stalled
     occupancy = {"vivos": {a["dispatch"]: a.get("modelo") for a in agent_rows if a.get("estado") in ANDA}}
     in_queue = {i.get("ticket") for i in queue}
     for t in sorted(tks, key=lambda t: (priority_of(events, t["task"], None, t["titulo"]), t["num"])):
@@ -5715,7 +5732,7 @@ def _work_without_user(events, now_at):
         pending = _integrator_pending(events)
         tks, group_map, queue, machine = tickets(), groups(), dispatch_queue_items(), machine_cfg()
         mate_to_open = next(((n, nums) for n, nums in mate_proposals(tks, group_map, _mates(), queue, machine) if group_map[n].get("mate_auto") is not True), None)
-        return next_without_user(tks, agent_rows, integration_queue(), queue, events, machine, without_push, pending and pending["motivo"], mate_to_open), pending
+        return next_without_user(tks, agent_rows, integration_queue(), queue, events, machine, without_push, pending and pending["motivo"], mate_to_open, now_at), pending
     except Exception as e:  # noqa: BLE001 - hook falha aberto
         log(f"trabalho_sem_usuario: {type(e).__name__}: {e}")
         return None, None
@@ -7399,9 +7416,12 @@ def wake_stopped(now_at=None):
     notified = _ts(check_state.get("avisado"))
     if minutes_elapsed < WAKE_STOPPED_MIN or (notified and (now_at - notified).total_seconds() < WAKE_REPEAT_MIN * 60):
         return []
-    if notify_coordinator(g["coordenador"], f"orq: coordinator stopped for {int(minutes_elapsed)} min with work that does not depend on the user: {reason}") not in ("enviado", "adiado"):
+    escalation = check_state.get("escalada", 0) + 1  # the reason is the key (dispatch + state for a stalled worker): it resets when the reason goes away or changes
+    suffix = (f" (escalation {escalation})" if escalation > 1 else "") + (" Look at the worker's terminal screen before another steer." if escalation >= 3 else "")
+    if notify_coordinator(g["coordenador"], f"orq: coordinator stopped for {int(minutes_elapsed)} min with work that does not depend on the user: {reason}{suffix}") not in ("enviado", "adiado"):
         return []
-    _write_json(file_path, {**check_state, "avisado": ts})
+    _write_json(file_path, {**check_state, "avisado": ts, "escalada": escalation})
+    append_event({"tipo": "acorda", "motivo": reason, "escalada": escalation})
     return [f"coordinator stopped with work that does not need the user: notice typed ({_quote(reason, 80)})"]
 
 
