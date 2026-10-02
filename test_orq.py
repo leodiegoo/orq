@@ -10639,6 +10639,25 @@ def test_grupo_de_roteia_pelo_explicito_pelo_titulo_e_pelo_cwd():
         assert "nenhum" in str(e)
 
 
+def test_ticket119_dentro_casa_por_identidade_de_arquivo_e_cai_na_string_se_a_pasta_sumiu():
+    with tempfile.TemporaryDirectory() as t:
+        real = os.path.join(os.path.realpath(t), "proj")
+        os.makedirs(os.path.join(real, "src"))
+        elo = os.path.join(os.path.realpath(t), "elo")
+        os.symlink(real, elo)
+        assert orq_mod._dentro(os.path.join(elo, "src"), real)  # symlink
+        assert orq_mod._dentro(real, elo)
+        assert orq_mod._dentro("/tmp", "/private/tmp") or not os.path.samefile("/tmp", "/private/tmp")
+        assert orq_mod._dentro(os.path.join(elo, "src"), os.path.join(elo))
+        assert not orq_mod._dentro(os.path.join(real, ".."), real)
+        assert not orq_mod._dentro(t, real)
+        sumida = os.path.join(real, "sumiu")
+        assert orq_mod._dentro(os.path.join(sumida, "x"), sumida)  # fallback por string
+        assert not orq_mod._dentro(os.path.join(real, "outro"), sumida)
+        nome, _ = orq_mod.grupo_de({"g": {"projetos": [real]}}, cwd=os.path.join(elo, "src"))
+        assert nome == "g"
+
+
 def test_grupo_de_ambiguo_fica_com_o_coordenador():
     gs = {**GRUPOS_T, "painel": {"projetos": ["/h/.claude/dashboard"], "prefixos": ["orq: painel"]}}
     nome, motivo = orq_mod.grupo_de(gs, titulo="orq: painel novo")

@@ -4254,7 +4254,18 @@ def grupos():
 
 def _dentro(cwd, pasta):
     c, p = os.path.abspath(os.path.expanduser(cwd)), os.path.abspath(os.path.expanduser(pasta))
-    return c == p or c.startswith(p.rstrip("/") + "/")
+    if c == p or c.startswith(p.rstrip("/") + "/"):
+        return True
+    if not os.path.exists(p):  # pasta que não existe mais: só a string compara
+        return False
+    while os.path.exists(c):  # identidade de arquivo: symlink, /tmp x /private/tmp, caixa em volume que não distingue
+        if os.path.samefile(c, p):
+            return True
+        pai = os.path.dirname(c)
+        if pai == c:
+            return False
+        c = pai
+    return False
 
 
 def grupo_de(grupos_, titulo=None, cwd=None, grupo=None):
