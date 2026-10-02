@@ -498,6 +498,8 @@ ORQ_BACKLOG=/tmp/rehearsal/backlog.md orq backlog
 
 It writes only to a new file, runs `tasks-axi render`, and exits 1 if Done, blocking edges or ready counts differ from the sources. Do not install the tasks-axi SessionStart hook (`tasks-axi setup hooks`): it injects the whole panel in every session, and `orq hook session` already injects the lines that matter.
 
+Identity: `githooks/pre-commit` rejects a commit whose author or committer email is not the project's noreply (`ORQ_AUTOR`, else any `*@users.noreply.github.com`) and prints the `git config user.name` / `user.email` fix; `orq dispatch` writes the dispatching repo's `user.name` and `user.email` into the worker's worktree so it starts right.
+
 Publication audit: `githooks/pre-push` runs `orq audit-publication <base>..<head>` on every ref pushed, and the integrator runs it before fast-forwarding `main`. It refuses a commit whose author or committer is not the configured noreply (`ORQ_AUTOR`, default `git config user.email`), with a `Co-Authored-By` trailer or generator footer, with a forbidden term in the added lines or the message, and a range that changes `orqlib.py` or `orq.py` without touching `README.md`. `git config core.hooksPath githooks` also runs `scripts/audiencia-check.py` before each commit: it scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, one term per line, `re:` prefix for a regex).
 
 ## Projects

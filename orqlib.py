@@ -8543,6 +8543,16 @@ def _dispatch_worker(dispatch, run=None):
     return w
 
 
+def stamp_identity(path, source):
+    """Writes `source`'s effective `user.name`/`user.email` into the git config of the worktree `path` (the pre-commit refuses any other author). No-op without a path or an email."""
+    if not path or not os.path.isdir(path):
+        return
+    for key in ("user.name", "user.email"):
+        val = (_git(source, "config", key) or "").strip()
+        if val:
+            subprocess.run(["git", "-C", path, "config", key, val], capture_output=True, check=False)
+
+
 def _checkpoint(dispatch):
     """The dispatch's worktree (path, head, dirty files) and the profile the worker came up with (agent, model, effort), from worker-show.
 
@@ -9910,6 +9920,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
               **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError, OSError):
+        stamp_identity(_checkpoint(dispatch)["caminho"], folder)  # ticket 348: the worker commits as the project's author, not as Git's default
     if agent == "codex":
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError):
             trusted += trust_codex(_checkpoint(dispatch)["caminho"])  # the worktree Orca created

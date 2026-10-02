@@ -378,6 +378,8 @@ elif cmd == "worker-start":
     n = len(ws) + 1
     tid = opt("--task") or "task_novo%d" % n  # --task despacha uma task que já existe (a do ticket) em vez de criar outra
     new = {"handle": "term_novo%d" % n, "run": run or bound, "task": tid, "status": "dispatched"}
+    if os.environ.get("FAKE_WT"):  # worktree que o Orca criou para o worker
+        new["worktree"] = os.environ["FAKE_WT"]
     if opt("--retry-of"):  # como o Orca real (30/09): a retentativa reaproveita a worktree que o --worktree nomeia e sobe com o perfil pedido
         new.update({"worktree": opt("--worktree", "").split("::", 1)[-1], "modelo": opt("--model"), "effort": opt("--effort"), "agente": opt("--agent")})
     ws.insert(0, new)
@@ -14775,6 +14777,39 @@ def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_
         wt = os.path.join(t, "wt")
         subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat/x", wt], check=True)
         assert "refused" not in subprocess.run(["sh", hook], cwd=wt, capture_output=True, text=True, env={**os.environ, "ORQ_INTEGRADOR": ""}).stderr
+
+
+def test_it_should_be_that_the_pre_commit_refuses_an_author_or_committer_outside_the_noreply():
+    hook = os.path.join(HERE, "githooks", "pre-commit")
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        subprocess.run(["git", "-C", repo, "checkout", "-qb", "feat/x"], check=True)
+        env = {**os.environ, "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull, "ORQ_INTEGRADOR": "", "ORQ_TERMOS": os.path.join(t, "nao-existe.txt")}
+        run = lambda **e: subprocess.run(["sh", hook], cwd=repo, capture_output=True, text=True, env={**env, **e})  # noqa: E731
+        git = lambda *x: subprocess.run(["git", "-C", repo, "config", *x], check=True)  # noqa: E731
+        git("user.name", "Leo")
+        git("user.email", "noreply@orq.local")
+        r = run()
+        assert r.returncode == 1 and "git config user.email" in r.stderr and "noreply@orq.local" in r.stderr, r.stderr
+        git("user.email", "1+leo@users.noreply.github.com")
+        assert "not the project's noreply" not in run().stderr  # passes the identity check (the audience script is not in this temp repo)
+        r = run(GIT_COMMITTER_EMAIL="x@y.z")  # author fine, committer wrong
+        assert r.returncode == 1 and "GIT_COMMITTER_IDENT" in r.stderr, r.stderr
+        assert run(ORQ_AUTOR="2+other@users.noreply.github.com").returncode == 1  # the configured one wins over the pattern
+
+
+def test_it_should_be_that_a_dispatch_writes_user_name_and_email_into_the_worker_worktree():
+    a = Env(run="run_a")
+    with tempfile.TemporaryDirectory() as t:
+        wt = os.path.join(t, "wt")
+        subprocess.run(["git", "init", "-q", wt], check=True)
+        cfg = os.path.join(t, "gitconfig")
+        open(cfg, "w").write("[user]\n\tname = Leo\n\temail = 1+leo@users.noreply.github.com\n")
+        r = a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium",
+                  cwd=t, FAKE_WT=wt, GIT_CONFIG_GLOBAL=cfg)
+        assert r.returncode == 0, r.stderr
+        got = subprocess.run(["git", "-C", wt, "config", "--local", "--get-regexp", "^user\\."], capture_output=True, text=True).stdout
+        assert "user.name Leo" in got and "user.email 1+leo@users.noreply.github.com" in got, got
 
 
 def _publication_repo(t):
