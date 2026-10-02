@@ -160,7 +160,7 @@ Write only what you change; the rest keeps its default:
 }
 ```
 
-Edit the file, or set a key without opening it. `orq machine set` takes the key names exactly as it lists them when you give it an unknown one (today the Portuguese spelling: `max_caros`, `carga_max`, `mem_piso_mb`, `mem_livre_min_mb`, `livre_pct_min`, `modelos_caros`, `runs_isentos`, `pausar_sob_pressao`, `stop_bloqueia`; `max_workers` and `max_e2e` are the same). It refuses an unknown key or a value of the wrong type:
+Edit the file, or set a key without opening it. `orq machine set` takes the key names of `machine.json` (`max_workers`, `max_e2e`, `max_expensive`, `expensive_models`, `mem_free_min_mb`, `free_pct_min`, `max_load`, `mem_floor_mb`, `exempt_runs`, `pause_under_pressure`, `stop_blocks`); the older Portuguese spellings (`max_caros`, `carga_max`, ...) are accepted too. It refuses an unknown key or a value of the wrong type:
 
 ```sh
 orq machine set max_workers 3
@@ -332,7 +332,7 @@ $ orq dispatch --run run_demo --ticket 02 --model <model-id> --effort medium \
 $ orq ticket close 02 --answer notes/login-done.md
 ```
 
-Without a ticket, `orq dispatch --run r --title "..." --spec-file f --model m --effort e` creates the task itself. The spec for `ticket new` must contain a `## Acceptance criteria` section. A ticket file header uses the lines `Status:`, `Blocked by:`, `Run:`, `Task:`, and the optional `Modelo:`, `Effort:`, `Despacho:` and `Espera:` (model, effort, dispatch policy, wait condition: the header names are read as written).
+Without a ticket, `orq dispatch --run r --title "..." --spec-file f --model m --effort e` creates the task itself. The spec for `ticket new` must contain a `## Acceptance criteria` section. A ticket file header uses the lines `Status:`, `Blocked by:`, `Run:`, `Task:`, and the optional `Model:`, `Effort:`, `Dispatch:` and `Waiting:` (model, effort, dispatch policy, wait condition; the older `Modelo:`, `Despacho:` and `Espera:` are read too).
 
 Workers:
 
@@ -386,7 +386,7 @@ Also available: `orq ingest [--refresh]`, `orq alert seen <task>`, `orq lavish-a
 - Heartbeat absorption. Orca notices whose mailbox holds only heartbeats are acknowledged and blocked before they reach the model, in the prompt hook and in the manager loop.
 - Agent manager. `orq manager bind|unbind|spawn|check|absorb` binds Runs to a separate terminal and rotates through several Runs, because Orca binds one Run per terminal. A round touches the `manager-alive` stamp at its start, after each Run and at its end. The coordinator is told the panel stopped only when the stamp is older than the larger of 90 s and 3x the average round; a stamp between 60 s and that limit reads "panel slow".
 - Notices never land in the middle of what you type. The manager types into the coordinator only with away mode on; otherwise every notice waits for your next prompt. With away mode on it types only when your last prompt is older than 10 minutes (`ORQ_COORD_OCIOSO_MIN`); the line that wakes it for a worker's message waits 2 minutes (`ORQ_WAKE_OCIOSO_MIN`). Every typing reads the input box twice, 3 seconds apart (`ORQ_AVISO_GAP_S`), and a draft in either read cancels it. `"notify_macos": true` in `manager.json` adds a macOS notification for each deferred notice. Orca has its own notice that it types into the Run's `coordinator_handle` and that cannot be turned off; orq keeps the coordinator from being that handle.
-- Typed notices are short. Everything orq types into a terminal stays at or under 150 characters (`AVISO_MAX`). A longer text is written whole to `$ORQ_HOME/avisos/<hash>.txt` and the typed line is its beginning plus `... full text in <path>`, so the agent reads the rest from the file.
+- Typed notices are short. Everything orq types into a terminal stays at or under 150 characters (`NOTICE_MAX`). A longer text is written whole to `$ORQ_HOME/avisos/<hash>.txt` and the typed line is its beginning plus `... full text in <path>`, so the agent reads the rest from the file.
 - Mailbox. `orq inbox [<run>] [--ack] [--all]` reads Orca's mailbox as the coordinator: one short line per message (heartbeats are only counted) and, with `--ack`, first runs each `worker_done` through the manager's ingest and then acknowledges it.
 
 ### Dispatch and workers
@@ -465,7 +465,7 @@ Optional: move the register to [tasks-axi](https://github.com/kunchenguid/tasks-
 - Pending list. It lives in the backlog (`repo: pend`, one item per pending entry). `orq pend`, the guard hook, `orq lavish-answer`, `orq ask`, the status line, the digest and the compaction handoff all read and write it, and the dashboard's `pendencias.json` is regenerated after every change.
 - Reads are done in Python (`backlog.py`; the hooks never start `tasks-axi`). Writes call the `tasks-axi` CLI and are refused unless `tasks-axi --version` is exactly `0.2.6`. A symlinked `backlog.md` is refused.
 - Tickets. With `backlog.tickets` on, a ticket is the item `tNN` and its state lives there. `orq ticket new` writes the file (the text), creates the Orca task and then the backlog item with one `blocked-by` per blocker. `orq dispatch --ticket NN` is gated: the item must exist, have no active hold and no open blocker. `orq ticket close NN` marks it done first, then appends `## Answer` to the file, completes the Orca task and lists the dependents it freed.
-- Closing a ticket frees what waited on it: it moves the dependents' Orca tasks from `blocked` to `ready`. A freed ticket of priority 1 or 2 whose header declares `Modelo:` and `Effort:` goes into the dispatch queue and the manager starts it when a slot opens; priority 3 never starts by itself. `Despacho: manual[, reason]` keeps a ticket out of the automatic queue, and `Espera: integrador vazio` enters it only while the integrator queue is empty. A freed ticket goes up with `--worktree current` for an orq ticket and `new-top-level` for a project ticket.
+- Closing a ticket frees what waited on it: it moves the dependents' Orca tasks from `blocked` to `ready`. A freed ticket of priority 1 or 2 whose header declares `Model:` and `Effort:` goes into the dispatch queue and the manager starts it when a slot opens; priority 3 never starts by itself. `Dispatch: manual[, reason]` keeps a ticket out of the automatic queue, and `Waiting: integrator empty` enters it only while the integrator queue is empty. A freed ticket goes up with `--worktree current` for an orq ticket and `new-top-level` for a project ticket.
 - Backlog by group. A secondmate's group may have its own backlog (`backlog` in `groups/<name>.json`). `orq backlog move NN... --group G` moves tickets there, all or nothing: only Queued tickets go and the whole connected set has to be named. `orq mate open` starts the mate with `ORQ_BACKLOG` pointing at its backlog.
 - `orq doctor backlog [--json]` prints one line per mismatch between the backlogs and the Orca tasks, with the repair command. It writes nothing and exits 1 when it finds something.
 
@@ -556,7 +556,7 @@ A third agent would mean one more `HARNESS` entry (resume command, screen patter
 
 The interface is English: command, subcommand and flag names, choice values, `--help`, the messages orq prints and the text the hooks inject into agents, this README and `docs/design.md`. State on disk is English too: file names, JSON keys, event types and recorded values; orq reads both the English and the older Portuguese form.
 
-The internal code still has Portuguese names: identifiers, comments and docstrings in `orqlib.py`, and a few data values that the code parses as written (the flow values `promocao` and `direto`, the obligation keys `comentario`, `limpeza` and `proximo`, the ticket header lines `Modelo:`, `Despacho:` and `Espera:`, and the keys of the digest contract `digest-v1`).
+Identifiers, comments and docstrings in the code are English too (ticket 133). What still carries Portuguese is data the code parses as written or reads from the outside: the dict keys the code keeps in memory (translated to English only at the disk boundary, see `docs/design.md`), the `ORQ_*` environment variable names, the flow values `promocao` and `direto`, the obligation keys `comentario`, `limpeza` and `proximo`, the older ticket header lines (`Modelo:`, `Despacho:`, `Espera:`, read next to the English ones) and the keys of the digest contract `digest-v1`.
 
 The Portuguese command names still work as aliases until the aliases are removed, and each use is logged to `orq.log` as `apelido pt:`. This table is the only place they appear:
 

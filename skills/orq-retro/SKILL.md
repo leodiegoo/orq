@@ -13,7 +13,7 @@ The collector (`orq retro`) counts failure signals without an LLM. This skill re
 2. For each signal with `n > 0`, open the pointer of at least one case before claiming anything: `sed -n <line>p ~/.claude/orq/events.jsonl`, the transcript line, the PR. A signal only becomes a proposal once the cause is read in the pointer.
 3. Separate signal from **noise**: a dirty tree with the same count on every `liberado_sujo` of the main checkout is dirt that was already there, not the worker's; a high `entrada_sem_tratamento` measures the coordinator's habit, not a bug; a steer from before the first `steer_end` in the log predates the read proof. Noise cases go in a single line.
 4. Classify each proposal into exactly one class:
-   - **check**: mechanical error (fixed pattern, forbidden command, wrong place). It becomes a hook, test or guard in orq. A new `_retro_viola` pattern goes here.
+   - **check**: mechanical error (fixed pattern, forbidden command, wrong place). It becomes a hook, test or guard in orq. A new `_retro_violations` pattern goes here.
    - **text**: judgment error. It becomes a line in AGENTS.md, in the worker's default spec or in a memory. Say which file and the exact line.
    - **calibration**: the model or effort missed by enough. It becomes a change to the `worker-routing` table, with the `por_modelo` table as proof.
 5. Make the short list: at most 5 proposals, each with 2 or more cases, or 1 case that lost work or broke orq. Order by severity.
