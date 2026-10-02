@@ -5246,12 +5246,30 @@ def terminal_livre(handle):
     return "rascunho" if rascunho else None
 
 
+AVISO_MAX = 150  # teto do que `digita` e `digita_ocupado` enviam (#6240 do firstmate: o aviso de ~290 caracteres não chegava ao painel em todo re-toque)
+
+
+def _curto(texto):
+    """O texto a digitar, com no máximo AVISO_MAX caracteres. O que passar do teto vai inteiro para `HOME/avisos/<hash>.txt` (o mesmo texto, o mesmo
+    arquivo) e o digitado leva o começo dele e o caminho completo: `<começo>… completo em <caminho>`."""
+    if len(texto) <= AVISO_MAX:
+        return texto
+    pasta = os.path.join(HOME, "avisos")
+    arq = os.path.join(pasta, hashlib.sha1(texto.encode()).hexdigest()[:12] + ".txt")
+    os.makedirs(pasta, exist_ok=True)
+    with open(arq, "w", encoding="utf-8") as f:
+        f.write(texto + "\n")
+    fim = f"… completo em {arq}"
+    return texto[: max(0, AVISO_MAX - len(fim))].rstrip() + fim
+
+
 def digita(handle, texto):
     """Digita `texto` + Enter no agente do terminal, uma vez. Devolve `enviado`, `ocupado`/`rascunho` (nada foi digitado: repita depois) ou
     `falhou` (o Orca recusou: nada foi digitado). A caixa é lida duas vezes, com AVISO_GAP_S entre elas (ticket 82: o usuário que começa a digitar
     entre a leitura e o send tinha o aviso por cima do texto). O tui-idle sozinho engana (satisfeito no começo do turno e por uns 20 s de turno, conferido
     no Orca real em 29/09): quem barra de verdade é o `agent_prompt_blocked` do send, que o Orca devolve com o agente no meio do turno. Se o Orca observa a submissão e não viu o turno começar, manda um Enter sozinho (numa caixa
     vazia não faz nada); timeout do send conta como enviado, porque o texto pode ter saído e repetir empilharia."""
+    texto = _curto(texto)
     if motivo := terminal_livre(handle):
         return motivo
     time.sleep(AVISO_GAP_S)
@@ -5289,6 +5307,7 @@ def digita_ocupado(handle, texto):
 
     Só com o spinner na tela, sem rascunho na caixa e sem menu esperando resposta humana, nas duas leituras (AVISO_GAP_S entre elas, ticket 82):
     nos três casos devolve `ocupado` sem digitar. Devolve `ocupado_digitado`, ou `ocupado` se o Orca barrou o send (agent_prompt_blocked) ou falhou."""
+    texto = _curto(texto)
     if not _tela_de_turno_sem_rascunho(handle):
         return "ocupado"
     time.sleep(AVISO_GAP_S)

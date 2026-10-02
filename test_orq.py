@@ -5128,6 +5128,11 @@ def test_gerente_waiter_acorda_com_escalation_de_run_do_gerente_que_nao_e_o_liga
 
 # ---------- ticket 20: aviso do painel repetido e sem Enter; steer que não chega a worker ocioso ----------
 
+def _inteiro(texto):
+    """O aviso inteiro: o digitado, ou o arquivo que ele cita quando passou do AVISO_MAX (ticket 98)."""
+    return open(texto.split("completo em ")[1], encoding="utf-8").read() if "completo em /" in texto else texto
+
+
 def _avisos_enviados(a, handle="term_coord"):
     """Os send.log de `orca terminal send` para o terminal, só os que digitam texto."""
     return [e for e in _log(a, "send.log") if "--text" in e and e[e.index("--terminal") + 1] == handle]
@@ -5264,7 +5269,7 @@ def test_ticket74_steer_a_worker_no_meio_do_turno_digita_o_aviso_com_o_resumo_e_
     assert ev["aviso_terminal"] == "ocupado_digitado", ev
 
 
-def test_ticket74_o_resumo_do_aviso_tem_ate_300_caracteres_numa_linha_so():
+def test_ticket74_o_aviso_digitado_tem_o_teto_e_o_arquivo_guarda_o_resumo_de_ate_300_caracteres_numa_linha_so():
     a = Amb()
     a.set("busy.json", ["term_w1"])
     a.set("screens.json", {"term_w1": ["esc to interrupt"]})
@@ -5274,7 +5279,9 @@ def test_ticket74_o_resumo_do_aviso_tem_ate_300_caracteres_numa_linha_so():
     assert a.orq("steer", "task_rodando", "ajuste\n" + "x" * 900).returncode == 0
     (env,) = _avisos_enviados(a, "term_w1")
     texto = env[env.index("--text") + 1]
-    assert "\n" not in texto and "x" * 250 in texto and "x" * 301 not in texto, texto
+    assert "\n" not in texto and len(texto) <= orq_mod.AVISO_MAX, texto  # ticket 98: o digitado cabe no teto
+    completo = open(texto.split("completo em ")[1], encoding="utf-8").read()  # e o arquivo citado guarda o resumo do ajuste (STEER_AVISO_MAX)
+    assert "x" * 250 in completo and "x" * 301 not in completo, completo
 
 
 def test_ticket74_steer_a_worker_ocupado_nao_digita_por_cima_de_rascunho_nem_de_menu():
@@ -9678,7 +9685,7 @@ def test_ticket79_sob_pressao_alta_nada_sobe_e_o_aviso_sai_uma_vez_por_episodio(
         assert a.orq("gerente", "absorver").returncode == 0
     assert not _log(a, "started.log") and len(_fila79(a)) == 1
     (env,) = _log(a, "send.log")
-    texto = env[env.index("--text") + 1]
+    texto = _inteiro(env[env.index("--text") + 1])
     assert env[env.index("--terminal") + 1] == "term_coord" and "máquina sob pressão" in texto and "carga 40" in texto and "1 na fila de despacho" in texto, texto
     assert "orq pausar task_term_v0" in texto, "propõe pausar o único worker vivo"
     assert not _log(a, "close.log"), "propor não é pausar"
@@ -9721,7 +9728,7 @@ def test_ticket79_pressao_com_pausar_sob_pressao_ligado_o_gerente_pausa_o_de_men
     a.maquina(carga=40)
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
-    assert "orq pausar task_term_f" in env[env.index("--text") + 1] and not _log(a, "close.log"), "sem a regra, só propõe: o failover P3, e não o P3 em review"
+    assert "orq pausar task_term_f" in _inteiro(env[env.index("--text") + 1]) and not _log(a, "close.log"), "sem a regra, só propõe: o failover P3, e não o P3 em review"
     a.orq("maquina", "set", "pausar_sob_pressao", "true")
     a.maquina()
     a.orq("gerente", "absorver")  # volta a normal: reabre o aviso
@@ -9971,7 +9978,7 @@ def test_ticket84_aviso_de_pressao_mostra_quantos_processos_em_segundo_plano_cad
     a.orq("gerente", "absorver")
     ev = next(e for e in a.events() if e["tipo"] == "maquina_aviso")
     assert ev["filhos"] == {"task_term_f": 3, "task_term_i": 1}, ev
-    texto = next(c[c.index("--text") + 1] for c in _log(a, "send.log") if c[c.index("--terminal") + 1] == "term_coord")
+    texto = _inteiro(next(c[c.index("--text") + 1] for c in _log(a, "send.log") if c[c.index("--terminal") + 1] == "term_coord"))
     assert "task_term_f 3" in texto and "task_term_i 1" in texto, texto
 
 
@@ -11915,7 +11922,7 @@ def test_ticket91_aviso_de_pausa_propoe_passar_cada_worker_a_pausar_quando_o_out
     _conta73(a, codex_semana=40)
     assert a.orq("gerente", "absorver").returncode == 0
     (env,) = _log(a, "send.log")
-    txt = env[env.index("--text") + 1]
+    txt = _inteiro(env[env.index("--text") + 1])
     assert "orq passar ctx_term_f --para codex" in txt and "orq passar ctx_term_i --para codex" in txt, txt
     assert "ctx_term_s" not in txt and "ctx_term_p" not in txt, "alta e em review não seriam pausados"
 
@@ -11929,7 +11936,7 @@ def test_ticket91_aviso_de_pausa_sem_folga_no_outro_harness_ou_sem_numero_dele_s
         _conta73(a, **conta)
         a.orq("gerente", "absorver")
         env = _log(a, "send.log")[0]  # o do Claude vem primeiro; o do Codex, se houver, é outro aviso
-        assert "orq passar" not in env[env.index("--text") + 1] and "orq pausar" in env[env.index("--text") + 1], conta
+        assert "orq passar" not in _inteiro(env[env.index("--text") + 1]) and "orq pausar" in _inteiro(env[env.index("--text") + 1]), conta
 
 # ticket 92: relatorio-final.md como worker_done de reserva e passagem aberta no status
 
@@ -14155,6 +14162,30 @@ def test_it_should_be_that_orq_transcrito_refuses_when_the_file_is_missing():
     json.dump({"ctx_w1": {"task": "task_w1", "transcrito": "/nao/existe.jsonl", "harness": "claude"}}, open(os.path.join(a.home, "turnos.json"), "w"))
     r = a.orq("transcrito", "ctx_w1")
     assert r.returncode == 1 and "não achou o transcrito" in r.stderr, (r.stdout, r.stderr)
+
+
+def test_it_should_type_at_most_aviso_max_characters_and_cite_the_file_with_the_full_text():
+    import tempfile
+    antes = (orq_mod.terminal_livre, orq_mod.orca, orq_mod.HOME, orq_mod.AVISO_GAP_S, orq_mod._tela_de_turno_sem_rascunho)
+    enviados = []
+    orq_mod.orca = lambda *a, **k: enviados.append(a[a.index("--text") + 1]) or {"send": {"prompt": {"observation": "unsupported"}}}
+    orq_mod.terminal_livre, orq_mod._tela_de_turno_sem_rascunho, orq_mod.AVISO_GAP_S = lambda h: None, lambda h: True, 0
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            orq_mod.HOME = d
+            curto = "orq: PR #1 entrou em development"
+            longo = "orq: worker task_1 terminou " + "x" * 400
+            assert orq_mod.digita("term_c", curto) == "enviado" and enviados == [curto], "o texto curto vai como está e não cria arquivo"
+            assert not os.path.exists(os.path.join(d, "avisos"))
+            for fn in (orq_mod.digita, orq_mod.digita_ocupado):
+                enviados.clear()
+                fn("term_c", longo)
+                (digitado,) = enviados
+                caminho = digitado.split("completo em ")[1]
+                assert len(digitado) <= orq_mod.AVISO_MAX and digitado.startswith("orq: worker task_1"), digitado
+                assert os.path.isabs(caminho) and open(caminho, encoding="utf-8").read() == longo + "\n", "o caminho citado tem o texto inteiro"
+    finally:
+        orq_mod.terminal_livre, orq_mod.orca, orq_mod.HOME, orq_mod.AVISO_GAP_S, orq_mod._tela_de_turno_sem_rascunho = antes
 
 
 if __name__ == "__main__":
