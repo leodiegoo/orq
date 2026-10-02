@@ -136,6 +136,8 @@ Choose the numbers from your machine. A starting recipe:
 | `pause_under_pressure` | false | `true`: under pressure the manager pauses the lowest-priority worker itself. `false`: it only tells the coordinator which one to pause. |
 | `stop_blocks` | false | `true`: the Stop hook blocks the end of a turn while any entry is open, not only the user entries from this turn. A decision for you to make. |
 | `max_e2e` | 1 | For the record only: the E2E queue already serializes stacks. |
+| `reserve_idle_min` | 5 | Minutes a queue item waits before it may take a slot that another project reserves (`reserve_slots`, below) and is not using. |
+| `release_batch_max` | 5 | A ticket close that frees more dependents than this queues only this many (by priority, then number); the rest stay `ready` outside the queue and enter as it drops below this number. The close prints `released 28, queued 5`. |
 
 Write only what you change; the rest keeps its default:
 
@@ -156,7 +158,9 @@ orq machine set max_workers 3
 orq machine set expensive_models '["claude-opus-*"]'   # values are JSON
 ```
 
-What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|discard <id> --reason "..."` manages it.
+Fairness between projects. The queue is one for the whole machine, so a project that releases many tickets at once would take every slot. Three optional keys in each `projects/<name>.json` ([Projects](#projects)) keep the others moving: `priority_base` (1 to 3: a queued item counts as `min(its priority, priority_base)`, so a product at `1` stays ahead of the tool at `3`, and an explicit P1 still goes first), `reserve_slots` (slots only that project uses while it has work; another project may take them once its own item has waited `reserve_idle_min` and the owner has nothing queued) and `max_slots` (a ceiling of live workers for the project, always applied). Within the same priority the projects take turns, the one with the fewest live workers first, so one free slot goes to the project with one item waiting before the one with twelve. `orq machine`, `orq agents`, `orq status` and the panel show live workers and queue per project and warn when a project has had an item waiting for 10 minutes with no live worker (`product-app: 1 item waiting for 14 min, 0 of 7 slots`). Limits: a resumed worker has no project, so the ceiling and the reserve do not hold it back, and a direct dispatch that finds a free slot starts without looking at the queue.
+
+What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first within a project; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|discard <id> --reason "..."` manages it.
 
 ### 2. `projects/<name>.json`: one file per project
 
@@ -188,6 +192,7 @@ Step by step:
 6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered), `{sha}` (its merge commit) and `{orq}` (orq's clone) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
+9. `priority_base`, `reserve_slots` and `max_slots` are optional integers that shape the shared dispatch queue (see `machine.json` above): the project's base priority (1 to 3), the slots kept for it and its ceiling of live workers. A value of the wrong type counts as absent.
 
 Check it with `orq projects` (an invalid file shows `invalid: <why>` and is never picked on its own) and `orq flow --repo <path>`.
 

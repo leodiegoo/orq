@@ -185,6 +185,13 @@ function blocoMaquina(e: Estado): Bloco {
   ]
   const alta = l && ((l.carga ?? 0) > cfg.carga_max || (l.mem_livre_mb ?? Infinity) < cfg.mem_livre_min_mb || (l.livre_pct ?? 100) < cfg.livre_pct_min)
   if (alta) linhas.push("PRESSÃO ALTA: o gerente segura despachos novos")
+  const projetos: Json[] = vagas?.projetos ?? []
+  if (projetos.length > 1 || projetos.some((p) => p.aviso)) {
+    for (const p of projetos) {
+      linhas.push(`projeto ${p.projeto ?? "(sem projeto)"}: ${p.vivos} vivos, ${p.fila} na fila${p.posicao ? ` (1º na posição ${p.posicao})` : ""}`)
+      if (p.aviso) linhas.push(`  AVISO: ${p.aviso}`)
+    }
+  }
   return { id: "maquina", titulo: "Máquina contra o orçamento", linhas }
 }
 

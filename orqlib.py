@@ -7752,6 +7752,44 @@ def _released_worktree(t):
     return "new-top-level", _slug(t["titulo"])[:40].strip("-")
 
 
+def _queue_released(t, reason, priority):
+    """Puts the released ticket in the dispatch queue: (queue id, None), or (None, why it did not enter)."""
+    try:
+        wt, item_name = _released_worktree(t)
+        return _enqueue_dispatch(reason, t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority, "claude")["fila"], None
+    except (OSError, ValueError) as e:
+        return None, f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}"
+
+
+def release_refill(cfg=None):
+    """The released tickets a close held back (`held_releases` in cursor.json, ticket 344) enter the dispatch queue while it has fewer than `release_batch_max` items, by priority.
+    A ticket that is no longer ready, was blocked again or already is in the queue leaves the list; one a Despacho/Espera header holds stays. Returns the panel lines."""
+    held = _cursor_ro().get("held_releases")
+    if not held:
+        return []
+    cfg = cfg or machine_cfg()
+    room = int(cfg["release_batch_max"]) - len(dispatch_queue_items())
+    ts = tickets()
+    status, by_num = {t["num"]: t["status"] for t in ts}, {t["num"]: t for t in ts}
+    queued_tickets = {i.get("ticket") for i in dispatch_queue_items()}
+    events, integration, without_push = read_events(), integration_queue(), _no_push()
+    keep, lines, ready = [], [], []
+    for num in held:
+        t = by_num.get(num)
+        if not t or t["status"] != STATUS_NEW or any(status.get(b) != STATUS_CLOSED for b in t["blocked_by"]) or num in queued_tickets:
+            continue
+        ready.append((priority_of(events, t["task"], None, t["titulo"]), t))
+    for priority, t in sorted(ready, key=lambda x: (x[0], x[1]["num"])):
+        if room <= 0 or dispatch_wait(t, integration, events, without_push):
+            keep.append(t["num"])
+            continue
+        fila, why = _queue_released(t, f"released {t['num']}, held back by the batch limit", priority)
+        room -= 1
+        lines.append(f"queue: ticket {t['num']} entered (held back by the release batch)" if fila else why)
+    _cursor_mut(lambda c: c.__setitem__("held_releases", keep) if keep else c.pop("held_releases", None))
+    return lines
+
+
 def _release_dependents(n, before=None):
     """Ticket `n` has just been resolved: removes the number from the `Blocked by:` of whoever depended on it (and the other blockers already resolved).
     With tickets in the backlog there is no line to rewrite: `before` (the tickets from before the `done`) says who depended on `n`, and the rest of the computation is the same.
@@ -7761,7 +7799,7 @@ def _release_dependents(n, before=None):
     Returns ([{ticket, prioridade, fila?}] by priority, notices). An Orca failure becomes a notice: the files are already right."""
     ts = tickets()
     status = {t["num"]: t["status"] for t in ts}
-    released, notices, free_items = [], [], []
+    released, notices, free_items, to_queue = [], [], [], []
     events, integration = read_events(), integration_queue()
     without_push = _no_push()
     no_backlog = _tickets_in_backlog()
@@ -7788,14 +7826,20 @@ def _release_dependents(n, before=None):
         if waiting and priority < 3:
             notices.append(f"ticket {t['num']} (P{priority}) released, outside the dispatch queue ({waiting}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
-            try:
-                wt, item_name = _released_worktree(t)
-                item["fila"] = _enqueue_dispatch(f"ticket {n} resolved: released {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority, "claude")["fila"]
-            except (OSError, ValueError) as e:
-                notices.append(f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}")
+            to_queue.append((priority, t, item))
         elif priority < 3:
             notices.append(f"ticket {t['num']} (P{priority}) released without a valid Model:/Effort: in the header: dispatch it with orq dispatch --ticket {t['num']}")
         released.append(item)
+    batch_max = machine_cfg()["release_batch_max"]  # ticket 344: a close that frees many dependents queues the first ones; the others wait outside the queue until it drops
+    to_queue.sort(key=lambda x: (x[0], x[1]["num"]))
+    for priority, t, item in to_queue[:int(batch_max)]:
+        item["fila"], why = _queue_released(t, f"ticket {n} resolved: released {t['num']}", priority)
+        if why:
+            notices.append(why)
+    held = [t["num"] for _, t, _item in to_queue[int(batch_max):]]
+    if held:
+        _cursor_mut(lambda c: c.__setitem__("held_releases", [*(x for x in c.get("held_releases") or [] if x not in held), *held]))
+        notices.append(f"released {len(released)}, queued {len(to_queue) - len(held)}: {len(held)} wait outside the dispatch queue and enter as it drops ({', '.join(held[:6])}{'…' if len(held) > 6 else ''})")
     for t in free_items:  # the task blocked by an Orca blocker (worker-stop, deps) becomes ready again
         if not (t["task"] and t["run"]):
             continue
@@ -8214,10 +8258,12 @@ def agents(run=None, include_all=False, now_at=None):
                         {d: a["pergunta"] for d, a in screens_read.items() if a["pergunta"]}, hib, limits={d: a["limite"] for d, a in screens_read.items() if a["limite"]},
                         paused=_dict(_cursor_ro().get("pausados")))
     unread_ids = {e.get("dispatch") for e in recent_alerts(events, now_at, agent_rows) if e.get("alerta") == "steer_nao_lido"}
+    project_of = {e["dispatch"]: e["projeto"] for e in events if e.get("tipo") == "despacho" and e.get("dispatch") and e.get("projeto")}
     for a in agent_rows:
         if a["dispatch"] in unread_ids:
             a["alerta"] = "steer not read"
         a["prioridade"] = priority_of(events, a["task"], a["dispatch"], a.get("titulo"))
+        a["projeto"] = project_of.get(a["dispatch"])
     return agent_rows if include_all else [a for a in agent_rows if not (a.get("titulo") or "").startswith(PROOF_PREFIX)]
 
 
@@ -8228,7 +8274,8 @@ def _control_text(c, dispatch):
 
 
 def agents_text(agent_rows):
-    """One line per dispatch, with what to do right below the stuck one (orq steer) and the delivered-without-release one (orq liberar)."""
+    """One line per dispatch, with what to do right below the stuck one (orq steer) and the delivered-without-release one (orq liberar); after them, the projects' slots and queue
+    (project_lines) when more than one project has something."""
     if not agent_rows:
         return "no dispatch"
     line_list = []
@@ -8275,7 +8322,8 @@ def agents_text(agent_rows):
             line_list.append(f"            -> orq release {a['dispatch']}" if not a.get("retido") else f"            retained: {a['retido']} (orq release does not close it)")
         elif a["estado"] == "hibernado":
             line_list.append(f"            -> orq wake {a['task']} (steer and reply also wake it)")
-    return "\n".join(line_list)
+    by_project = collections.Counter(a.get("projeto") for a in agent_rows if a.get("estado") in MACHINE_ALIVE)
+    return "\n".join(line_list + project_lines(project_view(by_project, dispatch_queue_items(by_project), machine_cfg())))
 
 
 def _dispatch_ack(run_id, dispatch):
@@ -9419,8 +9467,16 @@ def _file_environments(d):
     return branches, (marked or branches[-1:])[0], flow or ("promocao" if len(branches) > 1 else "direto"), None
 
 
+def _int_in(v, low, high=None):
+    """`v` if it is an integer in [low, high] (a bool is not), else None: a hand-written limit of the wrong type counts as absent."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= low and (high is None or v <= high) else None
+
+
 def projects():
     """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "erro"}}.
+
+    Fairness between projects in the dispatch queue (ticket 344): `priority_base` (1 to 3: the queue item inherits `min(its priority, priority_base)`), `reserve_slots` (machine slots only
+    this project uses while it has work) and `max_slots` (live workers of the project at the same time); each one comes as None when absent or of the wrong type.
 
     Only `repo` is required; a missing `harness` counts as claude and `group_name` only groups the listing. `environments` is the project's ordered list `[{"branch", "production"?}]`
     (the production one is the one marked, otherwise the last) and `flow` is `promocao` or `direto`; without the `environments` block it comes as None and the remote's default applies
@@ -9447,7 +9503,8 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
-                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None}
+                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
+                         "priority_base": _int_in(d.get("priority_base"), 1, 3), "reserve_slots": _int_in(d.get("reserve_slots"), 0), "max_slots": _int_in(d.get("max_slots"), 0)}
     return findings
 
 
@@ -9780,7 +9837,7 @@ def _gate_backlog(tk):
         raise ValueError(f"ticket {tk['num']} is blocked by {', '.join(tk['blocked_by'])}: close the blockers first")
 
 
-def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None):
+def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None, _age_s=0):
     """worker-start (with --model and --effort, which the worker-routing-guard hook requires) + `dispatch_mode` event + entry intake.
 
     Returns the ids and the waiter's command; waits for nothing. Refuses, before creating the task, whatever Orca would refuse later.
@@ -9852,7 +9909,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
     if not coordinator_run(run):
         raise ValueError(f"the dispatch is for Run {run}, which the coordinator does not command: {bind_tip(run)}")
     with _lock("dispatch.lock"):  # the checked slot and the worker-start form one step: parallel dispatches do not exceed the ceiling together
-        reason = machine_bar(model, run=run, priority=priority, service=service)
+        reason = machine_bar(model, run=run, priority=priority, service=service, project=project, age_s=_age_s)
         if reason and _draining:
             raise NoSlot(reason)
         if reason:
@@ -10365,6 +10422,8 @@ MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB o
                   "runs_isentos": ["Orquestrador*"],  # glob patterns (Run id or objective): orq's own work comes up under pressure and without the worker ceiling; max_caros, max_e2e and mem_piso_mb hold it back
                   "pausar_sob_pressao": False,  # True: under pressure the manager on its own pauses the lowest-priority worker (orq pausar)
                   "mate_ready_min": 3,  # ready tickets that match a group with no mate before orq proposes opening it (the group's `mate_ready_min` wins)
+                  "reserve_idle_min": 5,  # minutes a queue item waits before it may take a slot another project reserves (`reserve_slots`) and is not using (ticket 344)
+                  "release_batch_max": 5,  # a close that releases more dependents than this queues only this many; the rest enter as the queue drops (ticket 344)
                   "stop_bloqueia": False}  # True: the coordinator's Stop blocks the end of the turn with any entry that has no effect (GATE_BLOCKERS times per set); turning it on is the user's decision (ticket 27). An entry with no intake in the turn always blocks (ticket 150)
 DISPATCH_QUEUE = "dispatch-queue.json"  # {itens: [...]}: what `orq dispatch_worker` and `orq resume` could not bring up; the manager brings it up by priority
 DISPATCH_QUEUE_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: copy of the spec of a queued dispatch (the coordinator's file may vanish)
@@ -10536,7 +10595,7 @@ RECENT_DISPATCH_WINDOW = 120  # s: how long the dispatch recorded in events.json
 
 
 def machine_occupancy():
-    """{vivos: {dispatch: model}, dispatched: {dispatch}}: the workers with a live terminal in Orca (all Runs) and the dispatches still `dispatched`.
+    """{vivos: {dispatch: model}, dispatched: {dispatch}, projetos: {dispatch: project or None}}: the workers with a live terminal in Orca (all Runs) and the dispatches still `dispatched`.
 
     The model comes from the dispatch or resume event and, failing that, from worker-show; without a reliable terminal list every `dispatched` counts as live."""
     terminals = _alive_terminals()
@@ -10550,13 +10609,14 @@ def machine_occupancy():
     if still_missing:
         models |= {d: x["modelo"] for d, x in _details(still_missing).items() if x.get("modelo")}
     occupancy = {w["dispatchId"]: models.get(w["dispatchId"]) for w in live}
+    project_of = {e["dispatch"]: e["projeto"] for e in event_list if e.get("tipo") == "despacho" and e.get("dispatch") and e.get("projeto")}
     listed = {w.get("dispatchId") for w in include_all}
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=RECENT_DISPATCH_WINDOW)
     for e in event_list:  # worker-list lags: a dispatch from seconds ago doesn't show up yet and its slot would stay free for the next one (ticket 145)
         d = e.get("dispatch")
         if e.get("tipo") in ("despacho", "retomada") and d and d not in listed and d not in hibernated and e.get("ts") and _dt(e["ts"]) >= cutoff:
             occupancy[d] = e.get("modelo")
-    return {"vivos": occupancy, "dispatched": {w["dispatchId"] for w in ws} | set(occupancy)}
+    return {"vivos": occupancy, "dispatched": {w["dispatchId"] for w in ws} | set(occupancy), "projetos": {d: project_of.get(d) for d in occupancy}}
 
 
 def machine_slot(model, occupancy=None, cfg=None, exempt=False):
@@ -10571,21 +10631,67 @@ def machine_slot(model, occupancy=None, cfg=None, exempt=False):
     return None
 
 
-def machine_bar_item(model, run, occupancy, cfg, pressure, reading, priority=None, service=False):
+def _item_project(i):
+    """The project a queue item counts for: the one it was queued with, or the Run's (`queue_project`, for a released ticket that carries no `projeto`)."""
+    return i.get("queue_project") or i.get("projeto")
+
+
+def _live_by_project(occupancy):
+    """{project or None: live workers} from the occupancy."""
+    return collections.Counter(_dict(occupancy.get("projetos")).get(d) for d in occupancy["vivos"])
+
+
+def _item_age_s(it):
+    """Seconds the queue item has been waiting (0 without a stamp)."""
+    try:
+        return max(_dt(now()).timestamp() - _dt(it["ts"]).timestamp(), 0)
+    except (KeyError, AttributeError, ValueError):
+        return 0
+
+
+def project_slot(project, occupancy, cfg, waiting=None, age_s=0, projs=None):
+    """The reason one more worker of `project` does not fit (ticket 344), or None. Two limits, both in the project's file: `max_slots` (its live workers at the ceiling) and the slots
+    other projects reserve (`reserve_slots`): a reserve not in use is held while its project has an item in the queue (`waiting`, {project: items}; the queue itself when None) or until
+    the item has waited `reserve_idle_min`; the rest of the free slots are what is left to this one. A project with neither limit and no reserve elsewhere never asks for the queue."""
+    projs = projects() if projs is None else projs
+    reserves = {p: d["reserve_slots"] for p, d in projs.items() if p != project and d.get("reserve_slots") and not d.get("erro")}
+    ceiling = (projs.get(project) or {}).get("max_slots") if project else None
+    if ceiling is None and not reserves:
+        return None
+    live = _live_by_project(occupancy)
+    if ceiling is not None and live[project] >= ceiling:
+        return f"{project}: {live[project]}/{ceiling} project slots"
+    if reserves and cfg["max_workers"] - len(occupancy["vivos"]) >= 1:
+        if waiting is None:
+            waiting = collections.Counter(_item_project(i) for i in dispatch_queue_items())
+        held = {p: max(n - live[p], 0) for p, n in reserves.items() if waiting.get(p) or age_s < cfg["reserve_idle_min"] * 60}
+        held = {p: n for p, n in held.items() if n}
+        if held and cfg["max_workers"] - len(occupancy["vivos"]) - sum(held.values()) < 1:
+            return f"{sum(held.values()):g} of {cfg['max_workers']:g} slots held for {', '.join(held)}"
+    return None
+
+
+def machine_slot_for(model, occupancy, cfg, project=None, age_s=0, waiting=None):
+    """machine_slot and, after it, the project's limits (project_slot)."""
+    occupancy = occupancy or machine_occupancy()
+    return machine_slot(model, occupancy, cfg) or project_slot(project, occupancy, cfg, waiting, age_s)
+
+
+def machine_bar_item(model, run, occupancy, cfg, pressure, reading, priority=None, service=False, project=None, age_s=0):
     """The reason this Run's worker does not start now, or None. Machine pressure comes before the slots; the service or P1 worker of an exempt Run (`runs_isentos`)
-    passes through pressure and the worker ceiling, and only stops at the expensive ceiling (cost limit), the memory floor and max_e2e (the global E2E queue). P2/P3 counts toward the ceiling (ticket 168)."""
+    passes through pressure, the worker ceiling and the project limits, and only stops at the expensive ceiling (cost limit), the memory floor and max_e2e (the global E2E queue). P2/P3 counts toward the ceiling (ticket 168)."""
     cause = machine_cause(reading, cfg) if pressure[0] == "alta" else (None, None)
-    reason = (f"machine under pressure: {pressure[1]}" + (f"; it comes from outside orq ({cause[1]})" if cause[0] == "fora" else "")) if pressure[0] == "alta" else machine_slot(model, occupancy, cfg)
+    reason = (f"machine under pressure: {pressure[1]}" + (f"; it comes from outside orq ({cause[1]})" if cause[0] == "fora" else "")) if pressure[0] == "alta" else machine_slot_for(model, occupancy, cfg, project, age_s)
     if not reason or not (service or priority == 1) or not exempt_run(run, cfg):
         return reason
     return machine_slot(model, occupancy, cfg, exempt=True) or machine_floor(reading, cfg)
 
 
-def machine_bar(model, occupancy=None, cfg=None, run=None, priority=None, service=False):
+def machine_bar(model, occupancy=None, cfg=None, run=None, priority=None, service=False, project=None, age_s=0):
     """The reason the worker cannot start now, or None. Machine pressure comes before slots; exempt Run: see machine_bar_item."""
     cfg = cfg or machine_cfg()
     reading = machine_read()
-    return machine_bar_item(model, run, occupancy, cfg, machine_level(reading, cfg), reading, priority, service)
+    return machine_bar_item(model, run, occupancy, cfg, machine_level(reading, cfg), reading, priority, service, project, age_s)
 
 
 def _dispatch_queue_mut(fn):
@@ -10598,10 +10704,26 @@ def _dispatch_queue_mut(fn):
         return r
 
 
-def dispatch_queue_items():
-    """The queue items in the order they start: priority (1 before 3) and, on a tie, the oldest."""
+def _effective_priority(i, projs):
+    """The queue item's priority: its own, or the project's `priority_base` if that is higher (lower number): `min(priority, priority_base)`."""
+    base = (projs.get(_item_project(i)) or {}).get("priority_base")
+    return min(i.get("prioridade") or 2, base) if base else i.get("prioridade") or 2
+
+
+def dispatch_queue_items(live=None):
+    """The queue items in the order they start (ticket 344): effective priority first (the project's `priority_base`, see _effective_priority); within the same priority the projects
+    take turns, the one with the fewest live workers first (`live`: {project: n}, from the occupancy; without it the projects tie on the oldest item), and inside a project the oldest first."""
     item_list = [i for i in _dict(_read_json(_path(DISPATCH_QUEUE))).get("itens") or [] if isinstance(i, dict)]
-    return sorted(item_list, key=lambda i: (i.get("prioridade") or 2, i.get("ts") or ""))
+    projs, tiers = projects(), {}
+    for i in sorted(item_list, key=lambda i: i.get("ts") or ""):
+        tiers.setdefault(_effective_priority(i, projs), {}).setdefault(_item_project(i), []).append(i)
+    ordered = []
+    for priority in sorted(tiers):
+        by_project = tiers[priority]
+        turn = sorted(by_project, key=lambda p: ((live or {}).get(p, 0), by_project[p][0].get("ts") or ""))
+        for r in range(max(map(len, by_project.values()))):
+            ordered += [by_project[p][r] for p in turn if r < len(by_project[p])]
+    return ordered
 
 
 def dispatch_queue_add(item, reason):
@@ -10638,7 +10760,8 @@ def _enqueue_dispatch(reason, run, title, spec, model, effort, worktree, name, b
     import uuid
     id_ = "fd" + uuid.uuid4().hex[:6]
     item = {"id": id_, "tipo": "despacho", "run": run, "titulo": title, "modelo": model, "effort": effort, "agente": agent, "prioridade": priority,
-            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entry), ("ticket", tk and tk["num"]), ("projeto", project), ("servico", service)) if v}}
+            **{k: v for k, v in (("worktree", worktree), ("nome", name), ("base_branch", base_branch), ("entrada", entry), ("ticket", tk and tk["num"]), ("projeto", project), ("servico", service),
+                                 ("queue_project", project or run_project(run))) if v}}  # queue_project: the Run's project counts for the queue's fairness even when the item carries no `projeto`
     if os.environ.get("ORQ_MATE"):  # the Run belongs to the mate and only its terminal commands it: the manager drains with that handle (ticket 80)
         item.update(coord=os.environ.get("ORCA_TERMINAL_HANDLE"), mate=os.environ["ORQ_MATE"])
     copy_file = _path(os.path.join(DISPATCH_QUEUE_SPECS, id_ + ".md"))
@@ -10654,9 +10777,10 @@ def _enqueue_dispatch(reason, run, title, spec, model, effort, worktree, name, b
             "aviso": f"{'was already' if already else 'entered'} in the dispatch queue (position {pos}): {reason}. The manager starts it when a slot opens; see with orq dispatch-queue list"}
 
 
-def _occupy(occupancy, dispatch, model):
+def _occupy(occupancy, dispatch, model, project=None):
     """Counts the worker that just started in the occupancy, so the next item in the same batch sees the slot already taken."""
     occupancy["vivos"][dispatch] = model
+    occupancy.setdefault("projetos", {})[dispatch] = project
 
 
 @contextlib.contextmanager
@@ -10684,7 +10808,7 @@ def _promoted_from_queue(it):
     if it["tipo"] == "despacho":
         with _as_coordinator(it):
             r = dispatch_worker(it["run"], it.get("titulo") if not it.get("ticket") else None, it.get("spec_arquivo"), it["modelo"], it["effort"], it.get("worktree"), it.get("nome"),
-                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", it.get("projeto"), _draining=True, service=bool(it.get("servico")))
+                          it.get("base_branch"), it.get("entrada"), it.get("ticket"), it["prioridade"], it.get("agente") or "claude", it.get("projeto"), _draining=True, service=bool(it.get("servico")), _age_s=_item_age_s(it))
         return f"queue: {it['titulo']} started ({r.get('dispatchId')})"
     d = it["dispatch"]
     cp = _checkpoint(d)
@@ -10744,12 +10868,15 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
 
     An expensive-model item with the expensive cap full stays behind and the cheap lower-priority one starts. A resume whose dispatch already finished or came back is removed from
     the queue. Whatever plan usage or night mode holds waits WAIT_HELD_S; an error of another cause counts in `failures` and, at the QUEUE_FAILURES-th, the item leaves.
-    An item from an exempt Run (`runs_isentos`) starts without the worker cap, stopped only by the expensive cap and the memory floor; `only_exempt` (high pressure) tries only those."""
+    An item from an exempt Run (`runs_isentos`) starts without the worker cap, stopped only by the expensive cap and the memory floor; `only_exempt` (high pressure) tries only those.
+    Fairness between projects (ticket 344): the order is dispatch_queue_items' (priority base, then the projects take turns) and an item whose project is at its `max_slots`, or
+    whose free slots another project reserves, stays behind and the next one starts."""
     cfg, now_at = cfg or machine_cfg(), now_at or time.time()
-    item_list = dispatch_queue_items()
-    if not item_list:
+    if not dispatch_queue_items():
         return []
     occupancy, line_list = machine_occupancy(), []
+    item_list = dispatch_queue_items(_live_by_project(occupancy))
+    waiting = collections.Counter(_item_project(i) for i in item_list)
     for it in item_list:
         if it.get("nao_antes", 0) > now_at:
             continue
@@ -10757,10 +10884,11 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
             dispatch_queue_rm(it["id"], "saiu", motivo="the dispatch already finished or already came back")
             line_list.append(f"queue: {it['titulo']} left (the dispatch already finished or already came back)")
             continue
-        exempt = (only_exempt or machine_slot(it.get("modelo"), occupancy, cfg)) and (bool(it.get("servico")) or it.get("prioridade") == 1) and exempt_run(it.get("run"), cfg)  # only asks Orca when there is something to exempt
+        blocked = machine_slot_for(it.get("modelo"), occupancy, cfg, _item_project(it), _item_age_s(it), waiting)
+        exempt = (only_exempt or blocked) and (bool(it.get("servico")) or it.get("prioridade") == 1) and exempt_run(it.get("run"), cfg)  # only asks Orca when there is something to exempt
         if only_exempt and not exempt:
             continue
-        if exempt and (machine_slot(it.get("modelo"), occupancy, cfg, exempt=True) or machine_floor(machine_read(), cfg)) or not exempt and machine_slot(it.get("modelo"), occupancy, cfg):
+        if exempt and (machine_slot(it.get("modelo"), occupancy, cfg, exempt=True) or machine_floor(machine_read(), cfg)) or not exempt and blocked:
             continue
         try:
             line_list.append(_promoted_from_queue(it))
@@ -10825,11 +10953,12 @@ def machine_round():
     cfg = machine_cfg()
     reading = machine_read()
     level, reason = machine_level(reading, cfg)
+    refilled = release_refill(cfg)
     if level == "alta":
-        return _machine_notify(reason, len(dispatch_queue_items()), cfg, machine_cause(reading, cfg)) + drain_dispatch(cfg, only_exempt=True)
+        return refilled + _machine_notify(reason, len(dispatch_queue_items()), cfg, machine_cause(reading, cfg)) + drain_dispatch(cfg, only_exempt=True)
     if _cursor_ro().get("maquina_aviso"):
         _cursor_mut(lambda c: c.pop("maquina_aviso", None))
-    return drain_dispatch(cfg)
+    return refilled + drain_dispatch(cfg)
 
 
 def machine_text(cfg=None, reading=None, occupancy=None):
@@ -10846,6 +10975,10 @@ def machine_text(cfg=None, reading=None, occupancy=None):
         expensive_count = sum(expensive_model(m, cfg) for m in occupancy["vivos"].values())
         ls.append(f"slots: {len(occupancy['vivos'])}/{cfg['max_workers']:g} taken, {max(cfg['max_workers'] - len(occupancy['vivos']), 0):g} free; expensive {expensive_count}/{cfg['max_caros']:g}; E2E max {cfg['max_e2e']:g} (the E2E queue serializes); dispatch queue {len(dispatch_queue_items())}")
 
+    if occupancy is not None:
+        by_project = _live_by_project(occupancy)
+        ls += project_lines(project_view(by_project, dispatch_queue_items(by_project), cfg))
+
     def decide(model):
         m = f"high pressure: {reason}" if level == "alta" else machine_slot(model, occupancy, cfg) if occupancy is not None else None
         return f"queue ({m})" if m else "starts"
@@ -10853,13 +10986,54 @@ def machine_text(cfg=None, reading=None, occupancy=None):
     return ls
 
 
+STARVED_MIN = 10  # minutes a project with items in the queue may go without a live worker before the panel warns
+
+
+def project_view(live, queue, cfg, projs=None):
+    """One row per project that has a live worker or an item in the queue (ticket 344): {projeto, vivos, fila, posicao (of its first item in `queue`), espera_min (age of its oldest
+    item), reserva, teto, aviso}. `aviso` when the project has had an item waiting for more than STARVED_MIN minutes with no live worker: "product-app: 1 item waiting for 14 min,
+    0 of 7 slots"."""
+    projs = projects() if projs is None else projs
+    rows = {}
+    for pos, i in enumerate(queue, 1):
+        r = rows.setdefault(_item_project(i), {"fila": 0, "posicao": pos, "espera_min": 0})
+        r["fila"] += 1
+        r["espera_min"] = max(r["espera_min"], int(_item_age_s(i) // 60))
+    out = []
+    for name in sorted({*rows, *(p for p, n in live.items() if n)}, key=lambda p: (p is None, p or "")):
+        r, lim = rows.get(name, {"fila": 0, "posicao": None, "espera_min": 0}), projs.get(name) or {}
+        n = live.get(name, 0)
+        warning = (f"{name or '(no project)'}: {r['fila']} item{'s' if r['fila'] > 1 else ''} waiting for {r['espera_min']} min, {n} of {cfg['max_workers']:g} slots"
+                   if r["fila"] and not n and r["espera_min"] >= STARVED_MIN else None)
+        out.append({"projeto": name, "vivos": n, "fila": r["fila"], "posicao": r["posicao"], "espera_min": r["espera_min"], "reserva": lim.get("reserve_slots"), "teto": lim.get("max_slots"),
+                    "aviso": warning})
+    return out
+
+
+def project_lines(view):
+    """`project product-app: 2 live (reserve 2), 1 in the queue (first at position 7)` and the warning under it; nothing when only one project has anything."""
+    if len(view) < 2 and not any(r["aviso"] for r in view):
+        return []
+    lines = []
+    for r in view:
+        limits = ", ".join(x for x in (f"reserve {r['reserva']}" if r["reserva"] else "", f"max {r['teto']}" if r["teto"] is not None else "") if x)
+        lines.append(f"project {r['projeto'] or '(no project)'}: {r['vivos']} live{f' ({limits})' if limits else ''}, {r['fila']} in the queue" + (f" (first at position {r['posicao']})" if r["posicao"] else ""))
+        if r["aviso"]:
+            lines.append(f"  WARNING: {r['aviso']}")
+    return lines
+
+
 def machine_panel(agents_=None):
-    """What the panel and the digest show about the machine, from files only: {max_workers, max_caros, ocupadas, livres, caros, fila: [{id, tipo, titulo, prioridade, modelo}]}."""
+    """What the panel and the digest show about the machine, from files only: {max_workers, max_caros, ocupadas, livres, caros, fila: [{id, tipo, titulo, prioridade, modelo}],
+    projetos: project_view}."""
     cfg = machine_cfg()
     live = [a for a in agents_ or [] if isinstance(a, dict) and a.get("estado") in MACHINE_ALIVE]
+    by_project = collections.Counter(a.get("projeto") for a in live)
+    queue = dispatch_queue_items(by_project)
     return {"max_workers": cfg["max_workers"], "max_caros": cfg["max_caros"], "ocupadas": len(live), "livres": max(cfg["max_workers"] - len(live), 0),
             "caros": sum(expensive_model(a.get("modelo"), cfg) for a in live),
-            "fila": [{k: i.get(k) for k in ("id", "tipo", "titulo", "prioridade", "modelo")} for i in dispatch_queue_items()]}
+            "fila": [{k: i.get(k) for k in ("id", "tipo", "titulo", "prioridade", "modelo")} for i in queue],
+            "projetos": project_view(by_project, queue, cfg)}
 
 
 def machine_line():
@@ -10870,6 +11044,7 @@ def machine_line():
         return ""
     txt = f"Machine: {p['ocupadas']}/{p['max_workers']:g} workers ({p['caros']}/{p['max_caros']:g} expensive), {p['livres']:g} free slots"
     txt += f"; HIGH PRESSURE: {reason}" if level == "alta" else ""
+    txt += "".join(f"; WARNING {r['aviso']}" for r in p["projetos"] if r["aviso"])
     if p["fila"]:
         txt += f"; {len(p['fila'])} in the dispatch queue: " + ", ".join(f"P{i.get('prioridade') or 2} {_quote(i.get('titulo') or '?', 30)}" for i in p["fila"][:3]) + (f" +{len(p['fila']) - 3}" if len(p["fila"]) > 3 else "")
     return txt
@@ -13596,7 +13771,9 @@ def main(argv=None):
             cfg, reading = machine_cfg(), machine_read()
             level, reason = machine_level(reading, cfg)
             occupancy = machine_occupancy()
-            print(json.dumps({"config": cfg, "leitura": reading, "nivel": level, "motivo": reason, "vivos": occupancy["vivos"], "fila": dispatch_queue_items()}, ensure_ascii=False)
+            queue = dispatch_queue_items(_live_by_project(occupancy))
+            print(json.dumps({"config": cfg, "leitura": reading, "nivel": level, "motivo": reason, "vivos": occupancy["vivos"], "fila": queue,
+                              "projetos": project_view(_live_by_project(occupancy), queue, cfg)}, ensure_ascii=False)
                   if a.json else "\n".join(machine_text(cfg, reading, occupancy)))
         elif a.cmd == "dispatch-queue" and a.op == "rm":
             if not dispatch_queue_rm(a.id):
@@ -13610,7 +13787,7 @@ def main(argv=None):
         elif a.cmd == "dispatch-queue":
             item_list = dispatch_queue_items()
             print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(
-                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}) since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
+                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}){f' [{_item_project(i)}]' if _item_project(i) else ''} since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
         elif a.cmd == "usage":
             u = plan_usage(agent=a.agent)
             level, reason, _ = usage_level(u)
