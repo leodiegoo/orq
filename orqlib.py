@@ -4253,8 +4253,6 @@ def hook_prompt(ev, run):
         ln = linhas_noite(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # a noite acorda o coordenador por aviso, não por usuário
         if org == "orca" and (r := AVISO_RUN.search(ev.get("prompt") or "")):
             ln = [f"orq: leia e confirme a caixa com `orq caixa {r.group(1)} --ack` (liga o coordenador ao Run e volta o vínculo)", *ln]
-        if org == "orca" and (r := AVISO_RUN.search(ev.get("prompt") or "")):
-            ln = [f"orq: leia e confirme a caixa com `orq caixa {r.group(1)} --ack` (liga o coordenador ao Run e volta o vínculo)", *ln]
         if org == "aviso_orq" and texto.lstrip().startswith("orq: PR ") and (ob := linha_obrigacoes(read_events())):
             ln = [*ln, ob]  # o aviso do merge chega já com o que ele pede
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
