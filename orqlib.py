@@ -1829,6 +1829,53 @@ def _prova_de_entrega(m, p):
         append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": avisos})
 
 
+BRANCH_RE = re.compile(r"\b(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)/[\w./-]*\w")
+
+
+def _worktree_do_dispatch(run, dispatch):
+    """O caminho da worktree do dispatch no worker-list, ou None (sem linha, sem caminho ou o Orca falhou)."""
+    try:
+        w = next((w for w in _workers_todos(run) if w.get("dispatchId") == dispatch), None)
+    except (RuntimeError, KeyError):
+        return None
+    wt = (((w or {}).get("resource") or {}).get("worktreeId") or "").split("::", 1)[-1]
+    return wt if wt.startswith("/") else None
+
+
+def _terminal_do_integrador(events):
+    """O terminal do serviço de despacho que se chama integrador (o último que não foi liberado), ou None."""
+    servicos, liberados = _servicos(events), _liberados(events)
+    d = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") in servicos and e["dispatch"] not in liberados
+              and "integrador" in (e.get("titulo") or "").lower()), None)
+    return _terminal_do_dispatch(d.get("run"), d["dispatch"]) if d else None
+
+
+def _entrega_do_orq(m, p):
+    """worker_done `succeeded` de ticket do orq (a task é a `Task:` de um ticket de ISSUES; os do produto não entram) com branch no payload ou no texto ->
+    `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). Sem branch só o log: o coordenador adiciona à mão.
+    O aviso é digitado uma vez (ocupado: tenta enfileirar no turno; ainda assim não, fica só a fila, que o integrador lê no ciclo). Devolve o ticket ou None."""
+    if p.get("outcome") != "succeeded" or not p.get("taskId"):
+        return None
+    t = next((t for t in tickets() if t.get("task") == p["taskId"]), None)
+    if not t:
+        return None
+    texto = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
+    branch = p.get("branch") or next(iter(BRANCH_RE.findall(texto)), None)  # ponytail: a primeira branch citada; várias no texto, o worker deve usar o payload
+    if not branch:
+        log(f"entrega do orq: ticket {t['num']} sem branch no worker_done {m['id']}; fica fora da fila do integrador")
+        return None
+    commit = p.get("commit") or next(iter(SHA_RE.findall(texto)), None)
+    ev = integrar_fila_add(branch, t["num"])
+    wt = _worktree_do_dispatch(m.get("run_id"), p.get("dispatchId"))
+    aviso = f"orq: ticket {t['num']} entrou na fila. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
+    h = _terminal_do_integrador(read_events())
+    r = (digita(h, aviso) if h else "sem_integrador")
+    if r == "ocupado":
+        r = digita_ocupado(h, aviso)
+    append_event({"tipo": "entrega_orq", "ticket": ev["ticket"], "branch": branch, "worktree": wt, "commit": commit, "msg": m["id"], "dispatch": p.get("dispatchId"), "aviso": r})
+    return ev["ticket"]
+
+
 def _ingest_msg(m, desde, ja, titulos):
     """Uma mensagem da inbox -> 1 se virou entrada. Levanta o que a mensagem tiver de errado; quem chama isola.
 
@@ -1838,6 +1885,10 @@ def _ingest_msg(m, desde, ja, titulos):
         return 0
     p = _payload(m)
     _prova_de_entrega(m, p)
+    try:
+        _entrega_do_orq(m, p)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # a fila é um extra: o relatório da mensagem não se perde por ela
+        log(f"entrega do orq: worker_done {m['id']}: {type(e).__name__}: {e}")
     if p.get("reportPath"):
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": m.get("subject") or "", "fonte": f"worker {m.get('subject') or ''}",
                       "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId"), **_grupo_do_run(m["run_id"])}, novo_id=True)
@@ -6599,6 +6650,33 @@ def liberar(dispatch, run=None):
         return _liberar(dispatch, w)
 
 
+def _fecha_setup(dispatch, w, run_id, handle):
+    """Fecha os terminais da worktree que o orq pediu ao Orca para este dispatch (o do setup): os shells (sem `agentIdentity`) dessa worktree, e só dela.
+    Worktree `current` ou sem registro de despacho não é do dispatch: nada é tocado. Nunca fecha o terminal do worker, do coordenador (deste ou do Run),
+    de agente nem o de outro dispatch ainda rodando. Devolve (handles fechados, avisos).
+    ponytail: um shell que o usuário abriu à mão nessa worktree também cai; o filtro por criador não existe no `terminal list`."""
+    desp = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == dispatch), {})
+    wt = ((w.get("resource") or {}).get("worktreeId") or "").split("::", 1)[-1]
+    if not wt.startswith("/") or desp.get("worktree") in (None, "current"):
+        return [], []
+    try:
+        linhas = orca("list", "--worktree", f"path:{wt}", "--limit", "100", area="terminal")["terminals"]
+        protegidos = {handle, os.environ.get("ORCA_TERMINAL_HANDLE"), (orca("run-show", "--id", run_id)["run"] or {}).get("coordinator_handle"),
+                      *(x.get("agentTerminalHandle") for x in _workers_todos(run_id) if x.get("dispatchStatus") == "dispatched")}
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError) as e:
+        return [], [f"terminais de setup de {wt} não listados: {e}"]
+    fechados, avisos = [], []
+    for t in linhas:
+        if t.get("worktreePath") != wt or t.get("agentIdentity") or t.get("handle") in protegidos or not t.get("handle"):
+            continue
+        try:
+            orca("close", "--terminal", t["handle"], area="terminal")
+            fechados.append(t["handle"])
+        except RuntimeError as e:
+            avisos.append(f"terminal de setup {t['handle']} não fechou: {e}")
+    return fechados, avisos
+
+
 def _liberar(dispatch, w):
     """O corpo do liberar, com o Run do dispatch já comandado pelo coordenador (ou com a recusa que explica o que falta)."""
     run_id, handle, avisos = w.get("runId"), w.get("agentTerminalHandle"), []
@@ -6628,12 +6706,16 @@ def _liberar(dispatch, w):
             avisos.append(f"terminal close de {handle} falhou: {e}")
     elif estado == "release_pending":
         avisos.append("release_pending: o Orca ainda está liberando; repita orq liberar depois")
+    setup = []
+    if estado != "release_pending":
+        setup, a_setup = _fecha_setup(dispatch, w, run_id, handle)
+        avisos += a_setup
     if estado != "release_pending":  # a repetição do release_pending grava o fim de novo; vale o último
         append_event({"tipo": "fim_dispatch", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, **fim})
     if estado != "release_pending":
         _esquece_hibernado(dispatch)  # liberado não volta: o terminal já estava fechado e não há o que acordar
     ev = {"tipo": "liberar", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, "terminal": handle, "estado": estado, "fechado": fechado, "ack": entregas,
-          **({"interacao": True} if humano else {})}
+          **({"interacao": True} if humano else {}), **({"setup_fechados": setup} if setup else {})}
     append_event({**ev, **({"aviso": "; ".join(avisos)} if avisos else {})})
     refresh_bg()  # o resumo do próximo prompt já sai sem o dispatch liberado (M13)
     return {**ev, "aviso": "; ".join(avisos)}

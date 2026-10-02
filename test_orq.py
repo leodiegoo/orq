@@ -143,7 +143,7 @@ if sys.argv[1] == "terminal" and cmd == "list":
     if vivos is None:
         vivos = [w["handle"] for w in ler("workers.json", [])]
     # terminals_truncados: como o Orca com --limit menor que o total (truncated: true)
-    print(json.dumps({"ok": True, "result": {"terminals": [{"handle": h} for h in vivos], "truncated": os.path.exists(os.path.join(d, "terminals_truncados"))}})); sys.exit(0)
+    print(json.dumps({"ok": True, "result": {"terminals": [{"handle": h, **ler("terminais_wt.json", {}).get(h, {})} for h in vivos], "truncated": os.path.exists(os.path.join(d, "terminals_truncados"))}})); sys.exit(0)
 if sys.argv[1] == "terminal":
     # orca terminal show: terminals.json guarda os handles vivos; handle morto é terminal_handle_stale, como no Orca real
     if opt("--terminal") in ler("terminals.json", []):
@@ -285,7 +285,8 @@ elif cmd == "worker-list":
               "dispatchStatus": w.get("status", "completed"),
               "terminalState": w.get("terminal", "active" if w.get("status") == "dispatched" else "released"),
               "resource": None if w.get("sem_resource") else {"ownershipState": w.get("ownership", "owned"), "retainedReason": w.get("reason"), "terminalHandle": w["handle"],
-                                                            "originDispatchId": w.get("origem", w.get("dispatch", "ctx_" + w["handle"])), "ownerDispatchId": w.get("dono", w.get("dispatch", "ctx_" + w["handle"]))}}
+                                                            "originDispatchId": w.get("origem", w.get("dispatch", "ctx_" + w["handle"])), "ownerDispatchId": w.get("dono", w.get("dispatch", "ctx_" + w["handle"])),
+                                                            **({"worktreeId": "id::" + w["worktree"]} if w.get("worktree") else {})}}
              for w in ler("workers.json", [])]
     itens, prox = pagina([w for w in todos if not run or w["runId"] == run])
     res = {"workers": itens, "page": {"limit": int(opt("--limit", 100)), "hasMore": bool(prox), "nextCursor": prox},
@@ -7715,6 +7716,7 @@ def _tk_arq(a, nn, titulo, task=None, bloqueado=None):
 
 
 def _evs(a, *evs):
+    os.makedirs(a.home, exist_ok=True)
     with open(os.path.join(a.home, "events.jsonl"), "a") as f:
         f.writelines(json.dumps(e) + "\n" for e in evs)
 
@@ -14641,6 +14643,84 @@ def test_ticket144_stop_nao_duplica_quando_o_coordenador_ja_gravou_no_turno_e_ig
     assert open(arq).read().count("##") == 1, open(arq).read()
     _stop(a, last_assistant_message="outra longa. " * 100, cwd=repo)
     assert open(arq).read().count("##") == 2, "o turno seguinte, sem resumo gravado, ganha o automático"
+
+
+# ---- ticket 141: a entrega de ticket do orq entra na fila do integrador; o liberar fecha o setup ----
+
+def _entrega141(a, task="task_t141", body="branch feat/orq-x commit abc1234def", outcome="succeeded", **payload):
+    """Um ticket do orq (a Task: dele é `task`), o integrador (serviço aberto) e um worker_done novo na inbox."""
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"), "w") as f:
+        f.write(f"# 141: orq: teste\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: {task}\n\n## What to build\n\nx\n")
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
+                           {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": "/wt/141"}])
+    a.set("terminals.json", ["term_int", "term_w1"])
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_term_int", "dispatch": "ctx_term_int", "titulo": "orq: integrador (juntar branches)", "servico": True})
+    inbox = {"result": {"messages": [{"id": "msg_141", "run_id": "run_a", "type": "worker_done", "subject": "entregue", "body": body, "sequence": 5, "read": 0,
+                                       "created_at": "2099-01-01T00:00:00Z", "payload": json.dumps({"taskId": task, "dispatchId": "ctx_term_w1", "outcome": outcome, **payload})}]}}
+    a.set("inbox.json", inbox)
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ingest": {"desde": "2000-01-01T00:00:00Z", "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
+
+
+def test_ticket141_worker_done_de_ticket_do_orq_entra_na_fila_e_avisa_o_integrador():
+    a = Amb(run="run_a")
+    _entrega141(a)
+    assert a.orq("ingest").returncode == 0
+    fila = json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in fila] == [("141", "feat/orq-x")], fila
+    (envio,) = _log(a, "send.log")
+    assert envio[:3] == ["send", "--terminal", "term_int"], envio
+    texto = envio[envio.index("--text") + 1]
+    assert "141" in texto and "feat/orq-x" in texto and "/wt/141" in texto and "abc1234d" in texto and len(texto) <= 150, texto
+    (ev,) = [e for e in a.events() if e["tipo"] == "entrega_orq"]
+    assert (ev["ticket"], ev["aviso"]) == ("141", "enviado"), ev
+    a.orq("ingest")
+    assert len(_log(a, "send.log")) == 1, "o cursor não repete o aviso"
+
+
+def test_ticket141_worker_done_de_ticket_do_produto_ou_sem_branch_ou_falho_nao_entra():
+    a = Amb(run="run_a")
+    _entrega141(a, task="task_produto")
+    os.remove(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"))
+    a.orq("ingest")
+    assert not os.path.exists(os.path.join(a.home, "integrar-fila.json")) and not _log(a, "send.log")
+    b = Amb(run="run_a")
+    _entrega141(b, body="pronto, sem nada citado")
+    b.orq("ingest")
+    assert not os.path.exists(os.path.join(b.home, "integrar-fila.json")) and "sem branch" in b.log()
+    c = Amb(run="run_a")
+    _entrega141(c, outcome="failed")
+    c.orq("ingest")
+    assert not os.path.exists(os.path.join(c.home, "integrar-fila.json"))
+    d = Amb(run="run_a")
+    _entrega141(d, body="sem texto", branch="fix/do-payload", commit="1234abcd99")
+    d.orq("ingest")
+    assert json.load(open(os.path.join(d.home, "integrar-fila.json")))["itens"][0]["branch"] == "fix/do-payload"
+
+
+def test_ticket141_liberar_fecha_o_worker_e_o_setup_da_worktree_e_so_dela():
+    a = Amb(run="run_a")
+    _lib_env(a, release="retained", worktree="/wt/141")
+    a.set("terminais_wt.json", {"term_setup": {"worktreePath": "/wt/141"}, "term_w1": {"worktreePath": "/wt/141", "agentIdentity": "claude"},
+                                "term_agente": {"worktreePath": "/wt/141", "agentIdentity": "codex"}, "term_outra": {"worktreePath": "/wt/outra"}})
+    a.set("terminals.json", ["term_w1", "term_w2", "term_coord", "term_setup", "term_agente", "term_outra"])
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_w1", "dispatch": "ctx_term_w1", "worktree": "new-top-level"})
+    out = json.loads(a.orq("liberar", "ctx_term_w1").stdout)
+    assert out["fechado"] is True and out["setup_fechados"] == ["term_setup"], out
+    assert [c[2] for c in _log(a, "close.log")] == ["term_w1", "term_setup"], _log(a, "close.log")
+    (ev,) = [e for e in a.events() if e["tipo"] == "liberar"]
+    assert ev["setup_fechados"] == ["term_setup"], ev
+
+
+def test_ticket141_liberar_worktree_current_nao_fecha_nenhum_terminal_de_setup():
+    a = Amb(run="run_a")
+    _lib_env(a, release="retained", worktree="/wt/141")
+    a.set("terminais_wt.json", {"term_setup": {"worktreePath": "/wt/141"}})
+    a.set("terminals.json", ["term_w1", "term_w2", "term_coord", "term_setup"])
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_w1", "dispatch": "ctx_term_w1", "worktree": "current"})
+    out = json.loads(a.orq("liberar", "ctx_term_w1").stdout)
+    assert "setup_fechados" not in out and [c[2] for c in _log(a, "close.log")] == ["term_w1"], (out, _log(a, "close.log"))
 
 
 if __name__ == "__main__":
