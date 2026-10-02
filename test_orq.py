@@ -614,8 +614,7 @@ def test_contagem_de_entradas_sem_efeito():
     assert [e["id"] for e in orq_mod.abertas(ev)] == ["e1", "e2", "e3"]
     a.orq("intake", "e2", "conversa")
     assert [e["id"] for e in orq_mod.abertas(a.events())] == ["e1", "e3"]
-    # o Stop em modo aviso (stop_bloqueia false): systemMessage, grava gate_aviso e nunca bloqueia, nem com stop_hook_active
-    a.orq("maquina", "set", "stop_bloqueia", "false")
+    # o Stop em modo aviso: systemMessage, grava gate_aviso e nunca bloqueia, nem com stop_hook_active
     for ativo in (False, True):
         r = a.orq("hook", "stop", stdin=json.dumps({"stop_hook_active": ativo, "session_id": "s"}))
         out = json.loads(r.stdout)
@@ -629,6 +628,12 @@ def test_contagem_de_entradas_sem_efeito():
     assert (r.returncode, r.stdout) == (0, "")
 
 
+def _aviso_do_stop(stdout):
+    """O texto do aviso do Stop, quer ele tenha parado (systemMessage) quer barrado por entrada sem intake (reason)."""
+    out = json.loads(stdout)
+    return out.get("systemMessage") or out["reason"]
+
+
 def _stop_gate(a, sessao="s", ativo=False):
     return json.loads(a.orq("hook", "stop", stdin=json.dumps({"stop_hook_active": ativo, "session_id": sessao})).stdout or "{}")
 
@@ -636,11 +641,29 @@ def _stop_gate(a, sessao="s", ativo=False):
 def test_stop_barra_entrada_sem_intake_e_libera_com_intake():
     a = Amb()
     a.prompt("faça isso")
-    out = _stop_gate(a)
+    out = _stop_gate(a, sessao="abcdef123456")
     assert out["decision"] == "block" and "e1 ('faça isso')" in out["reason"]
     assert "tarefa|steer|pend|decisao|conversa|descartado" in out["reason"]
     a.orq("intake", "e1", "conversa")
-    assert _stop_gate(a) == {}
+    assert _stop_gate(a, sessao="abcdef123456") == {}
+
+
+def test_stop_de_outra_sessao_so_barra_entrada_velha_sem_stop_bloqueia():
+    a = Amb()
+    a.prompt("recente")
+    assert _stop_gate(a) == {} or "decision" not in _stop_gate(a)  # outra sessão, entrada nova: só avisa
+    with open(os.path.join(a.home, "events.jsonl")) as f:
+        linhas = [json.loads(x) for x in f]
+    linhas[0]["ts"] = "2026-01-01T00:00:00.000Z"
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(x) + "\n" for x in linhas))
+    assert [_stop_gate(a).get("decision") for _ in range(3)] == ["block", "block", None]
+
+
+def test_terceiro_stop_do_mesmo_conjunto_sem_intake_deixa_parar():
+    a = Amb()
+    a.prompt("um")
+    assert [_stop_gate(a, sessao="abcdef123456").get("decision") for _ in range(3)] == ["block", "block", None]
 
 
 def test_away_recebe_intake_conversa_sozinho():
@@ -671,6 +694,7 @@ def test_sem_efeito_do_hook_so_traz_24h_e_o_status_traz_as_velhas():
 
 def test_stop_com_orcamento_barra_no_maximo_2_vezes_o_mesmo_conjunto():
     a = Amb()
+    a.orq("maquina", "set", "stop_bloqueia", "true")
     a.prompt("um")
     # stop_hook_active verdadeiro (de outro hook) na primeira parada ainda barra
     saidas = [_stop_gate(a, ativo=True), _stop_gate(a), _stop_gate(a)]
@@ -687,7 +711,6 @@ def test_stop_com_orcamento_barra_no_maximo_2_vezes_o_mesmo_conjunto():
 
 def test_stop_desligado_nao_barra_e_excecao_sai_com_0():
     a = Amb()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     a.prompt("um")
     assert [_stop_gate(a).get("decision") for _ in range(3)] == [None] * 3
     a.orq("maquina", "set", "stop_bloqueia", "true")
@@ -1747,7 +1770,6 @@ def test_achado_9_json_de_entrada_corrompido_sai_com_0():
 
 def test_achado_10_entrada_sem_id_nao_cega_o_stop():
     a = Amb()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     a.prompt("boa")
     with open(os.path.join(a.home, "events.jsonl"), "a") as f:
         f.write(json.dumps({"tipo": "entrada", "origem": "usuario", "texto": "editada à mão, sem id"}) + "\n")
@@ -1997,14 +2019,13 @@ def _pos_despacho_sem_binding(a):
 
 def test_review2_m2_cursor_ilegivel_nao_desliga_o_orq_e_avisa_no_resumo_e_no_stop():
     a = Amb()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     for t in ("um", "dois", "três"):
         a.prompt(t)
     a.orq("intake", "e1", "conversa")
     a.orq("intake", "e2", "conversa")  # e3 fica sem efeito
     open(os.path.join(a.home, "cursor.json"), "w").write("{quebrado")
     r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
-    out = json.loads(r.stdout)["systemMessage"]
+    out = _aviso_do_stop(r.stdout)
     assert "1 entrada(s) sem efeito: e3" in out and "cursor.json estava ilegível" in out, "o Stop não fica mudo"
     ctx = json.loads(a.prompt("quarta mensagem").stdout)["hookSpecificOutput"]["additionalContext"]
     assert "entrada e4 (usuário)" in ctx and "cursor.json estava ilegível" in ctx and "Sem efeito: e3" in ctx, ctx
@@ -3167,7 +3188,6 @@ def test_review4_b12_intake_mostra_qual_entrada_fechou_e_recusa_conversa_em_rela
 
 def test_review4_b12_o_stop_cita_as_tres_primeiras_entradas_sem_efeito():
     a = Amb()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     for t in ("um assunto longo demais para caber inteiro na citação do stop", "dois", "três", "quatro"):
         a.prompt(t)
     msg = json.loads(a.orq("hook", "stop", stdin=json.dumps({"session_id": "s"})).stdout)["systemMessage"]
@@ -4710,7 +4730,6 @@ def test_marca_heartbeat_de_outro_run():
 
 def test_marca_stop():
     a = Amb()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     a.prompt("boa")
     assert json.loads(a.orq("hook", "stop", stdin="{}").stdout)["systemMessage"].startswith(orq_mod.MARCA)
 
@@ -8272,12 +8291,11 @@ def test_ausente_desligado_o_stop_nao_gera_digest_nem_evento():
 
 def test_ausente_falha_do_digest_nao_derruba_o_stop_nem_o_aviso_de_entrada():
     a = _digest_env()
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     a.orq("ausente", "ligar")
     open(os.path.join(a.home, "digest"), "w").write("arquivo no lugar da pasta")  # mkdir falha
     _evs(a, _ev("15:00:00", "entrada", id="e9", origem="usuario", texto="sem efeito ainda"))
     r = _stop(a, last_assistant_message="oi")
-    assert r.returncode == 0 and "e9" in json.loads(r.stdout)["systemMessage"], r
+    assert r.returncode == 0 and "e9" in _aviso_do_stop(r.stdout), r
     assert "digest" in a.log(), "a falha vai para o log"
 
 
@@ -12573,7 +12591,6 @@ def test_ticket114_adiar_cria_um_ticket_com_o_motivo():
 
 def test_ticket114_o_stop_avisa_uma_vez_da_obrigacao_velha():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     e = _merge_main(a)
     m1 = json.loads(_stop(a).stdout)["systemMessage"]
     assert "Obrigação aberta" in m1 and f"{e} comentario" in m1 and "orq feito" in m1, m1
@@ -12595,11 +12612,11 @@ def test_ticket114_o_stop_avisa_uma_vez_da_obrigacao_velha():
 
 def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
-    a.orq("maquina", "set", "stop_bloqueia", "false")
     e = _merge_main(a)
     r = _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?"))
     assert f"A fazer por você: {e} →" in _ctx(r), r.stdout
-    m = json.loads(_hook_codex(a, "stop", _codex("stop", session_id="abcdef123456")).stdout)["systemMessage"]
+    assert a.orq("intake", "e2", "conversa").returncode == 0  # o Stop barra entrada sem intake do turno; este teste é da obrigação
+    m = _aviso_do_stop(_hook_codex(a, "stop", _codex("stop", session_id="abcdef123456")).stdout)
     assert "Obrigação aberta" in m and f"{e} deploy" in m, m
     for chave in ("deploy", "comentario", "limpeza"):
         assert a.orq("feito", e, chave, "--prova", "ok").returncode == 0
