@@ -8,6 +8,7 @@ manager.json
 manager-notice.json
 manager-alive
 manager-ok
+relatorios/
 backup-pt-*/
 ask/
 # the portuguese names, until scripts/migrar-ingles.py renames them
