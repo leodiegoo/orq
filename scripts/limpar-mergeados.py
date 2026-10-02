@@ -379,6 +379,13 @@ def main():
                         guardados = guardar(w["path"], fa["artefatos"])
                     except OSError as e:  # sem a cópia, remover perderia o relatório
                         v, r = "skip", f"não consegui guardar {', '.join(fa['artefatos'])}: {e}"
+            if v == "remove" and not a.dry_run:
+                try:
+                    sys.path.insert(0, ORQ_DIR)
+                    from orqlib import encerrar_processos_da_worktree
+                    encerrar_processos_da_worktree(w["path"])
+                except Exception as e:  # sem o orq a limpeza segue; o Orca remove a worktree do mesmo jeito
+                    print(f"limpar-mergeados: processos da worktree não encerrados: {e}", file=sys.stderr)
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
             if guardados:
                 items[-1]["guardados"] = guardados

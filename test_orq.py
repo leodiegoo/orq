@@ -14732,6 +14732,69 @@ def test_ticket141_liberar_worktree_current_nao_fecha_nenhum_terminal_de_setup()
     assert "setup_fechados" not in out and [c[2] for c in _log(a, "close.log")] == ["term_w1"], (out, _log(a, "close.log"))
 
 
+# ---------- ticket 147: liberar e limpar encerram os processos com cwd dentro da worktree ----------
+
+def _procs147(a, wt):
+    os.makedirs(wt + "/web", exist_ok=True)
+    os.makedirs(wt + "-irma", exist_ok=True)
+    ps = [{"pid": 300, "ppid": 1, "rss": 5000, "args": "node meteor", "cwd": wt + "/web"},
+          {"pid": 301, "ppid": 300, "rss": 5000, "args": "docker compose up", "cwd": wt},
+          {"pid": 302, "ppid": 1, "rss": 5000, "args": "node teimoso", "cwd": wt, "ignora_term": True},
+          {"pid": 303, "ppid": 1, "rss": 5000, "args": "node de outra pasta", "cwd": wt + "-irma"},
+          {"pid": 304, "ppid": 1, "rss": 5000, "args": "claude coordenador", "cwd": os.path.dirname(wt)}]
+    a.set("../procs147.json", ps)
+    a.env["ORQ_PROCESSOS"] = os.path.join(a.tmp.name, "procs147.json")
+    a.env["ORQ_ENCERRA_ESPERA_S"] = "1"
+    return a.env["ORQ_PROCESSOS"]
+
+
+def test_ticket147_liberar_encerra_so_os_processos_com_cwd_dentro_da_worktree():
+    a = Amb(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt147")
+    os.makedirs(wt)
+    _lib_env(a)
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "active", "release": "released", "worktree": wt}])
+    arq = _procs147(a, wt)
+    r = a.orq("liberar", "ctx_term_w1")
+    assert r.returncode == 0, r.stderr
+    assert {p["pid"] for p in json.load(open(arq))} == {303, 304}, "dentro cai (o teimoso no KILL); fora e o coordenador ficam"
+    (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
+    assert (ev["encerrados"], ev["kill"]) == (3, 1), ev
+    assert "3 processo(s)" in json.loads(r.stdout)["aviso"]
+
+
+def test_ticket147_liberar_com_terminal_mantido_nao_encerra_processo_nenhum():
+    a = Amb(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt147")
+    os.makedirs(wt)
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "active", "release": "retained",
+                            "release_reason": "user_takeover", "worktree": wt}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    a.caixa(("worker_done", {"taskId": "task_w1", "dispatchId": "ctx_term_w1"}))
+    arq = _procs147(a, wt)
+    assert a.orq("liberar", "ctx_term_w1").returncode == 0
+    assert len(json.load(open(arq))) == 5
+
+
+def test_ticket147_encerrar_poupa_o_proprio_orq_e_quem_o_chamou():
+    import orqlib
+    a = Amb(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt147")
+    os.makedirs(wt)
+    eu, pai = os.getpid(), os.getppid()
+    arq = os.path.join(a.tmp.name, "p.json")
+    json.dump([{"pid": 400, "ppid": 1, "args": "node", "cwd": wt}, {"pid": pai, "ppid": 1, "args": "coordenador", "cwd": wt},
+               {"pid": eu, "ppid": pai, "args": "orq", "cwd": wt}], open(arq, "w"))
+    antes = {k: os.environ.get(k) for k in ("ORQ_PROCESSOS", "ORQ_HOME")}
+    os.environ.update(ORQ_PROCESSOS=arq, ORQ_HOME=a.home)
+    try:
+        res = orqlib.encerrar_processos_da_worktree(wt, espera_s=0.2)
+    finally:
+        for k, v in antes.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    assert res["encerrados"] == 1 and {p["pid"] for p in json.load(open(arq))} == {pai, eu}, res
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

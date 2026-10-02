@@ -2918,6 +2918,7 @@ def _limpar_branch_fechada(task, repo, b, itens, fx, dry):
     try:
         if wt:
             guardados = _guardar_relatorios(wt["path"])
+            encerrar_processos_da_worktree(wt["path"])
             orca("rm", "--worktree", f"path:{wt['path']}", "--run-hooks", area="worktree", timeout=120)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:  # sem a cópia ou sem tirar a worktree, apagar a branch perderia trabalho
         return f"{task}: {b} não limpa, a worktree ficou ({e})", False
@@ -6691,7 +6692,7 @@ def _liberar(dispatch, w):
         if "consumer_fenced" in str(e):
             raise ValueError(f"o coordenador precisa comandar o Run {run_id} para liberar o dispatch: {dica_ligar(run_id)}")
         raise
-    fechado, humano = False, False
+    fechado, humano, mantido = False, False, False
     if estado == "retained":
         try:
             pode, motivo, humano = _pode_fechar(handle, run_id, dispatch)
@@ -6699,6 +6700,7 @@ def _liberar(dispatch, w):
                 orca("close", "--terminal", handle, area="terminal")
                 fechado = True
             else:
+                mantido = True
                 avisos.append(f"terminal {handle} mantido: {motivo}")
         except RuntimeError as e:
             avisos.append(f"terminal close de {handle} falhou: {e}")
@@ -6708,6 +6710,10 @@ def _liberar(dispatch, w):
     if estado != "release_pending":
         setup, a_setup = _fecha_setup(dispatch, w, run_id, handle)
         avisos += a_setup
+    if estado != "release_pending" and not mantido and fim.get("caminho"):  # terminal mantido: alguém ainda usa a worktree
+        r = encerrar_processos_da_worktree(fim["caminho"])
+        if r and r["encerrados"]:
+            avisos.append(f"{r['encerrados']} processo(s) da worktree encerrado(s)" + (f", {r['kill']} só no KILL" if r["kill"] else ""))
     if estado != "release_pending":  # a repetição do release_pending grava o fim de novo; vale o último
         append_event({"tipo": "fim_dispatch", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, **fim})
     if estado != "release_pending":
@@ -9256,8 +9262,8 @@ def _agente_do(p):
     return nome if nome in HARNESS else None
 
 
-def _processos(com_cwd=True):
-    """[{pid, ppid, rss (KB), cpu (%), args, cwd}] do `ps`, com o cwd (lsof) só dos processos de agente (`com_cwd`); None se o ps falhar. `cwd` None: o lsof não o disse.
+def _processos(com_cwd=True, todos=False):
+    """[{pid, ppid, rss (KB), cpu (%), args, cwd}] do `ps`, com o cwd (lsof) só dos processos de agente (`com_cwd`), ou de todos (`todos`); None se o ps falhar. `cwd` None: o lsof não o disse.
 
     ORQ_PROCESSOS: caminho de um JSON com essa lista, no lugar do ps e do lsof (testes)."""
     if os.environ.get("ORQ_PROCESSOS"):
@@ -9272,10 +9278,10 @@ def _processos(com_cwd=True):
         c = l.split(None, 4)
         if len(c) == 5 and all(x.isdigit() for x in c[:3]) and re.fullmatch(r"\d+(\.\d+)?", c[3]):
             ps.append({"pid": int(c[0]), "ppid": int(c[1]), "rss": int(c[2]), "cpu": float(c[3]), "args": c[4], "cwd": None})
-    donos = [p for p in ps if _agente_do(p)] if com_cwd else []
+    donos = ps if todos else [p for p in ps if _agente_do(p)] if com_cwd else []
     if donos:
         try:
-            lsof = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(str(p["pid"]) for p in donos)], capture_output=True, text=True, timeout=10).stdout
+            lsof = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", *([] if todos else ["-p", ",".join(str(p["pid"]) for p in donos)])], capture_output=True, text=True, timeout=30).stdout
         except (subprocess.SubprocessError, OSError) as e:
             log(f"hibernar: lsof: {type(e).__name__}: {e}")
             return ps
@@ -9284,8 +9290,44 @@ def _processos(com_cwd=True):
             if l[:1] == "p" and l[1:].isdigit():
                 pid = int(l[1:])
             elif l[:1] == "n" and pid is not None:
-                next(p for p in donos if p["pid"] == pid)["cwd"] = l[1:]
+                dono = next((p for p in donos if p["pid"] == pid), None)  # com `todos` o lsof vê processo que nasceu depois do ps
+                if dono:
+                    dono["cwd"] = l[1:]
     return ps
+
+
+def encerrar_processos_da_worktree(wt, espera_s=None):
+    """TERM, espera e KILL só no que sobrou nos processos com cwd dentro da worktree `wt` (Meteor, node, watchers, docker compose da stack E2E). Poupa o
+    processo do orq e os de cima dele (o terminal de quem chamou: coordenador, gerente ou integrador); nada fora da worktree é tocado. Devolve
+    {"encerrados", "kill"} (kill: os que só caíram no KILL) e grava o evento `processos`; None sem a lista de processos ou com uma raiz que não é de worktree."""
+    raiz = os.path.realpath(wt) if wt else ""
+    if raiz in ("", "/", os.path.realpath(HOME)):
+        return None
+    procs = _processos(todos=True)
+    if procs is None:
+        return None
+    por_pid, protegidos, pid = {p["pid"]: p for p in procs}, set(), os.getpid()
+    while pid in por_pid and pid not in protegidos:
+        protegidos.add(pid)
+        pid = por_pid[pid]["ppid"]
+    protegidos.add(os.getpid())
+
+    def dentro():
+        return [p for p in (_processos(todos=True) or []) if p.get("cwd") and _dentro(p["cwd"], raiz) and p["pid"] not in protegidos]
+    alvos = {p["pid"] for p in dentro()}
+    for p in alvos:
+        _sinal(p, signal.SIGTERM)
+    fim = time.time() + (ENCERRA_ESPERA_S if espera_s is None else espera_s)
+    resta = [p for p in dentro() if p["pid"] in alvos]
+    while resta and time.time() < fim:
+        time.sleep(0.1)
+        resta = [p for p in dentro() if p["pid"] in alvos]
+    for p in resta:  # o cwd é conferido de novo: o pid pode ter sido reaproveitado
+        _sinal(p["pid"], signal.SIGKILL)
+    res = {"encerrados": len(alvos), "kill": len(resta)}
+    if alvos:
+        append_event({"tipo": "processos", "op": "encerrar", "worktree": raiz, **res})
+    return res
 
 
 def _descendentes(procs, pids):

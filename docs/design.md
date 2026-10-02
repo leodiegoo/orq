@@ -58,6 +58,7 @@ The model does the classifying. The code only checks that a classification was r
 | `nao_iniciou` | `orq despachar`: the prompt did not land, even after the Enter |
 | `despacho`, `steer`, `liberar`, `ticket`, `gerente` | the matching commands |
 | `fim_dispatch` | `orq liberar`: `dispatch`, `motivo` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
+| `processos` | `orq liberar`, `orq limpar --fechados`, `limpar-mergeados.py`: `worktree`, `encerrados` (processes with `cwd` inside it that got TERM), `kill` (those that only fell to KILL) |
 | `pr` (`op: ligar/desligar/sem_task/entrou/fechou/avisado`) | `orq pr`, the `prligar` hook, the poll, the manager loop |
 | `uso_aviso`, `uso_parou` | the manager loop warns the coordinator once per level and window; `orq despachar` refuses on budget |
 | `prioridade` | `orq prioridade <task> <1-3>`: `task`, `valor` |
