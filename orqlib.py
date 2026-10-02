@@ -3630,6 +3630,14 @@ def pr_poll(now_at=None, force=False):
         return _mutate_prs(lambda d: _apply_prs(d, seen, now_at)) + clean_closed(now_at, auto=True)
 
 
+def _merge_request(i, obligations):
+    """What the group's mate is asked when a PR of its Run enters a base: the notice with the obligations that are now its own (ticket 339)."""
+    what = ", ".join(f"{o['chave']} ({o['texto']})" for o in obligations)
+    return (f"{i['texto']}. Entry {i['entrada']}. Yours to do" + (f": {what}" if what else " (no obligation)") + ". Check the deploy through quave-one and the errors Slack, "
+            f"and open the PR for the next base if there is one. Close each with `orq fulfill {i['entrada']} <obligation> --proof \"...\"` or "
+            f"`orq defer {i['entrada']} <obligation> --reason \"...\"`; raise to the coordinator only what needs a decision.")
+
+
 def pr_notify():
     """Types into the coordinator a line `orq: PR #N has_entered em <base> …` per resolved PR not yet notified, once (the manager panel calls it on
     every round). Coordinator busy or with a draft: nothing is typed and the next round tries again. With no manager running there is no one to type: the
@@ -3652,17 +3660,23 @@ def pr_notify():
         # reserve before typing: two panels (or a restart mid-round) do not type the same notice twice
         if not _mutate_prs(reserve):
             continue
-        mate = owner.get(i["entrada"])  # a PR of the group's Run is the mate's: the notice is typed into its terminal, not the coordinator's (ticket 323)
-        notice, mate_terminal = f"orq: {i['texto']}. Entry {i['entrada']}.", mate and _dict(_mates().get(mate)).get("terminal")
-        if mate_terminal:
-            failed = type_text(mate_terminal, notice) != "enviado"
+        mate = owner.get(i["entrada"])  # a PR of the group's Run is the mate's: it gets the request, not the coordinator (tickets 323, 339)
+        notice, asked = f"orq: {i['texto']}. Entry {i['entrada']}.", None
+        if mate and (_dict(_mates().get(mate)).get("terminal") or _dict(_mates().get(mate)).get("dormiu")):  # open or asleep (the request wakes it)
+            try:
+                asked = mate_request(mate, _merge_request(i, open_obligations(read_events(), i["entrada"])))
+                intake(i["entrada"], "mate", asked["corr"])  # handed over: the coordinator only sees what the mate raises
+            except ValueError as e:  # the mate did not come up: nothing was recorded, the coordinator gets the notice below
+                log(f"pr_notify: mate {mate} did not take the request ({e})")
+        if asked:
+            failed = False  # a request not typed yet (mate busy) is recorded: the manager delivers it
         else:
             failed = notify_coordinator(g["coordenador"], notice, context=False) not in ("enviado", "adiado")  # the "PR: …" in the summary already shows it
         if failed:
             _mutate_prs(lambda d, f=reserve: f(d, value=False))  # nothing was typed: the next round tries
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
-        line_list.append(f"{i['task']}: PR #{i['numero']} notice typed in the {'mate ' + mate if mate_terminal else 'coordinator'}")
+        line_list.append(f"{i['task']}: PR #{i['numero']} " + (f"request {asked['corr']} sent to the mate {mate}" if asked else "notice typed in the coordinator"))
     return line_list
 
 
