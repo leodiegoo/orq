@@ -627,6 +627,38 @@ def test_contagem_de_entradas_sem_efeito():
     assert (r.returncode, r.stdout) == (0, "")
 
 
+def _stop_gate(a, sessao="s", ativo=False):
+    return json.loads(a.orq("hook", "stop", stdin=json.dumps({"stop_hook_active": ativo, "session_id": sessao})).stdout or "{}")
+
+
+def test_stop_com_orcamento_barra_no_maximo_2_vezes_o_mesmo_conjunto():
+    a = Amb()
+    a.orq("maquina", "set", "stop_bloqueia", "true")
+    a.prompt("um")
+    # stop_hook_active verdadeiro (de outro hook) na primeira parada ainda barra
+    saidas = [_stop_gate(a, ativo=True), _stop_gate(a), _stop_gate(a)]
+    assert [s.get("decision") for s in saidas] == ["block", "block", None]
+    assert "e1 ('um')" in saidas[0]["reason"] and "e1 ('um')" in saidas[2]["systemMessage"]
+    assert len([e for e in a.events() if e["tipo"] == "gate_falhou"]) == 1
+    assert _stop_gate(a).get("decision") is None  # continua liberado enquanto o conjunto for o mesmo
+    # conjunto novo reinicia o contador
+    a.prompt("dois")
+    assert [_stop_gate(a).get("decision") for _ in range(3)] == ["block", "block", None]
+    # outra sessão tem contador próprio
+    assert _stop_gate(a, sessao="outra").get("decision") == "block"
+
+
+def test_stop_desligado_nao_barra_e_excecao_sai_com_0():
+    a = Amb()
+    a.prompt("um")
+    assert [_stop_gate(a).get("decision") for _ in range(3)] == [None] * 3
+    a.orq("maquina", "set", "stop_bloqueia", "true")
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        f.write("[1, 2")  # ilegível: o hook falha aberto
+    r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "s"}))
+    assert r.returncode == 0
+
+
 def test_resumo_no_maximo_5_linhas():
     a = Amb()
     a.set("runs.json", [{"id": "run_a"}])

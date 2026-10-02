@@ -3847,8 +3847,30 @@ def away_bloqueio(events, agora):
     return f"{MARCA} away ligado e ainda há trabalho que não depende do usuário: {proximo}. Faça isso antes de encerrar o turno."
 
 
+GATE_BLOQUEIOS = 2  # o Stop barra o mesmo conjunto de entradas abertas, numa sessão, até 2 vezes seguidas; depois libera com systemMessage e `gate_falhou`
+
+
+def _gate_bloqueia(sessao, ids):
+    """O Stop deve barrar agora? Conta no cursor.json por sessão e por conjunto de entradas abertas: conjunto novo reinicia o contador, e o
+    GATE_BLOQUEIOS+1º Stop do mesmo conjunto passa. O `stop_hook_active` do payload não entra: outro hook (OMC, engram) o liga sem ser o nosso bloqueio."""
+    r = []
+
+    def conta(c):
+        s = _sub(_sub(c, "stop_gate"), sessao)
+        chave = ",".join(sorted(ids))
+        if s.get("conjunto") != chave:
+            s.clear()
+            s.update(conjunto=chave, n=0)
+        if s["n"] < GATE_BLOQUEIOS:
+            s["n"] += 1
+            r.append(True)
+
+    _cursor_mut(conta)
+    return bool(r)
+
+
 def hook_stop(ev, run):
-    # modo aviso (fatia 1): nunca bloqueia; a fatia 5 troca o systemMessage por decision=block com stop_hook_active
+    # com `stop_bloqueia` desligado (o padrão) só avisa; ligado, barra via _gate_bloqueia
     if not os.environ.get("ORQ_MATE"):  # o fim de turno do mate não é resposta do coordenador ao usuário ausente
         digest_no_stop(ev)
     events, agora = read_events(), datetime.now(timezone.utc)
@@ -3864,6 +3886,10 @@ def hook_stop(ev, run):
         rec = cursor_recuperado(_cursor_ro(), agora)
         citadas = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
         msg += f" {len(ids)} entrada(s) sem efeito: {citadas}. Use: orq intake <e> <efeito> [ref]" + (f" [aviso] {aviso_recuperado(rec)}" if rec else "")
+        if not os.environ.get("ORQ_MATE") and maquina_cfg()["stop_bloqueia"]:
+            if _gate_bloqueia((ev.get("session_id") or "")[:8], ids):
+                return {"decision": "block", "reason": msg}
+            append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
     if velhas:
         for o in velhas[:4]:  # cobrada uma vez, só a que foi citada: o Stop avisa, não bloqueia em loop; as outras vêm no Stop seguinte
             append_event({"tipo": "obrigacao", "op": "cobrada", "entrada": o["entrada"], "chave": o["chave"]})
@@ -7408,7 +7434,8 @@ MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RA
                   "carga_max": 12,  # loadavg de 1 min acima disto (uma por CPU) é pressão alta
                   "mem_piso_mb": 1024,  # piso de segurança: nem o Run isento sobe com a memória livre abaixo disto
                   "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem o teto de workers; max_caros, max_e2e e mem_piso_mb o seguram
-                  "pausar_sob_pressao": False}  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
+                  "pausar_sob_pressao": False,  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
+                  "stop_bloqueia": False}  # True: o Stop do coordenador barra o fim do turno com entrada sem efeito (GATE_BLOQUEIOS vezes por conjunto); ligar só depois da semana de aviso medida (desenho, seção 9)
 FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
 FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
 VIVOS_MAQUINA = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
