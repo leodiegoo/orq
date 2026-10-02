@@ -194,6 +194,13 @@ function blocoEventos(e: Estado): Bloco {
   return { id: "eventos", titulo: "Últimos eventos", linhas: linhas.length ? linhas : ["nenhum"] }
 }
 
+// as ondas (ticket 342) vêm prontas do serve, uma linha por onda; sem ondas o bloco não aparece
+function blocoOndas(e: Estado): Bloco {
+  const linhas = (fresco(e) ? e.gerente?.ondas ?? [] : []).map((l: unknown) => corta(String(l), 120))
+  return { id: "ondas", titulo: `Ondas (${linhas.length})`, linhas }
+}
+
 export function montarBlocos(e: Estado): Bloco[] {
-  return [blocoGerente(e), blocoWorkers(e), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
+  const ondas = blocoOndas(e)
+  return [blocoGerente(e), blocoWorkers(e), ...(ondas.linhas.length ? [ondas] : []), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
 }

@@ -59,3 +59,11 @@ test("it should be the same blocks from the fixtures migrated to english", () =>
   const en = montarBlocos({ ...lerEstado(home, agora), vivoMs: agora - 5000 })
   expect(en).toEqual(pt)
 })
+
+test("it should show the waves block only when the serve brought waves", () => {
+  const e = { ...lerEstado(fixtures, agora), vivoMs: agora - 5000 }
+  expect(montarBlocos(e).map((b) => b.id)).not.toContain("ondas")
+  const linha = "wave 2 Core: waiting, 0/3 integrated; waits for 02; open: 06, 07, 08"
+  const bloco = montarBlocos({ ...e, gerente: { ...e.gerente, ondas: [linha] } }).find((b) => b.id === "ondas")
+  expect(bloco).toEqual({ id: "ondas", titulo: "Ondas (1)", linhas: [linha] })
+})
