@@ -10803,13 +10803,13 @@ def test_ticket85_run_isento_sobe_sob_pressao_e_o_de_outro_run_enfileira():
     _frota79(a, vivos=[("Vivo", SONNET)])
     a.maquina(carga=40)
     _runs85(a, "Neo-jobs: insert diário")
-    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["estado"] == "enfileirado", "Run de outra frente enfileira"
+    assert json.loads(_desp79(a, "Ticket 05", 1).stdout)["estado"] == "enfileirado", "Run de outra frente enfileira"
     _runs85(a, "Orquestrador: registro de tarefas")
-    assert json.loads(_desp79(a, "Ticket 06", 2).stdout)["dispatchId"], "Run do orq sobe com a carga alta"
+    assert json.loads(_desp79(a, "Ticket 06", 1).stdout)["dispatchId"], "Run do orq sobe com a carga alta"
     assert _titulos_iniciados79(a) == ["Ticket 06"]
     a.orq("maquina", "set", "runs_isentos", '["run_a"]')
     _runs85(a, "Neo-jobs: insert diário")
-    assert json.loads(_desp79(a, "Ticket 07", 2).stdout)["dispatchId"], "o id do Run também vale como padrão"
+    assert json.loads(_desp79(a, "Ticket 07", 1).stdout)["dispatchId"], "o id do Run também vale como padrão"
 
 
 def test_ticket85_run_isento_sobe_sem_vaga_mas_o_piso_de_memoria_o_segura():
@@ -10817,12 +10817,12 @@ def test_ticket85_run_isento_sobe_sem_vaga_mas_o_piso_de_memoria_o_segura():
     _gerente(a)
     _frota79(a, vivos=[("V", SONNET)] * 4)
     _runs85(a, "Orquestrador: x")
-    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "4/4 workers vivos e o Run isento sobe"
+    assert json.loads(_desp79(a, "Ticket 05", 1).stdout)["dispatchId"], "4/4 workers vivos e o Run isento sobe"
     a.maquina(mem_livre_mb=800, livre_pct=5)
-    out = json.loads(_desp79(a, "Ticket 06", 2).stdout)
+    out = json.loads(_desp79(a, "Ticket 06", 1).stdout)
     assert out["estado"] == "enfileirado" and "piso de segurança (1024 MB)" in out["motivo"], out
     a.maquina(mem_livre_mb=2000, livre_pct=60)
-    assert json.loads(_desp79(a, "Ticket 07", 2).stdout)["dispatchId"], "abaixo do mínimo mole, acima do piso: sobe"
+    assert json.loads(_desp79(a, "Ticket 07", 1).stdout)["dispatchId"], "abaixo do mínimo mole, acima do piso: sobe"
 
 
 def test_ticket85_run_isento_respeita_o_max_caros_e_o_opus_enfileira_mesmo_sob_pressao():
@@ -10833,10 +10833,24 @@ def test_ticket85_run_isento_respeita_o_max_caros_e_o_opus_enfileira_mesmo_sob_p
     out = json.loads(_desp79(a, "Terceiro opus", 1, OPUS).stdout)
     assert out["estado"] == "enfileirado" and "2/2 workers caros" in out["motivo"], out
     a.maquina(carga=40)
-    assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["dispatchId"], "o barato do mesmo Run sobe com a carga alta e 2/4 workers"
+    assert json.loads(_desp79(a, "Ticket 05", 1).stdout)["dispatchId"], "o barato do mesmo Run sobe com a carga alta e 2/4 workers"
     assert [i["titulo"] for i in _fila79(a)] == ["Terceiro opus"]
     a.orq("gerente", "absorver")
     assert _titulos_iniciados79(a) == ["Ticket 05"] and len(_fila79(a)) == 1, "sob pressão o gerente drena só o que o max_caros deixa: o opus segue na fila"
+
+
+def test_ticket168_run_isento_enfileira_p2_sem_vaga_e_sobe_p1_e_servico():
+    a = _painel79()
+    _gerente(a)
+    _frota79(a, vivos=[("V", SONNET)] * 6)
+    a.orq("maquina", "set", "max_workers", "6")
+    _runs85(a, "Orquestrador: x")
+    out = json.loads(_desp79(a, "Ticket P2", 2).stdout)
+    assert out["estado"] == "enfileirado" and "6/6 workers vivos" in out["motivo"], out
+    assert json.loads(_desp79(a, "Ticket P1", 1).stdout)["dispatchId"], "P1 sobe sem vaga"
+    r = a.orq("despachar", "--run", "run_a", "--titulo", "Integrador", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium", "--prioridade", "2", "--servico")
+    assert json.loads(r.stdout)["dispatchId"], "serviço sobe sem vaga"
+    assert [i["titulo"] for i in _fila79(a)] == ["Ticket P2"]
 
 
 def test_ticket85_fila_do_run_isento_sobe_pelo_gerente_mesmo_sob_pressao():
@@ -10845,7 +10859,7 @@ def test_ticket85_fila_do_run_isento_sobe_pelo_gerente_mesmo_sob_pressao():
     _frota79(a, vivos=[("Vivo", SONNET)])
     a.maquina(carga=40)
     _runs85(a, "Neo-jobs")
-    _desp79(a, "Ticket 05", 2)
+    _desp79(a, "Ticket 05", 1)
     _runs85(a, "Orquestrador: x")
     a.orq("gerente", "absorver")
     assert _titulos_iniciados79(a) == ["Ticket 05"] and not _fila79(a), "o item do Run isento sai da fila com a pressão alta"

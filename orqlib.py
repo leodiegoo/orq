@@ -8124,7 +8124,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     if not run_do_coordenador(run):
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
     with _trava("despacho.lock"):  # a vaga conferida e o worker-start formam um passo: despachos paralelos não passam do teto juntos
-        motivo = maquina_barra(modelo, run=run)
+        motivo = maquina_barra(modelo, run=run, prio=prio, servico=servico)
         if motivo and _drenando:
             raise SemVaga(motivo)
         if motivo:
@@ -8713,21 +8713,21 @@ def maquina_vaga(modelo, ocup=None, cfg=None, isento=False):
     return None
 
 
-def maquina_barra_item(modelo, run, ocup, cfg, pressao, leitura):
-    """O motivo de o worker deste Run não subir agora, ou None. A pressão da máquina vem antes das vagas; o Run isento (`runs_isentos`) passa pela pressão e
-    pelo teto de workers, e só para no teto de caros (limite de custo), no piso de memória e no max_e2e (a fila global do E2E)."""
+def maquina_barra_item(modelo, run, ocup, cfg, pressao, leitura, prio=None, servico=False):
+    """O motivo de o worker deste Run não subir agora, ou None. A pressão da máquina vem antes das vagas; o worker de serviço ou P1 de um Run isento (`runs_isentos`)
+    passa pela pressão e pelo teto de workers, e só para no teto de caros (limite de custo), no piso de memória e no max_e2e (a fila global do E2E). P2/P3 conta no teto (ticket 168)."""
     causa = maquina_causa(leitura, cfg) if pressao[0] == "alta" else (None, None)
     motivo = (f"máquina sob pressão: {pressao[1]}" + (f"; vem de fora do orq ({causa[1]})" if causa[0] == "fora" else "")) if pressao[0] == "alta" else maquina_vaga(modelo, ocup, cfg)
-    if not motivo or not run_isento(run, cfg):
+    if not motivo or not (servico or prio == 1) or not run_isento(run, cfg):
         return motivo
     return maquina_vaga(modelo, ocup, cfg, isento=True) or maquina_piso(leitura, cfg)
 
 
-def maquina_barra(modelo, ocup=None, cfg=None, run=None):
+def maquina_barra(modelo, ocup=None, cfg=None, run=None, prio=None, servico=False):
     """O motivo de o worker não poder subir agora, ou None. A pressão da máquina vem antes das vagas; Run isento: ver maquina_barra_item."""
     cfg = cfg or maquina_cfg()
     leitura = maquina_ler()
-    return maquina_barra_item(modelo, run, ocup, cfg, maquina_nivel(leitura, cfg), leitura)
+    return maquina_barra_item(modelo, run, ocup, cfg, maquina_nivel(leitura, cfg), leitura, prio, servico)
 
 
 def _fila_despacho_mut(fn):
@@ -8854,7 +8854,7 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
             fila_despacho_rm(it["id"], "saiu", motivo="o dispatch já terminou ou já voltou")
             linhas.append(f"fila: {it['titulo']} saiu (o dispatch já terminou ou já voltou)")
             continue
-        isento = (so_isentos or maquina_vaga(it.get("modelo"), ocup, cfg)) and run_isento(it.get("run"), cfg)  # só pergunta ao Orca quando há o que isentar
+        isento = (so_isentos or maquina_vaga(it.get("modelo"), ocup, cfg)) and (bool(it.get("servico")) or it.get("prioridade") == 1) and run_isento(it.get("run"), cfg)  # só pergunta ao Orca quando há o que isentar
         if so_isentos and not isento:
             continue
         if isento and (maquina_vaga(it.get("modelo"), ocup, cfg, isento=True) or maquina_piso(maquina_ler(), cfg)) or not isento and maquina_vaga(it.get("modelo"), ocup, cfg):
@@ -9098,10 +9098,10 @@ def retomar(dry_run=False, run=None):
             subir.append((prioridade_de(eventos, w.get("taskId"), d, titulo), linha, cp, dica))
     if subir:  # o orçamento da máquina (ticket 79): sobe por prioridade até o teto, o resto vai para a fila de despacho
         cfg, ocup, leitura = maquina_cfg(), maquina_ocupacao(), maquina_ler()
-        pressao = maquina_nivel(leitura, cfg)
+        pressao, servicos = maquina_nivel(leitura, cfg), _servicos(read_events())
         for prio, linha, cp, dica in sorted(subir, key=lambda x: x[0]):  # estável: na mesma prioridade vale a ordem do Orca
             d = linha["dispatch"]
-            motivo = maquina_barra_item(linha["modelo"], linha["run"], ocup, cfg, pressao, leitura)
+            motivo = maquina_barra_item(linha["modelo"], linha["run"], ocup, cfg, pressao, leitura, prio, linha["dispatch"] in servicos)
             if motivo:
                 if not dry_run:
                     fila_despacho_add({"tipo": "retomada", "dispatch": d, "task": linha["task"], "run": linha["run"], "titulo": linha["titulo"], "agente": linha["agente"],
@@ -9420,9 +9420,9 @@ def retomar_pausados(run=None, forcar=False):
     res, cfg = [], maquina_cfg()
     ocup = maquina_ocupacao() if pausados else None
     leitura = maquina_ler()
-    pressao = maquina_nivel(leitura, cfg)
+    pressao, servicos = maquina_nivel(leitura, cfg), _servicos(read_events())
     for d, p in sorted(pausados.items(), key=lambda kv: kv[1].get("prioridade") or 2):
-        if (p.get("agente") or "claude") not in altos and (motivo := maquina_barra_item(p.get("modelo"), p["run"], ocup, cfg, pressao, leitura)):
+        if (p.get("agente") or "claude") not in altos and (motivo := maquina_barra_item(p.get("modelo"), p["run"], ocup, cfg, pressao, leitura, p.get("prioridade"), d in servicos)):
             res.append({"dispatch": d, "task": p["task"], "titulo": p["titulo"], "estado": "sem_vaga", "aviso": f"{motivo}; segue pausado, rode orq retomar --pausados quando abrir vaga"})
             continue
         if (p.get("agente") or "claude") in altos:
