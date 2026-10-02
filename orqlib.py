@@ -6350,24 +6350,29 @@ def _notify_mac(text_value):
 
 
 def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None):
-    """Delivers a notice to the coordinator without typing over someone who is writing (tickets 82 and 107). Only types with away mode on and the coordinator idle
-    (the old-prompt guard and the `type_text` draft guard still apply); without away mode the notice is never typed. Returns `enviado` (typed), `adiado`
-    (no away mode or coordinator with someone at it: the notice waits in the cursor's `notices` queue, goes out in the next prompt's context, `context` False for what the summary already
-    shows, and `deliver_notices` types it if the coordinator goes idle) or the `type_text` reason (nothing went out: retry later). `adiado` already counts as delivered."""
-    if _dict(_cursor_ro().get("ausente")) and not active_coordinator(minutes_elapsed=minutes_elapsed):  # only with away mode on does nobody write to Orca's compose box (ticket 107)
-        return type_text(handle, text_value)
+    """Delivers a notice to the coordinator without typing over someone who is writing (tickets 82, 107 and 182). With away mode on it types when the coordinator is idle
+    (the old-prompt guard and the `type_text` draft guard apply). With away mode off the old-prompt guard is dropped (ticket 182: deliveries sat waiting for the user's next message):
+    it types when the coordinator is stopped and the prompt box is empty; with a draft or a turn in progress it holds. Returns `enviado` (typed), `adiado`
+    (coordinator with someone at it, or held with away off: the notice waits in the cursor's `notices` queue, goes out in the next prompt's context, `context` False for what the summary already
+    shows, and `deliver_notices` types it if the coordinator goes idle) or, with away on, the `type_text` reason (nothing went out: retry later). `adiado` already counts as delivered."""
+    away = bool(_dict(_cursor_ro().get("ausente")))
+    if not away or not active_coordinator(minutes_elapsed=minutes_elapsed):
+        result = type_text(handle, text_value)
+        if away or result == "enviado":
+            return result
     _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text_value, "ts": now(), "contexto": context, **({"minutos": minutes_elapsed} if minutes_elapsed is not None else {})}))
     _notify_mac(text_value)
     return "adiado"
 
 
 def deliver_notices():
-    """One panel tick: with the coordinator idle for more than COORDINATOR_IDLE_MIN (WAKE_IDLE_MIN for the wake-up notice), types the oldest notice in the queue (one per tick; the next
-    one finds the coordinator busy). Returns the panel lines."""
+    """One panel tick: types the oldest notice in the queue (one per tick; the next one finds the coordinator busy). With away on, only with the coordinator idle for more than
+    COORDINATOR_IDLE_MIN (WAKE_IDLE_MIN for the wake-up notice); with away off (ticket 182), whenever it is stopped with an empty prompt box (`type_text` checks that). Returns the panel lines."""
     g, queue = _manager_cfg(), _cursor_ro().get("avisos")
-    if not g.get("coordenador") or not isinstance(queue, list) or not queue or not _dict(_cursor_ro().get("ausente")):
+    if not g.get("coordenador") or not isinstance(queue, list) or not queue:
         return []
-    a = next((x for x in queue if not active_coordinator(minutes_elapsed=x.get("minutos"))), None)  # the wake-up notice (2 min) does not wait behind a 10 one
+    away = bool(_dict(_cursor_ro().get("ausente")))
+    a = next((x for x in queue if not (away and active_coordinator(minutes_elapsed=x.get("minutos")))), None)  # the wake-up notice (2 min) does not wait behind a 10 one
     if not a or type_text(g["coordenador"], a["texto"]) != "enviado":
         return []
     _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))

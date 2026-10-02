@@ -8962,7 +8962,7 @@ def test_it_should_notify_on_macos_only_when_the_config_turns_it_on():
         open(fake, "w").write(f"#!/bin/sh\necho \"$@\" >> {log}\n")
         os.chmod(fake, 0o755)
         os.environ["ORQ_OSASCRIPT"] = fake
-        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: _does_not_type()
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: "rascunho"  # the notice is held (a draft in the box), so the macOS one is the only alert
         try:
             _user_spoke(home, 1)
             cfg = {"coordenador": "term_c", "gerente": "term_g", "runs": []}
@@ -12730,11 +12730,11 @@ def test_ticket114_the_same_flow_runs_with_the_codex_hook_payload():
     assert "To do by you" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
 
 
-def test_ticket107_without_away_mode_no_notice_is_typed_in_the_coordinator_and_all_reach_the_next_prompt():
+def test_ticket107_without_away_mode_a_held_notice_reaches_the_next_prompt():
     a = Env()
     with tempfile.TemporaryDirectory() as queue:
         before, dig = orq_mod.HOME, orq_mod.type_text
-        orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t: _does_not_type()
+        orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t: "rascunho"  # ticket 182: away off tries to type, and the draft holds it
         try:
             os.makedirs(a.home, exist_ok=True)
             _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
@@ -13514,8 +13514,8 @@ def test_ticket127_with_ready_group_ticket_notifies_coordinator_once_and_does_no
         assert r == ["mate orq: idle for 25 min, coordinator notified (104, 117 ready)"], r
         assert orq_mod.mates_sleep() == [], "avisado uma vez por ociosidade"
     assert not _log(a, "close.log") and _cursor(a)["mates"]["orq"]["terminal"] == "term_mate"
-    notices = [x["texto"] for x in _cursor(a)["avisos"]]  # without away mode the notice waits in the coordinator's next prompt context (ticket 82)
-    assert len(notices) == 1 and "mate orq idle, 104 and 117 ready" in notices[0], notices
+    (sent,) = _log(a, "send.log")  # away off (ticket 182): the empty prompt box lets the notice be typed at once, instead of waiting for the next prompt
+    assert "mate orq idle, 104 and 117 ready" in sent[sent.index("--text") + 1], sent
     # without a free slot on the machine the ready ticket does not take the mate: it sleeps
     b = _env127(25, ready=("104",))
     _write_state(os.path.join(b.home, "maquina.json"), {"max_workers": 0})
@@ -16926,6 +16926,54 @@ def _body182(a, msg_id, body_text, sender="term_w1"):
 def _ctx182(r):
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ticket182_away_off_with_an_empty_prompt_types_the_notice_even_after_a_recent_user_prompt():
+    with tempfile.TemporaryDirectory() as home:
+        before, dig = orq_mod.HOME, orq_mod.type_text
+        sent = []
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: sent.append(t) or "enviado"
+        try:
+            _user_spoke(home, 1)  # with away on this would defer (ticket 107); with away off the box is the only guard
+            assert orq_mod.notify_coordinator("term_c", "orq: a") == "enviado" and sent == ["orq: a"]
+            assert not orq_mod._cursor_ro().get("avisos"), "typed: nothing waits in the queue"
+        finally:
+            orq_mod.HOME, orq_mod.type_text = before, dig
+
+
+def test_ticket182_away_off_with_a_draft_holds_the_notice_and_tries_again_on_the_next_lap():
+    with tempfile.TemporaryDirectory() as home:
+        before, dig = orq_mod.HOME, orq_mod.type_text
+        answers, sent = ["rascunho", "rascunho", "enviado"], []
+
+        def fake(h, t):
+            r = answers.pop(0)
+            if r == "enviado":
+                sent.append(t)
+            return r
+        _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
+        orq_mod.HOME, orq_mod.type_text = home, fake
+        try:
+            assert orq_mod.notify_coordinator("term_c", "orq: b") == "adiado" and sent == []  # the draft holds it, and it counts as delivered
+            assert orq_mod.deliver_notices() == [] and sent == [], "still a draft on the next lap"
+            assert orq_mod.deliver_notices() == ["deferred notice typed into the coordinator, idle"] and sent == ["orq: b"]
+            assert orq_mod.deliver_notices() == [], "the queue is empty"
+        finally:
+            orq_mod.HOME, orq_mod.type_text = before, dig
+
+
+def test_ticket182_away_on_keeps_the_old_behavior():
+    with tempfile.TemporaryDirectory() as home:
+        before, dig = orq_mod.HOME, orq_mod.type_text
+        sent = []
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: sent.append(t) or "rascunho"
+        try:
+            orq_mod.away_on()
+            assert orq_mod.notify_coordinator("term_c", "orq: c") == "rascunho", "away on returns the reason, the caller retries"
+            _user_spoke(home, 1)
+            assert orq_mod.notify_coordinator("term_c", "orq: d") == "adiado" and sent == ["orq: c"], "recent user prompt: deferred without typing"
+        finally:
+            orq_mod.HOME, orq_mod.type_text = before, dig
 
 
 def test_ticket182_orca_notice_becomes_context_with_the_body_already_confirmed_and_ingested():
