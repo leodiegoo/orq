@@ -65,7 +65,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 
 ## Requirements
 
-- macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3 with the standard library only (developed and tested on 3.14)
+- macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3 with the standard library only (developed on 3.14, but the code must import on 3.9: the hooks can run under the system `/usr/bin/python3` when a harness starts without Homebrew on PATH, and a syntax error there silences every hook; avoid 3.12-only syntax such as nested same-quote f-strings)
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://developers.openai.com/codex) for the coordinator and workers (either one, or both)
 - [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
 - git
