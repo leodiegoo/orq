@@ -4417,7 +4417,7 @@ def linhas_noite(cur, events):
     gasto = f"{len(_desde_noite(events, noite, 'despacho'))}/{teto if teto is not None else '∞'} dispatches, until {_hora_local(noite['ate'])}"
     return ["[orq night] Rules: no AskUserQuestion (park the decision with orq pend add and carry on with what is independent), no push or merge, "
             "stop dispatching when the budget runs out.",
-            f"[orq night] {'Stopped dispatching: ' + parou['motivo'] + f' ({gasto}); orq night off lifts it.' if parou else 'Budget: ' + gasto + f', {noite.get('max_falhas') or NOITE_FALHAS} consecutive failures close it.'}"]
+            ("[orq night] Stopped dispatching: " + parou["motivo"] + " (" + str(gasto) + "); orq night off lifts it.") if parou else ("[orq night] Budget: " + str(gasto) + ", " + str(noite.get("max_falhas") or NOITE_FALHAS) + " consecutive failures close it.")]
 
 
 def noite_ligar(ate, max_despachos=None, max_falhas=NOITE_FALHAS, agora=None):
@@ -9722,7 +9722,7 @@ def texto_maquina(cfg=None, leitura=None, ocup=None):
           "RSS: " + ", ".join(f"{k} {rss.get(k, 0)} MB" for k in PROCESSOS_PESADOS)]
     if o := leitura.get("origem"):
         ls.append(f"load by owner: orq {o['orq_cpu']}% of CPU and {o['orq_rss_mb']} MB, outside orq {o['fora_cpu']}% and {o['fora_rss_mb']} MB"
-                  + (f" (largest outside: {', '.join(f'{x['nome']} {x['valor']}%' for x in o['fora_por_cpu'])})" if o["fora_por_cpu"] else ""))
+                  + ((" (largest outside: " + ", ".join("%s %s%%" % (x["nome"], x["valor"]) for x in o["fora_por_cpu"]) + ")") if o["fora_por_cpu"] else ""))
     if ocup is not None:
         caros = sum(modelo_caro(m, cfg) for m in ocup["vivos"].values())
         ls.append(f"slots: {len(ocup['vivos'])}/{cfg['max_workers']:g} taken, {max(cfg['max_workers'] - len(ocup['vivos']), 0):g} free; expensive {caros}/{cfg['max_caros']:g}; E2E max {cfg['max_e2e']:g} (the E2E queue serializes); dispatch queue {len(fila_despacho_itens())}")
