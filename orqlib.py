@@ -1241,6 +1241,8 @@ def _caixa_do_run(run, coord, ack):
         if not res.get("deliveryId") or not msgs:
             break
         hb += sum(1 for m in msgs if m.get("type") == "heartbeat")
+        if ack:
+            ingest_caixa(msgs)
         linhas += [_linha_caixa(m) for m in msgs if m.get("type") != "heartbeat"]
         n += len(msgs)
         if not ack:
@@ -1851,8 +1853,15 @@ def _repos_do_worker(m, p):
     return repos + [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
 
 
+def _ja_tem_evento(tipo, msg):
+    """O events.jsonl já tem um evento `tipo` desta mensagem? É o dedup de quando `orq caixa` e o gerente ingerem a mesma worker_done (ticket 171)."""
+    return any(e.get("tipo") == tipo and e.get("msg") == msg for e in read_events())
+
+
 def _prova_de_entrega(m, p):
     """worker_done com sha no texto -> evento `entrega` com os avisos, se houver."""
+    if _ja_tem_evento("entrega", m["id"]):
+        return
     texto = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
     if not SHA_RE.search(texto):
         return
@@ -1893,7 +1902,7 @@ def _entrega_do_orq(m, p):
     `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). A branch vem do payload, da branch atual da worktree do dispatch e só
     por último do texto, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
     O aviso é digitado uma vez (ocupado: tenta enfileirar no turno; ainda assim não, fica só a fila, que o integrador lê no ciclo). Devolve o ticket ou None."""
-    if p.get("outcome") != "succeeded" or not p.get("taskId"):
+    if p.get("outcome") != "succeeded" or not p.get("taskId") or _ja_tem_evento("entrega_orq", m["id"]):
         return None
     t = next((t for t in tickets() if t.get("task") == p["taskId"]), None)
     if not t:
@@ -1954,6 +1963,29 @@ def _registra_worker_done(m):
     p = _payload(m)
     append_event({"tipo": "worker_done", "msg": m["id"], "run": m.get("run_id"), "task": p.get("taskId"), "dispatch": p.get("dispatchId"),
                   "outcome": p.get("outcome"), "subject": m.get("subject") or ""})
+
+
+def ingest_caixa(msgs):
+    """worker_done lido por `orq caixa --ack` -> o mesmo registro e entrega do ingest do gerente, antes do ack tirar a mensagem da inbox (ticket 171).
+
+    Mesmo lock do ingest (espera, não pula); o dedup pelo `msg` (worker_done, entrada, alerta, entrega, entrega_orq) deixa o gerente ingerir de novo sem duplicar.
+    Falha de uma mensagem vai para o log e não impede o ack."""
+    os.makedirs(HOME, exist_ok=True)
+    with open(_path("ingest.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        desde = _dt(_dict(_read_cursor().get("ingest")).get("desde") or INICIO)
+        eventos = read_events()
+        ja = {e.get("ref") for e in eventos if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in eventos if e.get("tipo") == "alerta"}
+        feitos = {e.get("msg") for e in eventos if e.get("tipo") == "worker_done"}
+        for m in msgs:
+            if m.get("type") != "worker_done" or not m.get("id") or not m.get("created_at"):
+                continue
+            try:
+                if m["id"] not in feitos and _dt(m["created_at"]) > desde:
+                    _registra_worker_done(m)
+                _ingest_msg(m, desde, ja, {})
+            except Exception as e:  # noqa: BLE001
+                log(f"caixa: ingest da mensagem {m.get('id')}: {type(e).__name__}: {e}")
 
 
 def ingest_inbox():

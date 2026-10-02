@@ -14698,6 +14698,28 @@ def test_ticket140_caixa_sem_ack_so_le():
     assert r.returncode == 0 and "msg_1" in r.stdout and a.estados() == {"msg_1": "out"}, (r.stdout, r.stderr)
 
 
+def test_ticket171_caixa_com_ack_ingere_o_worker_done_e_o_gerente_nao_duplica():
+    a = Amb()
+    _caixa140(a)
+    _entrega141(a, body="sem texto", branch="fix/da-caixa")
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"}])
+    a.caixa(("worker_done", {"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"}))
+    a.set("inbox.json", {"result": {"messages": [{"id": "msg_1", "run_id": "run_a", "type": "worker_done", "subject": "worker_done", "body": "", "sequence": 5, "read": 0,
+                                                    "created_at": "2099-01-01T00:00:00Z",
+                                                    "payload": json.dumps({"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"})}]}})
+    r = a.orq("caixa", "run_a", "--ack")
+    assert r.returncode == 0, r.stderr
+    fila = json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in fila] == [("141", "fix/da-caixa")], fila
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_1"]
+    assert a.estados() == {"msg_1": "acked"}
+    assert a.orq("ingest").returncode == 0
+    assert len([e for e in a.events() if e["tipo"] == "entrega_orq"]) == 1, "o gerente ingere de novo sem duplicar a entrega"
+    assert len([e for e in a.events() if e["tipo"] == "worker_done"]) == 1
+    assert len([e for e in a.events() if e["tipo"] == "integrar_fila"]) == 1
+
+
+
 def test_ticket140_caixa_de_outro_run_volta_o_vinculo_ao_anterior():
     a = Amb()
     _caixa140(a, ligado="run_a")
