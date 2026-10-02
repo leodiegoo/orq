@@ -160,6 +160,7 @@ PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # minimum interval be
 PR_GH_S = 15  # time limit for each `gh pr view`
 OLD_READ_MIN = float(os.environ.get("ORQ_LEITURA_VELHA_MIN") or 10)  # minutes: CI and conflict read longer ago than this show up as a stale reading
 CHECK_FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+BASE_RED = CHECK_FAILED - {"CANCELLED"}  # a cancelled run on the base tip says nothing about the base being red
 STOPPED_WT_D = 3  # a worktree with no worker and no activity for longer than this enters the `orq status` line
 PR_VISIBLE_D = 7  # a feature with all PRs resolved for longer than this leaves `orq status`
 FLOWS = ("promocao", "direto")  # promocao (promotion): the same feature branch opens one PR per environment, in order; direto (direct): a single PR, to the production branch
@@ -1545,7 +1546,7 @@ KEYS_EN = {
     "entrada": "entry", "entrada_sem_tratamento": "untreated_entry", "entrega": "delivery", "entrega_com_aviso": "delivery_with_notice",
     "entregas": "deliveries", "entregue": "delivered", "enviado": "sent", "erro": "error", "escrito_por": "written_by", "espera": "wait",
     "espera_motivo": "wait_reason", "esperam": "waiting", "estado": "state", "eventos": "events", "externa_min": "external_min", "falha": "failure",
-    "falhas": "failures", "falhos": "failed_list", "falhou": "failed", "fase": "phase", "fechado": "closed", "fechado_em": "closed_at",
+    "falhas": "failures", "falhas_na_base": "failures_on_base", "base_avisada": "base_notified", "base_vermelha_desde": "base_red_since", "falhos": "failed_list", "falhou": "failed", "fase": "phase", "fechado": "closed", "fechado_em": "closed_at",
     "fechou": "closed_it", "feito": "done", "ficam": "stay", "ficaram": "stayed", "fila": "queue", "fila_e2e": "e2e_queue", "fila_tipo": "queue_type",
     "filho": "child", "filhos": "children", "fim": "end", "fim_dispatch": "dispatch_end", "fluxo": "flow", "fonte": "source", "fora": "outside",
     "fora_cpu": "out_cpu", "fora_por_cpu": "out_by_cpu", "fora_por_mem": "out_by_mem", "fora_rss_mb": "out_rss_mb", "frente": "stream",
@@ -2902,9 +2903,29 @@ def _pr_gh_list(urls):
         if not isinstance(listing, list):
             continue
         findings = {x.get("url"): x for x in listing if isinstance(x, dict)}
+        base_cache = {}
         for u in us:
             seen[u] = findings.get(u) or _pr_state(u)
+            if isinstance(seen[u], dict) and any((c.get("conclusion") or c.get("state")) in CHECK_FAILED for c in seen[u].get("statusCheckRollup") or [] if isinstance(c, dict)):
+                seen[u]["_base"] = _base_red(repo, seen[u].get("baseRefName"), base_cache)
     return seen
+
+
+def _base_red(repo, base, cache):
+    """{falhas: [names of the checks red on the tip of `base`], desde: when the oldest of them finished} or None if gh did not answer. One `gh api` call per repository
+    and base in each poll (`cache`). ponytail: reads the first 100 check runs of the tip, not the status contexts; paginate if a repository passes that."""
+    if not base:
+        return None
+    if (repo, base) not in cache:
+        try:
+            r = subprocess.run([GH, "api", f"repos/{repo}/commits/{base}/check-runs?per_page=100"], capture_output=True, text=True, timeout=PR_GH_S)
+            runs = json.loads(r.stdout).get("check_runs") if r.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+            runs = None
+        red = [c for c in runs if isinstance(c, dict) and (c.get("conclusion") or "").upper() in BASE_RED] if isinstance(runs, list) else None
+        cache[(repo, base)] = None if red is None else {"falhas": sorted({c.get("name") for c in red if c.get("name")}),
+                                                         "desde": min((c.get("completed_at") or "" for c in red), default="") or None}
+    return cache[(repo, base)]
 
 
 def _workflow_of_other_environment(workflow, base, flow_info):
@@ -2916,8 +2937,9 @@ def _workflow_of_other_environment(workflow, base, flow_info):
 
 
 def _gh_ci(seen_item, now_at, flow_info):
-    """{mergeable, falhas, rodando, outro_ambiente, lido_em} of what gh saw of a PR, or None if the response carries neither CI nor mergeable (gh with no response, `pr view`).
-    A workflow check from another environment (e.g. the test environment's on a PR to production) counts neither in falhas nor in rodando: the workflow becomes `outro_ambiente`, only if it failed."""
+    """{mergeable, falhas, rodando, outro_ambiente, lido_em, falhas_na_base?} of what gh saw of a PR, or None if the response carries neither CI nor mergeable (gh with no response, `pr view`).
+    A workflow check from another environment (e.g. the test environment's on a PR to production) counts neither in falhas nor in rodando: the workflow becomes `outro_ambiente`, only if it failed.
+    `falhas_na_base` are the names in falhas that are also red on the base tip (`_base`, from `_base_red`), with `base_vermelha_desde`."""
     if "mergeable" not in seen_item and "statusCheckRollup" not in seen_item:
         return None
     failures, running, other_item = [], [], []
@@ -2937,7 +2959,16 @@ def _gh_ci(seen_item, now_at, flow_info):
             running.append(item_name)
         elif c.get("conclusion") in CHECK_FAILED:
             failures.append(item_name)
-    return {"mergeable": seen_item.get("mergeable") or "UNKNOWN", "falhas": failures, "rodando": running, "outro_ambiente": other_item, "lido_em": now_at}
+    base_item = _dict(seen_item.get("_base"))
+    on_base = [f for f in failures if f in (base_item.get("falhas") or [])]
+    return {"mergeable": seen_item.get("mergeable") or "UNKNOWN", "falhas": failures, "rodando": running, "outro_ambiente": other_item, "lido_em": now_at,
+            **({"falhas_na_base": on_base, "base_vermelha_desde": base_item.get("desde")} if on_base else {})}
+
+
+def _blocked_by_base(ci):
+    """True if the PR has failures and every one of them is also red on the tip of its base: nothing in the PR to fix."""
+    ci = _dict(ci)
+    return bool(ci.get("falhas")) and all(f in (ci.get("falhas_na_base") or []) for f in ci["falhas"])
 
 
 def _gh_state(s):
@@ -3491,6 +3522,8 @@ def _apply_prs(d, seen, now_at):
         if i["estado"] == "aberto" and not new:
             ci = _gh_ci(seen_item, now_at, task_flow(i["task"], event_list))
             i.update(**({"ci": ci} if ci else {}), **({"head": seen_item["headRefName"]} if seen_item.get("headRefName") else {}))
+            if ci and not _blocked_by_base(ci):
+                i.pop("base_avisada", None)  # a new block by the base is news again
         if i["estado"] != "aberto" or not new:
             i["base"] = seen_item.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
@@ -3570,6 +3603,16 @@ def pr_notify():
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
         line_list.append(f"{i['task']}: PR #{i['numero']} notice typed in the coordinator")
+    for i in [x for x in _prs_ro()["itens"] if x["estado"] == "aberto" and _blocked_by_base(x.get("ci")) and x.get("base_avisada") != ", ".join(x["ci"]["falhas"])]:
+        key_name = ", ".join(i["ci"]["falhas"])
+        since = i["ci"].get("base_vermelha_desde")
+        _mutate_prs(lambda d, url=i["url"], v=key_name: [x.update(base_avisada=v) for x in d["itens"] if x["url"] == url])  # reserve before typing, as above
+        text_value = f"orq: PR #{i['numero']} blocked by {i.get('base') or 'its base'}: {key_name} red there" + (f" since {since[:10]}" if since else "") + "; not the PR's fault."
+        if notify_coordinator(g["coordenador"], text_value, context=False) not in ("enviado", "adiado"):
+            _mutate_prs(lambda d, url=i["url"]: [x.pop("base_avisada", None) for x in d["itens"] if x["url"] == url])
+            break
+        append_event({"tipo": "pr", "op": "base_vermelha", "task": i["task"], "url": i["url"], "numero": i["numero"], "base": i.get("base"), "falhas": i["ci"]["falhas"], "desde": since})
+        line_list.append(f"{i['task']}: PR #{i['numero']} blocked by the base, notice typed in the coordinator")
     return line_list
 
 
@@ -3891,20 +3934,24 @@ def merge_order(groups, ts):
 
 
 def _pr_reading(i, now_at=None):
-    """The CI and the conflict that the poll stored for an open PR: {marcas: [(icon, text)], pronto, velha, idade}. With no reading or with an old reading
+    """The CI and the conflict that the poll stored for an open PR: {marcas: [(icon, text)], pronto, velha, idade, bloqueada_pela_base}. With no reading or with an old reading
     (more than OLD_READ_MIN minutes) the PR does not count as ready. PR already resolved: None."""
     if i.get("estado") != "aberto":
         return None
     ci = _dict(i.get("ci"))
     if not ci:
-        return {"marcas": [("?", "no CI reading")], "pronto": False, "velha": False, "idade": None}
+        return {"marcas": [("?", "no CI reading")], "pronto": False, "velha": False, "idade": None, "bloqueada_pela_base": False}
     now_at = time.time() if now_at is None else now_at
     age = (now_at - (ci.get("lido_em") or 0)) / 60
-    marks = ([("✗", ", ".join(ci["falhas"]))] if ci.get("falhas") else []) + ([("⚠", "conflict")] if ci.get("mergeable") == "CONFLICTING" else []) \
+    on_base = [f for f in ci.get("falhas") or [] if f in (ci.get("falhas_na_base") or [])]
+    own = [f for f in ci.get("falhas") or [] if f not in on_base]
+    base_name = i.get("base") or "base"
+    marks = ([("✗", ", ".join(own))] if own else []) \
+        + ([("✗", f"already red on {base_name}: " + ", ".join(on_base))] if on_base and own else [("⛔", f"blocked by base: red on {base_name}: " + ", ".join(on_base))] if on_base else []) + ([("⚠", "conflict")] if ci.get("mergeable") == "CONFLICTING" else []) \
         + ([("⏳", "CI running")] if ci.get("rodando") else []) + ([("?", "conflict not computed yet")] if ci.get("mergeable") == "UNKNOWN" and not ci.get("falhas") and not ci.get("rodando") else [])
     old = age > OLD_READ_MIN
     note = [("ℹ", "failure in another environment: " + ", ".join(ci["outro_ambiente"]))] if ci.get("outro_ambiente") else []  # informs, does not block
-    return {"marcas": (marks or [("✓", "ready")]) + note, "pronto": not marks and not old, "velha": old, "idade": age}
+    return {"marcas": (marks or [("✓", "ready")]) + note, "pronto": not marks and not old, "velha": old, "idade": age, "bloqueada_pela_base": _blocked_by_base(ci)}
 
 
 def _pr_contract(i, now_at=None):
@@ -3915,7 +3962,8 @@ def _pr_contract(i, now_at=None):
     l = _pr_reading(i, now_at)
     if l:
         ci = _dict(i.get("ci"))
-        out.update(mergeable=ci.get("mergeable"), falhas=ci.get("falhas") or [], rodando=ci.get("rodando") or [], lidoEm=ci.get("lido_em"), velha=l["velha"], pronto=l["pronto"])
+        out.update(mergeable=ci.get("mergeable"), falhas=ci.get("falhas") or [], rodando=ci.get("rodando") or [], lidoEm=ci.get("lido_em"), velha=l["velha"], pronto=l["pronto"],
+                   **({"falhasNaBase": ci["falhas_na_base"], "bloqueadaPelaBase": l["bloqueada_pela_base"]} if ci.get("falhas_na_base") else {}))
     return out
 
 
