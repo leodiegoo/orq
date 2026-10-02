@@ -3113,6 +3113,19 @@ def ausente_desligar():
     return ligado
 
 
+def away_ligado():
+    """O modo ausente está ligado? Quem decide é o cursor.json (o marcador `estado/away` é só o espelho que o statusline lê)."""
+    return bool(_dict(_cursor_ro().get("ausente")))
+
+
+def pendencias_da_ausencia(desde):
+    """Linhas das pendências abertas que nasceram depois de `desde` (ts do `ausente_ligar`): decisões primeiro, cada uma com o link do Lavish, se houver."""
+    nascidas = {e["pend"] for e in read_events() if e.get("tipo") == "pend" and e.get("op") == "add" and (e.get("ts") or "") >= desde}
+    abertas = [i for i in _load_pend()["itens"] if i.get("id") in nascidas]
+    abertas.sort(key=lambda i: i.get("tipo") != "decisao")  # estável: a ordem de criação fica dentro de cada grupo
+    return [f"  {i.get('tipo')} {i['id']}: {_cita(i.get('titulo'), 70)} — {i.get('link') or 'sem link'}" for i in abertas]
+
+
 def linhas_ausente(cur):
     """O estado do modo ausente para `orq ausente`: uma linha, mais o aviso de que ninguém roda o poll dos PRs sem o gerente."""
     a = _dict(_dict(cur).get("ausente"))
@@ -3139,7 +3152,9 @@ def away(op=None):
         return [f"away mode ligado desde {desde}; o digest registra cada resposta"]
     n = len(digest_gerar()[0]["linha"]) if cur else 0
     ausente_desligar()
-    return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}"]
+    abertas = pendencias_da_ausencia(cur["ligada_em"]) if cur else []
+    return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}",
+            *([f"{len(abertas)} pendência(s) abertas durante a ausência (decisões primeiro):", *abertas] if abertas else [])]
 
 
 def _ultima_resposta(ev):
@@ -3677,6 +3692,61 @@ def hook_prompt(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
 
 
+AWAY_BLOQUEIOS = 3  # o Stop do coordenador com away ligado barra o mesmo motivo até 3 vezes dentro de AWAY_BLOQUEIO_MIN; depois deixa parar (o coordenador pode estar mesmo preso)
+AWAY_BLOQUEIO_MIN = 30
+
+
+def _sem_push():
+    """Commits da instalação do orq que o upstream ainda não tem; None se o git não responde. Só é chamado depois de um ciclo do integrador."""
+    try:
+        r = subprocess.run(["git", "-C", os.path.dirname(os.path.realpath(__file__)), "rev-list", "--count", "@{u}..HEAD"], capture_output=True, text=True, timeout=2)
+        return int(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push):
+    """O próximo passo do coordenador que não depende do usuário, ou None (pura; o Stop com away ligado barra o fim do turno enquanto houver um).
+
+    Na ordem: entrega (worker `entregue` de ticket aberto) fora da fila do integrador; ciclo do integrador com commits sem push (`sem_push` > 0); ticket
+    `ready-for-agent` sem bloqueio, P1 ou P2, com Modelo/Effort, fora da fila de despacho e com slot livre (o worker hibernado não ocupa slot)."""
+    por_num, de_dispatch = {t["num"]: t for t in tks}, _ticket_do_dispatch(events)
+    for a in ags:
+        n = de_dispatch.get(a.get("dispatch")) or de_dispatch.get(a.get("task"))
+        if a.get("estado") == "entregue" and n and n not in integracao and (por_num.get(n) or {}).get("status") != STATUS_FECHADO:
+            return f"o worker {a['dispatch']} entregou o ticket {n} e a entrega não foi integrada: `orq integrar fila add <branch> {n}`, depois libere o worker"
+    ciclo = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
+    if ciclo and sem_push:
+        return f"o ciclo do integrador ({str(ciclo.get('hash'))[:8]}) deixou {sem_push} commit(s) sem push: audite o diff e dê o push"
+    ocup = {"vivos": {a["dispatch"]: a.get("modelo") for a in ags if a.get("estado") in ANDA}}
+    na_fila = {i.get("ticket") for i in fila}
+    for t in sorted(tks, key=lambda t: (prioridade_de(events, t["task"], None, t["titulo"]), t["num"])):
+        if t["status"] != STATUS_NOVO or t["num"] in na_fila or any((por_num.get(b) or {}).get("status") != STATUS_FECHADO for b in t["blocked_by"]):
+            continue
+        if prioridade_de(events, t["task"], None, t["titulo"]) < 3 and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"] and not maquina_vaga(t["modelo"], ocup, cfg):
+            return f"o ticket {t['num']} ({_cita(t['titulo'], 50)}) está ready, sem bloqueio e há slot livre: `orq despachar --ticket {t['num']}`"
+    return None
+
+
+def away_bloqueio(events, agora):
+    """O motivo para o Stop barrar o fim do turno (away ligado e trabalho que não depende do usuário), ou None. Lê só os arquivos do orq, nunca o Orca;
+    qualquer falha deixa parar. Grava `away_bloqueio`: o mesmo motivo barra no máximo AWAY_BLOQUEIOS vezes em AWAY_BLOQUEIO_MIN."""
+    if not away_ligado():
+        return None
+    try:
+        ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
+        sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+        proximo = proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push)
+    except Exception as e:  # noqa: BLE001 - hook falha aberto
+        log(f"away_bloqueio: {type(e).__name__}: {e}")
+        return None
+    corte = agora - timedelta(minutes=AWAY_BLOQUEIO_MIN)
+    if not proximo or sum(e.get("tipo") == "away_bloqueio" and e.get("motivo") == proximo and (_ts(e.get("ts")) or corte) > corte for e in events) >= AWAY_BLOQUEIOS:
+        return None
+    append_event({"tipo": "away_bloqueio", "motivo": proximo})
+    return f"{MARCA} away ligado e ainda há trabalho que não depende do usuário: {proximo}. Faça isso antes de encerrar o turno."
+
+
 def hook_stop(ev, run):
     # modo aviso (fatia 1): nunca bloqueia; a fatia 5 troca o systemMessage por decision=block com stop_hook_active
     if not os.environ.get("ORQ_MATE"):  # o fim de turno do mate não é resposta do coordenador ao usuário ausente
@@ -3684,7 +3754,8 @@ def hook_stop(ev, run):
     events, agora = read_events(), datetime.now(timezone.utc)
     sem = abertas(events)
     velhas = [] if os.environ.get("ORQ_MATE") else obrigacoes_a_cobrar(events, agora)
-    if not sem and not velhas:
+    bloqueio = None if os.environ.get("ORQ_MATE") else away_bloqueio(events, agora)
+    if not sem and not velhas and not bloqueio:
         return None
     msg = MARCA
     if sem:
@@ -3698,7 +3769,7 @@ def hook_stop(ev, run):
             append_event({"tipo": "obrigacao", "op": "cobrada", "entrada": o["entrada"], "chave": o["chave"]})
         msg += (f" Obrigação aberta há mais de {OBRIGACAO_MIN:g} min: " + ", ".join(f"{o['entrada']} {o['chave']} ({o['texto']})" for o in velhas[:4])
                 + (f" +{len(velhas) - 4} no próximo Stop" if len(velhas) > 4 else "") + ': orq feito <e> <obrigação> --prova "…" ou orq adiar <e> <obrigação> --motivo "…".')
-    return {"systemMessage": msg}
+    return {**({"systemMessage": msg} if sem or velhas else {}), **({"decision": "block", "reason": bloqueio} if bloqueio else {})}
 
 
 def _ask_dados(ev):
@@ -3862,6 +3933,10 @@ def hook_guard(ev, run):
     """
     if ev.get("tool_name") != "AskUserQuestion" or os.path.exists(_path("ask-guard.off")):
         return None
+    if away_ligado():  # o usuário não está: a decisão espera como pendência e o coordenador segue no que não depende dela
+        motivo = (f"{MARCA} away ligado: registre com `orq pend add --tipo decisao --id <id> --titulo ...` e siga com o que não depende dela "
+                  "(o Lavish continua valendo: `orq perguntar` deixa a página aberta e não espera a resposta; worker parado nela leva `--task <id>`).")
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": motivo}}
     ativos = despachos_ativos()
     if not ativos:
         return None
@@ -4643,6 +4718,11 @@ def perguntar(id_, pergunta, opcoes, recomendada=1, detalhe=None, espera_min=Non
             res["avisos"].append(f"não abriu a aba no Orca ({e}); abra {url}")
     else:
         res["avisos"].append(f"lavish-axi não devolveu a url da sessão: {(abre.stderr or abre.stdout).strip()[:200]}")
+    if away_ligado():  # a página fica aberta para quando o usuário voltar; ninguém espera o poll
+        if url:
+            _mutar_pend(lambda itens: next(i for i in itens if i.get("id") == id_).update(link=url))
+        res["avisos"].append(f"away ligado: a pendência {id_} segue aberta até o usuário voltar (orq away off lista as abertas)")
+        return {**res, "efeito": "aberta"}
     if not poll:
         return {**res, "efeito": "aberta"}
     espera = (espera_min or PERGUNTAR_MIN) * 60
@@ -7068,7 +7148,8 @@ def maquina_ocupacao():
     O modelo vem do evento de despacho ou de retomada e, na falta dele, do worker-show; sem lista de terminais confiável todo `dispatched` conta como vivo."""
     terminais = _terminais_vivos()
     ws = [w for w in _workers_todos() if w.get("dispatchStatus") == "dispatched"]
-    vivos = [w for w in ws if terminais is None or w.get("agentTerminalHandle") in terminais]
+    hibernados = _hibernados()  # o terminal fechado de propósito não ocupa vaga, nem quando a lista de terminais falha
+    vivos = [w for w in ws if w.get("dispatchId") not in hibernados and (terminais is None or w.get("agentTerminalHandle") in terminais)]
     modelos = {e["dispatch"]: e["modelo"] for e in read_events() if e.get("tipo") in ("despacho", "retomada") and e.get("dispatch") and e.get("modelo")}
     faltam = [w for w in vivos if w["dispatchId"] not in modelos]
     if faltam:

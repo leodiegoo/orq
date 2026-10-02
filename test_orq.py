@@ -12569,6 +12569,124 @@ def test_ticket115_nenhum_nome_de_ambiente_fica_fixo_no_codigo():
     assert not fixos, fixos  # a branch padrão sem remoto é uma constante só
 
 
+# ---------- ticket 126: com o away ligado, decisão vira pendência e o coordenador segue com o desbloqueado ----------
+
+def _stop126(a, **ev):
+    r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456", **ev}))
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout) if r.stdout.strip() else {}
+
+
+def test_ticket126_com_away_o_hook_nega_askuserquestion_e_manda_para_orq_pend_add():
+    a = Amb(run="run_a")
+    assert _guard(a).stdout == "", "away desligado: a caixa passa"
+    a.orq("away", "on")
+    out = json.loads(_guard(a).stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "away ligado" in out["permissionDecisionReason"] and "orq pend add --tipo decisao" in out["permissionDecisionReason"], out
+    assert _guard(a, tool="Bash").stdout == "", "só o AskUserQuestion"
+    a.orq("away", "off")
+    assert _guard(a).stdout == "", "desligou: a caixa volta a passar"
+
+
+def test_ticket126_perguntar_com_away_grava_a_pendencia_com_o_link_e_volta_sem_esperar():
+    a = Amb()
+    a.orq("away", "on")
+    t = time.time()
+    r = _perguntar(a, None, FAKE_POLL="/nao/existe", ORQ_PERGUNTAR_MIN="0.5")  # um poll que fosse chamado quebraria ou esperaria 30 s
+    assert r.returncode == 0, r.stderr
+    saida = json.loads(r.stdout)
+    assert time.time() - t < 10 and saida["efeito"] == "aberta" and any("away" in x for x in saida["avisos"]), saida
+    (item,) = [i for i in json.load(open(a.env["ORQ_PENDENCIAS"]))["itens"] if i["id"] == "badge"]
+    assert item["tipo"] == "decisao" and item["link"] == "http://127.0.0.1:4387/session/abc", item
+    assert not os.path.exists(os.path.join(a.home, "perguntar", "badge.poll")), "não esperou o poll"
+
+
+def test_ticket126_stop_com_away_bloqueia_com_ticket_ready_e_vaga_e_cita_o_ticket():
+    a = Amb(run="run_a")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODELO105)
+    assert _stop126(a) == {}, "away desligado: nunca bloqueia por isso"
+    a.orq("away", "on")
+    out = _stop126(a)
+    assert out["decision"] == "block" and "88" in out["reason"] and "orq despachar --ticket 88" in out["reason"], out
+
+
+def test_ticket126_stop_com_away_deixa_parar_sem_trabalho_desbloqueado():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    assert _stop126(a) == {}
+    _tk105(a, "93", "Painel de passagem", task="task_93", extra=MODELO105)  # P3 nunca sobe sozinho
+    _tk105(a, "91", "Sem modelo", task="task_91")
+    _tk105(a, "90", "Bloqueado", bloqueado="93", task="task_90", extra=MODELO105)
+    _tk105(a, "89", "Em andamento", status="claimed", task="task_89", extra=MODELO105)
+    assert _stop126(a) == {}
+
+
+def test_ticket126_stop_nao_prende_o_coordenador_no_mesmo_bloqueio_para_sempre():
+    a = Amb(run="run_a")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODELO105)
+    a.orq("away", "on")
+    blocos = [bool(_stop126(a).get("decision")) for _ in range(orq_mod.AWAY_BLOQUEIOS + 2)]
+    assert blocos == [True] * orq_mod.AWAY_BLOQUEIOS + [False] * 2, blocos
+
+
+def _tk126(num, estado="ready-for-agent", modelo="claude-sonnet-5-5", bloqueado=(), task="t"):
+    return {"num": num, "titulo": f"ticket {num}", "status": estado, "blocked_by": list(bloqueado), "task": task, "run": "run_a", "modelo": modelo, "effort": "medium"}
+
+
+def test_ticket126_proximo_sem_usuario_entrega_sem_integrar_e_ciclo_sem_push():
+    ag = {"dispatch": "d1", "task": "t1", "estado": "entregue"}
+    ev = [{"tipo": "despacho", "dispatch": "d1", "task": "t1", "ticket": "50"}]
+    prox = lambda **k: orq_mod.proximo_sem_usuario(**{"tks": [_tk126("50", "claimed")], "ags": [ag], "integracao": {}, "fila": [], "events": ev, "cfg": orq_mod.maquina_cfg(), "sem_push": 0, **k})
+    assert "50" in prox() and "orq integrar fila add" in prox(), "entregue, ticket aberto e fora da fila do integrador"
+    assert prox(integracao={"50": {"ticket": "50"}}) is None, "já espera o integrador"
+    assert prox(tks=[_tk126("50", "resolved")]) is None, "ticket fechado: integrado"
+    assert prox(ags=[{**ag, "estado": "liberado"}]) is None
+    ciclo = ev + [{"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"}]
+    assert prox(ags=[], events=ciclo, sem_push=2) and "abc1234" in prox(ags=[], events=ciclo, sem_push=2) and "push" in prox(ags=[], events=ciclo, sem_push=2)
+    assert prox(ags=[], events=ciclo, sem_push=0) is None and prox(ags=[], events=ciclo, sem_push=None) is None, "sem commit a enviar, ou sem saber: deixa parar"
+    assert prox(ags=[], events=ev, sem_push=2) is None, "sem ciclo do integrador não há o que auditar"
+
+
+def test_ticket126_proximo_sem_usuario_ticket_ready_pede_prioridade_modelo_e_vaga():
+    base = {"ags": [], "integracao": {}, "events": [], "sem_push": 0, "cfg": {**orq_mod.maquina_cfg(), "max_workers": 2}}
+    prox = lambda tks, **k: orq_mod.proximo_sem_usuario(tks=tks, fila=[], **{**base, **k})
+    assert "orq despachar --ticket 07" in prox([_tk126("07")])
+    assert prox([_tk126("07", bloqueado=["06"])]) is None and prox([_tk126("07", modelo=None)]) is None
+    cheio = [{"dispatch": f"d{i}", "estado": "rodando", "modelo": "claude-sonnet-5-5"} for i in range(2)]
+    assert prox([_tk126("07")], ags=cheio) is None, "sem slot livre"
+    hib = [{**x, "estado": "hibernado"} for x in cheio]
+    assert prox([_tk126("07")], ags=hib), "worker hibernado não ocupa slot"
+    assert orq_mod.proximo_sem_usuario(tks=[_tk126("07")], fila=[{"ticket": "07"}], **base) is None, "já está na fila de despacho"
+
+
+def test_ticket126_maquina_ocupacao_nao_conta_o_worker_hibernado():
+    antes = (orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados)
+    try:
+        orq_mod._terminais_vivos = lambda: None  # sem lista de terminais todo `dispatched` contava como vivo
+        orq_mod._workers_todos = lambda: [{"dispatchId": "dH", "dispatchStatus": "dispatched", "agentTerminalHandle": "term_h"},
+                                          {"dispatchId": "dV", "dispatchStatus": "dispatched", "agentTerminalHandle": "term_v"}]
+        orq_mod._hibernados = lambda: {"dH": {"desde": "x"}}
+        orq_mod._detalhes = lambda faltam: {w["dispatchId"]: {"modelo": "claude-sonnet-5-5"} for w in faltam}
+        assert set(orq_mod.maquina_ocupacao()["vivos"]) == {"dV"}
+    finally:
+        orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados = antes
+
+
+def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_primeiro_com_o_link():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    a.orq("pend", "add", "--id", "aviso-1", "--tipo", "avisar", "--titulo", "Avisar o time")
+    r = a.orq("pend", "add", "--id", "badge", "--tipo", "decisao", "--titulo", "Qual badge?", "--link", "http://127.0.0.1:4387/session/abc")
+    assert r.returncode == 0, r.stderr
+    a.orq("pend", "add", "--id", "feita", "--tipo", "decisao", "--titulo", "Já respondida")
+    a.orq("pend", "done", "feita")
+    out = a.orq("away", "off").stdout
+    assert "away mode desligado" in out and "badge" in out and "http://127.0.0.1:4387/session/abc" in out and "aviso-1" in out, out
+    assert out.index("badge") < out.index("aviso-1"), "decisões primeiro"
+    assert "freio-prod" not in out and "feita" not in out, "só o aberto desde que ligou"
+    assert "pendência" not in a.orq("away", "off").stdout, "desligado de novo: sem lista"
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
