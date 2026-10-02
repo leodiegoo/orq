@@ -172,6 +172,14 @@ Closed PRs without a merge (ticket 104). When every PR linked to a task is close
 
 `orq auditar-respostas` reads the coordinator's transcripts from `ORQ_TRANSCRITOS`. By default that is the Claude Code project folder for the current directory (`~/.claude/projects/` plus the cwd with every character outside `[A-Za-z0-9]` turned into `-`), so run it from the coordinator's working directory or set the variable. Other knobs: `ORQ_ORCA` (path to the Orca binary), `ORQ_RUN_PARADO_CACHE_S` (seconds a live Run is not re-checked for release, default 300), `ORQ_ORCA_TIMEOUT` (seconds per Orca call, default 2.5), `ORQ_NO_BG=1` (no background refresh), `ORQ_GERENTE_PRESO_S`, `ORQ_OCIOSO_MS`, `ORQ_STEER_ESPERA_S`, `ORQ_WAIT_POLL`, `ORQ_WAIT_MAX`.
 
+## Princípio: obrigação é hook
+
+An obligation of the coordinator or a worker that depends on someone remembering a command gets forgotten: on 01/10 the coordinator missed `orq intake` (16 entries), `orq integrar fila add`, closing the terminal after `liberar`, the audit before a push, `orq ticket fechar` after integrating and the deploy check after a merge. So an obligation is fired by an event (a Claude/Codex hook, the ingest of an Orca message, a manager lap, a git hook), and a manual command is left for decisions, lookups and as an escape. The inventory of all 82 commands is in `docs/design.md`, "Obligations are hooks".
+
+- Already automatic: entry recording and ingest (prompt hook), the status summary, heartbeat absorption, `pr poll`, linking a PR and joining the merge queue (`gh pr create` hook), steer redelivery, hibernating and waking workers, the digest, the dispatch queue, the merge obligations themselves (ticket 114), closing the `ticket` obligation on `orq ticket fechar`, cleaning merged branches, and the model/effort guard on dispatch.
+- Still manual, by design: everything that is a decision (`despachar`, `steer`, `responder`, `encerrar`, `relancar`, `passar`, `pausar`, `perguntar`, `pend add`, `adiar`, `away`, `noite`), lookups (`agentes`, `status`, `fila lista`, `maquina`…) and setup (`iniciar`, `projeto add`, `gerente serve`).
+- Still manual, moving to an event: `intake` (Stop blocks, ticket 150; implied by the command, 157), `integrar fila add` and closing worker terminals (worker_done ingest, 141), the push audit (`pre-push`, 139), `ticket fechar`/`integrar fila rm`/`liberar`/`servico marcar` after integrating (`integrar.py` fast-forward, 154), `feito` for what orq can prove (155) and a Stop block for the rest (156), `retomar` after a crash (158), the away summary (144) and reading the Orca mailbox (`orq caixa`, 140).
+
 ## Usage
 
 Start the manager in a plain shell terminal inside Orca, then bind your Run to it from the coordinator:

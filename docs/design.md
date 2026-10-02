@@ -125,6 +125,25 @@ For a user prompt the hook appends the entry and injects at most five lines of c
 
 `orq hook stop` computes the open entries. If there are any, it appends a `gate_aviso` event and shows the user a `systemMessage` naming up to three of them. Today it only warns. The plan is to measure how many entries end a turn without an effect before deciding to block, and then block at most once per turn using Claude Code's `stop_hook_active` flag, so a blocked turn can never loop.
 
+## Obligations are hooks (ticket 153)
+
+An obligation that depends on someone remembering a command gets forgotten, so it is fired by an event that already exists, and a manual command stays only for decisions, lookups, setup and escapes. The inventory (ticket 153, `~/.claude/orquestrador-plan/relatorios/t153-comandos-viram-hooks.md`) covers the 82 leaf commands of `orq --help` (56 top-level): 25 are already fired by an event, 7 become automatic, 2 become a reminder that blocks until done, 48 stay manual.
+
+| Group | Commands | Event | Kind | Ticket |
+|---|---|---|---|---|
+| intake | `intake` | Stop of the coordinator; the command that implies the effect (`despachar`, `ticket novo`, `pend add`, `steer`, `perguntar`, `mate pedir`) | block + automatic | 150, 157 |
+| delivery into the integrator queue | `integrar fila add`, closing worker terminals on `liberar` | ingest of a `worker_done` of an orq ticket | automatic | 141 |
+| integrator cycle closes what it merged | `ciclo feito`, `servico marcar`, `integrar fila rm`, `ticket fechar`, `liberar` (orq tickets) | `scripts/integrar.py` fast-forwards `main` | automatic | 154 |
+| obligations orq can prove | `feito` for `limpeza`, `proximo`, `deploy` | `pr`/`limpou`; a PR of the task into the next environment; the project's `deploy_check` on a manager lap | automatic | 155 |
+| obligations left open | `feito`, `adiar` | Stop of the coordinator, with the ticket 27 budget | block | 156 |
+| worker that lost its terminal | `retomar` | refresh of `aberto.json`, read by the prompt, SessionStart and Stop hooks | block (reminder) | 158 |
+| push audit | (manual push) | `githooks/pre-push`, integrator cycle before the fast-forward | block | 139 |
+| away summary, Orca mailbox, dispatch headers, PR per environment | `resumo add`, `caixa`, `fila-despacho rm`, `pr ligar` | Stop with away; the command itself | automatic | 144, 140, 142, 143 |
+| already automatic | `hook`, `ingest`, `pr poll`, `pr auto`, `steers`, `digest`, `hibernar`, `acordar`, `mate dormir`, `uso`, `gerente absorver/checar/intervalo`, `ocupadas`, `fluxo`, `projeto confiar` … | hooks, manager lap, limpar-mergeados, worktree setup | done | — |
+| manual by design | decisions (`despachar`, `steer`, `responder`, `encerrar`, `relancar`, `passar`, `pausar`, `perguntar`, `pend add`, `adiar`, `away`, `noite`), lookups, setup | — | manual | — |
+
+`passagem` stays manual because nothing reliably detects a plan-limit screen; `doctor tasks` stays an escape because `ticket fechar` completes the task; `iniciar` is a decision (which front), and SessionStart already injects the state.
+
 ## Report ingestion
 
 `orq ingest` runs in the background after each prompt and after each Orca notice. It reads two sources.
