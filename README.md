@@ -174,7 +174,8 @@ The easy way is `orq project add <path|url>`, which writes it. By hand:
   ],
   "flow": "promocao",
   "e2e_queue": "~/.cache/my-app-e2e/queue",
-  "deploy_check": "my-deploy-status --env {base} --commit {sha}"
+  "deploy_check": "my-deploy-status --env {base} --commit {sha}",
+  "caminhos_ui": ["web/app/**"]
 }
 ```
 
@@ -410,6 +411,8 @@ The question "can I merge?" is answered by `orq queue list`: each step shows rea
 
 - `orq pr link <task> <url> [--issue N]` registers the PRs of a feature. The `prlink` PostToolUse hook does it by itself when the coordinator runs `gh pr create`, and the PR joins the merge queue. `orq pr auto` finds the task by the worktree name (with or without the `leodiegoo/` prefix), by an already linked PR of the same branch (the PR to main after development and staging) or by the worktree; with no owner the PR goes under "PR without a task" and the hook warns.
 - `orq pr open <dispatch|branch> --title "<conventional commit>" --body <file> [--environments development,staging]` publishes the delivery: it drops the user prefix Orca puts on the branch, runs `git merge-tree` against each environment and stops before any push on a conflict, pushes, opens one PR per environment in the project's order, links each to the task and prints the full links. It refuses an empty body, a generator footer or `Co-Authored-By`, and a title that is not a Conventional Commit. Production is only opened once the environments before it have a merged PR for the task.
+- `caminhos_ui` (optional, in the project file) lists the globs of the UI. When the diff of `orq pr open` touches one, the body needs an `Evidence` section with content, or `n/a: <reason>`; otherwise it stops before the push. A PR with UI evidence due opens the `evidencia` obligation.
+- `orq pr evidence <pr|url|task> --before <dir> --after <dir> [--scenarios <json>]` (`orq pr evidencia … --antes … --depois … --cenarios …`) publishes the images on the orphan branch `evidence/pr-<n>` without touching any worktree, checks each file with `gh api` at the commit SHA, and posts (or updates) one comment on the PR with a before/after table and links pinned to that SHA. `--scenarios` is a JSON list of `{name, before, after, live, evidence}` (`pass|fail|untested`); the comment shows the verdict (`go`, `no-go`, `inconclusive`, `no-surface`) and marks what did not run live. `untested` is never shown as passed.
 - `orq pr poll` (also every manager lap, at most every 2 minutes) wakes the coordinator only when a linked PR is merged or closed. The next PR is only suggested, never opened.
 - `orq queue add|done|rm|list` is the merge order the coordinator declares (each step: name, why, PR numbers); without one, the order comes from the tickets' `Blocked by`. `orq integrate queue add <branch> <ticket>|rm|list` is the separate queue of the integrator, which advances the orq's own `main` outside the live checkout.
 
@@ -441,6 +444,7 @@ While an entry has an open obligation, `conversation` and `discarded` are refuse
 Some close by themselves, with the proof orq saw:
 
 - `ticket`: `orq ticket close NN`.
+- `evidencia`: `orq pr evidence` on the PR, with the comment URL as proof.
 - `limpeza`: the cleanup event for the task's branch, when something was removed and nothing was kept or skipped.
 - `proximo`: `orq pr link` or `orq pr auto` of a request of the same task whose base is the environment the obligation asks for.
 - `deploy`: needs `deploy_check` in `projects/<name>.json`. The manager lap runs the command for each open `deploy` obligation, at most every 2 minutes (`ORQ_PR_POLL_S`), in the project's folder. Exit 0 closes with the first stdout line as proof; exit 2 means "still building" and leaves it open; any other exit (or more than 60 s) warns the coordinator once. Without the key nothing runs. The command is the project's to write:

@@ -8,6 +8,7 @@ import collections
 import contextlib
 import difflib
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -3197,6 +3198,11 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
     new = _no_user_prefix(branch)
     for a in envs:
         subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+    ui_diff = _touches_ui(task, wt, f"origin/{envs[0]}", branch, event_list)
+    evidence_na = bool(re.match(r"n/a:\s*\S", _section(text_value, "Evidence")))
+    if ui_diff and (not _section(text_value, "Evidence") or re.fullmatch(r"n/a:?", _section(text_value, "Evidence"), re.I)):
+        raise ValueError(f"the diff touches the project's UI paths ({ui_diff}) and the body has no Evidence section with content: write the evidence or `n/a: <reason>`. Nothing was pushed")
+    for a in envs:
         r = _git_wt(wt, "merge-tree", "--write-tree", "--name-only", "--no-messages", f"origin/{a}", branch)
         if r.returncode != 0:
             raise ValueError(f"conflict with {a}" + (f" in: {', '.join(x for x in r.stdout.splitlines()[1:] if x.strip())}" if r.returncode == 1 else f" (merge-tree failed: {r.stderr.strip()[-200:]})") +
@@ -3220,7 +3226,130 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
             queue_auto(pr_link(task, found_matches[-1]))
         elif not task:
             pr_auto(found_matches[-1], head=new, wt=wt)
+        if ui_diff and not evidence_na:
+            entry_event = append_event({"tipo": "entrada", "origem": "evidencia", "texto": f"PR #{found_matches[-1].rsplit('/', 1)[1]} touches UI ({ui_diff})", "fonte": f"PR #{found_matches[-1].rsplit('/', 1)[1]}",
+                                        "ref": found_matches[-1], "task": task}, new_id=True)
+            append_event({"tipo": "obrigacao", "op": "nova", "entrada": entry_event["id"], "chave": "evidencia", "url": found_matches[-1], "task": task,
+                          "texto": f"post the visual evidence: orq pr evidence {found_matches[-1]} --before <dir> --after <dir> [--scenarios <json>]"})
     return urls, notices
+
+
+def _section(text_value, name):
+    """The content of the `## <name>` section of a PR body (up to the next heading), stripped; '' if absent or empty."""
+    m = re.search(rf"^#+\s*{name}\b[^\n]*\n(.*?)(?=^#+\s|\Z)", text_value, re.M | re.I | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _touches_ui(task, wt, base, branch, event_list):
+    """The first file of `base...branch` that matches a `caminhos_ui` glob of the task's project (or of the one that holds `wt`), or None."""
+    run = next((e.get("run") for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("task") == task), None) if task else None
+    try:
+        item_name = dispatch_project(None, run) if run else None
+    except ValueError:
+        item_name = None
+    ps = projects()
+    globs = (ps.get(item_name or project_by_folder(ps, os.path.realpath(wt))) or {}).get("caminhos_ui") or []
+    if not globs:
+        return None
+    r = _git_wt(wt, "diff", "--name-only", f"{base}...{branch}")
+    return next((f for f in r.stdout.splitlines() if any(fnmatch.fnmatch(f, g) for g in globs)), None) if r.returncode == 0 else None
+
+
+# ---------- visual evidence of the PR (ticket 219) ----------
+
+EVIDENCE_MARK = "<!-- orq-evidence -->"
+EVIDENCE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm")
+
+
+def _gh_api(*args, fields=()):
+    r = subprocess.run([GH, "api", *args, *[x for k, v in fields for x in ("-f", f"{k}={v}")]], capture_output=True, text=True, timeout=PR_GH_S)
+    if r.returncode:
+        raise ValueError(f"gh api {args[-1]} failed: {(r.stderr or r.stdout).strip()[-200:]}")
+    return json.loads(r.stdout or "null")
+
+
+def _evidence_files(folder):
+    if not os.path.isdir(folder):
+        raise ValueError(f"not a folder: {folder}")
+    return sorted(f for f in os.listdir(folder) if f.lower().endswith(EVIDENCE_EXT) and os.path.isfile(os.path.join(folder, f)))
+
+
+def _evidence_branch(slug, n, files):
+    """Commits `files` ({path: source}) on the orphan branch `evidence/pr-<n>` of `slug` from a throwaway repository, so the PR's worktree is never touched. An existing branch is
+    continued (old SHAs keep working). Returns the commit SHA."""
+    import tempfile
+    branch, url = f"evidence/pr-{n}", f"https://github.com/{slug}.git"
+    with tempfile.TemporaryDirectory() as tmp:
+        g = lambda *a: subprocess.run([GIT, "-C", tmp, *a], capture_output=True, text=True, timeout=120)  # noqa: E731
+        g("init", "-q")
+        g("remote", "add", "origin", url)
+        if g("fetch", "-q", "origin", branch).returncode == 0:
+            g("checkout", "-q", "--detach", "FETCH_HEAD")
+            for f in os.listdir(tmp):
+                if f != ".git":
+                    shutil.rmtree(os.path.join(tmp, f)) if os.path.isdir(os.path.join(tmp, f)) else os.remove(os.path.join(tmp, f))
+        for dest, src in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, dest)), exist_ok=True)
+            shutil.copyfile(src, os.path.join(tmp, dest))
+        g("add", "-A")
+        if g("diff", "--cached", "--quiet").returncode:
+            r = g("-c", "user.name=orq", "-c", "user.email=noreply@orq.invalid", "commit", "-q", "-m", f"docs: evidence of PR #{n}")
+            if r.returncode:
+                raise ValueError(f"evidence commit failed: {r.stderr.strip()[-200:]}")
+            r = g("push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+            if r.returncode:
+                raise ValueError(f"push of {branch} failed: {r.stderr.strip()[-200:]}")
+        return g("rev-parse", "HEAD").stdout.strip()
+
+
+def evidence_verdict(scenarios):
+    """go / no-go / inconclusive / no-surface. 'untested' and a scenario that did not run live never become 'passed' (as in no-mistakes)."""
+    if not scenarios:
+        return "no-surface"
+    if any(s.get("after") == "fail" for s in scenarios):
+        return "no-go"
+    return "go" if all(s.get("after") == "pass" and s.get("live") for s in scenarios) else "inconclusive"
+
+
+def evidence_comment(links, scenarios):
+    """The comment body: the verdict, then a before/after table per scenario (or per image name when the run recorded no scenarios)."""
+    cell = lambda side, name: f"![{name}]({links[side][name]})" if name in links[side] else "—"  # noqa: E731
+    rows = [f"| {s['name']} | {s.get('before', 'untested')} | {s.get('after', 'untested')} | {'live' if s.get('live') else 'not run live'} | {cell('before', s.get('evidence') or '')} | {cell('after', s.get('evidence') or '')} |"
+            for s in scenarios] if scenarios else \
+           [f"| {n} | | | | {cell('before', n)} | {cell('after', n)} |" for n in sorted(set(links["before"]) | set(links["after"]))]
+    return "\n".join([EVIDENCE_MARK, f"## Evidence: {evidence_verdict(scenarios)}", "", "| Scenario | Before | After | Run | Before (image) | After (image) |", "|---|---|---|---|---|---|", *rows])
+
+
+def pr_evidence(target, before, after, scenarios_file=None):
+    """Publishes the PR's before/after evidence: orphan branch `evidence/pr-<n>`, links pinned to the commit SHA (checked with `gh api`), one comment that a re-run updates, and the
+    `evidencia` obligation closed with the comment URL. `target` is the PR URL, its number or the task. Returns the lines to print."""
+    items = _prs_ro()["itens"]
+    it = next((i for i in items if target in (i["url"], str(i.get("numero"))) or i["task"] == target and i["estado"] == "aberto"), None)
+    if not it:
+        raise ValueError(f"no PR linked for {target!r}: pass the URL, the number or the task (orq pr list)")
+    slug = re.search(r"github\.com/([^/]+/[^/]+)/pull/", it["url"]).group(1)
+    n = it["numero"]
+    scenarios = json.load(open(scenarios_file)) if scenarios_file else []
+    if not isinstance(scenarios, list) or any(not isinstance(s, dict) or not s.get("name") for s in scenarios):
+        raise ValueError("--scenarios: a JSON list of {name, before, after, live, evidence}")
+    files = {side: _evidence_files(folder) for side, folder in (("before", before), ("after", after))}
+    if not (files["before"] or files["after"]):
+        raise ValueError("no image or video in the folders")
+    sha = _evidence_branch(slug, n, {f"pr-{n}/{side}-{f}": os.path.join(folder, f) for side, folder in (("before", before), ("after", after)) for f in files[side]})
+    links = {side: {} for side in files}
+    for side in files:
+        for f in files[side]:
+            path = f"pr-{n}/{side}-{f}"
+            meta = _gh_api(f"repos/{slug}/contents/{path}?ref={sha}")
+            if not isinstance(meta, dict) or meta.get("type") != "file" or not meta.get("size"):
+                raise ValueError(f"{path} does not answer as a file at {sha[:9]}")
+            links[side][f] = f"https://github.com/{slug}/blob/{sha}/{path}?raw=true"
+    body = evidence_comment(links, scenarios)
+    old = next((c for c in _gh_api(f"repos/{slug}/issues/{n}/comments?per_page=100") or [] if EVIDENCE_MARK in (c.get("body") or "")), None)
+    c = _gh_api(f"repos/{slug}/issues/comments/{old['id']}", "-X", "PATCH", fields=[("body", body)]) if old else _gh_api(f"repos/{slug}/issues/{n}/comments", fields=[("body", body)])
+    comment_url = c["html_url"]
+    _close_auto("evidencia", it["task"], comment_url, lambda o: o.get("url") == it["url"])
+    return [f"evidence of PR #{n} ({evidence_verdict(scenarios)}): {comment_url}", f"commit {sha}", *(u for side in links for u in links[side].values())]
 
 
 def pr_list(task=None):
@@ -8750,7 +8879,8 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
-                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None}
+                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
+                         "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else []}
     return findings
 
 
@@ -11857,7 +11987,7 @@ FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays th
     "ate-prioridade": "up-to-priority", "grupo": "group", "prazo": "deadline", "responde": "answers", "sem-gh": "no-gh",
     "sem-transcritos": "no-transcripts", "gravar": "save", "corpo": "body", "ambientes": "environments", "ultimos": "last", "fechados": "closed",
     "destino": "dest", "substituir-orca-yaml": "replace-orca-yaml", "despacho": "dispatch", "parar": "stop", "instalar": "install",
-    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours"}
+    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours", "antes": "before", "depois": "after", "cenarios": "scenarios"}
 ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the dest)
     "titulo": "title", "spec-arquivo": "spec_file", "detalhe": "detail", "frente": "workstream", "comando": "command", "espera": "waiting", "ate":
     "until_at", "desde": "since", "todas": "all_listing", "todos": "include_all", "resposta": "answer_text", "entrada": "entry", "nota": "note",
@@ -11869,7 +11999,7 @@ ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the 
     "sem-gh": "without_gh", "sem-transcritos": "without_transcripts", "gravar": "write_out", "corpo": "body_text", "ambientes": "environments",
     "ultimos": "last_n", "fechados": "closed_items", "destino": "destination", "substituir-orca-yaml": "replace_orca_yaml", "despacho":
     "dispatch_mode", "parar": "stop", "instalar": "install", "desinstalar": "uninstall", "voltas": "loops", "estado": "state", "liberar": "release",
-    "horas": "max_age_hours"}
+    "horas": "max_age_hours", "antes": "before", "depois": "after", "cenarios": "scenarios"}
 FLAG_ALIASES = {f"--{pt}": f"--{en}" for pt, en in FLAG_EN.items()}
 ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the English command (op) or "<command> <op>" (acao)
     "": {"feito": "fulfill", "adiar": "defer", "fila": "queue", "ausente": "away", "responder": "reply", "iniciar": "start", "ocupadas": "busy",
@@ -11882,7 +12012,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "transcrito": "transcript", "servico": "service"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
-    "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink"},
+    "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink", "evidencia": "evidence"},
     "queue": {"feito": "done", "lista": "list"},
     "away": {"ligar": "on", "desligar": "off"},
     "alert": {"visto": "seen"},
@@ -12005,6 +12135,11 @@ def parser():
     _arg(po, "corpo", required=True, help="file with the PR body (sections of the /pr skill)")
     _arg(po, "ambientes", help="comma-separated branches; default: the project environments before production")
     po.add_argument("--cwd", help="where to find the worktree when the target is a branch")
+    pe = pr.add_parser("evidence", aliases=["evidencia"], help="orq pr evidence <pr|task> --before DIR --after DIR [--scenarios JSON]: publishes the before/after images on evidence/pr-<n> and comments the table on the PR")
+    pe.add_argument("target")
+    _arg(pe, "antes", required=True)
+    _arg(pe, "depois", required=True)
+    _arg(pe, "cenarios", help="JSON list of {name, before, after, live, evidence}")
     pr.add_parser("list", aliases=["lista"], help="the linked PRs (of one task, with --task)").add_argument("--task")
     pd2 = pr.add_parser("unlink", aliases=["desligar"], help="orq pr unlink <task> <url>: removes the PR from the task")
     pd2.add_argument("task")
@@ -12366,6 +12501,8 @@ def main(argv=None):
                 for av in notices:
                     print(f"warning: {av}", file=sys.stderr)
                 print("\n".join(urls))
+            elif a.op == "evidence":
+                print("\n".join(pr_evidence(a.target, a.before, a.after, a.scenarios)))
             elif a.op == "unlink":
                 pr_unlink(a.task, a.url)
                 print(f"PR unlinked from {a.task}")
