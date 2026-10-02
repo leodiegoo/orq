@@ -12,6 +12,7 @@ import subprocess
 from datetime import date
 
 VERSAO = "0.2.6"
+TOML = '[markdown]\ndone_keep = 100000\n'  # o `.tasks.toml` de uma pasta de backlog: o arquivamento tiraria do arquivo ticket que o orq ainda consulta (numeração, Blocked by)
 CLI_TIMEOUT_S = 20
 HOLD_KINDS = ("captain", "external", "load", "parked", "future")
 META_PEND = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # linhas `chave: valor` no topo do corpo da pendência
@@ -211,6 +212,21 @@ def ticket_de_item(i, por_id, raiz):
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
             "despacho": meta.get("despacho"), "espera": meta.get("espera"),  # os cabeçalhos `Despacho:` e `Espera:` (ticket 142)
             "fechado_em": i["closed"]}
+
+
+def repo_do_titulo(titulo):
+    """O `repo` de um ticket: o prefixo do título antes de `:` ("orq: x" -> "orq"), ou None."""
+    m = re.match(r"^([a-z][a-z0-9-]{1,15}):\s", titulo)
+    return m.group(1) if m else None
+
+
+def problema_titulo(titulo):
+    """Por que a CLI não guardaria este título como está (a gramática leria o fim como tag, ou a CLI leria o começo como opção), ou None."""
+    if _tags(titulo)[0] != titulo:
+        return f"o título termina numa tag do backlog (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): reescreva {titulo!r}"
+    if titulo.startswith("-"):
+        return f"o título não pode começar com '-' (a CLI o leria como opção): reescreva {titulo!r}"
+    return None
 
 
 def binario():

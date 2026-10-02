@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Converte os tickets (ORQ_ISSUES) e o pendencias.json (ORQ_PENDENCIAS) num backlog.md do tasks-axi (ticket 101, M2). Só lê as fontes.
 
-    converte-backlog.py [--saida ORQ_BACKLOG] [--issues D] [--pendencias F] [--eventos F] [--forcar]
+    converte-backlog.py [--saida ORQ_BACKLOG] [--issues D] [--pendencias F] [--eventos F] [--forcar | --completa [--outros B]]
 
 Escreve só em arquivo novo (recusa um que exista, a não ser com --forcar), então rodar de novo na cópia é seguro. Um ticket vira `tNN`
 (kind `ticket`, `repo` do prefixo do título antes de `:`), com `spec:` para o arquivo, `orca: <task> <run>` e `modelo:`/`effort:`/`issue:`/`despacho:`/`espera:`
@@ -9,8 +9,12 @@ quando o cabeçalho os tem; uma pendência vira o item `repo: pend` que `orq pen
 com o mtime do arquivo na falta. O `Blocked by` lê só os números do começo do campo ("none (… 30/09)" não bloqueia ninguém).
 Depois de escrever, roda o `tasks-axi render` (confere que a gramática foi aceita e que nada de fundo mudou) e compara as contagens
 (Done, arestas de bloqueio, prontos) com as das fontes; qualquer diferença sai com código 1.
+
+`--completa` (ticket 102) não reescreve nada: acrescenta, pela CLI, os tickets de `issues/` que o backlog ainda não tem (os criados depois da migração, antes de `ticket novo` escrever
+no backlog), imprime a contagem antes e depois e sai com 1 se o `depois` não fechar. Os backlogs de `grupos/*/backlog.md` ao lado da saída contam como já migrados.
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -21,7 +25,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import backlog  # noqa: E402
 
 ESTADO = {"resolved": "done", "claimed": "in_flight", "ready-for-agent": "queued"}
-TOML = '[markdown]\ndone_keep = 100000\n'  # o arquivamento tiraria do arquivo ticket que o orq ainda consulta (numeração, Blocked by)
 
 
 def _campo(cab, nome):
@@ -79,10 +82,9 @@ def converte(issues, pendencias, eventos):
         mtime = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(os.path.join(issues, t["nome"]))))
         bl = [f"t{b.zfill(2)}" for b in dict.fromkeys(t["bloqueios"]) if b.zfill(2) in nums and b.zfill(2) != n]
         arestas += len(bl)
-        prefixo = re.match(r"^([a-z][a-z0-9-]{1,15}):\s", t["titulo"])
         meta = {"spec": f"issues/{t['nome']}", "orca": f"{t['task']} {t['run']}" if t["task"] and t["run"] else None,
                 "modelo": t["modelo"], "effort": t["effort"], "issue": t["issue"], "despacho": t["despacho"], "espera": t["espera"]}
-        itens.append({"id": f"t{n}", "titulo": t["titulo"], "estado": estado, "kind": "ticket", "repo": prefixo.group(1) if prefixo else None, "bloqueios": bl,
+        itens.append({"id": f"t{n}", "titulo": t["titulo"], "estado": estado, "kind": "ticket", "repo": backlog.repo_do_titulo(t["titulo"]), "bloqueios": bl,
                       "since": novo.get(n) or mtime, "closed": fechou.get(n) or mtime, "corpo": backlog.corpo_com_meta(meta, None, backlog.META_TICKET)})
     try:
         with open(pendencias, encoding="utf-8") as f:
@@ -94,7 +96,37 @@ def converte(issues, pendencias, eventos):
     abertos = {n for n, e in por_estado.items() if e != "done"}
     prontos = [t for t in ts if por_estado[t["num"].zfill(2)] == "queued" and not any(b.zfill(2) in abertos for b in t["bloqueios"] if b.zfill(2) in nums)]
     return backlog.emite(itens), {"tickets": len(ts), "pendencias": len(vivas), "done": sum(e == "done" for e in por_estado.values()), "bloqueios": arestas,
-                                  "prontos": len(prontos)}
+                                  "prontos": len(prontos)}, itens
+
+
+def completa(saida, issues, pendencias, eventos, outros=()):
+    """Acrescenta ao backlog que existe os tickets de `issues` que nem ele nem os `outros` backlogs (os dos grupos) têm, pela CLI: travada e atômica, e a data de criação
+    vira a de hoje (são os criados depois da migração). Devolve (tickets antes, tickets depois, ids acrescentados, avisos); `depois` só confere se tudo entrou."""
+    _, _, itens = converte(issues, pendencias, eventos)
+    tickets = [i for i in itens if i["kind"] == "ticket"]
+    meu = {i["id"] for i in backlog.ler(saida)}
+    nums = {int(i[1:]) for i in meu | {i["id"] for o in outros for i in backlog.ler(o)} if re.fullmatch(r"t\d+", i)}
+    antes = sum(i["kind"] == "ticket" for i in backlog.ler(saida))
+    faltam, avisos, feitos = [i for i in tickets if int(i["id"][1:]) not in nums], [], []
+    for i in faltam:
+        if (p := backlog.problema_titulo(i["titulo"])):
+            avisos.append(f"{i['id']}: {p}")
+            continue
+        backlog.cli(saida, "add", i["id"], i["titulo"], "--kind", "ticket", *(["--repo", i["repo"]] if i["repo"] else []), *(["--body", i["corpo"]] if i["corpo"] else []))
+        feitos.append(i)
+    aqui = meu | {i["id"] for i in feitos}
+    for i in feitos:
+        for b in i["bloqueios"]:
+            if b in aqui:
+                backlog.cli(saida, "block", i["id"], "--by", b)
+            else:
+                avisos.append(f"{i['id']}: o bloqueador {b} está em outro backlog; a aresta não foi criada")
+        if i["estado"] == "in_flight":
+            backlog.cli(saida, "start", i["id"])
+        elif i["estado"] == "done":
+            backlog.cli(saida, "done", i["id"], "--no-prune")
+    depois = sum(i["kind"] == "ticket" for i in backlog.ler(saida))
+    return antes, depois, [i["id"] for i in feitos], avisos
 
 
 def ids_do_ready(saida_cli):
@@ -109,20 +141,34 @@ def main(argv=None):
     ap.add_argument("--pendencias", default=os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json"))
     ap.add_argument("--eventos", default=os.path.join(os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq"), "events.jsonl"))
     ap.add_argument("--forcar", action="store_true", help="sobrescreve a saída que já existe")
+    ap.add_argument("--completa", action="store_true", help="acrescenta ao backlog que existe os tickets de issues/ que ele ainda não tem (pela CLI, sem reescrever o arquivo)")
+    ap.add_argument("--outros", action="append", default=[], help="outro backlog que já guarda tickets (os de grupos/*/backlog.md ao lado da saída entram sozinhos); --completa não os repete")
     a = ap.parse_args(argv)
     if not a.saida:
         ap.error("diga onde escrever: --saida ou ORQ_BACKLOG")
+    if a.completa:
+        if not os.path.exists(a.saida):
+            print(f"{a.saida} não existe: --completa acrescenta a um backlog que já existe", file=sys.stderr)
+            return 1
+        outros = [*glob.glob(os.path.join(os.path.dirname(os.path.abspath(a.saida)), "grupos", "*", "backlog.md")), *a.outros]
+        antes, depois, feitos, avisos = completa(a.saida, a.issues, a.pendencias, a.eventos, outros)
+        print(f"tickets no backlog: antes {antes}, depois {depois} (+{len(feitos)}: {', '.join(feitos) or 'nenhum'})")
+        for x in avisos:
+            print(f"AVISO {x}", file=sys.stderr)
+        if depois != antes + len(feitos):
+            print(f"DIFERENÇA: esperava {antes + len(feitos)} tickets e o backlog tem {depois}", file=sys.stderr)
+        return 1 if avisos or depois != antes + len(feitos) else 0
     if os.path.exists(a.saida) and not a.forcar:
         print(f"{a.saida} já existe: a conversão só escreve em arquivo novo (--forcar sobrescreve)", file=sys.stderr)
         return 1
-    texto, esperado = converte(a.issues, a.pendencias, a.eventos)
+    texto, esperado, _ = converte(a.issues, a.pendencias, a.eventos)
     os.makedirs(os.path.dirname(os.path.abspath(a.saida)), exist_ok=True)
     with open(a.saida, "w", encoding="utf-8") as f:
         f.write(texto)
     toml = os.path.join(os.path.dirname(os.path.abspath(a.saida)), ".tasks.toml")
     if not os.path.exists(toml):
         with open(toml, "w", encoding="utf-8") as f:
-            f.write(TOML)
+            f.write(backlog.TOML)
     backlog.cli(a.saida, "render")
     with open(a.saida, encoding="utf-8") as f:
         depois = f.read()
