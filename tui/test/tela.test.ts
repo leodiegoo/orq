@@ -52,7 +52,8 @@ test("it should be the same blocks from the fixtures migrated to english", () =>
   const orca = join(tmp, "orca") // um Orca sem workers vivos: a migração recusa rodar com algum
   writeFileSync(orca, `#!/bin/sh\necho '{"ok": true, "result": {"workers": [], "scope": {"source": "all"}}}'\n`, { mode: 0o755 })
   const r = Bun.spawnSync(["python3", join(import.meta.dir, "..", "..", "scripts", "migrar-ingles.py")], {
-    env: { ...process.env, ORQ_HOME: home, ORQ_ORCA: orca, ORQ_NO_BG: "1" },
+    // hermético: nada de ORQ_, ORCA_ ou do harness de quem roda atravessa (ticket 328)
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(ORQ_|ORCA_|CLAUDE|CODEX_)/.test(k))), ORQ_HOME: home, ORQ_ORCA: orca, ORQ_NO_BG: "1" },
   })
   expect(r.exitCode).toBe(0)
   expect(existsSync(join(home, "open.json")) && !existsSync(join(home, "aberto.json"))).toBe(true)

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
 import ast
+import argparse
 import contextlib
 import hashlib
 import json
 import os
 import pathlib
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,16 +22,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORQ = os.path.join(HERE, "orq.py")
 CLEAN_SCRIPT = os.path.join(HERE, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, HERE)
-SUITE_TMP = []  # every temporary folder this run creates: the real-log check looks for their names (ticket 216)
-_mkdtemp = tempfile.mkdtemp
-tempfile.mkdtemp = lambda *a, **k: SUITE_TMP.append(_mkdtemp(*a, **k)) or SUITE_TMP[-1]  # TemporaryDirectory goes through it too
-os.environ["ORQ_HOME"] = tempfile.mkdtemp()  # orqlib reads ORQ_HOME once, at import: an in-process call never lands in the real state (ticket 216)
-import orq as orq_mod  # noqa: E402
-import orqlib  # noqa: E402
-if "ORQ_BACKLOG" not in os.environ:
-    orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
-if "ORQ_BACKLOG_TICKETS" not in os.environ:
-    orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
+# hermetic: nothing of the caller's orq, Orca or harness environment reaches a test (a worker's ORQ_HOOK_TIMEOUT=15 turned the 3 s alarm into 15 s, ticket 328)
+CALLER_ENV = {k: os.environ.pop(k) for k in sorted(os.environ) if k.startswith(("ORQ_", "ORCA_", "CLAUDE", "CODEX_"))}
+# every test's temporary files, the subprocesses' too, in one folder the runner removes at the end. Under /tmp: shorter than macOS's TMPDIR, so the paths that
+# go into a 150-character notice or a socket stay short
+SUITE_TMP = tempfile.tempdir = os.environ["TMPDIR"] = tempfile.mkdtemp(prefix="oq", dir="/tmp" if os.path.isdir("/tmp") else None)
+os.environ["ORQ_HOME"] = os.path.join(SUITE_TMP, "orq-home")  # in-process orq writes here: never to the live clone's events.jsonl (ticket 216 found 88 test lines there)
+# before the import: orqlib reads ORQ_LINK and ORQ_AVISO_GAP_S at load, and in-process tests saw the real link and a 3 s gap per notice (ticket 328)
 os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
 os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
 os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
@@ -38,6 +38,12 @@ os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
 os.environ["ORQ_AWAY_PREFLIGHT"] = "off"  # `away on` does not check the real machine in the older tests (ticket 217); the preflight tests turn it on
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
+import orq as orq_mod  # noqa: E402
+import orqlib  # noqa: E402
+if "ORQ_BACKLOG" not in os.environ:
+    orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
+if "ORQ_BACKLOG_TICKETS" not in os.environ:
+    orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
 orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")  # likewise: the real hooks.json has an orq hook and may be untrusted  # no test writes to the real ~/.codex/config.toml
 
@@ -1764,11 +1770,11 @@ def test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm():
     p = subprocess.Popen([sys.executable, ORQ, "hook", "stop"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=a.env)
     try:
-        assert p.wait(timeout=8) == 0
+        assert p.wait(timeout=15) == 0
     finally:
         p.stdin.close()
     dt = time.time() - t
-    assert 2.7 < dt < 3.6 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
+    assert 2.7 < dt < 8 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
     assert "TimeoutError: hook stop passou de 3s" in a.log()
 
 
@@ -1780,7 +1786,7 @@ def test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm():
         t = time.time()
         r = a.prompt("oi")
         dt = time.time() - t
-    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 3.6, (dt, r)
+    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 8, (dt, r)  # the ceiling only proves the cut: under load the start alone takes seconds (ticket 328)
     assert "TimeoutError: hook prompt passou de 3s" in a.log()
     assert a.events() == []
 
@@ -2183,9 +2189,10 @@ def test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pen
     a = Env()
     q = _gate_pending(a)
     t = time.time()
-    # run-current + inbox take 2.4 s; the pending item is written; gate-resolve starts and the 3 s ceiling wins inside it
-    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP="1.2")
-    assert r.returncode == 0 and time.time() - t < 4.5, r
+    # the pending item is written; gate-resolve hangs and the hook's ceiling wins inside it. Only gate-resolve is slow, with a 6 s ceiling: under load
+    # the calls before it take seconds, and a sleep on every call would let the alarm land before the write (ticket 328)
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP_CMD="gate-resolve:30", ORQ_HOOK_TIMEOUT="6")
+    assert r.returncode == 0 and time.time() - t < 12, r
     assert "gate-resolve gate_1: TimeoutError" in a.log(), a.log()
     assert "gate-dec" not in _pending_ids(a), "a pendência foi fechada"
     assert not [g for g in _gates_log(a) if g[0] == "gate-resolve"], "o gate ficou pendente"
@@ -2638,8 +2645,8 @@ def test_guard_fails_open_and_logs():
     b = Env(run="run_a")
     _workers(b, ("w1", "run_b", "dispatched"))
     t = time.time()
-    r = _guard(b, FAKE_SLEEP="6")
-    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 4.5 and "hook guard" in b.log()
+    r = _guard(b, FAKE_SLEEP="30")  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
+    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 9 and "hook guard" in b.log()
     c = Env(run="run_a")
     _workers(c, ("w1", "run_b", "dispatched"))
     c.env["ORQ_ORCA"] = "/nao/existe/orca"
@@ -2768,12 +2775,12 @@ def test_heartbeat_notice_without_run_passes():
 
 
 def test_heartbeat_orca_down_passes():
-    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:6"}):
+    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:30"}):  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
         a = Env(**failure)
         a.inbox(_hb("lendo"))
         t = time.time()
         r = a.prompt(NOTICE_A)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 4.5, (failure, r)
+        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 9, (failure, r)
         assert set(a.states().values()) == {"unread"}, failure
         assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
 
@@ -4834,7 +4841,7 @@ def test_review6_b31_orca_timeout_comes_from_environment_and_runner_shows_end_of
                        env={**os.environ, "ORQ_ORCA_TIMEOUT": "7.5"})
     assert r.stdout.strip() == "7.5", r
     assert orq_mod.TIMEOUT_ORCA == float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)
-    assert "str(e)[-400:]" in open(__file__).read().split('if __name__ == "__main__":')[-1], "o runner tem de mostrar o fim da mensagem (B40)"  # the assert line stays before __main__
+    assert "str(e)[-400:]" in open(__file__).read().split("\ndef _run_child(")[-1].split("\ndef ")[0], "o runner tem de mostrar o fim da mensagem (B40)"  # each test's child (ticket 328)
     assert Env().env["ORQ_ORCA_TIMEOUT"] == "10"
 
 
@@ -5508,7 +5515,7 @@ def test_ticket134_round_with_ten_unchanged_runs_queries_orca_only_on_first():
 
 
 def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
-    a = Env(ORCA_TERMINAL_HANDLE="term_ger", ORQ_RUN_PARADO_CACHE_S="0.5")
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
     a.set("runs.json", [_active_run(a), _active_run(a, "run_b")])
     a.orq("gerente", "absorver")
@@ -5516,7 +5523,8 @@ def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
     a.set("tasks_run_b.json", [{"id": "task_x", "status": "completed", "created_at": OLD, "completed_at": "2026-09-01T10:05:00Z"}])
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a", "run_b"], "dentro da validade o cache segura a soltura"
-    time.sleep(0.6)
+    cache = os.path.join(a.home, "run-parado.json")
+    _write_state(cache, {r: t - 600 for r, t in _read_state(cache).items()})  # the validity runs out in the cache's clock, not in a 0.5 s sleep a loaded machine overruns (ticket 328)
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a"], "vencida a validade, o Run parado é solto"
 
@@ -6259,6 +6267,10 @@ def _repo_git(tmp, dirty=False):
     open(os.path.join(repo, "f"), "w").write("x")
     g("add", "f")
     g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    for i in range(50):  # a short sha of only digits (1 in 27) is not a sha to SHA_RE: the PR test went red at random (ticket 328)
+        if orq_mod.SHA_RE.fullmatch(g("rev-parse", "--short=7", "HEAD")):
+            break
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--amend", "-qm", f"c{i}")
     if dirty:
         open(os.path.join(repo, "novo"), "w").write("y")
     return repo, g("rev-parse", "--short=7", "HEAD")
@@ -7094,6 +7106,20 @@ def test_night_external_hook_stays_under_100_ms():
     orq_mod._external_denied(ev, orq_mod._cursor_ro())
     assert time.time() - t0 < 0.1
 
+
+
+def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
+    a = Env(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"s1": "worker"}})
+    for cmd in ("python3 test_orq.py", "cd wt && rtk python3 test_orq.py -j 4", "python3 /x/test_orq.py --map m.json && python3 test_precompact.py"):
+        out = _external(a, cmd)
+        assert out and "orq test --affected" in out["additionalContext"] and "permissionDecision" not in out, cmd
+    for cmd in ("python3 test_orq.py test_x", "python3 test_orq.py -j 2 ticket328", "orq test --affected", "python3 test_precompact.py", "git commit -m 'python3 test_orq.py'",
+                "cat test_orq.py", "git diff test_orq.py", "wc -l test_orq.py"):
+        assert _external(a, cmd) is None, cmd
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {}})
+    assert _external(a, "python3 test_orq.py") is None, "the coordinator and the integrator's script are not warned"
 
 def _no_git_env(a, **env):
     """Removes from the test environment the git variables the developer's session may have (GIT_CONFIG_*, GIT_TERMINAL_PROMPT)."""
@@ -11126,6 +11152,26 @@ def test_ticket55_advance_refuses_forgotten_conflict_marker():
     assert r.returncode == 0 and open(os.path.join(alive, "nota.txt")).read() == "a\num e dois\nc\n", r.stdout + r.stderr
 
 
+
+def test_ticket328_advance_after_a_conflict_only_in_tests_or_docs_runs_the_affected_tests():
+    light = {"um": {"README.md": "um\n", "x.txt": "1\n"}, "dois": {"README.md": "dois\n"}}
+    for branches, resolved, expected in ((light, "README.md", "affected"), ({"um": {"nota.txt": "um\n"}, "dois": {"nota.txt": "dois\n"}}, "nota.txt", "full")):
+        alive, env, g = _alive_repo55(branches)
+        integrate, wt = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
+        ran = os.path.join(alive, "..", "ran.txt")  # the tests run in the worktree, which goes away
+        env = {**env, "ORQ_TESTES": f"echo full > {ran}", "ORQ_TESTES_AFETADOS": f"echo affected > {ran}"}
+        r = subprocess.run([sys.executable, integrate, "um", "dois"], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode != 0 and "conflict" in r.stderr, r.stderr
+        open(os.path.join(wt, resolved), "w").write("um e dois\n")
+        g("commit", "-qam", "resolve", cwd=wt)
+        r = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode == 0 and open(ran).read() == expected + "\n", (expected, r.stdout + r.stderr)
+        assert ("running the affected tests" in r.stdout) == (expected == "affected"), r.stdout
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    ran = os.path.join(alive, "..", "ran.txt")
+    r = subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "um"], cwd=alive, env={**env, "ORQ_TESTES": f"echo full > {ran}"}, capture_output=True, text=True)
+    assert r.returncode == 0 and open(ran).read() == "full\n", "a cycle without a conflict runs the full suite once, on the final tree"
+
 def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_log():
     t = tempfile.mkdtemp()
     for f in ("orq.py", "precompact.py", "fail_safe.py", "orqpaths.py"):
@@ -11709,7 +11755,7 @@ def test_mate_return_does_not_renotify_old_escalation_over_fifty():
         f.write("".join(json.dumps({"tipo": "entrada", "id": f"e{i}", "origem": "mate", "mate": "orq", "tipo_mate": "resumo", "texto": f"r{i}", "ts": _z(i)}) + "\n"
                         for i in range(1, 56)))
     with InProcess(a):
-        for _ in range(55):
+        for _ in range(2):  # one lap notifies the 55 and the next ones must notify nothing: a list capped at 50 re-notifies on the second (ticket 328: 55 laps took 175 s)
             orq_mod.mate_lap()
         assert orq_mod.mate_lap() == []
     texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
@@ -14579,9 +14625,9 @@ def test_ticket101_whole_backlog_reader_fits_the_hook_cap():
               "bloqueios": [f"t{n - 1}"] if n else [], "since": "2026-10-01", "closed": "2026-10-01", "corpo": f"spec: issues/{n}.md\norca: task_{n} run_{n}"} for n in range(600)]
     p = os.path.join(tempfile.mkdtemp(), "backlog.md")
     open(p, "w").write(backlog_mod.emit(item_list))
-    t0 = time.perf_counter()
+    t0 = time.process_time()  # the CPU the parse costs: wall time on a loaded machine (other suites, -j 4) also counts the waits for a core (ticket 328)
     read_handles = backlog_mod.read_value(p)
-    ms = (time.perf_counter() - t0) * 1000
+    ms = (time.process_time() - t0) * 1000
     assert len(read_handles) == 600 and ms < 40, f"{ms:.1f} ms para 600 itens: o teto do hook é 100 ms com tudo junto"
 
 
@@ -17474,6 +17520,12 @@ def test_it_should_give_the_same_segments_for_a_command_with_and_without_rtk_or_
     assert cmdnorm.segments("echo 'git push'") == ["echo \"\""] and cmdnorm.segments("git commit -F - <<'EOF'\nx\ngit push\nEOF") == ["git commit -F -"]
 
 
+def _hook_in_process(a, fn, cmd, cwd):
+    """A PreToolUse Bash hook's verdict computed in this process (ticket 328: hundreds of subprocesses only to parse commands); the routing has its own tests."""
+    with InProcess(a):
+        return (fn({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": "s1", "cwd": cwd}, None) or {}).get("hookSpecificOutput")
+
+
 def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     _night(a)
@@ -17481,22 +17533,25 @@ def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
         bare = cmd.removeprefix("rtk ")
         for pre in PREFIXES_250:
             for wrapped in (pre + bare, f"for b in a b; do {pre}{bare}; done", f"if true; then {pre}{bare}; fi"):
-                out = _external(a, wrapped)
+                out = _hook_in_process(a, orq_mod.hook_external, wrapped, a.tmp.name)
                 assert out and out["permissionDecision"] == "deny", wrapped
     for cmd in ("git status", "gh pr view 12", "git commit -m x"):
         for pre in PREFIXES_250:
-            assert _external(a, pre + cmd) is None, pre + cmd
+            assert _hook_in_process(a, orq_mod.hook_external, pre + cmd, a.tmp.name) is None, pre + cmd
+    assert _external(a, "rtk git push")["permissionDecision"] == "deny", "and through the hook"
 
 
 def test_it_should_give_place_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     a.prompt("oi")
     p, _ = _repo(a.tmp.name, branch="feat/outra")
+    place = lambda cmd: (_hook_in_process(a, orq_mod.hook_place, cmd, p) or {}).get("additionalContext", "")  # noqa: E731
     for pre in PREFIXES_250:
         for cmd in ("git commit -m x", "git push", "git -C /r commit"):
-            assert "wrong place" in _notice(_place(a, p, cmd=pre + cmd)), pre + cmd
-            assert "wrong place" in _notice(_place(a, p, cmd=f"for b in a; do {pre}{cmd}; done")), pre + cmd
-        assert _notice(_place(a, p, cmd=pre + "git status")) == "", pre
+            assert "wrong place" in place(pre + cmd), pre + cmd
+            assert "wrong place" in place(f"for b in a; do {pre}{cmd}; done"), pre + cmd
+        assert place(pre + "git status") == "", pre
+    assert "wrong place" in _notice(_place(a, p, cmd="rtk git push")), "and through the hook"
 
 
 def test_it_should_give_the_worker_routing_guard_the_same_verdict_with_and_without_rtk():
@@ -19270,7 +19325,7 @@ def log_leaks(before):
         if len(data) < size or hashlib.sha256(data[:size]).hexdigest() != digest:
             out.append(f"{p}: rewritten during the suite")
             continue
-        names = {os.path.basename(d) for d in SUITE_TMP}
+        names = set(os.listdir(SUITE_TMP)) if os.path.isdir(SUITE_TMP) else set()  # every test folder lives inside the suite's one (ticket 328)
         out += [f"{p}: test line appended: {x[:160]}" for x in data[size:].decode("utf-8", "replace").splitlines()
                 if any(n in names for n in re.findall(r"tmp[\w-]{8}", x))]
     return out
@@ -19431,20 +19486,376 @@ def test_ticket221_delivery_of_ticket_citing_red_green_starts_the_proof_once():
     assert "grepping the source text" in orq_mod.SPEC_BLOCKS and "fail without the change" in orq_mod.SPEC_BLOCKS
 
 
-if __name__ == "__main__":
-    filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
-    failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
-    real_logs = log_snapshot(_real_logs())
-    for item_name, fn in tests:
+
+# ---------- ticket 328: the runner (parallel, durations, suite queue, test map) ----------
+
+SUITE_QUEUE = CALLER_ENV.get("ORQ_SUITE_QUEUE") or os.path.expanduser("~/.cache/orq-suite/queue")  # the caller's, read before the strip
+
+
+def _private_paths():
+    """The machine paths each test gets of its own, so tests in parallel never share them (ticket 328): the orq link and Codex's config and hooks."""
+    os.environ["ORQ_LINK"] = orq_mod.ORQ_LINK = os.path.join(tempfile.mkdtemp(), "orq")
+    orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
+    orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")
+
+
+def _cpu():
+    """CPU seconds of this process and of its waited children (the orq and fake Orca subprocesses of a test)."""
+    s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
+
+
+def _run_child(name, fn, out, cover):
+    """In the forked child: runs one test with its output in `out`.log and writes {ok, err, cpu, cover} to `out`.json. `cover`: also the repo functions it ran (ORQ_COVER for its subprocesses)."""
+    res = {"ok": True, "err": ""}
+    try:
+        fd = os.open(out + ".log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)  # inside the try: a child that raises here never returns into the scheduler
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        _private_paths()
+        if cover:
+            os.environ["ORQ_COVER"] = out + ".cover"
+            orq_mod.cover_start()
+        fn()
+    except BaseException as e:  # noqa: BLE001 - the report shows all failures at once
+        res = {"ok": False, "err": f"{type(e).__name__}: {str(e)[-400:]!r}"}
+    try:
+        hits = set(orq_mod.COVER_HITS) if res["ok"] else set()
+        if cover and os.path.exists(out + ".cover"):
+            hits |= set(open(out + ".cover").read().split())
+        res.update(cpu=_cpu(), cover=sorted(hits))
+        with open(out + ".json", "w") as f:
+            json.dump(res, f)
+    finally:
+        sys.stdout.flush()
+        os._exit(0)
+
+
+def _run_tests(tests, jobs, cover=False, echo=print):
+    """Runs `tests` [(name, fn)], each in a forked child of its own and `jobs` at a time, in name order; echoes one line per test as it ends.
+    Returns {name: {ok, err, s, cpu, cover}}. A child that dies without writing its result is a failure with the exit status."""
+    tmp, pending, running, results = tempfile.mkdtemp(prefix="orq-suite-"), list(tests), {}, {}
+    while pending or running:
+        while pending and len(running) < jobs:
+            name, fn = pending.pop(0)
+            out = os.path.join(tmp, name)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            pid = os.fork()
+            if pid == 0:
+                _run_child(name, fn, out, cover)
+            running[pid] = (name, out, time.time())
+        pid, status = os.wait()
+        name, out, t0 = running.pop(pid)
         try:
-            fn()
-            print(f"ok      {item_name}")
-        except Exception as e:  # noqa: BLE001 - the report shows all failures at once
-            failures.append(item_name)
-            print(f"FALHOU  {item_name}: {type(e).__name__}: {str(e)[-400:]!r}")
+            res = json.load(open(out + ".json"))
+        except (OSError, ValueError):
+            res = {"ok": False, "err": f"the test process died (status {status})", "cpu": 0, "cover": []}
+        res["s"] = time.time() - t0
+        results[name] = res
+        echo(f"ok      {name}" if res["ok"] else f"FALHOU  {name}: {res['err']}")
+        if not res["ok"]:
+            echo(open(out + ".log").read().rstrip()[-2000:] if os.path.exists(out + ".log") else "")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
+@contextlib.contextmanager
+def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
+    """One full suite at a time on the machine (ticket 328), like the E2E queue: a `<time_ns>-<pid>` ticket in `queue` with the worktree, in order of arrival.
+    Waits while an older ticket has a live pid, echoing who is ahead whenever that changes; a dead owner's ticket is removed. The ticket goes away at the end."""
+    os.makedirs(queue, exist_ok=True)
+    mine = f"{time.time_ns():020d}-{os.getpid()}"
+    with open(os.path.join(queue, mine), "w") as f:
+        f.write(HERE)
+    try:
+        shown = None
+        while True:
+            ahead = []
+            for n in sorted(x for x in os.listdir(queue) if x < mine):
+                if not orq_mod._pid_alive(n.rsplit("-", 1)[-1]):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(queue, n))
+                    continue
+                with contextlib.suppress(OSError):
+                    ahead.append((n, open(os.path.join(queue, n)).read().strip()))
+            if not ahead:
+                break
+            if ahead[0][0] != shown:
+                shown, (n, wt) = ahead[0][0], ahead[0]
+                echo(f"suite queue: {len(ahead)} ahead; running: {wt} (pid {n.rsplit('-', 1)[-1]}, {int((time.time_ns() - int(n.split('-')[0])) / 6e10)} min)")
+            time.sleep(poll_s)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(queue, mine))
+
+
+def _live_events():
+    """The live events.jsonl a leaking test would write to (the clone's and the caller's ORQ_HOME), with their sizes now."""
+    paths = {os.path.join(p, "events.jsonl") for p in (orq_mod.orqpaths.CODE, CALLER_ENV.get("ORQ_HOME")) if p}
+    return {p: os.path.getsize(p) if os.path.exists(p) else 0 for p in paths}
+
+
+def _leaks(before):
+    """The lines the run appended to a live events.jsonl that carry the suite's temporary folder: a test that wrote outside its ORQ_HOME (ticket 328)."""
+    out, marks = [], {SUITE_TMP, os.path.realpath(SUITE_TMP)}
+    for p, size in before.items():
+        try:
+            with open(p, "rb") as f:
+                f.seek(size)
+                new = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        out += [f"{p}: {line[:300]}" for line in new.splitlines() if any(m in line for m in marks)]
+    return out
+
+
+def _write_map(path, results, full):
+    """The test map of `orq test --affected`: {tests: {name: ["file:function", ...]}}. A full green run replaces it; otherwise only the tests that passed
+    update their entry, so a test that failed or died early keeps the coverage it had instead of a short one."""
+    ok = {n: r["cover"] for n, r in results.items() if r["ok"]}
+    old = {} if full and len(ok) == len(results) else _dict_file(path).get("tests", {})
+    data = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": {**old, **ok}}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def _dict_file(path):
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _suite_args(argv):
+    """`test_orq.py [-j N] [--map PATH] [name...]`: a name equal to a test picks exactly it, any other is a substring. -j defaults to min(4, CPUs/2)."""
+    ap = argparse.ArgumentParser(prog="test_orq.py")
+    ap.add_argument("-j", "--jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--map", help="writes the test map (the functions each test ran) to PATH")
+    ap.add_argument("names", nargs="*")
+    return ap.parse_args(argv)
+
+
+def _pick(all_tests, names):
+    """The tests the names select: exact name, otherwise substring; no names is everything."""
+    known = {n for n, _ in all_tests}
+    return [(n, f) for n, f in all_tests if not names or any(x == n or (x not in known and x in n) for x in names)]
+
+
+def test_ticket328_runner_picks_exact_names_and_substrings():
+    tests = [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _pick(tests, []) == tests
+    assert _pick(tests, ["test_a"]) == [("test_a", 1)], "an exact name does not drag the longer ones"
+    assert _pick(tests, ["_a", "c"]) == [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _suite_args(["-j", "3", "--map", "m.json", "x"]).__dict__ == {"jobs": 3, "map": "m.json", "names": ["x"]}
+
+
+def test_ticket328_runner_runs_each_test_in_its_own_process_and_reports_failures():
+    def ok():
+        os.environ["LEAK328"] = "1"
+        print("barulho")
+
+    def fails():
+        assert "LEAK328" not in os.environ, "the previous test's environment leaked"
+        raise ValueError("quebrou")
+
+    def dies():
+        os._exit(7)
+    seen = []
+    res = _run_tests([("t_ok", ok), ("t_fails", fails), ("t_dies", dies)], jobs=1, echo=seen.append)
+    assert res["t_ok"]["ok"] and "barulho" not in "".join(seen), "a passing test's output stays out"
+    assert res["t_fails"]["err"] == "ValueError: 'quebrou'", res["t_fails"]
+    assert not res["t_dies"]["ok"] and "died" in res["t_dies"]["err"], res["t_dies"]
+    assert seen[0] == "ok      t_ok" and seen[1].startswith("FALHOU  t_fails"), seen
+    res = _run_tests([(f"t{i}", ok) for i in range(6)], jobs=3, echo=seen.append)
+    assert sorted(res) == [f"t{i}" for i in range(6)] and all(r["ok"] for r in res.values())
+
+
+def test_ticket328_runner_records_the_functions_a_test_runs_in_process_and_in_subprocesses():
+    def runs():
+        orq_mod.origin_name("oi")
+        Env().orq("status")
+    res = _run_tests([("t", runs)], jobs=1, cover=True, echo=lambda _: None)["t"]
+    assert res["ok"], res
+    assert {"orqlib.py:origin_name", "test_orq.py:Env", "orqlib.py:main", "orqlib.py:state"} <= set(res["cover"]), res["cover"][:20]
+    t = tempfile.mkdtemp()
+    _write_map(os.path.join(t, "m.json"), {"t": res}, full=True)
+    _write_map(os.path.join(t, "m.json"), {"u": {"ok": True, "cover": ["x.py:f"]}}, full=False)
+    assert set(_dict_file(os.path.join(t, "m.json"))["tests"]) == {"t", "u"}, "a partial run updates its tests and keeps the rest"
+    _write_map(os.path.join(t, "m.json"), {"t": {"ok": False, "cover": []}, "u": {"ok": True, "cover": ["x.py:g"]}}, full=True)
+    assert _dict_file(os.path.join(t, "m.json"))["tests"] == {"t": res["cover"], "u": ["x.py:g"]}, "a red full run keeps the failed test's old coverage"
+
+
+def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead_one():
+    q = tempfile.mkdtemp()
+    with open(os.path.join(q, f"{1:020d}-999999"), "w") as f:
+        f.write("/wt/morto")  # dead owner
+    seen = []
+    with _suite_turn(q, poll_s=0.05, echo=seen.append):
+        assert len(os.listdir(q)) == 1 and seen == [], "the dead ticket went away and nobody waited"
+    assert os.listdir(q) == [], "the ticket goes away at the end"
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with open(os.path.join(q, f"{2:020d}-{holder.pid}"), "w") as f:
+            f.write("/wt/vivo")
+        t0 = time.time()
+        threading.Timer(0.3, lambda: (holder.kill(), holder.wait())).start()  # reaped: a zombie still answers kill(pid, 0)
+        with _suite_turn(q, poll_s=0.05, echo=seen.append):
+            pass
+        assert time.time() - t0 >= 0.3 and seen and seen[0].startswith("suite queue: 1 ahead; running: /wt/vivo (pid "), seen
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+
+def _repo328(files):
+    """A git repo with `files` {path: text} committed on main: returns its path."""
+    root = tempfile.mkdtemp()
+    for path, text_value in files.items():
+        os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+        with open(os.path.join(root, path), "w") as f:
+            f.write(text_value)
+    for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", root, *c], check=True, capture_output=True)
+    return root
+
+
+def _edit328(root, path, old, new):
+    p = os.path.join(root, path)
+    text_value = open(p).read()
+    assert old in text_value, old
+    with open(p, "w") as f:
+        f.write(text_value.replace(old, new, 1))
+
+
+LIB328 = '"""doc"""\nimport os\n\nLIMIT = 3\n\n\ndef a():\n    return 1\n\n\ndef b():\n    return LIMIT\n\n\ndef c():\n    return 2\n'
+TESTS328 = ('import orqlib as orq_mod\n\nFAKE = "fake"\n\n\nclass Env:\n    x = FAKE\n\n\ndef test_a():\n    assert orq_mod.a()\n\n\ndef test_b():\n    Env()\n\n\n'
+            'def test_c():\n    assert orq_mod.LIMIT\n\n\ndef test_readme():\n    open("README.md")\n\n\nif __name__ == "__main__":\n    pass\n')
+MAP328 = {"tests": {"test_a": ["orqlib.py:a", "test_orq.py:test_a"], "test_b": ["orqlib.py:b", "test_orq.py:Env"], "test_c": ["orqlib.py:c"], "test_readme": []}}
+
+
+def test_ticket328_affected_picks_the_tests_that_ran_the_changed_function():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "docs/design.md": "x\n"})
+    _edit328(root, "orqlib.py", "return 1", "return 11")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_a"} and r["reasons"] == ["orqlib.py: a -> 1 tests"], r
+    _edit328(root, "orqlib.py", "LIMIT = 3", "LIMIT = 4")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_a", "test_b", "test_c"}, "a module name reaches the defs that use it and the tests that read it as orq_mod.X"
+
+
+def test_ticket328_affected_runs_changed_tests_and_the_ones_behind_a_changed_helper():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n"})
+    _edit328(root, "test_orq.py", "assert orq_mod.LIMIT", "assert orq_mod.LIMIT > 0")
+    _edit328(root, "test_orq.py", "\n\nif __name__", "\n\ndef test_novo():\n    pass\n\n\nif __name__")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_c", "test_novo"}, "the changed test and the new one, which no map knows yet"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_b"}, "FAKE -> Env -> the tests that built an Env"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "README.md", "# x", "# y")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_readme"} and r["reasons"] == ["README.md: 1 tests mention it"], r
+
+
+def test_ticket328_affected_falls_back_to_the_full_suite_when_it_cannot_tell():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "tool.py": "def f():\n    pass\n"})
+    assert orq_mod.affected_tests(root, "main", {})["tests"] is None, "no map"
+    _edit328(root, "orqlib.py", "import os", "import os\nimport re")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "module-level line" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "tool.py", "pass", "return 1")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "tool.py: not in the test map" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    r = orq_mod.affected_tests(root, "main", {"tests": {"test_a": ["orqlib.py:a"]}})
+    assert r["tests"] is None and "no test in the map ran Env" in r["reasons"][-1], "a def the map has no test for (untested, import-time, newer than the map) runs everything"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    with open(os.path.join(root, "novo.md"), "w") as f:
+        f.write("x\n")
+    assert orq_mod.affected_tests(root, "main", MAP328)["reasons"] == ["novo.md: 0 tests mention it"], "an untracked file is part of the diff"
+    os.remove(os.path.join(root, "novo.md"))
+    _edit328(root, "orqlib.py", '"""doc"""', '"""the doc"""')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == set(), "the module docstring reaches nothing"
+
+
+def test_ticket328_orq_test_affected_runs_only_the_affected_tests():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "precompact.py": "def p():\n    pass\n"})
+    m = os.path.join(root, "..", os.path.basename(root) + "-map.json")
+    with open(m, "w") as f:
+        json.dump(MAP328, f)
+    _edit328(root, "orqlib.py", "return 2", "return 3")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", cwd=root)
+    assert (r.returncode, r.stdout) == (0, "test_orq.py test_c\n") and "1 affected tests" in r.stderr, r
+    _edit328(root, "precompact.py", "pass", "return 1")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", "-j", "2", cwd=root)
+    assert r.stdout == "test_orq.py -j 2 test_c\ntest_precompact.py\n", r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, cwd=root)
+    assert (r.returncode, r.stdout) == (0, "orq test: the diff against main touches no test\n"), r
+    r = Env().orq("test", cwd=tempfile.mkdtemp())
+    assert r.returncode != 0 and "no test_orq.py" in r.stderr, r
+
+
+def test_ticket328_the_caller_environment_does_not_reach_the_tests():
+    caller_home = tempfile.mkdtemp()
+    env = {**os.environ, "ORQ_HOOK_TIMEOUT": "15", "ORQ_HOME": caller_home, "ORCA_TERMINAL_HANDLE": "y", "CLAUDECODE": "1"}
+    alarm = ["test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm", "test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm", "test_guard_fails_open_and_logs",
+             "test_heartbeat_orca_down_passes", "test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pending",
+             "test_ticket134_run_that_really_stopped_is_still_detected_after_expiry", "test_ticket147_release_ends_only_processes_with_cwd_inside_worktree"]
+    r = subprocess.run([sys.executable, os.path.join(HERE, "test_orq.py"), "-j", "4", *alarm], env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and f"{len(alarm)}/{len(alarm)} testes passaram" in r.stdout, r.stdout[-3000:]
+    ignored = next(x for x in r.stdout.splitlines() if x.startswith("ignored from the environment: "))
+    assert {"CLAUDECODE", "ORCA_TERMINAL_HANDLE", "ORQ_HOME", "ORQ_HOOK_TIMEOUT"} <= set(ignored.split(": ", 1)[1].split(", ")), ignored
+    assert os.listdir(caller_home) == [], "nothing was written to the caller's ORQ_HOME"
+
+
+def test_ticket328_the_runner_flags_a_test_line_in_a_live_events_file():
+    p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+    with open(p, "w") as f:
+        f.write('{"type": "old"}\n')
+    before = {p: os.path.getsize(p)}
+    with open(p, "a") as f:
+        f.write('{"type": "entry", "text": "real work"}\n' + json.dumps({"type": "processes", "worktree": os.path.join(SUITE_TMP, "tmpx", "wt147")}) + "\n")
+    (leak,) = _leaks(before)
+    assert leak.startswith(p + ": ") and "wt147" in leak, leak
+
+
+if __name__ == "__main__":
+    opts = _suite_args(sys.argv[1:])
+    os.nice(10)  # the suite yields to interactive work (ticket 328)
+    tests = _pick([(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)], opts.names)
+    failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
+    for n in failures:
+        print(f"FALHOU  {n}")
+    if CALLER_ENV:
+        print(f"ignored from the environment: {', '.join(CALLER_ENV)}")
+    live = _live_events()
+    real_logs = log_snapshot(_real_logs())  # ticket 216: the legacy log too
+    with _suite_turn() if not opts.names else contextlib.nullcontext():
+        w0, c0 = time.time(), _cpu()
+        results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
+        wall, cpu = time.time() - w0, _cpu() - c0
+    if opts.names and not tests:
+        print(f"FALHOU  no test matches {' '.join(opts.names)}")
+        failures.append("no test")
+    if opts.map:
+        _write_map(opts.map, results, full=not opts.names)
+    failures += [n for n, r in results.items() if not r["ok"]]
+    for leak in _leaks(live):
+        print(f"FALHOU  a test wrote to a live events.jsonl: {leak}")
+        failures.append(leak)
     for leak in log_leaks(real_logs):  # ticket 216: the suite leaves the real events.jsonl as it found it
         failures.append(leak)
         print(f"FALHOU  isolation: {leak}")
-    print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram")
+    shutil.rmtree(SUITE_TMP, ignore_errors=True)
+    slow = sorted(results.items(), key=lambda x: -x[1]["s"])[:15]
+    print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
+    print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
