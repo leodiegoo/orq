@@ -70,6 +70,7 @@ CLEAN_SCRIPT = os.environ.get("ORQ_LIMPAR") or os.path.join(orqpaths.HERE, "scri
 CLEAN_DELAY_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # the same delay as the "merged" hook
 CLOSED_DAYS = float(os.environ.get("ORQ_FECHADO_DIAS") or 1)  # days between the task's last PR closed without merge and the automatic branch cleanup
 REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(PLAN, "relatorios")
+STEERS = os.environ.get("ORQ_STEERS") or os.path.join(PLAN, "steers")  # the long adjustments, one file each: <task>-<n>.md
 FINAL_BASE = os.environ.get("ORQ_FINAL_BASE")  # forces the base that closes out the branch; without it, the project's production applies (same as limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 ASK_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # how long `orq ask` waits for the answer before leaving the pending item open
@@ -127,8 +128,10 @@ SCREEN_QUESTIONS = (("trust", re.compile(r"trust (?:this|the files in this) fold
                   ("pergunta", re.compile(r"Enter to select|Type something|Chat about this", re.I)))  # o AskUserQuestion aberto
 SCREEN_FOOTER_MAX = 4  # non-empty lines after the options (menu footer) for the menu to still count as open
 WAIT_PHASE = re.compile(r"^\s*(?:esperando:|waiting\b[:\s.…-]*)\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
-STEER_READ_S = 90  # adjustment the dispatch has not read (`read` in the Orca inbox or the id in the worker's transcript) this long after sending, or after the last retype, is redelivered
-STEER_ATTEMPTS = 3  # retypes of the notice to the idle worker; without a read STEER_READ_S after the third, it becomes the "steer não lido" (unread steer) alert
+STEER_READ_S = 300  # adjustment with no receipt (read in the Orca inbox, the id in the worker's transcript, or `orq reply`) this long after sending, or after the retype, is typed again (ticket 350)
+STEER_ATTEMPTS = 1  # retypes of the line to the idle worker; without a receipt STEER_READ_S after it, it becomes the "steer not read" alert, the user's entry
+STEER_LINE = "orq: adjustment in "  # how the line of a long adjustment starts: the worker's prompt hook acks the inbox on it too
+STEER_FILE_MIN = 250  # an adjustment longer than this goes whole to STEERS/<task>-<n>.md and the message carries only a line with the path (Orca's notice cuts at 300)
 STEER_TRANSCRIPT_BYTES = 4_000_000  # the end of the worker's transcript where the steer message id is looked up
 STEER_WINDOW_S = 30 * 60  # a steer older than this leaves the tracking: the 200-message inbox no longer reaches it
 NOT_STARTED_S = 120  # a dispatch open with no turn recorded this long after the dispatch did not start (the worker-start that was left without Enter)
@@ -2020,6 +2023,38 @@ def record_turn(kind, ev, harness="claude"):
             del turns[k]
 
     _turns_mut(write)
+
+
+def worker_ack(ev):
+    """Prompt hook of a worker (and of the integrator, a service worker), ticket 350: confirms (`check --ack`) every batch of the terminal's inbox older than the newest message.
+
+    A worker that reads with `check` and never acks gets the oldest batch again at each reread (FIFO), so the newest message, a steer, never shows. The newest batch
+    stays open for the worker's own `check`. An older message the transcript does not cite (the worker never saw it) comes back in the context before it is confirmed.
+    Fail-open: the hook's output is the context text, or None."""
+    handle = os.environ["ORCA_TERMINAL_HANDLE"]
+    box = orca("check", "--terminal", handle, "--peek")["messages"]
+    if not box:
+        return None
+    newest, acked, res = box[-1].get("id"), [], orca("check", "--terminal", handle)
+    for _ in range(INBOX_BATCHES):
+        if not res.get("deliveryId") or any(m.get("id") == newest for m in res.get("messages") or []):
+            break
+        acked += res.get("messages") or []
+        res = orca("check", "--terminal", handle, "--ack", res["deliveryId"])
+    unseen = [m for m in acked if m.get("type") != "heartbeat"]
+    if unseen:
+        try:
+            with open(ev["transcript_path"], "rb") as f:
+                f.seek(max(0, f.seek(0, 2) - STEER_TRANSCRIPT_BYTES))
+                tail = f.read()
+        except (KeyError, OSError):
+            tail = b""
+        unseen = [m for m in unseen if str(m.get("id")).encode() not in tail]
+    if not acked:
+        return None
+    ln = [f"orq: the hook confirmed {len(acked)} older message(s) in your inbox, so your next `orca orchestration check` brings the newest."]
+    ln += [f"  not seen yet, {m.get('id')} {m.get('subject') or ''}: {str(m.get('body') or '')[:INBOX_BODY_HOOK]}" for m in unseen]
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}}
 
 
 def daily_report(base, created_ms):
@@ -5747,7 +5782,13 @@ def run_hook(kind, harness="claude"):
         if run is None:
             sid = ev.get("session_id") or ""
             if kind in ("prompt", "stop") and _roles().get(sid) == "worker":
-                record_turn(kind, ev, harness)  # the worker only records the turn: no Orca, no Run
+                record_turn(kind, ev, harness)  # the worker records the turn: no Run
+                if kind == "prompt" and (origin_name(ev.get("prompt")) == "orca" or (ev.get("prompt") or "").startswith(STEER_LINE)):
+                    try:
+                        if out := worker_ack(ev):
+                            print(json.dumps(out, ensure_ascii=False))
+                    except Exception as e:  # noqa: BLE001 - fail-open: without the ack the worker reads as before
+                        log(f"worker ack: {type(e).__name__}: {e}")
             if kind == "guard" and ev.get("tool_name") == "AskUserQuestion" and _roles().get(sid) == "worker":
                 print(json.dumps(guard_worker(), ensure_ascii=False))  # without Orca: the box opens in the terminal, where only whoever is watching sees it
                 return 0
@@ -6989,7 +7030,7 @@ def redeliver_steers(now_at=None):
 
     Only touches Orca with an overdue steer (STEER_READ_S after sending or after the last retype, and after the end of the worker's turn if it ended after that). A message with `read` in the inbox or cited in the
     worker's transcript (read_in_transcript): `steer_fim` (read).
-    A dispatch that already delivered: `steer_fim` (closed). Worker `stopped` (stopped; turn ended, per the hooks): retypes the notice with `type_text`, which does not type
+    A dispatch that already delivered: `steer_fim` (closed). Worker `stopped` (stopped; turn ended, per the hooks): retypes the steer's line (the notice, for a short one) with `type_text`, which does not type
     over a turn in progress or a draft and so does not spend the attempt. After STEER_ATTEMPTS retypes without a read it records the
     alert `steer_nao_lido` (summary and `orq agents`) and the steer leaves tracking. A busy worker gets nothing, as with the steer; a worker `perguntando` (asking; open question) neither: no notice and no alert."""
     now_at = now_at or datetime.now(timezone.utc)
@@ -7018,17 +7059,29 @@ def redeliver_steers(now_at=None):
         elif s["tentativas"] >= STEER_ATTEMPTS:
             append_event({"tipo": "alerta", "alerta": "steer_nao_lido", **base})
             line_list.append(f"{st.get('task')}: steer not read after {s['tentativas']} notices (alert recorded)")
-        elif agent_row["estado"] == "parado" and type_text(agent_row["terminal"], _worker_notice(agent_row["terminal"])) == "enviado":
+        elif agent_row["estado"] == "parado" and type_text(agent_row["terminal"], st.get("linha") or _worker_notice(agent_row["terminal"])) == "enviado":
             append_event({"tipo": "steer_reentrega", **base, "tentativa": s["tentativas"] + 1})
             line_list.append(f"{st.get('task')}: steer not read, notice retyped ({s['tentativas'] + 1}/{STEER_ATTEMPTS})")
     return line_list
 
 
+def _steer_receipt(target, text_value):
+    """`orq reply <task|msg_id> "<text>"` run by the worker: the receipt of its open steer (`steer_fim` read, source reply), or None if the target is no open steer."""
+    m, s = next(((m, s) for m, s in open_steers(read_events(), datetime.now(timezone.utc)).items() if target in (m, s["steer"].get("task"))), (None, None))
+    if not s:
+        return None
+    st = s["steer"]
+    return append_event({"tipo": "steer_fim", "msg_id": m, "task": st.get("task"), "dispatch": st.get("dispatch"), "run": st.get("run"), "motivo": "lido", "fonte": "reply", "texto": text_value})
+
+
 def reply_to(msg_id, text_value):
     """Replies to a worker's message (`orca orchestration reply`) through the manager's handle, first binding the message's Run.
+    A task or message id with an open steer is the worker confirming it (`_steer_receipt`): no Orca call.
 
     Orca only lets you reply from the terminal bound to the message's Run (consumer_fenced with the manager on another Run, seen on 29/09): the run comes from the inbox
     row and `orca()` binds the manager to it. A Run that neither the manager nor the coordinator holds is refused with the missing `run-use`."""
+    if receipt := _steer_receipt(msg_id, text_value):
+        return receipt
     line = next((x for x in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(x, dict) and x.get("id") == msg_id), None)
     if not line:
         raise ValueError(f"message {msg_id} is not among the 200 newest in the inbox")
@@ -7081,6 +7134,19 @@ def steer(task, text_value, run=None, entry=None):
         return _steer(task, text_value, target, entry, request)
 
 
+def _steer_line(task, body_text):
+    """(what goes in the message, the file or None): an adjustment over STEER_FILE_MIN goes whole to STEERS/<task>-<n>.md and the message carries one line with the path
+    and the request for `orq reply` (at most NOTICE_MAX with the usual paths, so `type_text` sends it whole; Orca's typed notice cuts the body at 300 characters, and a worker that does not ack rereads the oldest message: the text must fit)."""
+    if len(body_text) <= STEER_FILE_MIN:
+        return body_text, None
+    os.makedirs(STEERS, exist_ok=True)
+    n = len(glob.glob(os.path.join(glob.escape(STEERS), f"{glob.escape(task)}-*.md"))) + 1
+    file_path = os.path.join(STEERS, f"{task}-{n}.md")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(body_text + "\n")
+    return f'{STEER_LINE}{file_path}. Read it, then: orq reply {task} "<plan>"', file_path
+
+
 def _steer(task, text_value, target, entry, request):
     """The steer body, with the `target` Run already commanded by the coordinator (or with the refusal that explains what is missing)."""
     fenced = f"the coordinator must command the worker's Run: {bind_tip(target)}"
@@ -7090,12 +7156,14 @@ def _steer(task, text_value, target, entry, request):
     if not t:
         raise ValueError(f"task {task} does not exist in Run {target}")
     body_text = text_value if request is None else f"{text_value}\n\n{REQUEST_TITLE} (addition)\n{request}"
+    line, steer_file = _steer_line(task, body_text)
+    extra = {"arquivo": steer_file, "linha": line} if steer_file else {}
     if t.get("dispatch_id") in _hibernated():  # no terminal to receive it: the resume carries the adjustment (even for an already delivered task, which the hibernated worker can still follow)
-        r = wake(t["dispatch_id"], f"coordinator adjustment: {body_text}")
+        r = wake(t["dispatch_id"], f"coordinator adjustment: {line}")
         if r["estado"] == "falhou":
             raise ValueError(f"the worker is hibernated and did not wake: {r['aviso']}")
         ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": target, "texto": text_value, "acordado": r["estado"],
-                           **({"pedido": request} if request is not None else {})})
+                           **({"pedido": request} if request is not None else {}), **extra})
         if entry:
             intake(entry, "steer", task, run=target)
         return ev
@@ -7105,7 +7173,7 @@ def _steer(task, text_value, target, entry, request):
         raise ValueError(f"task {task} is {t.get('status')}, not dispatched: no worker to receive the adjustment")
     try:
         res = orca("send", "--run", target, "--to", f"dispatch:{t['dispatch_id']}", "--subject", "Adjustment",
-                   "--body", body_text, "--priority", "high", timeout=10)
+                   "--body", line, "--priority", "high", timeout=10)
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
     msg = res.get("message") or res
@@ -7115,11 +7183,11 @@ def _steer(task, text_value, target, entry, request):
     handle = _dispatch_terminal(target, t["dispatch_id"])
     delivery = "orca" if _orca_notified(msg.get("id")) else type_text(handle, _worker_notice(handle)) if handle else "sem_terminal"
     if delivery == "ocupado":
-        delivery = type_text_busy(handle, _adjustment_notice(handle, text_value))
+        delivery = type_text_busy(handle, line if steer_file else _adjustment_notice(handle, text_value))
         if delivery == "ocupado_digitado":
             append_event({"tipo": "steer_digitado_ocupado", "task": task, "dispatch": t["dispatch_id"], "run": target, "msg_id": msg.get("id")})
     ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": target, "texto": text_value, "msg_id": msg.get("id"),
-                       **({"pedido": request} if request is not None else {}), **({"aviso_terminal": delivery} if delivery != "ocupado" else {})})
+                       **({"pedido": request} if request is not None else {}), **({"aviso_terminal": delivery} if delivery != "ocupado" else {}), **extra})
     if entry:
         intake(entry, "steer", task, run=target)
     return ev
@@ -8257,9 +8325,14 @@ def agents(run=None, include_all=False, now_at=None):
                         {d: a["pergunta"] for d, a in screens_read.items() if a["pergunta"]}, hib, limits={d: a["limite"] for d, a in screens_read.items() if a["limite"]},
                         paused=_dict(_cursor_ro().get("pausados")))
     unread_ids = {e.get("dispatch") for e in recent_alerts(events, now_at, agent_rows) if e.get("alerta") == "steer_nao_lido"}
+    sent_at = {}
+    for s in open_steers(events, now_at).values():
+        sent_at.setdefault(s["steer"].get("dispatch"), s["steer"]["ts"])  # the oldest open one
     for a in agent_rows:
         if a["dispatch"] in unread_ids:
             a["alerta"] = "steer not read"
+        elif a["dispatch"] in sent_at and a.get("estado") not in ("entregue", "liberado"):
+            a["steer_sem_recibo_min"] = int((now_at - _ts(sent_at[a["dispatch"]])).total_seconds() // 60)
         a["prioridade"] = priority_of(events, a["task"], a["dispatch"], a.get("titulo"))
     return agent_rows if include_all else [a for a in agent_rows if not (a.get("titulo") or "").startswith(PROOF_PREFIX)]
 
@@ -8308,8 +8381,10 @@ def agents_text(agent_rows):
             p = a["pergunta"]
             line_list.append(f"            QUESTION ON SCREEN ({p['tipo']}): {p['texto']} [{' | '.join(f'{n}) {r}' for n, r in p['opcoes'])}]")
             line_list.append(f'            -> orq answer-screen {a["task"]} <option>')
+        if a.get("steer_sem_recibo_min") is not None:
+            line_list.append(f"            steer without receipt for {a['steer_sem_recibo_min']} min")
         if a.get("alerta"):
-            line_list.append(f"            ALERT: {a['alerta']} (the worker did not read the adjustment after {STEER_ATTEMPTS} notices; a check without --ack hides the new messages)")
+            line_list.append(f"            ALERT: {a['alerta']} (the worker did not read the adjustment after {STEER_ATTEMPTS} retype; a check without --ack hides the new messages)")
         if a["estado"] == "sem_terminal":
             line_list.append("            -> orq resume --dry-run (the terminal vanished before worker_done; the steer has nowhere to land)")
         elif a["estado"] in ("travado", "nao_comecou", "parado"):

@@ -2,6 +2,7 @@
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
 import argparse
 import contextlib
+import glob
 import hashlib
 import json
 import os
@@ -216,7 +217,9 @@ if cmd == "check":
     # confirmadas do mesmo tipo; o check repete a entrega em aberto até o --ack; o --ack confirma o lote e já devolve o próximo;
     # confirmar de novo o mesmo id repete a entrega atual; id desconhecido é stale_delivery
     target = opt("--run")
-    if bound is None or (target and target != bound):
+    if opt("--terminal") and not target:
+        target = "term:" + opt("--terminal")  # o worker lê a própria caixa (`check --terminal`): o run_id "term:<handle>" guarda as mensagens dele; não depende de Run ligado
+    elif bound is None or (target and target != bound):
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "This coordinator terminal is no longer bound to Run " + str(target)}})); sys.exit(0)
     if os.environ.get("FAKE_FAIL_ACK") and "--ack" in a:
         failure("falhou --ack")
@@ -458,7 +461,7 @@ class Env:
         os.chmod(self.bin, 0o755)
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
-                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
+                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_STEERS": os.path.join(t, "steers"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
                     "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.machine()
@@ -5395,7 +5398,7 @@ def test_ticket74_steer_to_worker_mid_turn_types_notice_with_summary_and_records
     assert ev["aviso_terminal"] == "ocupado_digitado", ev
 
 
-def test_ticket74_typed_notice_has_the_cap_and_file_stores_summary_up_to_300_chars_in_one_line():
+def test_ticket74_typed_notice_has_the_cap_and_a_long_adjustment_goes_to_its_file_with_a_one_line_notice():
     a = Env()
     a.set("busy.json", ["term_w1"])
     a.set("screens.json", {"term_w1": ["esc to interrupt"]})
@@ -5406,8 +5409,9 @@ def test_ticket74_typed_notice_has_the_cap_and_file_stores_summary_up_to_300_cha
     (env,) = _sent_notices(a, "term_w1")
     text_value = env[env.index("--text") + 1]
     assert "\n" not in text_value and len(text_value) <= orq_mod.NOTICE_MAX, text_value  # ticket 98: what was typed fits within the cap
-    full_text = open(text_value.split("full text at ")[1], encoding="utf-8").read()  # and the quoted file keeps the summary of the adjustment (STEER_NOTICE_MAX)
-    assert "x" * 250 in full_text and "x" * 301 not in full_text, full_text
+    assert text_value.startswith(orq_mod.STEER_LINE), text_value  # ticket 350: over 250 characters the notice is the line with the path, not a cut of the text
+    full_text = open(text_value[len(orq_mod.STEER_LINE):].split(". Read it")[0], encoding="utf-8").read()
+    assert "x" * 900 in full_text, full_text
 
 
 def test_ticket74_steer_to_busy_worker_does_not_type_over_draft_or_menu():
@@ -5906,18 +5910,18 @@ def _typed_26(a):
     return [e[e.index("--text") + 1] for e in _sent_notices(a, "term_w1")]
 
 
-def test_ticket26_no_reading_after_90_s_with_stopped_worker_retypes_notice():
+def test_ticket26_no_reading_after_5_min_with_stopped_worker_retypes_notice():
     a = Env()
     _steer_26(a)
-    assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "menos de 90 s: ainda dá tempo de ler"
-    _age_26(a, 100)
+    assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "menos de 300 s: ainda dá tempo de ler"
+    _age_26(a, 350)
     r = a.orq("steers")
     assert r.returncode == 0, r.stderr
     (text_value,) = _typed_26(a)
     assert text_value.startswith("You have 1 orchestration message.") and "check --terminal term_w1" in text_value, text_value
     (ev,) = [e for e in a.events() if e["tipo"] == "steer_reentrega"]
     assert (ev["msg_id"], ev["dispatch"], ev["tentativa"]) == ("msg_9", "ctx_1", 1), ev
-    assert _typed_26(a) == [text_value] and a.orq("steers").returncode == 0 and len(_typed_26(a)) == 1, "a tentativa recomeça a contagem dos 90 s"
+    assert _typed_26(a) == [text_value] and a.orq("steers").returncode == 0 and len(_typed_26(a)) == 1, "a tentativa recomeça a contagem dos 300 s"
 
 
 def test_ticket26_busy_worker_receives_nothing():
@@ -5935,21 +5939,20 @@ def test_ticket26_busy_worker_receives_nothing():
     assert not [e for e in b.events() if e["tipo"] == "alerta"]
 
 
-def test_ticket26_third_failure_writes_alert_and_stops_typing():
+def test_ticket26_failed_retry_writes_alert_and_stops_typing():
     a = Env()
     _steer_26(a)
-    for _ in range(3):
-        _age_26(a, 100)
-        assert a.orq("steers").returncode == 0
-    assert len(_typed_26(a)) == 3 and not [e for e in a.events() if e["tipo"] == "alerta"], "três tentativas, ainda sem alerta"
-    _age_26(a, 100)
+    _age_26(a, 350)
+    assert a.orq("steers").returncode == 0
+    assert len(_typed_26(a)) == 1 and not [e for e in a.events() if e["tipo"] == "alerta"], "uma tentativa, ainda sem alerta"
+    _age_26(a, 350)
     r = a.orq("steers")
     assert "steer not read" in r.stdout, r.stdout
     (al,) = [e for e in a.events() if e["tipo"] == "alerta"]
     assert (al["alerta"], al["task"], al["dispatch"], al["run"], al["msg_id"]) == ("steer_nao_lido", "task_rodando", "ctx_1", "run_a", "msg_9"), al
-    _age_26(a, 100)
+    _age_26(a, 350)
     a.orq("steers")
-    assert len(_typed_26(a)) == 3 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
+    assert len(_typed_26(a)) == 1 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
     assert "steer not read" in a.orq("status").stdout, "o resumo carrega o alerta"
     agent_row = _agents(a)["ctx_1"]
     assert agent_row["alerta"] == "steer not read", agent_row
@@ -5961,29 +5964,28 @@ def test_ticket26_third_failure_writes_alert_and_stops_typing():
 def test_ticket118_worker_with_open_question_receives_neither_notice_nor_alert():
     a = Env()
     _steer_26(a)
-    for _ in range(3):
-        _age_26(a, 100)
-        assert a.orq("steers").returncode == 0
-    assert len(_typed_26(a)) == 3
+    _age_26(a, 350)
+    assert a.orq("steers").returncode == 0
+    assert len(_typed_26(a)) == 1
     _inbox(a, _ask_question(950, "ctx_1"), {"id": "msg_9", "run_id": "run_a", "type": "status", "priority": "high", "subject": "Ajuste", "body": "x",
                                           "payload": None, "from_handle": "term_coord", "to_handle": "dispatch:ctx_1", "read": 0, "sequence": 900,
                                           "created_at": _iso(-5), "delivered_at": None})
-    _age_26(a, 100)
+    _age_26(a, 350)
     r = a.orq("steers")
     assert r.returncode == 0 and "steer not read" not in r.stdout, r.stdout
     assert not [e for e in a.events() if e["tipo"] == "alerta"], "a pergunta aberta é a razão do silêncio: sem alerta"
-    assert len(_typed_26(a)) == 3
+    assert len(_typed_26(a)) == 1
 
 
 def test_ticket26_no_redelivery_after_reading():
     a = Env()
     _steer_26(a)
-    _age_26(a, 100)
+    _age_26(a, 350)
     a.orq("steers")
     assert len(_typed_26(a)) == 1
     _line_26(a, read_text=1)  # o worker rodou o check
     for _ in range(4):
-        _age_26(a, 100)
+        _age_26(a, 350)
         assert a.orq("steers").returncode == 0
     assert len(_typed_26(a)) == 1 and not [e for e in a.events() if e["tipo"] == "alerta"], "lido: sem nova tentativa e sem alerta"
     assert [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "orca")]
@@ -6007,13 +6009,13 @@ def test_ticket26_worker_that_read_by_check_without_ack_counts_as_read_by_transc
     a = Env()
     _steer_26(a)  # read stays 0: the worker's check did not confirm the delivery (seen in the real Orca)
     env = _transcribed_26(a, 'tool_result {"messages": [{"id": "msg_9", "subject": "Ajuste"}]}')
-    _age_26(a, 100)
+    _age_26(a, 350)
     assert a.orq("steers", **env).returncode == 0
     assert _typed_26(a) == [] and [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "transcrito")]
     b = Env()
     _steer_26(b)
     env = _transcribed_26(b, "o worker rodou outra coisa e não viu o ajuste")
-    _age_26(b, 100)
+    _age_26(b, 350)
     assert b.orq("steers", **env).returncode == 0 and len(_typed_26(b)) == 1, "transcrito sem o id: não leu"
 
 
@@ -6059,7 +6061,7 @@ def test_ticket26_manager_panel_redelivers_every_round():
     a.set("busy.json", [])
     _stopped_26(a)
     _line_26(a)
-    _age_26(a, 100)
+    _age_26(a, 350)
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0 and len(_typed_26(a)) == 1 and "task_rodando" in r.stdout and "retyped" in r.stdout, (r.stdout, r.stderr)
 
@@ -6073,10 +6075,10 @@ def test_ticket99_tolerance_runs_from_end_of_turn_that_exceeded_tolerance():
         _line_26(a)
         _age_26(a, 500)  # the steer went out 500 s ago, the long turn only ended now
         return a
-    a = envs(70)  # idle (>= STOPPED_S) but within the 90 s of the end of the turn
+    a = envs(70)  # idle (>= STOPPED_S) but within the 300 s of the end of the turn
     assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "turno acabou há 70 s: ainda dentro da tolerância"
-    b = envs(100)
-    assert b.orq("steers").returncode == 0 and len(_typed_26(b)) == 1, "turno acabou há 100 s sem leitura: redigita"
+    b = envs(350)
+    assert b.orq("steers").returncode == 0 and len(_typed_26(b)) == 1, "turno acabou há 350 s sem leitura: redigita"
     c = envs(70)
     env = _transcribed_26(c, "msg_9 lida")
     _write_state(os.path.join(c.home, "turnos.json"), {"ctx_1": {"task": "task_rodando", "sessao": "sess26", "inicio": now_iso(-600), "fim": now_iso(-70)}})
@@ -6084,7 +6086,130 @@ def test_ticket99_tolerance_runs_from_end_of_turn_that_exceeded_tolerance():
 
 
 def test_ticket26_named_constants():
-    assert (orq_mod.STEER_READ_S, orq_mod.STEER_ATTEMPTS) == (90, 3)
+    assert (orq_mod.STEER_READ_S, orq_mod.STEER_ATTEMPTS, orq_mod.STEER_FILE_MIN) == (300, 1, 250)
+
+
+LONG_350 = "ajuste longo: " + "x" * 586  # 600 characters: more than Orca's notice carries
+
+
+def _long_steer_350(a, text_value=LONG_350, **env):
+    """A steer of `text_value` to the idle worker term_w1 that Orca did not notify (orq types the notice); returns the finished command."""
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    _steer_env(a)
+    r = a.orq("steer", "task_rodando", text_value, **env)
+    assert r.returncode == 0, r.stderr
+    _line_26(a)
+    _stopped_26(a)
+    return r
+
+
+def _worker_box_350(a, *batches):
+    """The mailbox of worker term_w1 with `batches` (one message each, a different type per batch, so Orca delivers each one alone), oldest first."""
+    for i, (type_name, body_text) in enumerate(batches):
+        a.inbox((type_name, {}), run="term:term_w1")
+        cx = json.load(open(os.path.join(a.fake, "mailbox.json")))
+        cx["msgs"][-1].update({"id": f"msg_w{i}", "subject": type_name, "body": body_text})
+        json.dump(cx, open(os.path.join(a.fake, "mailbox.json"), "w"))
+
+
+def _worker_check_350(a):
+    """What the worker sees on its own `orca orchestration check --terminal term_w1` (the batch Orca replays)."""
+    p = subprocess.run([a.bin, "orchestration", "check", "--terminal", "term_w1", "--json"], capture_output=True, text=True, env={**a.env, "ORCA_TERMINAL_HANDLE": "term_w1"})
+    return json.loads(p.stdout)["result"]
+
+
+def test_ticket350_worker_hook_acks_old_batches_so_long_steer_arrives_whole():
+    a = Env()
+    _long_steer_350(a)
+    (sent,) = _sent(a)
+    body_text = sent[sent.index("--body") + 1]
+    _worker_box_350(a, ("status", "velha 1"), ("dispatch", "velha 2"), ("status", "velha 3"), ("handoff", body_text))
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    notice = "You have 1 orchestration message. Run `orca orchestration check --terminal term_w1`."
+    r = a.orq("hook", "prompt", stdin=json.dumps({"prompt": notice, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert r.returncode == 0, r.stderr
+    seen = _worker_check_350(a)["messages"]
+    assert [m["id"] for m in seen] == ["msg_w3"], "the worker's first re-read brings the newest message, not the oldest unconfirmed batch"
+    (arquivo,) = glob.glob(os.path.join(a.tmp.name, "steers", "task_rodando-*.md"))
+    assert seen[0]["body"] == body_text and arquivo in body_text and "orq reply" in body_text and len(body_text) <= 250, body_text
+    assert open(arquivo, encoding="utf-8").read().startswith(LONG_350), "the whole adjustment is in the file"
+    assert [a.states()[f"msg_w{i}"] for i in range(3)] == ["acked"] * 3 and a.states()["msg_w3"] != "acked", "the newest stays unconfirmed for the worker's own check"
+
+
+def test_ticket350_worker_hook_shows_old_message_the_worker_never_saw():
+    a = Env()
+    _worker_box_350(a, ("status", "ajuste que o worker nunca viu"), ("handoff", "novo"))
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    notice = "You have 1 orchestration message. Run `orca orchestration check --terminal term_w1`."
+    r = a.orq("hook", "prompt", stdin=json.dumps({"prompt": notice, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert "ajuste que o worker nunca viu" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
+    assert a.states()["msg_w0"] == "acked"
+
+
+def test_ticket350_worker_hook_also_acks_on_the_retyped_steer_line_and_ignores_plain_prompts():
+    a = Env()
+    _worker_box_350(a, ("status", "velha"), ("handoff", "nova"))
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    hook = lambda prompt: a.orq("hook", "prompt", stdin=json.dumps({"prompt": prompt, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert hook("continua o que estava fazendo").returncode == 0 and a.states()["msg_w0"] != "acked", "a plain prompt does not touch Orca"
+    assert hook(orq_mod.STEER_LINE + '/x/task_rodando-1.md. Read it, then: orq reply task_rodando "<plan>"').returncode == 0
+    assert a.states()["msg_w0"] == "acked" and a.states()["msg_w1"] != "acked"
+
+
+def test_ticket350_short_steer_goes_as_it_is_and_long_ones_number_their_files():
+    a = Env()
+    _long_steer_350(a, "use o índice novo")
+    (sent,) = _sent(a)
+    assert sent[sent.index("--body") + 1] == "use o índice novo" and not os.path.exists(os.path.join(a.tmp.name, "steers"))
+    _long_steer_350(a)
+    _long_steer_350(a, LONG_350.replace("x", "y"))
+    assert sorted(os.path.basename(f) for f in glob.glob(os.path.join(a.tmp.name, "steers", "*.md"))) == ["task_rodando-1.md", "task_rodando-2.md"]
+    assert [e["file"] for e in map(lambda e: json.loads(e), open(os.path.join(a.home, "events.jsonl"))) if e.get("type") == "steer" and e.get("file")] == [
+        os.path.join(a.tmp.name, "steers", "task_rodando-1.md"), os.path.join(a.tmp.name, "steers", "task_rodando-2.md")]
+
+
+def test_ticket350_no_receipt_in_5_min_types_the_same_line_then_second_miss_is_a_user_alert():
+    a = Env()
+    _long_steer_350(a)
+    typed_first = _typed_26(a)
+    _age_26(a, 250)
+    assert a.orq("steers").returncode == 0 and _typed_26(a) == typed_first, "under 5 min: still time to read"
+    _age_26(a, 100)
+    r = a.orq("steers")
+    assert r.returncode == 0, r.stderr
+    (steer_ev,) = [e for e in a.events() if e["tipo"] == "steer"]
+    typed = _typed_26(a)
+    assert len(typed) == len(typed_first) + 1 and typed[-1].startswith(steer_ev["linha"][:100]), typed
+    assert [e["tentativa"] for e in a.events() if e["tipo"] == "steer_reentrega"] == [1], "the retry goes to the timeline"
+    _age_26(a, 350)
+    assert "steer not read" in a.orq("steers").stdout
+    assert [e["alerta"] for e in a.events() if e["tipo"] == "alerta"] == ["steer_nao_lido"] and len(_typed_26(a)) == len(typed), "no third typing: it became the user's entry"
+
+
+def test_ticket350_worker_orq_reply_is_the_receipt():
+    a = Env()
+    _long_steer_350(a)
+    _age_26(a, 350)
+    r = a.orq("reply", "task_rodando", "li o arquivo, sigo")
+    assert r.returncode == 0, r.stderr
+    (fim,) = [e for e in a.events() if e["tipo"] == "steer_fim"]
+    assert (fim["motivo"], fim["fonte"], fim["task"]) == ("lido", "reply", "task_rodando"), fim
+    a.orq("steers")
+    assert not [e for e in a.events() if e["tipo"] in ("steer_reentrega", "alerta")]
+
+
+def test_ticket350_agents_shows_steer_without_receipt_per_worker():
+    a = Env()
+    _long_steer_350(a)
+    assert "steer without receipt" not in a.orq("agents").stdout or "for 0 min" in a.orq("agents").stdout
+    _age_26(a, 400)
+    out = a.orq("agents").stdout
+    assert "steer without receipt for 6 min" in out, out
+    a.orq("reply", "task_rodando", "ok")
+    assert "steer without receipt" not in a.orq("agents").stdout
 
 
 def test_ticket26_reply_links_question_run_and_replies_through_manager():
