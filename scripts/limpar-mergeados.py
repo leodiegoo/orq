@@ -20,43 +20,43 @@ HOME = os.path.expanduser("~")
 KEEP_FILE = os.path.join(HOME, ".claude/scripts/limpar-mergeados.keep")
 LAST = os.path.join(HOME, ".claude/logs/limpar-mergeados.last.json")
 PROTECTED = set()  # as branches que nunca se apagam: o main() preenche com os ambientes do projeto (`fluxo_do_repo`), o self-test com os do exemplo
-ORFA_OCIOSA_H = 24  # worktree órfã só sai depois deste tempo sem atividade
+ORPHAN_IDLE_H = 24  # worktree órfã só sai depois deste tempo sem atividade
 ORQ = os.path.join(HOME, ".claude/orq/orq.py")
 ORQ_DIR = os.path.dirname(ORQ)
-RELATORIOS = os.environ.get("ORQ_RELATORIOS") or os.path.join(HOME, ".claude/orquestrador-plan/relatorios")
+REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(HOME, ".claude/orquestrador-plan/relatorios")
 # Escritos pelo próprio worker a pedido do orq: não são trabalho do worker (caminhos relativos à raiz da worktree).
-ARTEFATOS_ORQ = ("PAUSE.md", "HANDOFF.md", "final-report*.md", ".scratch/*/final-report.md",
+ORQ_ARTIFACTS = ("PAUSE.md", "HANDOFF.md", "final-report*.md", ".scratch/*/final-report.md",
                  "PAUSA.md", "PASSAGEM.md", "relatorio*.md", ".scratch/*/relatorio-final.md")  # os nomes pt: worker que segue o spec antigo
 
 
-def fluxo_do_repo(repo):
+def repo_flow(repo):
     """{producao, ambientes} do projeto desse repositório, lido do orq (`orq flow --repo`): em um fluxo de promoção a mesma branch vai por PR a cada ambiente e só
     o merge na produção a encerra. ORQ_FINAL_BASE e ORQ_PROTECTED_BRANCHES (lista separada por vírgula) forçam um dos dois. Sem o orq, a branch padrão do remoto."""
-    fx = None
+    flow_info = None
     try:
         r = run([sys.executable, ORQ, "flow", "--repo", repo, "--json"])
-        fx = json.loads(r.stdout) if r.returncode == 0 else None
+        flow_info = json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
-    if not fx:
+    if not flow_info:
         ref = run(["git", "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo).stdout.strip().removeprefix("origin/")
-        fx = {"producao": ref, "ambientes": [ref] if ref else []}
+        flow_info = {"producao": ref, "ambientes": [ref] if ref else []}
     if os.environ.get("ORQ_FINAL_BASE"):
-        fx["producao"] = os.environ["ORQ_FINAL_BASE"]
+        flow_info["producao"] = os.environ["ORQ_FINAL_BASE"]
     if os.environ.get("ORQ_PROTECTED_BRANCHES"):
-        fx["ambientes"] = os.environ["ORQ_PROTECTED_BRANCHES"].split(",")
-    return fx
+        flow_info["ambientes"] = os.environ["ORQ_PROTECTED_BRANCHES"].split(",")
+    return flow_info
 
 
-def is_final(pr, branch, fx):
+def is_final(pr, branch, flow_info):
     """O merge que encerra a branch: na produção do projeto, ou o de uma merge/<feature>-<ambiente> no próprio ambiente."""
-    return pr["baseRefName"] == fx["producao"] or (branch.startswith("merge/") and pr["baseRefName"] in fx["ambientes"])
+    return pr["baseRefName"] == flow_info["producao"] or (branch.startswith("merge/") and pr["baseRefName"] in flow_info["ambientes"])
 
 
-def pr_final(prs, branch, fx):
+def pr_final(prs, branch, flow_info):
     """O PR mergeado mais novo que encerra a branch, ou None."""
-    finais = [p for p in prs if is_final(p, branch, fx)]
-    return max(finais, key=lambda p: p["number"]) if finais else None
+    final = [p for p in prs if is_final(p, branch, flow_info)]
+    return max(final, key=lambda p: p["number"]) if final else None
 
 
 def run(args, cwd=None):
@@ -75,27 +75,27 @@ def is_kept(branch, patterns):
     return any(fnmatch.fnmatchcase(branch, p) for p in patterns)
 
 
-def sujeira(where):
+def dirt(where):
     """(bloqueios, artefatos) da worktree: linhas do `git status` que seguram a remoção, e caminhos de artefatos do orq não rastreados.
     Só arquivo não rastreado pode ser artefato; qualquer outro (modificado, staged, apagado) ou não rastreado de outro nome bloqueia."""
-    bloqueios, artefatos = [], []
+    blockers, artifacts = [], []
     for l in run(["git", "status", "--porcelain", "-uall"], where).stdout.splitlines():
-        caminho = l[3:].strip('"')
-        if l.startswith("?? ") and any(fnmatch.fnmatchcase(caminho, p) and (p.startswith(".scratch/") or "/" not in caminho) for p in ARTEFATOS_ORQ):
-            artefatos.append(caminho)
+        path = l[3:].strip('"')
+        if l.startswith("?? ") and any(fnmatch.fnmatchcase(path, p) and (p.startswith(".scratch/") or "/" not in path) for p in ORQ_ARTIFACTS):
+            artifacts.append(path)
         else:
-            bloqueios.append(l)
-    return bloqueios, artefatos
+            blockers.append(l)
+    return blockers, artifacts
 
 
-def guardar(where, artefatos, dest=None):
+def store(where, artifacts, dest=None):
     """Copia os artefatos para RELATORIOS/<worktree>-<arquivo> (a `/` do caminho vira `-`) e devolve os destinos. Levanta OSError se uma cópia falhar."""
-    dest = dest or RELATORIOS
+    dest = dest or REPORTS
     os.makedirs(dest, exist_ok=True)
-    nome = os.path.basename(where.rstrip("/"))
+    item_name = os.path.basename(where.rstrip("/"))
     out = []
-    for c in artefatos:
-        d = os.path.join(dest, f"{nome}-{c.replace('/', '-')}")
+    for c in artifacts:
+        d = os.path.join(dest, f"{item_name}-{c.replace('/', '-')}")
         shutil.copy2(os.path.join(where, c), d)
         out.append(d)
     return out
@@ -128,7 +128,7 @@ def decide(f):
     return "remove", "merged PR and no pending work"
 
 
-def decide_orfa(f):
+def decide_orphan(f):
     """Worktree sem PR mergeado. Só sai se nada nela se perde: todo commit já está na main (cherry sem "+", p.ex. cherry-pick), árvore limpa,
     nenhum worker vivo do orq (`busy` None, sem resposta do orq, conta como vivo) e sem atividade recente (worktree que acabou de nascer também não tem commit)."""
     if f["branch"] in PROTECTED or f["branch"].startswith("prototype/") or f["kept"]:
@@ -142,7 +142,7 @@ def decide_orfa(f):
     if f["busy"] is not False:
         return "skip", "a live orq worker uses the worktree"
     if f["recente"]:
-        return "skip", f"activity in the last {ORFA_OCIOSA_H} h"
+        return "skip", f"activity in the last {ORPHAN_IDLE_H} h"
     return "remove", "no commit outside main, clean tree and no worker"
 
 
@@ -180,9 +180,9 @@ def self_test_git():
         # squash: patch-id não casa; só HEAD == headRefOid do PR prova que nada ficou de fora
         tip = g("rev-parse", "feat/x")
         prs = [{"number": 5, "baseRefName": "development"}, {"number": 3, "baseRefName": "main"}, {"number": 4, "baseRefName": "main"}]
-        fx = {"producao": "main", "ambientes": ["development", "staging", "main"]}
-        assert pr_final(prs, "feat/x", fx)["number"] == 4 and pr_final(prs[:1], "feat/x", fx) is None  # development não encerra; o maior em main vence
-        assert pr_final(prs[:1], "merge/feat-development", fx)["number"] == 5 and pr_final(prs[:1], "feat/merge/x", fx) is None
+        flow_info = {"producao": "main", "ambientes": ["development", "staging", "main"]}
+        assert pr_final(prs, "feat/x", flow_info)["number"] == 4 and pr_final(prs[:1], "feat/x", flow_info) is None  # development não encerra; o maior em main vence
+        assert pr_final(prs[:1], "merge/feat-development", flow_info)["number"] == 5 and pr_final(prs[:1], "feat/merge/x", flow_info) is None
         assert pr_final(prs, "feat/x", {"producao": "trunk", "ambientes": ["trunk"]}) is None  # a produção vem do projeto, não de um nome fixo
         assert not is_ahead("origin/nope", "feat/x", d, tip)  # HEAD == headRefOid do PR
         assert is_ahead("origin/nope", "feat/x", d, "0" * 40)
@@ -197,7 +197,7 @@ def self_test_git():
         g("worktree", "remove", "--force", wt)
 
 
-def self_test_sujeira():
+def self_test_dirt():
     import tempfile
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as rel:
         def g(*a):
@@ -205,38 +205,38 @@ def self_test_sujeira():
             assert r.returncode == 0, r.stderr
         g("init", "-q", "-b", "main")
         open(f"{d}/a", "w").write("a"); g("add", "a"); g("commit", "-qm", "a")
-        assert sujeira(d) == ([], [])
+        assert dirt(d) == ([], [])
         os.makedirs(f"{d}/.scratch/feat")
         for n in ("PAUSA.md", "relatorio-final.md", "PASSAGEM.md", ".scratch/feat/relatorio-final.md"):
             open(f"{d}/{n}", "w").write(n)
-        bl, ar = sujeira(d)  # worktree só com artefatos do orq: nada bloqueia
+        bl, ar = dirt(d)  # worktree só com artefatos do orq: nada bloqueia
         assert bl == [] and sorted(ar) == [".scratch/feat/relatorio-final.md", "PASSAGEM.md", "PAUSA.md", "relatorio-final.md"], (bl, ar)
         assert decide(dict(branch="feat/a", kind="worktree", kept=False, merged=True, open_head=False, dirty=bool(bl), ahead=False))[0] == "remove"
-        guardados = guardar(d, ar, rel)  # copiados antes de remover
-        assert sorted(os.listdir(rel)) == sorted(f"{os.path.basename(d)}-{c.replace('/', '-')}" for c in ar) and len(guardados) == 4
+        stored = store(d, ar, rel)  # copiados antes de remover
+        assert sorted(os.listdir(rel)) == sorted(f"{os.path.basename(d)}-{c.replace('/', '-')}" for c in ar) and len(stored) == 4
         assert open(f"{rel}/{os.path.basename(d)}-PAUSA.md").read() == "PAUSA.md"
         open(f"{d}/notas.md", "w").write("x")  # qualquer outro não rastreado bloqueia
-        bl, ar = sujeira(d)
+        bl, ar = dirt(d)
         assert bl == ["?? notas.md"] and len(ar) == 4
         assert decide(dict(branch="feat/a", kind="worktree", kept=False, merged=True, open_head=False, dirty=True, ahead=False))[0] == "skip"
         os.remove(f"{d}/notas.md")
         open(f"{d}/a", "w").write("mod")  # tracked modificado bloqueia; artefato com o mesmo nome fora do padrão também
-        assert sujeira(d)[0] == [" M a"]
+        assert dirt(d)[0] == [" M a"]
         g("checkout", "-q", "a")
         os.makedirs(f"{d}/src"); open(f"{d}/src/PAUSA.md", "w").write("x")
-        assert sujeira(d)[0] == ["?? src/PAUSA.md"]  # só a raiz vale; subpasta é arquivo do worker
+        assert dirt(d)[0] == ["?? src/PAUSA.md"]  # só a raiz vale; subpasta é arquivo do worker
 
 
 def self_test():
     PROTECTED.update({"main", "development", "staging"})  # os ambientes do exemplo; no uso real vêm do projeto
     self_test_git()
-    self_test_sujeira()
-    orfa = dict(branch="feat/o", kept=False, open_head=False, dirty=False, ahead=False, busy=False, recente=False)
-    assert decide_orfa(orfa)[0] == "remove"  # cherry-pick: sem commit "+", árvore limpa, sem worker
+    self_test_dirt()
+    orphan = dict(branch="feat/o", kept=False, open_head=False, dirty=False, ahead=False, busy=False, recente=False)
+    assert decide_orphan(orphan)[0] == "remove"  # cherry-pick: sem commit "+", árvore limpa, sem worker
     for k, v in dict(branch="main", kept=True, open_head=True, dirty=True, ahead=True, busy=True, recente=True).items():
-        assert decide_orfa({**orfa, k: v})[0] == "skip", k
-    assert decide_orfa({**orfa, "branch": "prototype/2039-x"})[0] == "skip"  # prototype nunca, mesmo fora do .keep
-    assert decide_orfa({**orfa, "busy": None})[0] == "skip"  # sem resposta do orq sobre workers, na dúvida não apaga
+        assert decide_orphan({**orphan, k: v})[0] == "skip", k
+    assert decide_orphan({**orphan, "branch": "prototype/2039-x"})[0] == "skip"  # prototype nunca, mesmo fora do .keep
+    assert decide_orphan({**orphan, "busy": None})[0] == "skip"  # sem resposta do orq sobre workers, na dúvida não apaga
     assert is_kept("prototype/2039-x", ["prototype/*"]) and not is_kept("feat/x", ["prototype/*"])
     assert is_kept("main_bkp_1", ["main_bkp_*"]) and is_kept("feat/plataform-metrics", ["feat/plataform-metrics"])
     base = dict(branch="feat/a", kind="worktree", kept=False, merged=True, open_head=False, open_base=False,
@@ -253,7 +253,7 @@ def self_test():
     print("self-test ok")
 
 
-def worktrees_ocupadas():
+def busy_worktrees():
     """Caminhos das worktrees com worker vivo, pelo `orq busy`; None se o orq não responder."""
     p = run(["python3", ORQ, "busy"])
     return None if p.returncode else set(p.stdout.split("\n"))
@@ -285,8 +285,8 @@ def main():
     cwd = top.stdout.strip()
     # o cwd pode ser uma worktree; o checkout principal é o primeiro de `git worktree list`
     main_path = run(["git", "worktree", "list", "--porcelain"], cwd).stdout.split("\n")[0].removeprefix("worktree ")
-    fx = fluxo_do_repo(main_path)
-    PROTECTED.update(fx["ambientes"], [fx["producao"]])
+    flow_info = repo_flow(main_path)
+    PROTECTED.update(flow_info["ambientes"], [flow_info["producao"]])
     items = []
 
     def add(kind, name, action, reason):
@@ -326,7 +326,7 @@ def main():
             try:
                 prs = gh_json(["pr", "list", "--head", b, "--state", "merged", "--json",
                                "number,baseRefName,headRefOid,author"], main_path)
-                merged_cache[b] = pr_final(prs, b, fx)
+                merged_cache[b] = pr_final(prs, b, flow_info)
             except Exception as e:
                 merged_cache[b] = e
         return merged_cache[b]
@@ -342,8 +342,8 @@ def main():
             fa["ahead"] = is_ahead(f"origin/{pr['baseRefName']}", "HEAD" if kind == "worktree" else b,
                                    where if kind == "worktree" else main_path, pr.get("headRefOid"))
             if kind == "worktree":
-                bloqueios, fa["artefatos"] = sujeira(where)
-                fa["dirty"] = bool(bloqueios)
+                blockers, fa["artefatos"] = dirt(where)
+                fa["dirty"] = bool(blockers)
         return fa
 
     # 1. worktrees do Orca
@@ -352,7 +352,7 @@ def main():
     except Exception as e:
         wts = []
         add("worktree", "(orca worktree list)", "error", str(e))
-    busy = worktrees_ocupadas()
+    busy = busy_worktrees()
     for w in wts:
         if w.get("isMainWorktree") or not w.get("branch"):
             continue
@@ -364,32 +364,32 @@ def main():
             v, r = decide(fa)
             if not fa["merged"] and not fa["is_main_current"]:  # sem PR mergeado: talvez órfã (cherry-pick, pesquisa, parada)
                 fa["ahead"] = is_ahead("origin/main", "HEAD", w["path"])
-                bloqueios, fa["artefatos"] = sujeira(w["path"])
-                fa["dirty"] = bool(bloqueios)
+                blockers, fa["artefatos"] = dirt(w["path"])
+                fa["dirty"] = bool(blockers)
                 fa["busy"] = None if busy is None else w["path"] in busy
-                fa["recente"] = (datetime.now(timezone.utc).timestamp() * 1000 - (w.get("lastActivityAt") or 0)) < ORFA_OCIOSA_H * 3600 * 1000
-                v, r = decide_orfa(fa)
+                fa["recente"] = (datetime.now(timezone.utc).timestamp() * 1000 - (w.get("lastActivityAt") or 0)) < ORPHAN_IDLE_H * 3600 * 1000
+                v, r = decide_orphan(fa)
                 if v == "remove":
                     r += "; branch local apagada junto"
-            guardados = []
+            stored = []
             if v == "remove" and fa.get("artefatos"):
                 if a.dry_run:
-                    guardados = fa["artefatos"]
+                    stored = fa["artefatos"]
                 else:
                     try:
-                        guardados = guardar(w["path"], fa["artefatos"])
+                        stored = store(w["path"], fa["artefatos"])
                     except OSError as e:  # sem a cópia, remover perderia o relatório
                         v, r = "skip", f"could not save {', '.join(fa['artefatos'])}: {e}"
             if v == "remove" and not a.dry_run:
                 try:
                     sys.path.insert(0, ORQ_DIR)
-                    from orqlib import encerrar_processos_da_worktree
-                    encerrar_processos_da_worktree(w["path"])
+                    from orqlib import terminate_worktree_processes
+                    terminate_worktree_processes(w["path"])
                 except Exception as e:  # sem o orq a limpeza segue; o Orca remove a worktree do mesmo jeito
                     print(f"limpar-mergeados: worktree processes not terminated: {e}", file=sys.stderr)
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
-            if guardados:
-                items[-1]["guardados"] = guardados
+            if stored:
+                items[-1]["guardados"] = stored
             if v == "remove" and not fa["merged"] and not a.dry_run and items[-1]["action"] == "removed":
                 run(["git", "branch", "-D", b], main_path)  # o commit já está na main (cherry sem "+"), então -D não perde trabalho
         except Exception as e:
@@ -419,7 +419,7 @@ def main():
     seen = set()
     for pr in sorted(mine_merged, key=lambda p: -p["number"]):
         b = pr["headRefName"]
-        if (a.branch and b != a.branch) or not is_final(pr, b, fx):
+        if (a.branch and b != a.branch) or not is_final(pr, b, flow_info):
             continue
         if b in seen or b not in tips:
             continue
@@ -431,17 +431,17 @@ def main():
     return finish(items, a)
 
 
-def evento_orq(task, branch, items):
+def orq_event(task, branch, items):
     """Grava no log do orq o que a limpeza removeu, guardou e pulou. Orq fora do lugar ou log inacessível: segue sem o evento."""
     try:
         sys.path.insert(0, ORQ_DIR)
-        from orqlib import append_event, limpou_fecha
+        from orqlib import append_event, cleaned_close
         ev = {"tipo": "pr", "op": "limpou", "task": task, "branch": branch,
                       "removidos": [f"{i['kind']}:{i['name']}" for i in items if i["action"] == "removed"],
                       "guardados": [g for i in items for g in i.get("guardados", [])],
                       "pulados": [f"{i['kind']}:{i['name']} ({i['reason']})" for i in items if i["action"] in ("skip", "error")]}
         append_event(ev)
-        limpou_fecha(ev)
+        cleaned_close(ev)
     except Exception as e:  # noqa: BLE001 - o evento é registro, não pode derrubar a limpeza
         print(f"event not recorded: {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -452,7 +452,7 @@ def finish(items, a):
     with open(LAST, "w") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)
     if a.task:
-        evento_orq(a.task, a.branch, items)
+        orq_event(a.task, a.branch, items)
     if a.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:

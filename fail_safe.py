@@ -7,12 +7,12 @@ import sys
 from datetime import datetime, timezone
 
 
-def sair(origem, exc):
+def bail_out(origin_name, exc):
     try:
         log = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {origem}: import failed, hook ignored: {type(exc).__name__}: {exc}\n")
+            f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {origin_name}: import failed, hook ignored: {type(exc).__name__}: {exc}\n")
     except OSError:
         pass
     sys.exit(0)

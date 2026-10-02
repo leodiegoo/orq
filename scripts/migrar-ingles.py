@@ -22,149 +22,149 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import orqlib as o  # noqa: E402
 
-PASTAS = ("groups", "projects", "retro", "handoff")  # as pastas de estado com .json; digest/ fica em pt
-TRAVAS_ANTIGAS = {"fila.lock": "merge-queue.lock", "fila-despacho.lock": "dispatch-queue.lock", "integrar-fila.lock": "integrate-queue.lock",
+FOLDERS = ("groups", "projects", "retro", "handoff")  # as pastas de estado com .json; digest/ fica em pt
+OLD_LOCKS = {"fila.lock": "merge-queue.lock", "fila-despacho.lock": "dispatch-queue.lock", "integrar-fila.lock": "integrate-queue.lock",
                   "turnos.lock": "turns.lock", "gerente.lock": "manager.lock", "despacho.lock": "dispatch.lock", "pend.lock": "pending.lock",
                   "passagem.lock": "handoff.lock", "revisao.lock": "review.lock"}
 # chave que sobrou em pt depois do para_en: acento, sufixo ou palavra que o inglês não tem
 PT = re.compile(r"[^\x00-\x7f]|(?:cao|coes|agem|ados?|idas?|idos?|ndo|eiro|ento)$|^(?:sem|com|por|para|de|em|na|no)_|_(?:em|de|do|da|na|no)$")
 
 
-def _vivos():
+def _live_blockers():
     """O que impede a migração: workers vivos, gerente rodando, travas presas. Lista vazia é caminho livre."""
     out = []
     eu = os.environ.get("ORCA_TERMINAL_HANDLE")
     try:
-        ws = [w for w in o._workers_todos() if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") != eu]
+        ws = [w for w in o._all_workers() if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") != eu]
     except Exception as e:  # noqa: BLE001 - sem o Orca não há como saber se há worker vivo: recusa
         return [f"não consegui listar os workers no Orca ({type(e).__name__}: {e})"]
     out += [f"worker vivo: {w.get('dispatchId')} (task {w.get('taskId')}, terminal {w.get('agentTerminalHandle')})" for w in ws]
-    if pid := o.serve_dono():
+    if pid := o.serve_owner():
         out.append(f"gerente rodando: orq gerente serve (pid {pid})")
-    vivo = o._path(o.PAINEL_VIVO)
-    if os.path.exists(vivo) and time.time() - os.path.getmtime(vivo) < o.PAINEL_LIMITE_MIN_S:
-        out.append(f"gerente rodando: o painel do agent manager tocou {os.path.basename(vivo)} há {time.time() - os.path.getmtime(vivo):.0f} s")
+    alive = o._path(o.PANEL_ALIVE)
+    if os.path.exists(alive) and time.time() - os.path.getmtime(alive) < o.PANEL_LIMIT_MIN_S:
+        out.append(f"gerente rodando: o painel do agent manager tocou {os.path.basename(alive)} há {time.time() - os.path.getmtime(alive):.0f} s")
     return out
 
 
 @contextlib.contextmanager
-def _travas():
+def _locks():
     """Toma todas as travas do orq (nomes novos e antigos) sem esperar e as segura até o fim: append de hook espera a troca do events.jsonl."""
-    abertas, presas = [], []
+    open_entries, stuck_locks = [], []
     try:
-        for nome in sorted({os.path.basename(p) for p in glob.glob(os.path.join(o.HOME, "*.lock"))} | {"cursor.lock"}):
-            f = open(os.path.join(o.HOME, nome), "a")
+        for item_name in sorted({os.path.basename(p) for p in glob.glob(os.path.join(o.HOME, "*.lock"))} | {"cursor.lock"}):
+            f = open(os.path.join(o.HOME, item_name), "a")
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                presas.append(f"trava presa: {nome}")
+                stuck_locks.append(f"trava presa: {item_name}")
                 f.close()
                 continue
-            abertas.append(f)
-        yield presas
+            open_entries.append(f)
+        yield stuck_locks
     finally:
-        for f in abertas:
+        for f in open_entries:
             f.close()
 
 
-def _ler(caminho):
-    with open(caminho, encoding="utf-8") as f:
+def _read_value(path):
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def _gravar_json(caminho, dado):
-    o._write_json(caminho, dado, indent=2)  # o _write_json passa pelo para_en: o que já está em inglês fica igual
+def _write_json_file(path, dado):
+    o._write_json(path, dado, indent=2)  # o _write_json passa pelo para_en: o que já está em inglês fica igual
 
 
-def _sobras(obj, achadas):
+def _leftovers(obj, found_labels):
     """Junta em `achadas` as chaves que parecem pt depois do para_en."""
     if isinstance(obj, list):
         for x in obj:
-            _sobras(x, achadas)
+            _leftovers(x, found_labels)
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(k, str) and PT.search(k) and k not in o.CHAVES_PT:
-                achadas[k] = achadas.get(k, 0) + 1
-            _sobras(v, achadas)
+            if isinstance(k, str) and PT.search(k) and k not in o.KEYS_PT:
+                found_labels[k] = found_labels.get(k, 0) + 1
+            _leftovers(v, found_labels)
 
 
-def plano():
+def plan():
     """O que a migração faria: {eventos: (linhas, mudam, ilegíveis), arquivos: [(origem, destino)], travas: [...], sobras: {chave: n}}."""
-    sobras, arquivos = {}, []
+    leftovers, files_set = {}, []
     ev = os.path.join(o.HOME, "events.jsonl")
-    linhas = mudam = 0
-    ilegiveis = []
+    line_list = to_change = 0
+    unreadable = []
     if os.path.exists(ev):
         with open(ev, encoding="utf-8") as f:
-            for n, linha in enumerate(f, 1):
-                linhas += 1
+            for n, line in enumerate(f, 1):
+                line_list += 1
                 try:
-                    e = json.loads(linha)
+                    e = json.loads(line)
                 except ValueError:
-                    ilegiveis.append(n)
+                    unreadable.append(n)
                     continue
-                en = o.para_en(e)
-                _sobras(en, sobras)
-                mudam += en != e
-    for novo, antigo in o.ARQ_ANTIGO.items():
-        a, b = os.path.join(o.HOME, antigo), os.path.join(o.HOME, novo)
+                en = o.to_en(e)
+                _leftovers(en, leftovers)
+                to_change += en != e
+    for new, old_name in o.OLD_FILE.items():
+        a, b = os.path.join(o.HOME, old_name), os.path.join(o.HOME, new)
         if os.path.exists(a):
-            arquivos.append((a, b))
+            files_set.append((a, b))
             if a.endswith(".json"):
                 with contextlib.suppress(OSError, ValueError):
-                    _sobras(o.para_en(_ler(a)), sobras)
-    nomes = {os.path.join(o.HOME, x) for x in o.ARQ_ANTIGO.values()}
-    for p in sorted(glob.glob(os.path.join(o.HOME, "*.json")) + [q for d in PASTAS for q in glob.glob(os.path.join(o.HOME, d, "*.json"))]):
-        if p in nomes or not o._do_orq(p):
+                    _leftovers(o.to_en(_read_value(a)), leftovers)
+    names = {os.path.join(o.HOME, x) for x in o.OLD_FILE.values()}
+    for p in sorted(glob.glob(os.path.join(o.HOME, "*.json")) + [q for d in FOLDERS for q in glob.glob(os.path.join(o.HOME, d, "*.json"))]):
+        if p in names or not o._is_orq_path(p):
             continue
         try:
-            d = _ler(p)
+            d = _read_value(p)
         except (OSError, ValueError):
             continue
-        en = o.para_en(d)
-        _sobras(en, sobras)
+        en = o.to_en(d)
+        _leftovers(en, leftovers)
         if en != d:
-            arquivos.append((p, p))
-    travas = [os.path.join(o.HOME, t) for t in TRAVAS_ANTIGAS if os.path.exists(os.path.join(o.HOME, t))]
-    return {"eventos": (linhas, mudam, ilegiveis), "arquivos": arquivos, "travas": travas, "sobras": sobras}
+            files_set.append((p, p))
+    locks = [os.path.join(o.HOME, t) for t in OLD_LOCKS if os.path.exists(os.path.join(o.HOME, t))]
+    return {"eventos": (line_list, to_change, unreadable), "arquivos": files_set, "travas": locks, "sobras": leftovers}
 
 
 def _backup(p):
-    pasta = os.path.join(o.HOME, f"backup-pt-{time.strftime('%Y-%m-%dT%H-%M-%S')}")
+    folder = os.path.join(o.HOME, f"backup-pt-{time.strftime('%Y-%m-%dT%H-%M-%S')}")
     rel = lambda x: os.path.relpath(x, o.HOME)  # noqa: E731
-    copiar = ([os.path.join(o.HOME, "events.jsonl")] if p["eventos"][1] else []) + [a for a, _ in p["arquivos"]]
-    for a in copiar:
-        destino = os.path.join(pasta, rel(a))
-        os.makedirs(os.path.dirname(destino), exist_ok=True)
-        (shutil.copytree if os.path.isdir(a) else shutil.copy2)(a, destino)
-    return pasta
+    to_copy = ([os.path.join(o.HOME, "events.jsonl")] if p["eventos"][1] else []) + [a for a, _ in p["arquivos"]]
+    for a in to_copy:
+        destination = os.path.join(folder, rel(a))
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        (shutil.copytree if os.path.isdir(a) else shutil.copy2)(a, destination)
+    return folder
 
 
-def _eventos():
+def _events():
     """Reescreve o events.jsonl com para_en num tmp ao lado; confere as linhas e troca. A linha ilegível vai como está."""
     ev = os.path.join(o.HOME, "events.jsonl")
     tmp = f"{ev}.migrar-{os.getpid()}.tmp"
-    entrada = saida = 0
+    entry = output = 0
     with open(ev, encoding="utf-8") as f, open(tmp, "w", encoding="utf-8") as g:
-        for linha in f:
-            entrada += 1
+        for line in f:
+            entry += 1
             try:
-                e = json.loads(linha)
+                e = json.loads(line)
             except ValueError:
-                g.write(linha if linha.endswith("\n") else linha + "\n")
+                g.write(line if line.endswith("\n") else line + "\n")
             else:
-                g.write(json.dumps(o.para_en(e), ensure_ascii=False) + "\n")
-            saida += 1
+                g.write(json.dumps(o.to_en(e), ensure_ascii=False) + "\n")
+            output += 1
     with open(tmp, encoding="utf-8") as g:
-        conferidas = sum(1 for _ in g)
-    if not entrada == saida == conferidas:
+        checked = sum(1 for _ in g)
+    if not entry == output == checked:
         os.unlink(tmp)
-        raise RuntimeError(f"events.jsonl: {entrada} linhas lidas, {conferidas} gravadas; nada foi trocado")
+        raise RuntimeError(f"events.jsonl: {entry} linhas lidas, {checked} gravadas; nada foi trocado")
     os.replace(tmp, ev)
-    return entrada
+    return entry
 
 
-def _arquivo(a, b):
+def _file_path(a, b):
     """Traduz e grava `a` em `b` (o nome novo), apaga `a`. Pasta (perguntar/ -> ask/) e arquivo que não é JSON (gerente-vivo) só trocam de nome."""
     if os.path.isdir(a) or not a.endswith(".json"):
         if os.path.exists(b):
@@ -172,27 +172,27 @@ def _arquivo(a, b):
         os.replace(a, b)
         return None
     try:
-        d = _ler(a)
+        d = _read_value(a)
     except (OSError, ValueError) as e:
         return f"{os.path.basename(a)}: ilegível ({e}), ficou como está"
     if a != b and os.path.exists(b):
         os.unlink(a)
         return f"{os.path.basename(a)}: {os.path.basename(b)} já existe, ficou o novo (o antigo está no backup)"
-    _gravar_json(b, d)
+    _write_json_file(b, d)
     if a != b:
         os.unlink(a)
     return None
 
 
-def relatorio(p, feito=None):
-    linhas, mudam, ilegiveis = p["eventos"]
+def report(p, done=None):
+    line_list, to_change, unreadable = p["eventos"]
     rel = lambda x: os.path.relpath(x, o.HOME)  # noqa: E731
-    out = [f"ORQ_HOME: {o.HOME}", f"events.jsonl: {linhas} linhas, {mudam} em pt" + (f", {len(ilegiveis)} ilegíveis (linhas {', '.join(map(str, ilegiveis[:10]))}) vão como estão" if ilegiveis else "")]
+    out = [f"ORQ_HOME: {o.HOME}", f"events.jsonl: {line_list} linhas, {to_change} em pt" + (f", {len(unreadable)} ilegíveis (linhas {', '.join(map(str, unreadable[:10]))}) vão como estão" if unreadable else "")]
     out += [f"  {rel(a)} -> {rel(b)}" if a != b else f"  {rel(a)}: traduzido" for a, b in p["arquivos"]] or ["  nenhum arquivo em pt"]
     out += [f"  trava antiga apagada: {rel(t)}" for t in p["travas"]]
     out.append("chaves pt sem tradução: " + (", ".join(f"{k} ({n})" for k, n in sorted(p["sobras"].items())) or "nenhuma"))
-    if feito:
-        out += feito
+    if done:
+        out += done
     return "\n".join(out)
 
 
@@ -200,30 +200,30 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="só mostra o que faria")
     a = ap.parse_args(argv)
-    if bloqueios := _vivos():
-        print("migração recusada:\n" + "\n".join(f"- {b}" for b in bloqueios), file=sys.stderr)
+    if blockers := _live_blockers():
+        print("migração recusada:\n" + "\n".join(f"- {b}" for b in blockers), file=sys.stderr)
         return 2
-    with _travas() as presas:
-        if presas:
-            print("migração recusada:\n" + "\n".join(f"- {b}" for b in presas), file=sys.stderr)
+    with _locks() as stuck_locks:
+        if stuck_locks:
+            print("migração recusada:\n" + "\n".join(f"- {b}" for b in stuck_locks), file=sys.stderr)
             return 2
-        p = plano()
+        p = plan()
         if a.dry_run:
-            print(relatorio(p) + "\n(dry-run: nada foi gravado)")
+            print(report(p) + "\n(dry-run: nada foi gravado)")
             return 0
         if not p["eventos"][1] and not p["arquivos"] and not p["travas"]:
-            print(relatorio(p) + "\nnada a migrar")
+            print(report(p) + "\nnada a migrar")
             return 0
-        feito = [f"backup: {_backup(p)}"]
+        done = [f"backup: {_backup(p)}"]
         if p["eventos"][1]:
-            feito.append(f"events.jsonl reescrito: {_eventos()} linhas")
-        for origem, destino in p["arquivos"]:
-            if aviso := _arquivo(origem, destino):
-                feito.append(f"aviso: {aviso}")
+            done.append(f"events.jsonl reescrito: {_events()} linhas")
+        for origin_name, destination in p["arquivos"]:
+            if notice := _file_path(origin_name, destination):
+                done.append(f"aviso: {notice}")
         for t in p["travas"]:
             with contextlib.suppress(OSError):
                 os.unlink(t)
-    print(relatorio(p, feito))
+    print(report(p, done))
     return 0
 
 

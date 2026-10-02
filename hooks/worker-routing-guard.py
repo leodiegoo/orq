@@ -40,8 +40,8 @@ if tool == "Bash":
                 deny(" (missing " + " and ".join(missing) + " in worker-start)")
     # o orq despachar chama o worker-start por dentro: sem --modelo e --effort ele nem sobe, mas a recusa vem aqui com o texto da skill
     # só em posição de comando (início, ou depois de ; & | ( , e então um python3 opcional): o mesmo texto dentro de aspas (um --body, um echo, um commit) não conta
-    sem_aspas = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
-    if re.search(r"(?:^|[;&|(]\s*)(?:python3?\s+)?(?:\S*/)?orq(?:\.py)?\s+(?:dispatch|despachar)\b", sem_aspas) and "--help" not in cmd:
+    without_quotes = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
+    if re.search(r"(?:^|[;&|(]\s*)(?:python3?\s+)?(?:\S*/)?orq(?:\.py)?\s+(?:dispatch|despachar)\b", without_quotes) and "--help" not in cmd:
         missing = [f for f in ("--model", "--effort") if f not in cmd]
         if missing:
             deny(" (missing " + " and ".join(missing) + " in orq dispatch)")

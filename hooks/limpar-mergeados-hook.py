@@ -10,12 +10,12 @@ import signal
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/.claude/orq"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the checkout of this hook (installed as ~/.claude/orq/hooks/)
 try:
-    from orq import coordenador, origem
+    from orq import coordinator, origin_name
 except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver falha_segura.py)
-    import falha_segura
-    falha_segura.sair("limpar-mergeados-hook.py", e)
+    import fail_safe
+    fail_safe.bail_out("limpar-mergeados-hook.py", e)
 
 try:
     event = json.load(sys.stdin)
@@ -25,7 +25,7 @@ if not isinstance(event, dict):
     sys.exit(0)  # entrada ruim: sem prompt, nada a limpar
 cwd = event.get("cwd") if isinstance(event.get("cwd"), str) and event.get("cwd") else os.getcwd()
 prompt = event.get("prompt") if isinstance(event.get("prompt"), str) else ""
-if origem(prompt) != "usuario" or prompt.rstrip().endswith("?"):
+if origin_name(prompt) != "usuario" or prompt.rstrip().endswith("?"):
     sys.exit(0)
 if not re.search(r"\bmerged\b", prompt, re.I):
     sys.exit(0)
@@ -35,7 +35,7 @@ if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=cwd, capture_output=Tru
 signal.signal(signal.SIGALRM, lambda *_: sys.exit(0))
 signal.alarm(3)  # o mesmo teto dos hooks do orq
 try:
-    if coordenador(event) is None:
+    if coordinator(event) is None:
         sys.exit(0)
 except Exception:  # noqa: BLE001 - sem confirmar que é o coordenador, não limpa
     sys.exit(0)

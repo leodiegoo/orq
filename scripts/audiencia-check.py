@@ -10,38 +10,38 @@ import subprocess
 import sys
 
 
-def termos(caminho):
-    padroes = []
-    for linha in open(caminho, encoding="utf-8"):
-        linha = linha.strip()
-        if not linha or linha.startswith("#"):
+def terms(path):
+    defaults = []
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        padroes.append(re.compile(linha[3:] if linha.startswith("re:") else re.escape(linha), re.I))
-    return padroes
+        defaults.append(re.compile(line[3:] if line.startswith("re:") else re.escape(line), re.I))
+    return defaults
 
 
-def achados(raiz, padroes):
-    arquivos = subprocess.run(["git", "-C", raiz, "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0")
-    for nome in filter(None, arquivos):
+def findings(root, defaults):
+    files_set = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0")
+    for item_name in filter(None, files_set):
         try:
-            texto = open(os.path.join(raiz, nome), encoding="utf-8").read()
+            text_value = open(os.path.join(root, item_name), encoding="utf-8").read()
         except (OSError, UnicodeDecodeError):
             continue  # binário (png) ou apagado no índice
-        for n, linha in enumerate(texto.splitlines(), 1):
-            for p in padroes:
-                if p.search(linha):
-                    yield f"{nome}:{n}: termo proibido /{p.pattern}/"
+        for n, line in enumerate(text_value.splitlines(), 1):
+            for p in defaults:
+                if p.search(line):
+                    yield f"{item_name}:{n}: termo proibido /{p.pattern}/"
 
 
 def main():
-    raiz = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    lista = os.environ.get("ORQ_TERMOS") or os.path.expanduser("~/.claude/orquestrador-plan/termos-proibidos.txt")
-    if not os.path.exists(lista):
-        print(f"audiencia-check: sem {lista}, checagem pulada", file=sys.stderr)
+    root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    listing = os.environ.get("ORQ_TERMOS") or os.path.expanduser("~/.claude/orquestrador-plan/termos-proibidos.txt")
+    if not os.path.exists(listing):
+        print(f"audiencia-check: sem {listing}, checagem pulada", file=sys.stderr)
         return 0
-    falhas = list(achados(raiz, termos(lista)))
-    print("\n".join(falhas))
-    return 1 if falhas else 0
+    failures = list(findings(root, terms(listing)))
+    print("\n".join(failures))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

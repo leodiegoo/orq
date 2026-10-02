@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.expanduser("~/.claude/orq"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the checkout of this script (installed as a symlink into ~/.claude/orq)
 try:
     import orq
 except Exception:  # noqa: BLE001 - sem o orq o waiter confirma heartbeat sozinho, sem gravar o evento
@@ -30,10 +30,10 @@ ORCA = os.environ.get("ORQ_ORCA") or "orca"  # os testes do orq apontam para o O
 
 def orca(*args):
     h = orq.handle_orca() if orq else None  # com o agent manager ligado, o Run é lido pelo terminal dele
-    if orq and "--run" in args and not orq._do_gerente(args[args.index("--run") + 1]):
+    if orq and "--run" in args and not orq._is_manager_run(args[args.index("--run") + 1]):
         h = os.environ.get("ORCA_TERMINAL_HANDLE") or h  # Run que o coordenador segura fora do gerente (B52)
     env = {**os.environ, "ORCA_TERMINAL_HANDLE": h} if h else None
-    if orq and args[0] in orq.MUTA_RUN and "--run" in args and orq._do_gerente(args[args.index("--run") + 1]):
+    if orq and args[0] in orq.MUTA_RUN and "--run" in args and orq._is_manager_run(args[args.index("--run") + 1]):
         orq.orca("run-use", "--id", args[args.index("--run") + 1])  # o gerente liga um Run por vez; quem chama segura a trava
     out = subprocess.run([ORCA, "orchestration", *args, "--json"], capture_output=True, text=True, timeout=30, env=env).stdout
     return json.loads(out or "{}")
@@ -48,30 +48,30 @@ def open_tasks(run):
 runs = sys.argv[1:]
 before = {run: open_tasks(run) for run in runs}
 bound = (orca("run-current").get("result") or {}).get("run", {}).get("id")
-vigiados = (orq.runs_do_gerente() if orq else []) or ([bound] if bound else [])  # com o gerente ligado, a caixa de cada Run dele
-vigiados += [r for r in runs if r not in vigiados and orq and orq.run_do_coordenador(r)]
+watched = (orq.manager_runs() if orq else []) or ([bound] if bound else [])  # com o gerente ligado, a caixa de cada Run dele
+watched += [r for r in runs if r not in watched and orq and orq.coordinator_run(r)]
 start = time.time()
 while time.time() - start < MAX_S:
     time.sleep(POLL_S)
-    for bound in vigiados:
-        with orq.trava_gerente() if orq else contextlib.nullcontext():  # ligar, ler e confirmar o Run na mesma ligação do gerente
+    for bound in watched:
+        with orq.manager_lock() if orq else contextlib.nullcontext():  # ligar, ler e confirmar o Run na mesma ligação do gerente
             res = orca("check", "--run", bound).get("result") or {}
             if orq and res.get("messages"):
                 try:
-                    res = orq.confirmar_lotes(bound, res)[1]
+                    res = orq.confirm_batches(bound, res)[1]
                 except Exception:  # noqa: BLE001 - lote consumido e sem ack é repetido no próximo check: nada se perde
                     res = {}
         msgs = res.get("messages") or []
         if not orq and msgs and all(m.get("type") == "heartbeat" for m in msgs):
             orca("check", "--run", bound, "--ack", res["deliveryId"])
             msgs = []
-        elif orq and msgs and orq.so_heartbeats(msgs):  # sobrou lote de heartbeat além do teto de lotes: fica para a próxima volta
+        elif orq and msgs and orq.only_heartbeats(msgs):  # sobrou lote de heartbeat além do teto de lotes: fica para a próxima volta
             msgs = []
         if msgs:
             print(json.dumps({"run": bound, "messages": msgs}, ensure_ascii=False))
             sys.exit(0)
     for run in runs:
-        if run not in vigiados:  # Run que o coordenador não lê (o check dá consumer_fenced): question/escalation/worker_done só aparecem no inbox
+        if run not in watched:  # Run que o coordenador não lê (o check dá consumer_fenced): question/escalation/worker_done só aparecem no inbox
             msgs = [m for m in (orca("inbox", "--limit", "200").get("result") or {}).get("messages") or []
                     if isinstance(m, dict) and m.get("to_handle") == f"run:{run}" and not m.get("read") and m.get("type") != "heartbeat"]
             if msgs:  # nada é consumido: as mensagens saem num lote quando o coordenador faz run-use --id <run>

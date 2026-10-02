@@ -10,8 +10,8 @@ try:
 except Exception as e:  # noqa: BLE001 - orqlib quebrado (conflito aberto, edição pela metade): o hook sai mudo, o comando mostra a causa
     if sys.argv[1:2] != ["hook"]:
         raise
-    import falha_segura
-    falha_segura.sair("orq.py hook", e)
+    import fail_safe
+    fail_safe.bail_out("orq.py hook", e)
 
 if __name__ == "__main__":
     sys.exit(orqlib.main())

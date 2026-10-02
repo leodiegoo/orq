@@ -15,35 +15,35 @@ import shlex
 import subprocess
 import sys
 
-TESTES = "python3 test_orq.py && python3 test_precompact.py"
+TESTS = "python3 test_orq.py && python3 test_precompact.py"
 
 
 def git(cwd, *args):
     return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
 
 
-def morrer(msg):
+def die(msg):
     print(f"integrar: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
-def vivo():
+def alive():
     """A worktree principal do repositório: a instalação que roda."""
     r = git(os.path.dirname(os.path.realpath(__file__)), "worktree", "list", "--porcelain")
     if r.returncode:
-        morrer(r.stderr.strip())
+        die(r.stderr.strip())
     return r.stdout.split("\n", 1)[0].removeprefix("worktree ")
 
 
-def arquivo_branches(wt):
+def branches_file(wt):
     """Onde a worktree guarda as branches que o ciclo integra (dentro do gitdir dela, para o `--avancar` achá-las depois de um conflito)."""
     return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-branches")
 
 
-def concluir(viva, wt):
+def conclude(viva, wt):
     """Avisa o orq que a main andou. A main já avançou: falha aqui vira aviso, com o comando para repetir à mão."""
     try:
-        branches = open(arquivo_branches(wt)).read().split()
+        branches = open(branches_file(wt)).read().split()
     except OSError:
         branches = []
     if not branches:
@@ -59,30 +59,30 @@ def concluir(viva, wt):
             print(r.stderr.strip(), file=sys.stderr)
 
 
-def avancar(wt):
-    viva = vivo()
-    ramo = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
-    if not ramo.startswith("integra/"):
-        morrer(f"{wt} is not an integration worktree (branch {ramo or 'detached'})")
+def advance(wt):
+    viva = alive()
+    branch = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    if not branch.startswith("integra/"):
+        die(f"{wt} is not an integration worktree (branch {branch or 'detached'})")
     if git(wt, "status", "--porcelain").stdout.strip():
-        morrer(f"{wt} has a conflict or uncommitted changes: resolve, commit and run `integrar.py --avancar {wt}`")
-    marcadores = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
-    if marcadores:
-        morrer(f"leftover conflict marker:\n{marcadores}")
-    testes = os.environ.get("ORQ_TESTES") or TESTES
-    if subprocess.run(testes, shell=True, cwd=wt).returncode:
-        morrer(f"tests failing in {wt}; main did not advance")
-    ff = git(viva, "merge", "--ff-only", ramo)
+        die(f"{wt} has a conflict or uncommitted changes: resolve, commit and run `integrar.py --avancar {wt}`")
+    markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
+    if markers:
+        die(f"leftover conflict marker:\n{markers}")
+    tests = os.environ.get("ORQ_TESTES") or TESTS
+    if subprocess.run(tests, shell=True, cwd=wt).returncode:
+        die(f"tests failing in {wt}; main did not advance")
+    ff = git(viva, "merge", "--ff-only", branch)
     if ff.returncode:
-        morrer(f"the live main cannot fast-forward (it moved, or has local changes):\n{ff.stderr.strip()}\n"
+        die(f"the live main cannot fast-forward (it moved, or has local changes):\n{ff.stderr.strip()}\n"
                f"bring main into the worktree (`git -C {shlex.quote(wt)} merge main`), resolve there and run `integrar.py --avancar {wt}`")
-    concluir(viva, wt)  # antes de remover a worktree: o arquivo das branches vive no gitdir dela
+    conclude(viva, wt)  # antes de remover a worktree: o arquivo das branches vive no gitdir dela
     git(viva, "worktree", "remove", "--force", wt)
-    git(viva, "branch", "-d", ramo)
+    git(viva, "branch", "-d", branch)
     print(f"integrar: main at {git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}, worktree removed")
 
 
-def limpar(viva):
+def clean(viva):
     """Começo do ciclo: se o push da main já saiu, remove as worktrees do orq-wt cujas branches a origin/main contém. Falha vira aviso."""
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # o orq.py roda dentro da main viva: nenhum __pycache__ suja a árvore
     if os.environ.get("ORQ_WT_DIR"):
@@ -91,32 +91,32 @@ def limpar(viva):
     print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
 
 
-def integrar(branches):
-    viva = vivo()
-    limpar(viva)
+def integrate(branches):
+    viva = alive()
+    clean(viva)
     slug = re.sub(r"[^\w.-]+", "-", "-".join(branches))[:60]
     wt = os.path.join(os.environ.get("ORQ_WT_DIR") or os.path.join(os.path.dirname(viva), "orq-wt"), f"integra-{slug}")
     if os.path.exists(wt):
-        morrer(f"{wt} already exists: finish with `integrar.py --avancar {wt}` or remove it with `git worktree remove --force {wt}`")
+        die(f"{wt} already exists: finish with `integrar.py --avancar {wt}` or remove it with `git worktree remove --force {wt}`")
     base = git(viva, "symbolic-ref", "--short", "HEAD").stdout.strip()
     r = git(viva, "worktree", "add", "-b", f"integra/{slug}", wt, base)
     if r.returncode:
-        morrer(r.stderr.strip())
-    with open(arquivo_branches(wt), "w") as f:
+        die(r.stderr.strip())
+    with open(branches_file(wt), "w") as f:
         f.write("\n".join(branches))
     for b in branches:
         r = git(wt, "merge", "--no-edit", b)
         if r.returncode:
-            morrer(f"conflict integrating {b} in {wt} (the live main is untouched):\n{git(wt, 'status', '--short').stdout.strip()}\n"
+            die(f"conflict integrating {b} in {wt} (the live main is untouched):\n{git(wt, 'status', '--short').stdout.strip()}\n"
                    f"resolve there, commit and run `integrar.py --avancar {wt}`")
-    avancar(wt)
+    advance(wt)
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     if len(args) == 2 and args[0] == "--avancar":
-        avancar(args[1])
+        advance(args[1])
     elif args and not args[0].startswith("-"):
-        integrar(args)
+        integrate(args)
     else:
-        morrer(__doc__)
+        die(__doc__)
