@@ -21,8 +21,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORQ = os.path.join(HERE, "orq.py")
 CLEAN_SCRIPT = os.path.join(HERE, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, HERE)
-for _k in [k for k in os.environ if k.startswith("ORQ_") and k not in ("ORQ_BACKLOG", "ORQ_BACKLOG_TICKETS")]:
-    del os.environ[_k]  # the session's own tuning (a worker's ORQ_HOOK_TIMEOUT=15 turned the 3 s alarm into 15 s) never reaches the tests (ticket 328)
+# hermetic: nothing of the caller's orq, Orca or harness environment reaches a test (a worker's ORQ_HOOK_TIMEOUT=15 turned the 3 s alarm into 15 s, ticket 328)
+CALLER_ENV = {k: os.environ.pop(k) for k in sorted(os.environ) if k.startswith(("ORQ_", "ORCA_", "CLAUDE", "CODEX_"))}
+# every test's temporary files, the subprocesses' too, in one folder the runner removes at the end. Under /tmp: shorter than macOS's TMPDIR, so the paths that
+# go into a 150-character notice or a socket stay short
+SUITE_TMP = tempfile.tempdir = os.environ["TMPDIR"] = tempfile.mkdtemp(prefix="oq", dir="/tmp" if os.path.isdir("/tmp") else None)
+os.environ["ORQ_HOME"] = os.path.join(SUITE_TMP, "orq-home")  # in-process orq writes here: never to the live clone's events.jsonl (ticket 216 found 88 test lines there)
 # before the import: orqlib reads ORQ_LINK and ORQ_AVISO_GAP_S at load, and in-process tests saw the real link and a 3 s gap per notice (ticket 328)
 os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
 os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
@@ -14365,9 +14369,9 @@ def test_ticket101_whole_backlog_reader_fits_the_hook_cap():
               "bloqueios": [f"t{n - 1}"] if n else [], "since": "2026-10-01", "closed": "2026-10-01", "corpo": f"spec: issues/{n}.md\norca: task_{n} run_{n}"} for n in range(600)]
     p = os.path.join(tempfile.mkdtemp(), "backlog.md")
     open(p, "w").write(backlog_mod.emit(item_list))
-    t0 = time.perf_counter()
+    t0 = time.process_time()  # the CPU the parse costs: wall time on a loaded machine (other suites, -j 4) also counts the waits for a core (ticket 328)
     read_handles = backlog_mod.read_value(p)
-    ms = (time.perf_counter() - t0) * 1000
+    ms = (time.process_time() - t0) * 1000
     assert len(read_handles) == 600 and ms < 40, f"{ms:.1f} ms para 600 itens: o teto do hook é 100 ms com tudo junto"
 
 
@@ -18518,7 +18522,7 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
 
 # ---------- ticket 328: the runner (parallel, durations, suite queue, test map) ----------
 
-SUITE_QUEUE = os.environ.get("ORQ_SUITE_QUEUE") or os.path.expanduser("~/.cache/orq-suite/queue")
+SUITE_QUEUE = CALLER_ENV.get("ORQ_SUITE_QUEUE") or os.path.expanduser("~/.cache/orq-suite/queue")  # the caller's, read before the strip
 
 
 def _private_paths():
@@ -18618,6 +18622,26 @@ def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
     finally:
         with contextlib.suppress(OSError):
             os.remove(os.path.join(queue, mine))
+
+
+def _live_events():
+    """The live events.jsonl a leaking test would write to (the clone's and the caller's ORQ_HOME), with their sizes now."""
+    paths = {os.path.join(p, "events.jsonl") for p in (orq_mod.orqpaths.CODE, CALLER_ENV.get("ORQ_HOME")) if p}
+    return {p: os.path.getsize(p) if os.path.exists(p) else 0 for p in paths}
+
+
+def _leaks(before):
+    """The lines the run appended to a live events.jsonl that carry the suite's temporary folder: a test that wrote outside its ORQ_HOME (ticket 328)."""
+    out, marks = [], {SUITE_TMP, os.path.realpath(SUITE_TMP)}
+    for p, size in before.items():
+        try:
+            with open(p, "rb") as f:
+                f.seek(size)
+                new = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        out += [f"{p}: {line[:300]}" for line in new.splitlines() if any(m in line for m in marks)]
+    return out
 
 
 def _write_map(path, results, full):
@@ -18799,6 +18823,31 @@ def test_ticket328_orq_test_affected_runs_only_the_affected_tests():
     r = Env().orq("test", cwd=tempfile.mkdtemp())
     assert r.returncode != 0 and "no test_orq.py" in r.stderr, r
 
+
+def test_ticket328_the_caller_environment_does_not_reach_the_tests():
+    caller_home = tempfile.mkdtemp()
+    env = {**os.environ, "ORQ_HOOK_TIMEOUT": "15", "ORQ_HOME": caller_home, "ORCA_TERMINAL_HANDLE": "y", "CLAUDECODE": "1"}
+    alarm = ["test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm", "test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm", "test_guard_fails_open_and_logs",
+             "test_heartbeat_orca_down_passes", "test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pending",
+             "test_ticket134_run_that_really_stopped_is_still_detected_after_expiry", "test_ticket147_release_ends_only_processes_with_cwd_inside_worktree"]
+    r = subprocess.run([sys.executable, os.path.join(HERE, "test_orq.py"), "-j", "4", *alarm], env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and f"{len(alarm)}/{len(alarm)} testes passaram" in r.stdout, r.stdout[-3000:]
+    ignored = next(x for x in r.stdout.splitlines() if x.startswith("ignored from the environment: "))
+    assert {"CLAUDECODE", "ORCA_TERMINAL_HANDLE", "ORQ_HOME", "ORQ_HOOK_TIMEOUT"} <= set(ignored.split(": ", 1)[1].split(", ")), ignored
+    assert os.listdir(caller_home) == [], "nothing was written to the caller's ORQ_HOME"
+
+
+def test_ticket328_the_runner_flags_a_test_line_in_a_live_events_file():
+    p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+    with open(p, "w") as f:
+        f.write('{"type": "old"}\n')
+    before = {p: os.path.getsize(p)}
+    with open(p, "a") as f:
+        f.write('{"type": "entry", "text": "real work"}\n' + json.dumps({"type": "processes", "worktree": os.path.join(SUITE_TMP, "tmpx", "wt147")}) + "\n")
+    (leak,) = _leaks(before)
+    assert leak.startswith(p + ": ") and "wt147" in leak, leak
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
@@ -18806,6 +18855,9 @@ if __name__ == "__main__":
     failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
     for n in failures:
         print(f"FALHOU  {n}")
+    if CALLER_ENV:
+        print(f"ignored from the environment: {', '.join(CALLER_ENV)}")
+    live = _live_events()
     with _suite_turn() if not opts.names else contextlib.nullcontext():
         w0, c0 = time.time(), _cpu()
         results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
@@ -18813,6 +18865,10 @@ if __name__ == "__main__":
     if opts.map:
         _write_map(opts.map, results, full=not opts.names)
     failures += [n for n, r in results.items() if not r["ok"]]
+    for leak in _leaks(live):
+        print(f"FALHOU  a test wrote to a live events.jsonl: {leak}")
+        failures.append(leak)
+    shutil.rmtree(SUITE_TMP, ignore_errors=True)
     slow = sorted(results.items(), key=lambda x: -x[1]["s"])[:15]
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
