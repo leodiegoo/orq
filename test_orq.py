@@ -15522,6 +15522,82 @@ def test_ticket146_review_task_without_dispatch_refuses():
     assert r.returncode == 1 and "has no dispatch" in r.stderr and not _log(a, "nm.log"), r
 
 
+# ---------- ticket 225: review loop with recorded decisions and the invariant on send-back ----------
+
+def _git225(wt, *args):
+    return subprocess.run(["git", "-C", wt, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _env225():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _git225(a.wt, "init", "-q", "-b", "feat/x")
+    _git225(a.wt, "commit", "-q", "--allow-empty", "-m", "first")
+    return a
+
+
+def _intent225(a):
+    return _log(a, "nm.log")[-2]["args"].copy() and (lambda args: args[args.index("--intent") + 1])(_log(a, "nm.log")[-2]["args"])
+
+
+def test_ticket225_review_intent_is_pure_and_unchanged_without_decisions_or_commits():
+    assert orq_mod.review_intent("base", [], []) == "base"
+    d = [{"achado": "a.py:1", "decisao": "ignorar", "motivo": "by design"}, {"achado": "a.py:1", "decisao": "corrigir"}, {"achado": "b.py:2", "decisao": "ignorar"}]
+    out = orq_mod.review_intent("base", d, ["abc123 fix x"])
+    assert "Decisions already taken, do not reopen" in out and "- b.py:2: ignorar" in out and "- a.py:1: corrigir" in out and "by design" not in out, out  # latest per finding
+    assert "## Commits since the last review" in out and "- abc123 fix x" in out
+    big = [{"achado": f"f{i}", "decisao": "ignorar", "motivo": "x" * 200} for i in range(40)]
+    sec = orq_mod.review_intent("", big, []).split("\n", 3)[3] if False else orq_mod.review_intent("", big, [])
+    assert len(sec) < orq_mod.NM_DECISIONS_MAX + 400 and "f39" in sec and "f0:" not in sec, "the budget drops the oldest"
+    assert orq_mod.parse_decision("a.py:3=ignorar:legacy: ok") == ("a.py:3", "ignorar", "legacy: ok")
+    try:
+        orq_mod.parse_decision("a.py:3=talvez")
+        raise AssertionError("accepted a bad decision")
+    except ValueError:
+        pass
+
+
+def test_ticket225_ignored_finding_shows_in_next_review_of_the_branch_and_not_in_another_branch():
+    a = _env225()
+    r = a.orq("revisar", "task_term_r1", "--decidir", "a.py:1=ignorar:by design", "--decidir", "b.py:2=corrigir")
+    assert r.returncode == 0, r.stderr
+    (e1, e2) = [e for e in a.events() if e["tipo"] == "achado_decisao"]
+    assert (e1["branch"], e1["achado"], e1["decisao"], e1["motivo"]) == ("feat/x", "a.py:1", "ignorar", "by design") and e2["decisao"] == "corrigir", (e1, e2)
+    assert not _log(a, "nm.log"), "--decidir does not run the review"
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    intent = _intent225(a)
+    assert "Decisions already taken" in intent and "- a.py:1: ignorar (by design)" in intent and "- b.py:2: corrigir" in intent, intent
+    _git225(a.wt, "checkout", "-q", "-b", "feat/other")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    assert "Decisions already taken" not in _intent225(a), "another branch does not inherit the decisions"
+
+
+def test_ticket225_commits_after_the_last_reviewed_head_get_their_section_and_otherwise_the_intent_is_unchanged():
+    a = _env225()
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    first = _intent225(a)
+    assert "Commits since" not in first and "Decisions already" not in first
+    (rev,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert rev["branch"] == "feat/x" and rev["head"] == _git225(a.wt, "rev-parse", "HEAD"), rev
+    assert a.orq("revisar", "task_term_r1").returncode == 0 and _intent225(a) == first, "no decision, no new commit: same intent"
+    _git225(a.wt, "commit", "-q", "--allow-empty", "-m", "fix: the finding")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    intent = _intent225(a)
+    assert "## Commits since the last review" in intent and "fix: the finding" in intent and "first" not in intent.split("## Commits since")[1], intent
+
+
+def test_ticket225_send_back_with_achado_carries_the_invariant_rule_and_without_it_does_not():
+    a = Env()
+    a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"}])
+    a.set("terminals.json", ["term_w0", "term_coord"])
+    _steer_env(a)
+    assert a.orq("devolver", "task_feita", "plain reason").returncode == 0
+    assert orq_mod.INVARIANT_RULE not in _sent(a)[-1][_sent(a)[-1].index("--body") + 1]
+    assert a.orq("devolver", "task_feita", "finding a.py:1", "--achado").returncode == 0
+    body = _sent(a)[-1][_sent(a)[-1].index("--body") + 1]
+    assert "finding a.py:1" in body and orq_mod.INVARIANT_RULE in body, body
+
+
 def test_ticket165_returned_delivery_leaves_stop_until_new_worker_done():
     from datetime import datetime, timezone
     now_at = datetime.now(timezone.utc)
