@@ -1117,12 +1117,13 @@ Measured on 2026-10-02 on the author's machine (12 CPUs) with other workers runn
 | Before (main 88056d9) | sequential, 1165 tests | 906 s | 563 s | 176.8 s | 19.1 → 13 (5 alarm tests failed: the session's ORQ_HOOK_TIMEOUT) |
 | 1. Slow tests | sequential, 1165 tests | 647 s | 550 s | 9.5 s | 10.9 → 13.2 |
 | 2. Parallel runner | `-j 1`, 1175 tests | 774 s | 582 s | 7.8 s | 13.2 → 17.9 |
-| 2. Parallel runner | `-j 4`, run 1 (with `--map`) | 262 s | 720 s | 12.6 s | 17.9 → 17.5 |
-| 2. Parallel runner | `-j 4`, run 2 | 306 s | 670 s | 10.5 s | 17.5 → 35.2 |
-| 2. Parallel runner | `-j 4`, run 3 | 192 s | 618 s | 10.4 s | 10.4 → 15.1 |
-| 3. `orq test --affected` | one line in `e2e_line`: 55 tests from the map, 12 from the docs diff | 13.5 s | 43 s | | 13.2 |
+| 2. Parallel runner | `-j 4`, three runs | 262 / 306 / 192 s | 720 / 670 / 618 s | 12.6 / 10.5 / 10.4 s | 17.9 → 17.5, 17.5 → 35.2, 10.4 → 15.1 |
+| Final tree (hermetic) | `-j 1`, 1177 tests | 789 s | 591 s | 8.1 s | 10.1 → 14.4 |
+| Final tree (hermetic) | `-j 4`, three runs, `ORQ_HOOK_TIMEOUT=15` exported | 234 / 236 / 200 s | 714 / 668 / 632 s | 16.0 / 10.4 / 18.1 s | 7.4 → 18.6, 18.6 → 30.9, 30.9 → 12.6 |
+| Final tree (hermetic) | `-j 4`, `env -u ORQ_HOOK_TIMEOUT` | 163 s | 551 s | 7.8 s | 12.6 → 9.4 |
+| 3. `orq test --affected` | one line changed in `e2e_line`: 55 tests | 19.5 s | 48 s | | 14.0 |
 
-All 1175 tests (the 1165 plus 10 of this ticket) pass in each of the four runs, and every name of the 1165 is in each. CPU goes up at `-j 4` because each test pays its own fork and more processes share the cores. The single-test numbers include the per-child fork. `-j 1` is slower than layer 1 alone mostly because of the load, not the fork, which costs milliseconds. Layer 4 shows up as no number: it keeps a second full suite from running alongside this one.
+Every run of the final tree passes 1177 of 1177 (the 1165, plus 12 of this ticket), and every name of the 1165 is in each run. No line of a run's temporary folder reached the live `events.jsonl`. The `-j 1` number is from the last commit (a test helper fix); the `-j 4` runs are from the commit before it. CPU goes up at `-j 4` because each test pays its own fork and more processes share the cores, and single-test numbers include that fork. Layer 4 has no number of its own: what it buys is that a second full suite never runs alongside this one.
 
 ## Why the defaults are what they are (moved out of the README)
 
