@@ -149,6 +149,12 @@ if sys.argv[1] == "terminal":
     if opt("--terminal") in ler("terminals.json", []):
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal")}}})); sys.exit(0)
     print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}})); sys.exit(0)
+if sys.argv[1] == "repo" and cmd == "add":
+    # orca repo add --path: grava o repo no repos.json, como o Orca registra a pasta
+    json.dump(ler("repos.json", []) + [{"id": "r%d" % (len(ler("repos.json", [])) + 1), "path": opt("--path"), "displayName": os.path.basename(opt("--path"))}], open(os.path.join(d, "repos.json"), "w"))
+    print(json.dumps({"ok": True, "result": {"repo": {"id": "r1"}}})); sys.exit(0)
+if sys.argv[1] == "repo" and cmd == "set-base-ref":
+    print(json.dumps({"ok": True, "result": {"repo": {"worktreeBaseRef": opt("--ref")}}})); sys.exit(0)
 if sys.argv[1] == "repo" and cmd == "list":
     print(json.dumps({"ok": True, "result": {"repos": ler("repos.json", [])}})); sys.exit(0)
 if sys.argv[1] == "tab":
@@ -12686,6 +12692,172 @@ def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_pri
     assert out.index("badge") < out.index("aviso-1"), "decisões primeiro"
     assert "freio-prod" not in out and "feita" not in out, "só o aberto desde que ligou"
     assert "pendência" not in a.orq("away", "off").stdout, "desligado de novo: sem lista"
+
+
+# ---- ticket 125: orq projeto add registra no Orca com o orca.yaml gerado; o mate roda no projeto do Orca
+
+def _repo_git(a, nome="app", arquivos=()):
+    pasta = os.path.join(a.tmp.name, nome)
+    os.makedirs(pasta)
+    subprocess.run(["git", "init", "-q", "-b", "main", pasta], check=True)
+    for arq in arquivos:
+        os.makedirs(os.path.dirname(os.path.join(pasta, arq)), exist_ok=True)
+        open(os.path.join(pasta, arq), "w").write("")
+    return os.path.realpath(pasta)
+
+
+def _chamadas_repo(a):
+    return [c[:-1] for c in _log(a, "calls.log") if c[0] in ("add", "set-base-ref")]  # sem o --json que o orca() acrescenta
+
+
+TRUST_CLAUDE = "python3 ~/.claude/scripts/trust-cwd.py"
+
+
+def test_ticket125_add_sem_registro_registra_no_orca_grava_o_projeto_e_o_orca_yaml_so_com_o_que_o_repo_tem():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    r = a.orq("projeto", "add", repo)
+    assert r.returncode == 0, r.stderr
+    assert _chamadas_repo(a) == [["add", "--path", repo], ["set-base-ref", "--repo", f"path:{repo}", "--ref", "origin/main"]], _chamadas_repo(a)
+    assert json.load(open(os.path.join(a.home, "projects", "app.json")))["repo"] == f"path:{repo}"
+    y = open(os.path.join(repo, "orca.yaml")).read()
+    assert TRUST_CLAUDE in y and "npm ci" in y and ".scratch" in y, y
+    # só package-lock.json: sem Meteor, E2E, graphify nem o script de setup de worktree
+    for ausente in ("meteor", ".meteor", "e2e", "graphify", "setup-worktree", "docker"):
+        assert ausente not in y, (ausente, y)
+    assert orq_mod.orca_yaml_ler(y)[0]["setup"][0] == TRUST_CLAUDE
+
+
+def test_ticket125_cada_bloco_entra_so_pelo_marcador_que_o_repo_tem():
+    a = Amb()
+    tudo = _repo_git(a, "tudo", ["pnpm-lock.yaml", "scripts/setup-worktree.sh", "graphify-out/graph.json", "web/.meteor/release", "docker-compose.e2e.yml"])
+    open(os.path.join(tudo, "scripts", "e2e-infra.sh"), "w").write("case $1 in\n  destroy) :;;\nesac\n")
+    y = orq_mod.orca_yaml_montar(tudo, "claude", {})[0]
+    assert "pnpm install" in y and "sh scripts/setup-worktree.sh" in y and "graphify update" in y, y
+    assert "rm -rf web/.meteor/local web/_build" in y and "sh scripts/e2e-infra.sh destroy" in y, y
+    nada = _repo_git(a, "nada")
+    y = orq_mod.orca_yaml_montar(nada, "claude", {})[0]
+    assert TRUST_CLAUDE in y and "install" not in y and "meteor" not in y and "e2e" not in y, y
+
+
+def test_ticket125_projeto_pode_ligar_e_desligar_blocos_e_acrescentar_comandos():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json", "web/.meteor/release"])
+    cfg = {"blocos": {"meteor": False, "install": False, "graphify": True}, "setup_extra": ["make bootstrap"], "archive_extra": ["rm -rf .cache"]}
+    y = orq_mod.orca_yaml_montar(repo, "claude", cfg)[0]
+    assert "npm ci" not in y and "meteor" not in y and "graphify update" in y, y
+    setup, archive = (orq_mod.orca_yaml_ler(y)[0][k] for k in ("setup", "archive"))
+    assert setup[-1] == "make bootstrap" and archive[-1] == "rm -rf .cache", (setup, archive)
+    for ruim in ({"blocos": {"docker": True}}, {"blocos": {"meteor": "sim"}}, {"setup_extra": "x"}, {"setup_extra": [1]}):
+        try:
+            orq_mod.orca_yaml_montar(repo, "claude", ruim)
+        except ValueError:
+            continue
+        raise AssertionError(f"aceitou {ruim}")
+
+
+def test_ticket125_orca_yaml_existente_nao_e_sobrescrito_e_mostra_o_diff():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    antigo = "scripts:\n  setup: |\n    echo meu\n"
+    open(os.path.join(repo, "orca.yaml"), "w").write(antigo)
+    r = a.orq("projeto", "add", repo)
+    assert r.returncode == 0, r.stderr
+    assert open(os.path.join(repo, "orca.yaml")).read() == antigo
+    assert "-    echo meu" in r.stdout and "+    npm ci" in r.stdout and "--substituir-orca-yaml" in r.stdout, r.stdout
+    assert ["add", "--path", repo] in _chamadas_repo(a), "o registro no Orca segue valendo"
+    r = a.orq("projeto", "add", repo, "--substituir-orca-yaml")
+    assert r.returncode == 0 and "npm ci" in open(os.path.join(repo, "orca.yaml")).read()
+
+
+def test_ticket125_a_parte_fixa_entra_sempre_inclusive_na_proposta_do_agente_e_no_codex():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    prop = os.path.join(a.tmp.name, "prop.yaml")
+    open(prop, "w").write("scripts:\n  setup: |\n    make deps\n  archive: |\n    make clean\n")
+    r = a.orq("projeto", "add", repo, "--orca-yaml", prop, "--harness", "codex")
+    assert r.returncode == 0, r.stderr
+    setup, archive = (orq_mod.orca_yaml_ler(open(os.path.join(repo, "orca.yaml")).read())[0][k] for k in ("setup", "archive"))
+    assert setup[0] == "orq projeto confiar" and setup[1].startswith("main=$(git worktree list") and setup[-1] == "make deps", setup
+    assert archive[0].startswith("main=$(git worktree list") and archive[-1] == "make clean", archive
+    assert "npm ci" not in "\n".join(setup), "a proposta do agente troca a detecção"
+    assert json.load(open(os.path.join(a.home, "projects", "app.json")))["harness"] == "codex"
+
+
+def test_ticket125_proposta_com_yaml_invalido_ou_chave_desconhecida_e_recusada_antes_de_gravar():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    for i, ruim in enumerate(("scripts:\n  setup: echo a: b\n", "scripts:\n  setup: |\n    ok\nfoo: 1\n", "scripts:\n  teardown: |\n    x\n",
+                              "scripts:\n\tsetup: x\n", "isto nao e yaml", "scripts:\n  setup:\n", "scripts:\n  setup: |\n    a\n  setup: |\n    b\n")):
+        prop = os.path.join(a.tmp.name, f"p{i}.yaml")
+        open(prop, "w").write(ruim)
+        r = a.orq("projeto", "add", repo, "--orca-yaml", prop)
+        assert r.returncode != 0, (ruim, r.stdout)
+        assert not os.path.exists(os.path.join(repo, "orca.yaml")) and not os.path.exists(os.path.join(a.home, "projects")) and not _chamadas_repo(a), ruim
+
+
+def test_ticket125_repo_ja_registrado_no_orca_nao_registra_de_novo():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    a.set("repos.json", [{"id": "r9", "path": repo, "displayName": "app"}])
+    assert a.orq("projeto", "add", repo).returncode == 0
+    assert _chamadas_repo(a) == [], _chamadas_repo(a)
+
+
+def test_ticket125_dry_run_mostra_o_orca_yaml_e_nao_grava_nem_registra_nada():
+    a = Amb()
+    repo = _repo_git(a, arquivos=["package-lock.json"])
+    r = a.orq("projeto", "add", repo, "--dry-run")
+    assert r.returncode == 0 and TRUST_CLAUDE in r.stdout and "npm ci" in r.stdout, r
+    assert not os.path.exists(os.path.join(repo, "orca.yaml")) and not os.path.exists(os.path.join(a.home, "projects")) and not _chamadas_repo(a)
+
+
+def test_ticket125_add_de_url_clona_e_pasta_que_nao_e_repo_ou_nome_de_outro_repo_recusa():
+    a = Amb()
+    origem = _repo_git(a, "origem", ["package-lock.json"])
+    subprocess.run(["git", "-C", origem, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    destino = os.path.join(a.tmp.name, "clone")
+    r = a.orq("projeto", "add", f"file://{origem}", "--destino", destino, "--nome", "clonado")
+    assert r.returncode == 0, r.stderr
+    assert os.path.isfile(os.path.join(destino, "orca.yaml")) and json.load(open(os.path.join(a.home, "projects", "clonado.json")))["repo"] == f"path:{os.path.realpath(destino)}"
+    solta = os.path.join(a.tmp.name, "solta")
+    os.makedirs(solta)
+    assert a.orq("projeto", "add", solta).returncode != 0
+    outro = _repo_git(a, "outro")
+    r = a.orq("projeto", "add", outro, "--nome", "clonado")
+    assert r.returncode != 0 and "clonado" in r.stderr, r
+
+
+def test_ticket125_mate_abrir_abre_o_terminal_no_projeto_do_grupo_registrado_no_orca():
+    a = Amb()
+    repo, outro = _repo_git(a, "p1"), _repo_git(a, "p2")
+    a.set("repos.json", [{"id": "r1", "path": repo, "displayName": "p1"}, {"id": "r2", "path": outro, "displayName": "p2"}])
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    _grupo(a, projetos=[repo, outro])
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    cria = _log(a, "create.log")[0]
+    assert cria[cria.index("--worktree") + 1] == f"path:{repo}", cria  # vários projetos: o primeiro
+    assert cria[cria.index("--command") + 1].startswith(f"cd {repo}; "), cria
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret2": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    cur = _cursor(a)
+    cur["mates"] = {}
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    _grupo(a, projetos=[repo, outro], projeto_mate=outro)
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    cria = _log(a, "create.log")[1]
+    assert cria[cria.index("--worktree") + 1] == f"path:{outro}", cria  # projeto_mate ganha
+
+
+def test_ticket125_mate_abrir_sem_o_projeto_no_orca_segue_no_checkout_atual():
+    a = Amb()
+    repo = _repo_git(a, "p1")
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    _grupo(a, projetos=[repo])
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    assert "--worktree" not in _log(a, "create.log")[0]
 
 
 if __name__ == "__main__":

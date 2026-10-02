@@ -5,6 +5,7 @@ ORQ_PENDENCIAS troca o pendencias.json, ORQ_HOME troca o diretório de dados, OR
 """
 import argparse
 import contextlib
+import difflib
 import fcntl
 import glob
 import hashlib
@@ -4380,7 +4381,9 @@ def mate_abrir(grupo):
     cwd = cwd and os.path.expanduser(cwd)
     agente = cfg.get("harness") or "claude"
     comando, texto = _comando_mate(grupo, cfg, m.get("sessao"), cwd)
-    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", comando)
+    # o terminal abre no projeto do grupo, se o Orca o conhece (ele agrupa o mate com o projeto na tela): `projeto_mate`, senão o primeiro dos `projetos`
+    pasta_mate = os.path.expanduser(cfg.get("projeto_mate") or next(iter(cfg.get("projetos") or []), "")) or None
+    novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", comando, pasta_mate and _repo_no_orca(pasta_mate))
     ok = _agente_pronto(novo, agente, MATE_ESPERA_S) and digita(novo, texto) == "enviado" if texto else not m.get("sessao") or _voltou(novo, agente)
     if not ok:
         # sessão que não volta, ou agente que não subiu, deixa um shell: o gerente digitaria o pedido nele. Fecha e, se era resume, esquece a sessão
@@ -6547,6 +6550,192 @@ def pasta_do_repo(seletor):
         return None
     campo = {"id": "id", "name": "displayName"}.get(tipo)
     return next((os.path.realpath(r["path"]) for r in repos if campo and r.get(campo) == valor and r.get("path")), None)
+
+
+# ---- orq projeto add (ticket 125): registra no Orca e gera o orca.yaml
+
+ORCA_YAML_RAIZ = ("scripts", "setupAgentStartupPolicy", "issueCommand", "defaultTabs", "environmentRecipes", "worktree")  # as chaves de topo que o Orca lê (conferido no app em 01/10)
+ORCA_YAML_SCRIPTS = ("setup", "archive")
+TRUST_DO_HARNESS = {"claude": "python3 ~/.claude/scripts/trust-cwd.py", "codex": "orq projeto confiar"}  # a parte fixa do setup: confiar a pasta no harness do projeto
+SCRATCH_ENTRA = ('main=$(git worktree list --porcelain | awk \'NR==1{print $2}\'); if [ -n "$main" ] && [ "$main" != "$(pwd -P)" ] && [ -d "$main/.scratch" ]; then '
+                 'mkdir -p .scratch && rsync -a --ignore-existing "$main/.scratch/" .scratch/; fi || echo "sync do .scratch falhou"')
+SCRATCH_VOLTA = ('main=$(git worktree list --porcelain | awk \'NR==1{print $2}\'); if [ -n "$main" ] && [ "$main" != "$(pwd -P)" ] && [ -d .scratch ]; then '
+                 'mkdir -p "$main/.scratch" && rsync -a --update .scratch/ "$main/.scratch/"; fi || echo "copia do .scratch de volta falhou"')
+LOCKFILES = (("pnpm-lock.yaml", "pnpm install --frozen-lockfile"), ("yarn.lock", "yarn install --frozen-lockfile"), ("package-lock.json", "npm ci"),
+             ("bun.lock", "bun install"), ("bun.lockb", "bun install"), ("uv.lock", "uv sync"))
+E2E_SCRIPT = "scripts/e2e-infra.sh"
+# bloco -> (fase, comando de quando o projeto liga o bloco que a detecção não achou); a detecção de cada um está em _bloco_detectado
+BLOCOS_ORCA = {"install": ("setup", "npm install"), "setup_script": ("setup", "sh scripts/setup-worktree.sh"),
+               "graphify": ("setup", 'graphify update . >/dev/null 2>&1 || echo "graphify update falhou"'),
+               "meteor": ("archive", "rm -rf .meteor/local _build"), "e2e": ("archive", f'sh {E2E_SCRIPT} destroy >/dev/null 2>&1 || echo "e2e destroy falhou"')}
+
+
+def _bloco_detectado(repo, bloco):
+    """As linhas do bloco, se o repositório tem o marcador dele (arquivo ou pasta); senão None."""
+    ha = lambda *p: os.path.exists(os.path.join(repo, *p))  # noqa: E731
+    if bloco == "install":
+        return next(([cmd] for arq, cmd in LOCKFILES if ha(arq)), None)
+    if bloco == "setup_script":
+        return [BLOCOS_ORCA[bloco][1]] if ha("scripts", "setup-worktree.sh") else None
+    if bloco == "graphify":
+        return [BLOCOS_ORCA[bloco][1]] if ha("graphify-out") else None
+    if bloco == "meteor":
+        pastas = [d for d in [".", *sorted(x for x in os.listdir(repo) if os.path.isdir(os.path.join(repo, x)) and not x.startswith("."))] if ha(d, ".meteor")]
+        return [f"rm -rf {' '.join(f'{d}/{x}' if d != '.' else x for x in ('.meteor/local', '_build'))}" for d in pastas] or None
+    if ha(E2E_SCRIPT) and "destroy)" in open(os.path.join(repo, E2E_SCRIPT), errors="replace").read():
+        return [BLOCOS_ORCA[bloco][1]]
+    return ['docker compose -p "e2e-$(basename "$(pwd -P)")" -f docker-compose.e2e.yml down -v --remove-orphans >/dev/null 2>&1 || echo "e2e destroy falhou"'] if ha("docker-compose.e2e.yml") else None
+
+
+def _scripts_do_orca_yaml(corpo, n0):
+    """{setup|archive: [linhas]} do corpo (linhas indentadas) da chave `scripts:`. Só o bloco `|` ou uma linha simples; o resto é ValueError com a linha."""
+    out, k = {}, 0
+    while k < len(corpo):
+        linha = corpo[k]
+        if not linha.strip() or linha.lstrip().startswith("#"):
+            k += 1
+            continue
+        m = re.fullmatch(r"( +)([A-Za-z][A-Za-z0-9_-]*):(?:\s+(.*))?", linha)
+        if not m:
+            raise ValueError(f"orca.yaml, linha {n0 + k}: esperava `setup:` ou `archive:` em `scripts:`, veio {linha.strip()!r}")
+        indent, chave, valor = len(m.group(1)), m.group(2), (m.group(3) or "").strip()
+        if chave not in ORCA_YAML_SCRIPTS or chave in out:
+            raise ValueError(f"orca.yaml, linha {n0 + k}: `scripts.{chave}` {'repetida' if chave in out else 'que o orq não conhece'} (só {', '.join(ORCA_YAML_SCRIPTS)})")
+        k += 1
+        if re.fullmatch(r"\|[-+]?", valor):
+            bloco = []
+            while k < len(corpo) and (not corpo[k].strip() or len(corpo[k]) - len(corpo[k].lstrip()) > indent):
+                bloco.append(corpo[k])
+                k += 1
+            base = min((len(x) - len(x.lstrip()) for x in bloco if x.strip()), default=None)
+            if base is None:
+                raise ValueError(f"orca.yaml, linha {n0 + k - 1}: `scripts.{chave}` está vazio")
+            out[chave] = [x[base:] if x.strip() else "" for x in bloco]
+            while out[chave] and not out[chave][-1]:
+                out[chave].pop()
+        elif valor and valor[0] not in "'\"{[&*>|!#" and ": " not in valor and " #" not in valor and not valor.endswith(":"):
+            out[chave] = [valor]
+        else:
+            raise ValueError(f"orca.yaml, linha {n0 + k - 1}: `scripts.{chave}` com valor que não é YAML simples; use um bloco `|`")
+    return out
+
+
+def orca_yaml_ler(texto):
+    """({setup: [linhas], archive: [linhas]}, resto) do subconjunto do orca.yaml que o orq aceita: só chaves de topo que o Orca lê, `scripts:` com `setup` e
+    `archive` (bloco `|` ou linha simples), indentação com espaço. O `resto` são as outras chaves de topo, como vieram. YAML fora disso é ValueError."""
+    if "\t" in texto:
+        raise ValueError("orca.yaml: tab na indentação (YAML só aceita espaço)")
+    linhas, i, scripts, resto = texto.splitlines(), 0, {}, []
+    while i < len(linhas):
+        if not linhas[i].strip() or linhas[i].startswith("#"):
+            i += 1
+            continue
+        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9_-]*):(?:\s+(.*))?", linhas[i])
+        if not m:
+            raise ValueError(f"orca.yaml, linha {i + 1}: esperava uma chave de topo, veio {linhas[i].strip()!r}")
+        if m.group(1) not in ORCA_YAML_RAIZ:
+            raise ValueError(f"orca.yaml, linha {i + 1}: chave {m.group(1)!r} que o Orca não lê (aceita {', '.join(ORCA_YAML_RAIZ)})")
+        j = i + 1
+        while j < len(linhas) and (not linhas[j].strip() or linhas[j][0] in " #"):
+            j += 1
+        if m.group(1) == "scripts":
+            if m.group(2):
+                raise ValueError(f"orca.yaml, linha {i + 1}: `scripts:` é um mapa, não {m.group(2)!r}")
+            scripts = _scripts_do_orca_yaml(linhas[i + 1:j], i + 2)
+        else:
+            resto += linhas[i:j]
+        i = j
+    while resto and not resto[-1].strip():
+        resto.pop()
+    return scripts, resto
+
+
+def orca_yaml_montar(repo, harness, cfg, proposta=None):
+    """(texto do orca.yaml, resto) de `repo`. A parte fixa entra sempre (confiar a pasta no harness, o `.scratch` indo e voltando); o resto vem da `proposta`
+    do agente ((scripts, resto) de `orca_yaml_ler`) ou, sem ela, dos blocos que o repositório tem. `cfg` é o `orca` do arquivo do projeto: `blocos`
+    {nome: bool} liga (true) ou desliga (false) um bloco que a detecção errou, `setup_extra` e `archive_extra` acrescentam comandos."""
+    cfg = _dict(cfg)
+    blocos, extras = _dict(cfg.get("blocos")), {f: cfg.get(f"{f}_extra", []) for f in ORCA_YAML_SCRIPTS}
+    if not all(b in BLOCOS_ORCA and isinstance(v, bool) for b, v in blocos.items()):
+        raise ValueError(f"orca.blocos: esperava {{bloco: true|false}} com blocos de {', '.join(BLOCOS_ORCA)}")
+    if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in extras.values()):
+        raise ValueError("orca.setup_extra e orca.archive_extra: esperava listas de comandos (texto)")
+    fixo = {"setup": [TRUST_DO_HARNESS[harness], SCRATCH_ENTRA], "archive": [SCRATCH_VOLTA]}
+    scripts = {}
+    for fase in ORCA_YAML_SCRIPTS:
+        if proposta:
+            meio = proposta[0].get(fase, [])
+        else:
+            meio = [l for b, (f, padrao) in BLOCOS_ORCA.items() if f == fase and blocos.get(b) is not False
+                    for l in (_bloco_detectado(repo, b) or ([padrao] if blocos.get(b) else []))]
+        scripts[fase] = fixo[fase] + [l for l in meio if l not in fixo[fase]] + extras[fase]
+    resto = proposta[1] if proposta else []
+    texto = "scripts:\n" + "".join(f"  {f}: |\n" + "".join(f"    {l}\n" if l else "\n" for l in scripts[f]) for f in ORCA_YAML_SCRIPTS) + ("".join(f"{l}\n" for l in resto))
+    if orca_yaml_ler(texto)[0] != scripts:  # o que o orq escreve, o orq lê de volta igual
+        raise ValueError("orca.yaml montado não lê de volta igual: comando com linha que o YAML não guarda")
+    return texto, resto
+
+
+def _repo_no_orca(pasta):
+    """A raiz do repositório de `pasta` se o Orca o conhece (`orca repo list`); senão None, também com o Orca fora do ar."""
+    raiz = _raiz_do_repo(pasta)
+    try:
+        repos = orca("list", area="repo")["repos"]
+    except (RuntimeError, subprocess.TimeoutExpired, KeyError, ValueError) as e:
+        log(f"_repo_no_orca: orca repo list falhou: {type(e).__name__}: {e}")
+        return None
+    return raiz if raiz and any(r.get("path") and os.path.realpath(r["path"]) == raiz for r in repos) else None
+
+
+def projeto_add(alvo, nome=None, harness=None, grupo=None, proposta_arq=None, destino=None, substituir=False, dry_run=False):
+    """`orq projeto add <caminho|url>`: grava ORQ_HOME/projects/<nome>.json, registra o repositório no Orca se faltar (`repo add`, e a base das worktrees
+    novas, `origin/<produção do projeto>`) e escreve o orca.yaml na raiz dele. Tudo é validado antes de mexer em qualquer coisa. Um orca.yaml que já existe
+    não é trocado: devolve o diff, e só `substituir` o troca. `dry_run` só devolve o que faria."""
+    if re.match(r"(https?://|ssh://|file://|git@)", alvo):
+        nome = nome or re.sub(r"\.git$", "", alvo.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        destino = os.path.expanduser(destino or os.path.join("~/Developer", nome))
+        if not os.path.isdir(destino):
+            if dry_run:
+                raise ValueError(f"{destino} ainda não existe: --dry-run não clona")
+            subprocess.run(["git", "clone", "-q", alvo, destino], check=True, capture_output=True, text=True, timeout=600)
+        alvo = destino
+    raiz = _raiz_do_repo(os.path.realpath(os.path.expanduser(alvo))) if os.path.isdir(os.path.expanduser(alvo)) else None
+    if not raiz:
+        raise ValueError(f"{alvo} não é uma pasta de repositório git")
+    nome = nome or os.path.basename(raiz)
+    arq = os.path.join(_path("projects"), f"{nome}.json")
+    existe = os.path.exists(arq)
+    dados = _dict(_read_json(arq)) if existe else {"repo": f"path:{raiz}", **({"harness": harness} if harness and harness != "claude" else {}), **({"grupo": grupo} if grupo else {})}
+    if dados.get("repo") != f"path:{raiz}":
+        raise ValueError(f"o projeto {nome} já existe em {arq} e aponta para {dados.get('repo')}, não para {raiz}: passe --nome")
+    harness = dados.get("harness") or "claude"
+    if harness not in TRUST_DO_HARNESS:
+        raise ValueError(f"harness {harness!r} do projeto {nome}: o orq confia a pasta só de {', '.join(TRUST_DO_HARNESS)}")
+    proposta = orca_yaml_ler(open(proposta_arq, encoding="utf-8").read()) if proposta_arq else None
+    texto, _ = orca_yaml_montar(raiz, harness, dados.get("orca"), proposta)
+    _, producao, _, erro = _ambientes_do_arquivo(dados)
+    if erro:
+        raise ValueError(f"projeto {nome}: {erro}")
+    base = producao or branch_padrao(raiz)
+    caminho_yaml = os.path.join(raiz, "orca.yaml")
+    atual = open(caminho_yaml, encoding="utf-8").read() if os.path.exists(caminho_yaml) else None
+    grava = atual is None or (substituir and atual != texto)
+    out = {"projeto": nome, "repo": raiz, "arquivo": arq, "base": f"origin/{base}", "orca_yaml": texto, "orca_yaml_estado": "novo" if atual is None else "igual" if atual == texto else "trocado" if grava else "mantido",
+           "diff": "" if atual in (None, texto) else "".join(difflib.unified_diff(atual.splitlines(True), texto.splitlines(True), "orca.yaml (atual)", "orca.yaml (proposto)")), "dry_run": dry_run}
+    if dry_run:
+        return out
+    registrar = not _repo_no_orca(raiz)
+    if registrar:
+        orca("add", "--path", raiz, area="repo")
+        orca("set-base-ref", "--repo", f"path:{raiz}", "--ref", f"origin/{base}", area="repo")
+    if not existe:
+        _write_json(arq, dados, indent=2)
+    if grava:
+        tmp = f"{caminho_yaml}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(texto)
+        os.replace(tmp, caminho_yaml)
+    return {**out, "registrado_no_orca": registrar, "arquivo_novo": not existe}
 
 
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False, servico=False):
@@ -8890,6 +9079,18 @@ def main(argv=None):
     rp.add_argument("--run")
     pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo, ambientes)")
     pj.add_argument("--json", action="store_true")
+    pa = sub.add_parser("projeto", help="projeto novo: registra no Orca e gera o orca.yaml (add), ou confia a pasta no Codex (confiar)").add_subparsers(dest="op", required=True)
+    paa = pa.add_parser("add", help="orq projeto add <caminho|url>: grava projects/<nome>.json, registra o repo no Orca se faltar e escreve o orca.yaml")
+    paa.add_argument("alvo")
+    paa.add_argument("--nome")
+    paa.add_argument("--harness", choices=sorted(TRUST_DO_HARNESS))
+    paa.add_argument("--grupo")
+    paa.add_argument("--destino", help="url: a pasta do clone (padrão ~/Developer/<nome>)")
+    paa.add_argument("--orca-yaml", dest="orca_yaml", help="o orca.yaml que o agente propôs: troca os blocos detectados (a parte fixa entra sempre)")
+    paa.add_argument("--substituir-orca-yaml", action="store_true", help="troca o orca.yaml que o repositório já tem (sem a flag ele só mostra o diff)")
+    paa.add_argument("--dry-run", action="store_true", help="mostra o orca.yaml e o que faria, sem gravar nem registrar")
+    paa.add_argument("--json", action="store_true")
+    pa.add_parser("confiar", help="marca o cwd (e a raiz do repo dele) como confiável no Codex: a linha fixa do setup do orca.yaml de um projeto Codex")
     fl = sub.add_parser("fluxo", help="os ambientes e a produção do projeto que contém --repo (o limpar-mergeados.py lê daqui)")
     fl.add_argument("--repo", default=".")
     fl.add_argument("--json", action="store_true")
@@ -9139,6 +9340,21 @@ def main(argv=None):
         elif a.cmd == "fluxo":
             fx = fluxo_do_repo(a.repo)
             print(json.dumps(fx, ensure_ascii=False) if a.json else f"produção {fx['producao']}; ambientes {', '.join(fx['ambientes'])}; fluxo {fx['fluxo']}" + ("" if fx["declarado"] else " (padrão: sem bloco ambientes)"))
+        elif a.cmd == "projeto" and a.op == "confiar":
+            cwd = os.path.realpath(os.getcwd())
+            print("\n".join(f"codex: pasta confiável {p}" for p in confiar_codex(_raiz_do_repo(cwd), cwd)))
+        elif a.cmd == "projeto":
+            r = projeto_add(a.alvo, a.nome, a.harness, a.grupo, a.orca_yaml, a.destino, a.substituir_orca_yaml, a.dry_run)
+            if a.json:
+                print(json.dumps(r, ensure_ascii=False))
+            else:
+                print(f"projeto {r['projeto']}: {r['repo']} (base das worktrees {r['base']})" + (" [dry-run: nada gravado]" if r["dry_run"] else
+                      f"\n  arquivo {r['arquivo']} {'criado' if r['arquivo_novo'] else 'mantido'}; Orca: {'registrado' if r['registrado_no_orca'] else 'já registrado'}"))
+                print(f"orca.yaml ({r['orca_yaml_estado']}):\n{r['orca_yaml']}")
+                if r["diff"]:
+                    print(f"diferença para o orca.yaml que o repositório tem:\n{r['diff']}")
+                if r["orca_yaml_estado"] == "mantido":
+                    print("o orca.yaml existente não foi trocado: pergunte ao usuário e, se ele aceitar, rode de novo com --substituir-orca-yaml")
         elif a.cmd == "projetos":
             ps = projetos()
             if a.json:
