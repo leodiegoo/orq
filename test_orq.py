@@ -7095,6 +7095,19 @@ def test_night_external_hook_stays_under_100_ms():
     assert time.time() - t0 < 0.1
 
 
+
+def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
+    a = Env(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"s1": "worker"}})
+    for cmd in ("python3 test_orq.py", "cd wt && rtk python3 test_orq.py -j 4", "python3 /x/test_orq.py --map m.json && python3 test_precompact.py"):
+        out = _external(a, cmd)
+        assert out and "orq test --affected" in out["additionalContext"] and "permissionDecision" not in out, cmd
+    for cmd in ("python3 test_orq.py test_x", "python3 test_orq.py -j 2 ticket328", "orq test --affected", "python3 test_precompact.py", "git commit -m 'python3 test_orq.py'"):
+        assert _external(a, cmd) is None, cmd
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {}})
+    assert _external(a, "python3 test_orq.py") is None, "the coordinator and the integrator's script are not warned"
+
 def _no_git_env(a, **env):
     """Removes from the test environment the git variables the developer's session may have (GIT_CONFIG_*, GIT_TERMINAL_PROMPT)."""
     for k in [k for k in a.env if k.startswith("GIT_CONFIG_") or k == "GIT_TERMINAL_PROMPT"]:
@@ -18682,6 +18695,89 @@ def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead
     finally:
         holder.kill()
         holder.wait()
+
+
+
+def _repo328(files):
+    """A git repo with `files` {path: text} committed on main: returns its path."""
+    root = tempfile.mkdtemp()
+    for path, text_value in files.items():
+        os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+        with open(os.path.join(root, path), "w") as f:
+            f.write(text_value)
+    for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", root, *c], check=True, capture_output=True)
+    return root
+
+
+def _edit328(root, path, old, new):
+    p = os.path.join(root, path)
+    text_value = open(p).read()
+    assert old in text_value, old
+    with open(p, "w") as f:
+        f.write(text_value.replace(old, new, 1))
+
+
+LIB328 = '"""doc"""\nimport os\n\nLIMIT = 3\n\n\ndef a():\n    return 1\n\n\ndef b():\n    return LIMIT\n\n\ndef c():\n    return 2\n'
+TESTS328 = ('import orqlib as orq_mod\n\nFAKE = "fake"\n\n\nclass Env:\n    x = FAKE\n\n\ndef test_a():\n    assert orq_mod.a()\n\n\ndef test_b():\n    Env()\n\n\n'
+            'def test_c():\n    assert orq_mod.LIMIT\n\n\ndef test_readme():\n    open("README.md")\n\n\nif __name__ == "__main__":\n    pass\n')
+MAP328 = {"tests": {"test_a": ["orqlib.py:a", "test_orq.py:test_a"], "test_b": ["orqlib.py:b", "test_orq.py:Env"], "test_c": ["orqlib.py:c"], "test_readme": []}}
+
+
+def test_ticket328_affected_picks_the_tests_that_ran_the_changed_function():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "docs/design.md": "x\n"})
+    _edit328(root, "orqlib.py", "return 1", "return 11")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_a"} and r["reasons"] == ["orqlib.py: a -> 1 tests"], r
+    _edit328(root, "orqlib.py", "LIMIT = 3", "LIMIT = 4")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_a", "test_b", "test_c"}, "a module name reaches the defs that use it and the tests that read it as orq_mod.X"
+
+
+def test_ticket328_affected_runs_changed_tests_and_the_ones_behind_a_changed_helper():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n"})
+    _edit328(root, "test_orq.py", "assert orq_mod.LIMIT", "assert orq_mod.LIMIT > 0")
+    _edit328(root, "test_orq.py", "\n\nif __name__", "\n\ndef test_novo():\n    pass\n\n\nif __name__")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_c", "test_novo"}, "the changed test and the new one, which no map knows yet"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_b"}, "FAKE -> Env -> the tests that built an Env"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "README.md", "# x", "# y")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_readme"} and r["reasons"] == ["README.md: 1 tests mention it"], r
+
+
+def test_ticket328_affected_falls_back_to_the_full_suite_when_it_cannot_tell():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "tool.py": "def f():\n    pass\n"})
+    assert orq_mod.affected_tests(root, "main", {})["tests"] is None, "no map"
+    _edit328(root, "orqlib.py", "import os", "import os\nimport re")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "module-level line" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "tool.py", "pass", "return 1")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "tool.py: not in the test map" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "orqlib.py", '"""doc"""', '"""the doc"""')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == set(), "the module docstring reaches nothing"
+
+
+def test_ticket328_orq_test_affected_runs_only_the_affected_tests():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "precompact.py": "def p():\n    pass\n"})
+    m = os.path.join(root, "..", os.path.basename(root) + "-map.json")
+    with open(m, "w") as f:
+        json.dump(MAP328, f)
+    _edit328(root, "orqlib.py", "return 2", "return 3")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", cwd=root)
+    assert (r.returncode, r.stdout) == (0, "test_orq.py test_c\n") and "1 affected tests" in r.stderr, r
+    _edit328(root, "precompact.py", "pass", "return 1")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", "-j", "2", cwd=root)
+    assert r.stdout == "test_orq.py -j 2 test_c\ntest_precompact.py\n", r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, cwd=root)
+    assert (r.returncode, r.stdout) == (0, "orq test: the diff against main touches no test\n"), r
+    r = Env().orq("test", cwd=tempfile.mkdtemp())
+    assert r.returncode != 0 and "no test_orq.py" in r.stderr, r
 
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])

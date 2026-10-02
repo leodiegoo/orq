@@ -4883,11 +4883,29 @@ def _external_denied(ev, cur):
     return "git reset --hard in the main checkout"
 
 
+def _full_suite(cmd):
+    """Does `cmd` run the whole test_orq.py, with options but no test name? (ticket 328: the worker runs `orq test --affected`)."""
+    for seg in cmdnorm.segments(cmd):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        i = next((k for k, t in enumerate(toks) if t.endswith("test_orq.py")), None)
+        rest = toks[i + 1:] if i is not None else None
+        if rest is not None and not [t for k, t in enumerate(rest) if not t.startswith("-") and not (k and rest[k - 1] in ("-j", "--jobs", "--map"))]:
+            return True
+    return False
+
+
 def hook_external(ev, run):
     """PreToolUse of Bash, in every session (workers included): with night mode on it denies push, PR merge, deploy, commit without hook,
     `orca worktree rm --force` and `git reset --hard` on the main checkout. The message says to park the work and how to turn it off. When off, nothing changes."""
-    item_name = _external_denied(ev, _cursor_ro())
+    cur = _cursor_ro()
+    item_name = _external_denied(ev, cur)
     if not item_name:
+        if _dict(cur.get("papeis")).get(ev.get("session_id") or "") == "worker" and _full_suite(_dict(ev.get("tool_input")).get("command") or ""):
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": f"{MARK} the whole test_orq.py takes minutes and competes with the other "
+                    "workers for CPU: run `orq test --affected` (the tests your diff touches); the integrator runs the full suite (notice, nothing was blocked)."}}
         return None
     reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
               "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
@@ -9774,6 +9792,147 @@ def add_project(target, item_name=None, harness=None, group_name=None, proposal_
         os.replace(tmp, yaml_path)
     return {**out, "registrado_no_orca": registrar, "arquivo_novo": not does_exist}
 
+# ---------- orq test (ticket 328) ----------
+
+TEST_MAP = os.environ.get("ORQ_TEST_MAP") or os.path.join(PLAN, "test-map.json")  # the functions each test runs: the integrator's full run writes it (test_orq.py --map), outside git
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+TOP_DEF = ("FunctionDef", "AsyncFunctionDef", "ClassDef")
+
+
+def _diff_ranges(diff):
+    """{path: ([new (first, last)], [old (first, last)])} of a `git diff -U0` text; a side of a hunk with 0 lines has no range on that side."""
+    out, path = {}, None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = line.split(" b/", 1)[-1]
+            out.setdefault(path, ([], []))
+        elif path and (m := HUNK.match(line)):
+            o, oc, n, nc = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
+            if nc:
+                out[path][0].append((n, n + nc - 1))
+            if oc:
+                out[path][1].append((o, o + oc - 1))
+    return out
+
+
+def _top(src):
+    """The top-level statements of a module's source ([] if it does not parse), each with its first line (decorators included)."""
+    import ast  # late import: only `orq test` parses code (ticket 49: the hooks' 100 ms)
+    try:
+        return [(min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])]), st) for st in ast.parse(src).body]
+    except (SyntaxError, ValueError):
+        return []
+
+
+def _touched(src, ranges):
+    """What the line ranges touch at the top of a module: (defs and classes, module names assigned, loose). Loose is a module-level statement that is
+    neither, like an import or an `if`: then no map says which tests it reaches. The module docstring counts as nothing."""
+    import ast
+    defs, names, loose = set(), set(), False
+    for i, (first, st) in enumerate(_top(src)):
+        if not any(a <= st.end_lineno and b >= first for a, b in ranges):
+            continue
+        if type(st).__name__ in TOP_DEF:
+            defs.add(st.name)
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names |= {n.id for t in getattr(st, "targets", [getattr(st, "target", None)]) for n in ast.walk(t) if isinstance(n, ast.Name)}
+        elif not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
+            loose = True
+    return defs, names, loose
+
+
+def _using(top, names):
+    """The top-level defs and classes of a parsed module that use one of `names`, as a name or as an attribute (`orq_mod.X`)."""
+    import ast
+    return {st.name for _, st in top if type(st).__name__ in TOP_DEF and names and
+            any(getattr(n, "id", None) in names or (isinstance(n, ast.Attribute) and n.attr in names) for n in ast.walk(st))}
+
+
+def affected_tests(root, base, test_map):
+    """The test_orq.py tests that the diff of the tree `root` against `base` touches: {tests (None: only the full suite is safe), reasons, precompact}.
+
+    A changed def or class of a .py reaches the tests that ran it (the map: {tests: {test: ["file:function"]}}); a module-level name reaches it through the
+    defs that use it; a test changed or new in test_orq.py always runs. A file the map does not know (a script run without coverage, a non-.py) reaches the
+    tests whose source mentions its name. Full suite: no map, a failed diff, a loose module-level line (import, `if`), or a .py the map does not know
+    that no test mentions. Limit: a module-level name used only through another module name (A = B + 1) is followed one level."""
+    diff = _git(root, "diff", "-U0", "--no-color", "--no-renames", base, "--")
+    by_fn = {}
+    for t, fns in _dict(_dict(test_map).get("tests")).items():
+        for f in fns:
+            by_fn.setdefault(f, set()).add(t)
+    if diff is None or not by_fn:
+        return {"tests": None, "reasons": [f"git diff {base} failed" if diff is None else f"no test map in {TEST_MAP}: the integrator's full run writes it"], "precompact": False}
+    try:
+        tests_src = open(os.path.join(root, "test_orq.py"), encoding="utf-8").read()
+    except OSError:
+        tests_src = ""
+    t_top, lines = _top(tests_src), tests_src.splitlines()
+    all_tests = {st.name for _, st in t_top if type(st).__name__ in TOP_DEF and st.name.startswith("test_")}
+
+    def via_tests_file(defs, names=frozenset()):
+        defs = set(defs) | _using(t_top, names)
+        return {d for d in defs if d in all_tests} | {t for d in defs for t in by_fn.get(f"test_orq.py:{d}", ())}
+
+    def mentioning(needle):
+        hits = [(first, st) for first, st in t_top if needle in "\n".join(lines[first - 1:st.end_lineno])]
+        return via_tests_file({st.name for _, st in hits if type(st).__name__ in TOP_DEF}, _touched(tests_src, [(f, st.end_lineno) for f, st in hits])[1])
+
+    picked, reasons, precompact = set(), [], False
+    for path, (new, old) in sorted(_diff_ranges(diff).items()):
+        precompact |= path in ("precompact.py", "test_precompact.py")
+        if not path.endswith(".py"):
+            hits = mentioning(os.path.basename(path))
+            picked |= hits
+            reasons.append(f"{path}: {len(hits)} tests mention it")
+            continue
+        try:
+            cur = open(os.path.join(root, path), encoding="utf-8").read()
+        except OSError:
+            cur = ""
+        prev = _git(root, "show", f"{base}:{path}") or ""
+        (d1, n1, l1), (d2, n2, l2) = _touched(cur, new), _touched(prev, old)
+        if l1 or l2:
+            return {"tests": None, "reasons": reasons + [f"{path}: a module-level line outside any def (import, if...): full suite"], "precompact": precompact}
+        names = n1 | n2
+        defs = d1 | d2 | _using(_top(cur), names) | _using(_top(prev), names)
+        hits = {t for d in defs for t in by_fn.get(f"{path}:{d}", ())} | via_tests_file(defs if path == "test_orq.py" else set(), names)
+        if path != "test_orq.py" and not any(k.startswith(path + ":") for k in by_fn):
+            hits |= mentioning(os.path.basename(path))
+            if not hits and path not in ("precompact.py", "test_precompact.py"):
+                return {"tests": None, "reasons": reasons + [f"{path}: not in the test map and no test mentions it: full suite"], "precompact": precompact}
+        uncovered = sorted(d for d in defs if not by_fn.get(f"{path}:{d}") and d not in all_tests)
+        picked |= hits
+        reasons.append(f"{path}: {', '.join(sorted(defs | names)) or 'no code'} -> {len(hits)} tests" + (f" (no test ran {', '.join(uncovered)})" if uncovered else ""))
+    return {"tests": picked & all_tests, "reasons": reasons, "precompact": precompact}
+
+
+def run_tests(affected=False, base=None, jobs=None, names=(), test_map=None, dry_run=False, cwd=None):
+    """`orq test`: runs test_orq.py of the clone or worktree of the cwd (-j, names); with `affected`, only the tests the diff against `base` touches
+    (default: the merge-base with origin/main, uncommitted changes included), plus test_precompact.py when precompact changed. Returns the exit code."""
+    root = (_git(cwd or os.getcwd(), "rev-parse", "--show-toplevel") or "").strip()
+    if not root or not os.path.exists(os.path.join(root, "test_orq.py")):
+        raise ValueError("orq test runs inside a clone or worktree of orq (there is no test_orq.py here)")
+    cmd, precompact = [sys.executable, "test_orq.py", *(["-j", str(jobs)] if jobs else []), *names], False
+    if affected:
+        base = base or (_git(root, "merge-base", "HEAD", "origin/main") or "").strip() or BRANCH_NO_REMOTE
+        r = affected_tests(root, base, _read_json(test_map or TEST_MAP))
+        print("\n".join(f"orq test: {x}" for x in r["reasons"]), file=sys.stderr)
+        precompact = r["precompact"]
+        if r["tests"] is None:
+            print("orq test: running the full suite", file=sys.stderr)
+        elif not r["tests"] and not precompact:
+            print(f"orq test: the diff against {base} touches no test")
+            return 0
+        else:
+            print(f"orq test: {len(r['tests'])} affected tests (diff against {base})", file=sys.stderr)
+            cmd += sorted(r["tests"])
+    runs = ([cmd] if not affected or r["tests"] is None or r["tests"] else []) + ([[sys.executable, "test_precompact.py"]] if precompact else [])
+    if dry_run:
+        print("\n".join(shlex.join(c[1:]) for c in runs))
+        return 0
+    return max([subprocess.run(c, cwd=root).returncode for c in runs] or [0])
+
+
 def orq_ticket(title, project=None):
     """True if the dispatch touches orq itself: project `orq`, or a title that starts with `orq` (`orq: ...`, `orq ...`)."""
     return project == "orq" or bool(re.match(r"orq\b", (title or "").strip(), re.I))
@@ -9785,7 +9944,8 @@ def orq_worktree_block(number=None):
     live, wt = ORQ_INSTALL, os.path.join(WT_ROOT, n)
     return (f"{ORQ_WT_TITLE}\n\nNever commit on `main` of the live checkout `{live}`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
             f"Create the worktree `{wt}` from `origin/main` on a branch of its own (`git -C {live} worktree add -b <type>/<description> {wt} origin/main`) "
-            "and work and commit only in it.\n")
+            "and work and commit only in it.\n"
+            "Run `orq test --affected` (the tests your diff touches), not the whole `python3 test_orq.py`: the integrator runs the full suite.\n")
 
 
 def _with_orq_block(txt, number=None):
@@ -13080,6 +13240,13 @@ def parser():
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
+    te = sub.add_parser("test", help="orq test [--affected] [--base <ref>] [-j N] [name...]: runs test_orq.py of this worktree; --affected only the tests the diff touches")
+    te.add_argument("--affected", action="store_true", help="only the tests the diff against --base touches (the test map in plan/test-map.json)")
+    te.add_argument("--base", help="the diff base (default: the merge-base with origin/main)")
+    te.add_argument("-j", "--jobs", type=int)
+    te.add_argument("--map", help="the test map to read (default: plan/test-map.json)")
+    te.add_argument("--dry-run", action="store_true", help="prints the commands instead of running them")
+    te.add_argument("names", nargs="*")
     wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the ORQ_WT worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
     wl.add_parser("clean", aliases=["limpar"], help="removes the ORQ_WT worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: refuses a wrong author, trailer, forbidden term and code without a README before publishing main")
@@ -13482,6 +13649,8 @@ def main(argv=None):
         elif a.cmd == "integrate":
             item_list = list(integration_queue().values())
             print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (since {_hora_local(i['ts'])})" for i in item_list) or "integrator queue empty")
+        elif a.cmd == "test":
+            return run_tests(a.affected, a.base, a.jobs, a.names, a.map, a.dry_run)
         elif a.cmd == "worktrees":
             r = clean_orq_worktrees(dry_run=a.dry_run)
             print(f"{'would remove' if a.dry_run else 'removed'}: {len(r['removidas'])}; kept: {len(r['ficaram'])}" + (f"; bundle {r['bundle']}" if r["bundle"] else ""))
