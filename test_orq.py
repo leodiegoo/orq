@@ -12708,7 +12708,7 @@ def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_pri
 
 # ---- ticket 125: orq projeto add registra no Orca com o orca.yaml gerado; o mate roda no projeto do Orca
 
-def _repo_git(a, nome="app", arquivos=()):
+def _repo_git_de_projeto(a, nome="app", arquivos=()):
     pasta = os.path.join(a.tmp.name, nome)
     os.makedirs(pasta)
     subprocess.run(["git", "init", "-q", "-b", "main", pasta], check=True)
@@ -12727,7 +12727,7 @@ TRUST_CLAUDE = "python3 ~/.claude/scripts/trust-cwd.py"
 
 def test_ticket125_add_sem_registro_registra_no_orca_grava_o_projeto_e_o_orca_yaml_so_com_o_que_o_repo_tem():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     r = a.orq("projeto", "add", repo)
     assert r.returncode == 0, r.stderr
     assert _chamadas_repo(a) == [["add", "--path", repo], ["set-base-ref", "--repo", f"path:{repo}", "--ref", "origin/main"]], _chamadas_repo(a)
@@ -12742,19 +12742,19 @@ def test_ticket125_add_sem_registro_registra_no_orca_grava_o_projeto_e_o_orca_ya
 
 def test_ticket125_cada_bloco_entra_so_pelo_marcador_que_o_repo_tem():
     a = Amb()
-    tudo = _repo_git(a, "tudo", ["pnpm-lock.yaml", "scripts/setup-worktree.sh", "graphify-out/graph.json", "web/.meteor/release", "docker-compose.e2e.yml"])
+    tudo = _repo_git_de_projeto(a, "tudo", ["pnpm-lock.yaml", "scripts/setup-worktree.sh", "graphify-out/graph.json", "web/.meteor/release", "docker-compose.e2e.yml"])
     open(os.path.join(tudo, "scripts", "e2e-infra.sh"), "w").write("case $1 in\n  destroy) :;;\nesac\n")
     y = orq_mod.orca_yaml_montar(tudo, "claude", {})[0]
     assert "pnpm install" in y and "sh scripts/setup-worktree.sh" in y and "graphify update" in y, y
     assert "rm -rf web/.meteor/local web/_build" in y and "sh scripts/e2e-infra.sh destroy" in y, y
-    nada = _repo_git(a, "nada")
+    nada = _repo_git_de_projeto(a, "nada")
     y = orq_mod.orca_yaml_montar(nada, "claude", {})[0]
     assert TRUST_CLAUDE in y and "install" not in y and "meteor" not in y and "e2e" not in y, y
 
 
 def test_ticket125_projeto_pode_ligar_e_desligar_blocos_e_acrescentar_comandos():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json", "web/.meteor/release"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json", "web/.meteor/release"])
     cfg = {"blocos": {"meteor": False, "install": False, "graphify": True}, "setup_extra": ["make bootstrap"], "archive_extra": ["rm -rf .cache"]}
     y = orq_mod.orca_yaml_montar(repo, "claude", cfg)[0]
     assert "npm ci" not in y and "meteor" not in y and "graphify update" in y, y
@@ -12770,7 +12770,7 @@ def test_ticket125_projeto_pode_ligar_e_desligar_blocos_e_acrescentar_comandos()
 
 def test_ticket125_orca_yaml_existente_nao_e_sobrescrito_e_mostra_o_diff():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     antigo = "scripts:\n  setup: |\n    echo meu\n"
     open(os.path.join(repo, "orca.yaml"), "w").write(antigo)
     r = a.orq("projeto", "add", repo)
@@ -12784,7 +12784,7 @@ def test_ticket125_orca_yaml_existente_nao_e_sobrescrito_e_mostra_o_diff():
 
 def test_ticket125_a_parte_fixa_entra_sempre_inclusive_na_proposta_do_agente_e_no_codex():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     prop = os.path.join(a.tmp.name, "prop.yaml")
     open(prop, "w").write("scripts:\n  setup: |\n    make deps\n  archive: |\n    make clean\n")
     r = a.orq("projeto", "add", repo, "--orca-yaml", prop, "--harness", "codex")
@@ -12798,7 +12798,7 @@ def test_ticket125_a_parte_fixa_entra_sempre_inclusive_na_proposta_do_agente_e_n
 
 def test_ticket125_proposta_com_yaml_invalido_ou_chave_desconhecida_e_recusada_antes_de_gravar():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     for i, ruim in enumerate(("scripts:\n  setup: echo a: b\n", "scripts:\n  setup: |\n    ok\nfoo: 1\n", "scripts:\n  teardown: |\n    x\n",
                               "scripts:\n\tsetup: x\n", "isto nao e yaml", "scripts:\n  setup:\n", "scripts:\n  setup: |\n    a\n  setup: |\n    b\n")):
         prop = os.path.join(a.tmp.name, f"p{i}.yaml")
@@ -12810,7 +12810,7 @@ def test_ticket125_proposta_com_yaml_invalido_ou_chave_desconhecida_e_recusada_a
 
 def test_ticket125_repo_ja_registrado_no_orca_nao_registra_de_novo():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     a.set("repos.json", [{"id": "r9", "path": repo, "displayName": "app"}])
     assert a.orq("projeto", "add", repo).returncode == 0
     assert _chamadas_repo(a) == [], _chamadas_repo(a)
@@ -12818,7 +12818,7 @@ def test_ticket125_repo_ja_registrado_no_orca_nao_registra_de_novo():
 
 def test_ticket125_dry_run_mostra_o_orca_yaml_e_nao_grava_nem_registra_nada():
     a = Amb()
-    repo = _repo_git(a, arquivos=["package-lock.json"])
+    repo = _repo_git_de_projeto(a, arquivos=["package-lock.json"])
     r = a.orq("projeto", "add", repo, "--dry-run")
     assert r.returncode == 0 and TRUST_CLAUDE in r.stdout and "npm ci" in r.stdout, r
     assert not os.path.exists(os.path.join(repo, "orca.yaml")) and not os.path.exists(os.path.join(a.home, "projects")) and not _chamadas_repo(a)
@@ -12826,7 +12826,7 @@ def test_ticket125_dry_run_mostra_o_orca_yaml_e_nao_grava_nem_registra_nada():
 
 def test_ticket125_add_de_url_clona_e_pasta_que_nao_e_repo_ou_nome_de_outro_repo_recusa():
     a = Amb()
-    origem = _repo_git(a, "origem", ["package-lock.json"])
+    origem = _repo_git_de_projeto(a, "origem", ["package-lock.json"])
     subprocess.run(["git", "-C", origem, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
     destino = os.path.join(a.tmp.name, "clone")
     r = a.orq("projeto", "add", f"file://{origem}", "--destino", destino, "--nome", "clonado")
@@ -12835,14 +12835,14 @@ def test_ticket125_add_de_url_clona_e_pasta_que_nao_e_repo_ou_nome_de_outro_repo
     solta = os.path.join(a.tmp.name, "solta")
     os.makedirs(solta)
     assert a.orq("projeto", "add", solta).returncode != 0
-    outro = _repo_git(a, "outro")
+    outro = _repo_git_de_projeto(a, "outro")
     r = a.orq("projeto", "add", outro, "--nome", "clonado")
     assert r.returncode != 0 and "clonado" in r.stderr, r
 
 
 def test_ticket125_mate_abrir_abre_o_terminal_no_projeto_do_grupo_registrado_no_orca():
     a = Amb()
-    repo, outro = _repo_git(a, "p1"), _repo_git(a, "p2")
+    repo, outro = _repo_git_de_projeto(a, "p1"), _repo_git_de_projeto(a, "p2")
     a.set("repos.json", [{"id": "r1", "path": repo, "displayName": "p1"}, {"id": "r2", "path": outro, "displayName": "p2"}])
     a.set("terminals.json", ["term_coord"])
     a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
@@ -12864,7 +12864,7 @@ def test_ticket125_mate_abrir_abre_o_terminal_no_projeto_do_grupo_registrado_no_
 
 def test_ticket125_mate_abrir_sem_o_projeto_no_orca_segue_no_checkout_atual():
     a = Amb()
-    repo = _repo_git(a, "p1")
+    repo = _repo_git_de_projeto(a, "p1")
     a.set("terminals.json", ["term_coord"])
     a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
     _grupo(a, projetos=[repo])
