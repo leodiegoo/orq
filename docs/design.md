@@ -124,7 +124,7 @@ Orca types its notice into the terminal even while the user is typing, so a user
 
 For a user prompt the hook appends the entry and injects at most five lines of context: the new entry id and the entries still without effect, one line for alerts (stuck workers, suspicious or free-text answers, pending gates, untriaged reports), the open work in Orca with the live workers, the size of the user's pending list, and the `orq intake` syntax.
 
-`orq hook stop` computes the open entries. If there are any, it appends a `gate_aviso` event and shows the user a `systemMessage` naming up to three of them. Today it only warns. The plan is to measure how many entries end a turn without an effect before deciding to block, and then block at most once per turn using Claude Code's `stop_hook_active` flag, so a blocked turn can never loop.
+`orq hook stop` computes the open entries. If there are any, it appends a `gate_aviso` event and shows the user a `systemMessage` naming up to three of them. Since ticket 150 it also blocks the end of the turn (`stop_bloqueia` defaults to true), naming the ids and `orq intake <e> tarefa|steer|pend|decisao|conversa|descartado`. The budget is 2 blocks per set of open entries per session, counted in `cursor.json` (`stop_hook_active` is ignored, because another hook can set it); the third Stop of the same set passes and records `gate_falhou`. The prompt hook closes entries that are only `/away` or `/away status` with a `conversa` intake, and the "Sem efeito" line of the hook lists only entries from the last 24 h; older ones show in `orq status`.
 
 ## Obligations are hooks (ticket 153)
 

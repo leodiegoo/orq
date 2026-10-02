@@ -949,14 +949,21 @@ def _linha_runs(aberto):
     return " Runs: " + ", ".join(f"{_cita(x['objetivo'], 30)} ({x['abertas']} abertas)" for x in rs[:3]) + (f" +{len(rs) - 3}" if len(rs) > 3 else "") + "." if rs else ""
 
 
-def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, turnos=None, painel=None):
+SEM_EFEITO_H = 24  # a linha "Sem efeito" do hook só traz entradas das últimas 24 h; as mais velhas aparecem no `orq status` (ticket 150)
+
+
+def resumo(events, aberto, pendencias, entrada=None, agora=None, cursor=None, turnos=None, painel=None, antigas=False):
     """No máximo 5 linhas: entrada e o que está sem efeito, uma linha extra (suspeita, alerta, relatórios), aberto no Orca, pendências, como dar efeito."""
     todas = abertas(events)
+    agora = agora or datetime.now(timezone.utc)
     sem = [e for e in todas if e["id"] != (entrada or {}).get("id") and e.get("origem", "usuario") == "usuario"]
+    velhas = [e for e in sem if (t := _ts(e.get("ts"))) and (agora - t).total_seconds() > SEM_EFEITO_H * 3600]
+    sem = [e for e in sem if e not in velhas]
     quem = f"entrada {entrada['id']} (usuário). " if entrada else ""
     lista = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
     l1 = f"[orq] {quem}Sem efeito: {lista or 'nenhum'}."
-    agora = agora or datetime.now(timezone.utc)
+    if antigas and velhas:
+        l1 += f" Há mais de {SEM_EFEITO_H} h: " + ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in velhas[:3]) + (f" +{len(velhas) - 3}" if len(velhas) > 3 else "") + "."
     extra = _extra(events, todas, agora, pendencias, cursor, aberto, turnos, painel)
     if aberto:
         bl = aberto["backlog"]
@@ -3304,9 +3311,9 @@ def linha_sem_terminal(aberto):
     return f"{n} worker(s) perderam o terminal sem worker_done: orq retomar --dry-run" if n else ""
 
 
-def estado(entrada=None):
+def estado(entrada=None, antigas=False):
     events, cur, aberto = read_events(), _cursor_ro(), _read_json(_path("aberto.json"))
-    txt = resumo(events, aberto, _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
+    txt = resumo(events, aberto, _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel(), antigas=antigas)
     return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *filter(None, [linha_sem_terminal(aberto)]), *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets()), linha_espera_despacho(tickets(), events)])])
 
 
@@ -4337,6 +4344,9 @@ def bloqueio_de_heartbeat(ev, run):
     return {"decision": "block", "reason": f"{MARCA} {len(ev['heartbeats'])} sinais de vida absorvidos ({_run_curto(alvo)})"}
 
 
+SO_COMANDO_ORQ = re.compile(r"\s*/away(\s+\w+)?\s*$")
+
+
 def hook_prompt(ev, run):
     org = origem(ev.get("prompt"))
     texto, com_aviso = separa_aviso(ev.get("prompt")) if org == "usuario" else (ev.get("prompt") or "", False)
@@ -4367,6 +4377,8 @@ def hook_prompt(ev, run):
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     entrada = append_event({"tipo": "entrada", "origem": "usuario", "texto": texto[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             **({"com_aviso": True} if com_aviso else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, novo_id=True)
+    if SO_COMANDO_ORQ.match(texto):  # `/away` e `/away status` não pedem efeito: fecham sozinhos
+        intake(entrada["id"], "conversa", nota="comando do orq")
     checar_gerente_bg()
     ctx = estado(entrada)
     if not os.environ.get("ORQ_MATE") and (adiados := avisos_do_contexto()):  # a fila de avisos é do coordenador
@@ -4487,7 +4499,7 @@ def _gate_bloqueia(sessao, ids):
 
 
 def hook_stop(ev, run):
-    # com `stop_bloqueia` desligado (o padrão) só avisa; ligado, barra via _gate_bloqueia
+    # com `stop_bloqueia` ligado (o padrão) barra via _gate_bloqueia; desligado, só avisa
     if not os.environ.get("ORQ_MATE"):  # o fim de turno do mate não é resposta do coordenador ao usuário ausente
         digest_no_stop(ev)
     events, agora = read_events(), datetime.now(timezone.utc)
@@ -4502,7 +4514,7 @@ def hook_stop(ev, run):
         append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
         rec = cursor_recuperado(_cursor_ro(), agora)
         citadas = ", ".join(f"{e['id']} ({_cita(e.get('texto'))!r})" for e in sem[:3]) + (f" +{len(sem) - 3}" if len(sem) > 3 else "")
-        msg += f" {len(ids)} entrada(s) sem efeito: {citadas}. Use: orq intake <e> <efeito> [ref]" + (f" [aviso] {aviso_recuperado(rec)}" if rec else "")
+        msg += f" {len(ids)} entrada(s) sem efeito: {citadas}. Use: orq intake <e> tarefa|steer|pend|decisao|conversa|descartado [ref]" + (f" [aviso] {aviso_recuperado(rec)}" if rec else "")
         if not os.environ.get("ORQ_MATE") and maquina_cfg()["stop_bloqueia"]:
             if _gate_bloqueia((ev.get("session_id") or "")[:8], ids):
                 return {"decision": "block", "reason": msg}
@@ -8345,7 +8357,7 @@ def linhas_passagens(events, turnos, agora=None):
 
 def texto_status():
     """O que `orq status` imprime: o estado, as passagens abertas, os PRs, as worktrees, a fila de E2E e a máquina."""
-    return "\n".join([estado(), *linhas_passagens(read_events(), _turnos_ro()), *linhas_pr(), *linhas_worktrees(), *linhas_mates(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
+    return "\n".join([estado(antigas=True), *linhas_passagens(read_events(), _turnos_ro()), *linhas_pr(), *linhas_worktrees(), *linhas_mates(), *filter(None, [linha_e2e(fila_e2e()), linha_maquina()])])
 
 
 # ---------- orq iniciar: o coordenador que já está aberto, em qualquer harness ----------
@@ -8450,7 +8462,7 @@ MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RA
                   "mem_piso_mb": 1024,  # piso de segurança: nem o Run isento sobe com a memória livre abaixo disto
                   "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem o teto de workers; max_caros, max_e2e e mem_piso_mb o seguram
                   "pausar_sob_pressao": False,  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
-                  "stop_bloqueia": False}  # True: o Stop do coordenador barra o fim do turno com entrada sem efeito (GATE_BLOQUEIOS vezes por conjunto); ligar só depois da semana de aviso medida (desenho, seção 9)
+                  "stop_bloqueia": True}  # o Stop do coordenador barra o fim do turno com entrada sem efeito (GATE_BLOQUEIOS vezes por conjunto); False só avisa (ticket 150)
 FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
 FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
 VIVOS_MAQUINA = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
