@@ -15182,6 +15182,19 @@ def test_ticket165_devolver_manda_a_correcao_grava_o_evento_e_volta_a_task_para_
     (ev,) = [e for e in a.events() if e["tipo"] == "devolver"]
     assert (ev["task"], ev["dispatch"], ev["run"]) == ("task_feita", "ctx_0", "run_a"), ev
     assert a.orq("devolver", "task_fantasma", "x").returncode == 1
+
+
+def test_ticket177_devolver_aceita_dispatch_entregue_que_o_task_list_nao_liga_a_task():
+    """O task-list do Orca zera o dispatch_id de task concluída (ticket criado com o backlog ligado); o worker-list, que o `agentes` lê, ainda o tem."""
+    a = Amb()
+    a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"}])
+    a.set("terminals.json", ["term_w0", "term_coord"])
+    _steer_env(a)
+    a.set("tasks_run_a.json", [{"id": "task_feita", "status": "completed", "dispatch_id": None}])
+    for alvo in ("ctx_0", "task_feita"):
+        r = a.orq("devolver", alvo, "refaça")
+        assert r.returncode == 0, (alvo, r.stderr)
+    assert [e["dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_0", "ctx_0"]
 # ---------- ticket 155: obrigação que o orq consegue provar fecha sozinha ----------
 
 def _py155(a, codigo):

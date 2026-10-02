@@ -6379,6 +6379,8 @@ def devolver(alvo, motivo, run=None):
         raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
     with _no_run(run_):
         t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if alvo in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
+        if not t:  # o task-list zera o dispatch_id da task concluída (ticket criado com o backlog ligado); o worker-list, que o `agentes` lê, ainda liga task e dispatch
+            t = next(({"id": w["taskId"], "dispatch_id": w["dispatchId"]} for w in _workers_todos(run_) if alvo in (w.get("taskId"), w.get("dispatchId")) and w.get("dispatchId")), None)
         if not t:
             raise ValueError(f"{alvo} não é task nem dispatch do Run {run_}")
         d, corpo = t["dispatch_id"], f"A entrega foi devolvida pelo coordenador; refaça e mande um worker_done novo. Motivo: {motivo}"
