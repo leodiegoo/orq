@@ -199,7 +199,7 @@ ESTADO_TICKET = {"queued": "ready-for-agent", "in_flight": "claimed", "done": "r
 
 def ticket_de_item(i, por_id, raiz):
     """O ticket (formato de `tickets()` do orq) de um item `tNN` kind `ticket`, ou None se o item é outra coisa. `blocked_by` traz só os bloqueadores ainda
-    abertos; `run` e `task` vêm da linha `orca: <task> <run>`; `arquivo` é o `spec:` relativo a `raiz`."""
+    abertos (num ticket Done, todos: é o histórico que `orq ticket lista` mostra); `run` e `task` vêm da linha `orca: <task> <run>`; `arquivo` é o `spec:` relativo a `raiz`."""
     m = re.fullmatch(r"t(\d+)", i["id"])
     if not m or i["kind"] != "ticket":
         return None
@@ -207,7 +207,7 @@ def ticket_de_item(i, por_id, raiz):
     task, _, run = (meta.get("orca") or "").partition(" ")
     issue = meta.get("issue", "").lstrip("#")
     return {"num": m.group(1).zfill(2), "arquivo": os.path.join(raiz, meta["spec"]) if meta.get("spec") else None, "titulo": i["titulo"], "status": ESTADO_TICKET[i["estado"]],
-            "blocked_by": [b[1:].zfill(2) for b in i["bloqueios"] if re.fullmatch(r"t\d+", b) and por_id.get(b, {}).get("estado") not in (None, "done")],
+            "blocked_by": [b[1:].zfill(2) for b in i["bloqueios"] if re.fullmatch(r"t\d+", b) and (i["estado"] == "done" or por_id.get(b, {}).get("estado") not in (None, "done"))],
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
             "despacho": meta.get("despacho"), "espera": meta.get("espera"),  # os cabeçalhos `Despacho:` e `Espera:` (ticket 142)
             "fechado_em": i["closed"]}

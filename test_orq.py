@@ -14145,6 +14145,15 @@ def test_ticket101_m2_tickets_do_backlog_sao_os_dos_arquivos_exceto_o_bloqueador
     assert bl["03"]["blocked_by"] == ["02"] and bl["03"]["modelo"] == "claude-opus-5-5" and bl["03"]["issue"] == 2045 and bl["03"]["task"] == "task_c3" and bl["03"]["run"] == "run_a"
 
 
+def test_ticket167_ticket_resolvido_no_backlog_mantem_o_blocked_by_do_arquivo():
+    base = {"kind": "ticket", "corpo": [], "closed": None}
+    por_id = {"t06": {"estado": "done"}, "t09": {"estado": "queued"}}
+    feito = backlog_mod.ticket_de_item({**base, "id": "t07", "titulo": "x", "estado": "done", "bloqueios": ["t06", "t09"]}, por_id, "/r")
+    aberto = backlog_mod.ticket_de_item({**base, "id": "t08", "titulo": "y", "estado": "queued", "bloqueios": ["t06", "t09"]}, por_id, "/r")
+    assert feito["blocked_by"] == ["06", "09"], "Done guarda o histórico do cabeçalho"
+    assert aberto["blocked_by"] == ["09"], "aberto só mostra quem ainda bloqueia"
+
+
 # ---- M3: pendências no backlog ----
 
 def test_ticket101_m3_pend_add_done_grava_no_backlog_espelha_o_json_e_registra_o_evento():
