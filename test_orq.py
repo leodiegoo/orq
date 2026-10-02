@@ -18,6 +18,8 @@ ORQ = os.path.join(AQUI, "orq.py")
 LIMPAR = os.path.join(AQUI, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
+if "ORQ_BACKLOG" not in os.environ:
+    orq_mod.BACKLOG = None  # o backlog.path da máquina (ticket 167) não liga o backlog nos testes em processo
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # a segunda leitura da caixa não espera nos testes
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
