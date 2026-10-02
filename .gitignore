@@ -54,3 +54,4 @@ tui/node_modules/
 !tui/bun.lock
 integrar-fila.json
 avisos/
+run-parado.json
