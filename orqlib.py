@@ -451,18 +451,74 @@ def integration_queue():
     return {i["ticket"]: i for i in _dict(_read_json(_path(INTEGRATE_QUEUE_FILE))).get("itens") or [] if isinstance(i, dict) and i.get("ticket")}
 
 
-def integrate_queue_add(branch, ticket):
-    """Puts the ticket's branch on the integrator queue (repeating swaps the branch, doesn't duplicate). While it is there, the ticket's worker stays `aguardando integração`."""
+def integrate_queue_add(branch, ticket, head=None):
+    """Puts the ticket's branch on the integrator queue (repeating swaps the branch, doesn't duplicate). While it is there, the ticket's worker stays `aguardando integração`.
+    `head` is the commit the delivery proved (ticket 222): `integrate_proof` refuses the cycle when the branch tip is not that commit. Without it (manual add, old item) it only warns."""
     n = str(ticket).strip().zfill(2)
     if not branch or not branch.strip():
         raise ValueError("empty branch")
-    new = {"branch": branch.strip(), "ticket": n, "ts": now()}
+    new = {"branch": branch.strip(), "ticket": n, "ts": now(), **({"head": head} if head else {})}
     with _lock("integrate-queue.lock"):
         item_list = [i for i in _dict(_read_json(_path(INTEGRATE_QUEUE_FILE))).get("itens") or [] if isinstance(i, dict)]
         pos = next((k for k, i in enumerate(item_list) if i.get("ticket") == n), len(item_list))
         item_list[pos:pos + 1] = [new]
         _write_json(_path(INTEGRATE_QUEUE_FILE), {"itens": item_list}, indent=2)
-    return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": new["branch"]})
+    return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": new["branch"], **({"head": head} if head else {})})
+
+
+def prove(task, step, head, result, **extra):
+    """Records that `step` proved something about `task` at commit `head` (`prova` event, ticket 222): what `pr open` and the integrator compare the branch tip against."""
+    return append_event({"tipo": "prova", "task": task, "passo": step, "head": head, "resultado": result, **extra})
+
+
+def proof_head(task, events=None):
+    """The commit of the task's last proof (`prova` event), or None."""
+    return next((e["head"] for e in reversed(events or read_events()) if e.get("tipo") == "prova" and e.get("task") == task and e.get("head")), None)
+
+
+def _branch_repo(branch):
+    """The first ORQ_REPOS repository that has `branch`, or None."""
+    return next((r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r and _git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") is not None), None)
+
+
+def _proof_gap(repo, branch, head):
+    """Why the tip of `branch` is not the proven `head` (commits after the proof, or not a descendant of it), or None when it is."""
+    tip = (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip()
+    if tip == head:
+        return None
+    if subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", head, tip], capture_output=True).returncode == 0:
+        after = (_git(repo, "log", "--reverse", "--format=%h %s (%an)", f"{head}..{tip}") or "").strip().replace("\n", "\n    ")
+        return f"{branch} has commits after the proof ({head[:7]}), run `orq review` again:\n    {after}"
+    return f"{branch} ({tip[:7]}) is not a descendant of the proven commit {head[:7]} (amend, rebase or reset)"
+
+
+def proof_guard(checks, no_proof=None):
+    """`checks` is [(repo, branch, head, who)], `who` the event keys (task or ticket). A branch whose tip is the proven head passes; no head recorded passes with a notice;
+    commits after the proof or a non-descendant tip are refused (ValueError listing all of them), unless `no_proof` gives the reason, which goes to the `prova` event. Returns the notices."""
+    notices, refused = [], []
+    for repo, branch, head, who in checks:
+        if not head:
+            notices.append(f"{branch}: no proven commit recorded, nothing to compare")
+        elif gap := _proof_gap(repo, branch, head):
+            if not no_proof:
+                refused.append(gap)
+                continue
+            notices.append(f"{gap} (--no-proof: {no_proof})")
+            prove(who.get("task"), "no_proof", (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip(), "waived", motivo=no_proof, branch=branch, anterior=head, **{k: v for k, v in who.items() if k != "task"})
+    if refused:
+        raise ValueError("\n".join(refused) + "\nor `--no-proof \"<reason>\"` to go ahead without the proof")
+    return notices
+
+
+def integrate_proof(branches, no_proof=None):
+    """The integrator cycle's check (`integrar.py` calls it before merging): each queued branch against the commit its delivery recorded. A branch not in the queue or not found passes."""
+    queue = integration_queue()
+    checks = []
+    for b in branches:
+        item = next((i for i in queue.values() if i["branch"] == b), None)
+        if item and (repo := _branch_repo(b)):
+            checks.append((repo, b, item.get("head"), {"ticket": item["ticket"]}))
+    return proof_guard(checks, no_proof)
 
 
 def audit_publication(revs, repo=None):
@@ -1606,7 +1662,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "entrega_orq": "orq_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
     "ausente_desligar": "away_off", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
     "processos": "processes", "resumo_add": "summary_add", "devolver": "send_back", "limite_tela": "screen_limit",
-    "pendente_avisado": "pending_notified", "revisao_nm": "nm_review",
+    "pendente_avisado": "pending_notified", "revisao_nm": "nm_review", "prova": "proof",
 }
 PENDING_EN = {"acao": "action", "decisao": "decision", "avisar": "notify"}
 ESCALATION_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqueio": "blocker", "resumo": "summary"}
@@ -2278,6 +2334,27 @@ def _integrator_terminal(events):
     return _dispatch_terminal(d.get("run"), d["dispatch"]) if d else None
 
 
+def _delivery_head(branch, commit):
+    """(head, problem) of an orq delivery: `head` is the tip of `branch` now, what the queue and the proofs pin. `problem` when the commit the worker cited exists in the repository
+    but is not in `branch` (the name was swapped); a commit that does not resolve, or a branch that does not exist here, proves nothing against it."""
+    repo = _branch_repo(branch)
+    tip = (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip() if repo else ""
+    cited = (_git(repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}") or "").strip() if tip and commit else ""
+    if cited and subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", cited, tip], capture_output=True).returncode:
+        return None, f"commit {commit[:8]} of the worker_done is not in {branch} ({tip[:7]}): wrong branch name?"
+    return tip or None, None
+
+
+def _delivery_head_of_worktree(m, p):
+    """worker_done `succeeded` of a task that is not an orq ticket: pins the head of the dispatch worktree's branch (`prova` event, step delivery), for `pr open` to compare."""
+    if p.get("outcome") != "succeeded" or not p.get("taskId") or any(t.get("task") == p["taskId"] for t in tickets()) or _already_has_event("prova", m["id"]):
+        return
+    wt = _dispatch_worktree(m.get("run_id"), p.get("dispatchId"))
+    branch, head = ((_git(wt, "branch", "--show-current") or "").strip(), (_git(wt, "rev-parse", "HEAD") or "").strip()) if wt else ("", "")
+    if branch and head and not _environment_branch(branch):
+        prove(p["taskId"], "delivery", head, "ok", branch=branch, msg=m["id"])
+
+
 def _orq_delivery(m, p):
     """worker_done `succeeded` of an orq ticket (the task is the `Task:` of an ISSUES ticket; the product's do not enter) with a branch in the payload or the text ->
     `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `<ORQ_WT>/<ticket>` worktree, the dispatch worktree's current branch and only
@@ -2298,13 +2375,21 @@ def _orq_delivery(m, p):
                       "avisos": [f"delivery of ticket {t['num']} has no branch: it did not enter the integrator queue; `orq integrate queue add <branch> {t['num']}`"]})
         return None
     commit = p.get("commit") or next(iter(SHA_RE.findall(text_value)), None)
-    ev = integrate_queue_add(branch, t["num"])
+    head, problem = _delivery_head(branch, commit)
+    if problem:
+        log(f"orq delivery: ticket {t['num']}: {problem}; it stays out of the integrator queue")
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
+                      "avisos": [f"delivery of ticket {t['num']} did not enter the integrator queue: {problem}; `orq integrate queue add <branch> {t['num']}` once the branch is right"]})
+        return None
+    ev = integrate_queue_add(branch, t["num"], head)
+    if head:
+        prove(p["taskId"], "delivery", head, "ok", ticket=t["num"], branch=branch, msg=m["id"])
     notice = f"orq: ticket {t['num']} entered the queue. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
     h = _integrator_terminal(read_events())
     r = (type_text(h, notice) if h else "sem_integrador")
     if r == "ocupado":
         r = type_text_busy(h, notice)
-    append_event({"tipo": "entrega_orq", "ticket": ev["ticket"], "branch": branch, "worktree": wt, "commit": commit, "msg": m["id"], "dispatch": p.get("dispatchId"), "aviso": r})
+    append_event({"tipo": "entrega_orq", "ticket": ev["ticket"], "branch": branch, "head": head, "worktree": wt, "commit": commit, "msg": m["id"], "dispatch": p.get("dispatchId"), "aviso": r})
     return ev["ticket"]
 
 
@@ -2319,6 +2404,7 @@ def _ingest_msg(m, since, already, titles):
     _delivery_proof(m, p)
     try:
         _orq_delivery(m, p)
+        _delivery_head_of_worktree(m, p)
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
     if p.get("reportPath"):
@@ -3158,9 +3244,10 @@ def _git_wt(wt, *args, timeout=60):
     return subprocess.run([GIT, "-C", wt, *args], capture_output=True, text=True, timeout=timeout)
 
 
-def pr_open(target, title, body_text, environments=None, cwd=None):
+def pr_open(target, title, body_text, environments=None, cwd=None, no_proof=None):
     """Publishes the delivery: strips the user prefix from the branch, checks `git merge-tree` against each environment (a conflict stops before the push), pushes, opens one
-    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Returns (urls, notices); ValueError before touching anything."""
+    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Refuses when the branch tip is not the commit the task's last
+    proof pinned (`proof_guard`; `no_proof` is the reason to go ahead anyway). Returns (urls, notices); ValueError before touching anything."""
     text_value = open(body_text).read() if os.path.isfile(body_text) else None
     if not (text_value or "").strip():
         raise ValueError(f"empty or missing body: {body_text}")
@@ -3186,6 +3273,7 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         task = branch_task(branch, wt, event_list)
     if not branch:
         raise ValueError(f"no branch in worktree {wt}")
+    notices += proof_guard([(wt, branch, proof_head(task, event_list) if task else None, {"task": task})], no_proof)
     flow_info = task_flow(task, event_list) if task else repo_flow(wt)
     envs = environments or ([a for a in flow_info["ambientes"] if a != flow_info["producao"]] or [flow_info["producao"]] if flow_info["fluxo"] == "promocao" else [flow_info["producao"]])
     envs = sorted(dict.fromkeys(envs), key=lambda a: flow_info["ambientes"].index(a) if a in flow_info["ambientes"] else len(flow_info["ambientes"]))
@@ -11827,10 +11915,13 @@ def review(task):
             subprocess.run([NM_BIN, "axi", "abort"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)
         _loose_review()
     usage = _nm_usage(t0)
-    res = {"task": task, "worktree": wt, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), **usage, "saida": output}
+    head = (_git(wt, "rev-parse", "HEAD") or "").strip() or None
+    res = {"task": task, "worktree": wt, "head": head, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), **usage, "saida": output}
     append_event({"tipo": "revisao_nm", **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
     if error:
         raise RuntimeError(error)
+    if head:
+        prove(task, "review", head, "findings" if usage["achados"] else "ok")
     return res
 
 
@@ -11849,7 +11940,7 @@ def _implicit(effect, ref=None, run=None):
 
 FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays the pt name, which the rest of the code reads
     "titulo": "title", "spec-arquivo": "spec-file", "detalhe": "detail", "frente": "stream", "comando": "command", "espera": "waiting", "ate": "until",
-    "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "motivo": "reason",
+    "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "sem-prova": "no-proof", "motivo": "reason",
     "tipo": "type", "forcar": "force", "abrir": "open", "passo": "step", "nome": "name", "por": "why", "agente": "agent", "objetivo": "objective",
     "assumir": "take-over", "noite": "night", "parada": "stopped-by", "modelo": "model", "para": "to", "max-despachos": "max-dispatches",
     "max-falhas": "max-failures", "projeto": "project", "prioridade": "priority", "servico": "service", "pergunta": "question", "opcao": "option",
@@ -11861,7 +11952,7 @@ FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays th
 ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the dest)
     "titulo": "title", "spec-arquivo": "spec_file", "detalhe": "detail", "frente": "workstream", "comando": "command", "espera": "waiting", "ate":
     "until_at", "desde": "since", "todas": "all_listing", "todos": "include_all", "resposta": "answer_text", "entrada": "entry", "nota": "note",
-    "prova": "proof", "motivo": "reason", "tipo": "type_name", "forcar": "force", "abrir": "open_page", "passo": "step", "nome": "item_name", "por":
+    "prova": "proof", "sem-prova": "no_proof", "motivo": "reason", "tipo": "type_name", "forcar": "force", "abrir": "open_page", "passo": "step", "nome": "item_name", "por":
     "by", "agente": "agent", "objetivo": "objective", "assumir": "take_over", "noite": "night", "parada": "stopped_by", "modelo": "model", "para":
     "to_", "max-despachos": "max_dispatches", "max-falhas": "max_failures", "projeto": "project", "prioridade": "priority_level", "servico":
     "service", "pergunta": "question", "opcao": "option", "recomendada": "recommended", "espera-min": "wait_min", "sem-poll": "without_poll",
@@ -12005,6 +12096,7 @@ def parser():
     _arg(po, "corpo", required=True, help="file with the PR body (sections of the /pr skill)")
     _arg(po, "ambientes", help="comma-separated branches; default: the project environments before production")
     po.add_argument("--cwd", help="where to find the worktree when the target is a branch")
+    _arg(po, "sem-prova", metavar="REASON", help="goes ahead although the branch has commits after the last proof or is not its descendant; the reason goes to the `prova` event")
     pr.add_parser("list", aliases=["lista"], help="the linked PRs (of one task, with --task)").add_argument("--task")
     pd2 = pr.add_parser("unlink", aliases=["desligar"], help="orq pr unlink <task> <url>: removes the PR from the task")
     pd2.add_argument("task")
@@ -12144,6 +12236,9 @@ def parser():
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
+    igk = ig.add_parser("check", help="orq integrate check <branch>... [--no-proof REASON]: what integrar.py runs before merging; refuses a queued branch whose tip is not the commit its delivery proved")
+    igk.add_argument("branches", nargs="+")
+    _arg(igk, "sem-prova", metavar="REASON", help="goes ahead without the proof; the reason goes to the `prova` event")
     wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the ORQ_WT worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
     wl.add_parser("clean", aliases=["limpar"], help="removes the ORQ_WT worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: refuses a wrong author, trailer, forbidden term and code without a README before publishing main")
@@ -12362,7 +12457,7 @@ def main(argv=None):
             elif a.op == "auto":
                 print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
             elif a.op == "open":
-                urls, notices = pr_open(a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd)
+                urls, notices = pr_open(a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd, a.no_proof)
                 for av in notices:
                     print(f"warning: {av}", file=sys.stderr)
                 print("\n".join(urls))
@@ -12513,6 +12608,9 @@ def main(argv=None):
             r = integrate_conclude(a.hash, a.branches, a.dispatch)
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
+                print(f"warning: {x}", file=sys.stderr)
+        elif a.cmd == "integrate" and a.op == "check":
+            for x in integrate_proof(a.branches, a.no_proof):
                 print(f"warning: {x}", file=sys.stderr)
         elif a.cmd == "integrate" and a.action == "add":
             print(json.dumps(integrate_queue_add(a.branch, a.ticket), ensure_ascii=False))

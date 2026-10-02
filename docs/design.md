@@ -162,6 +162,7 @@ An obligation that depends on someone remembering a command gets forgotten, so i
 | obligations left open | `fulfill`, `defer` | Stop of the coordinator, with the ticket 27 budget | block | 156 |
 | worker that lost its terminal | `resume` | refresh of `open.json`, read by the prompt, SessionStart and Stop hooks | block (reminder) | 158 |
 | push audit | (manual push) | `githooks/pre-push`, integrator cycle before the fast-forward | block | 139 |
+| proof pinned to the head | `--no-proof` (the escape) | ingest of a `worker_done`, the end of `review`, `pr open`, `scripts/integrar.py` before it merges | block | 222 |
 | away summary, Orca mailbox, dispatch headers, PR per environment | `summary add`, `inbox`, `dispatch-queue rm`, `pr link` | Stop with away; the command itself | automatic | 144, 140, 142, 143 |
 | already automatic | `hook`, `ingest`, `pr poll`, `pr auto`, `steers`, `digest`, `hibernate`, `wake`, `mate sleep`, `usage`, `manager absorb/check/interval`, `busy`, `flow`, `project trust` … | hooks, manager lap, limpar-mergeados, worktree setup | done | — |
 | manual by design | decisions (`dispatch`, `steer`, `reply`, `end`, `relaunch`, `switch`, `pause`, `ask`, `pend add`, `defer`, `away`, `night`), lookups, setup | — | manual | — |
@@ -1038,6 +1039,16 @@ The merge cleanup (`limpar-mergeados.py`) and the orphan cleanup (ticket 45) lea
 Why a preview first: deleting a remote branch is the one irreversible-looking step, so the automatic run only prints `limparia …` (task marked `previa`) until a real `orq clean --closed` writes `limpar-fechados.json`. The `limpou_fechado` event carries the remote tip and a note that GitHub restores the branch from the closed PR.
 
 
+
+## Proof pinned to the head (ticket 222)
+
+Delivering a branch used to prove nothing about the commit that got published: the integrator fast-forwarded, and `orq pr open` pushed, whatever the branch pointed at then, which could be a commit added after the review or the return, or a branch with the wrong name. Now a step that proves something records a `prova` event, `{task, passo, head, resultado}`, and what publishes compares the branch tip with it.
+
+- Who writes `prova`: the ingest of a `worker_done` (step `delivery`; for an orq ticket the head is the branch tip when it enters the queue, for any other task the head of the dispatch worktree's branch), and the end of `orq review` (step `review`, at the worktree `HEAD`; a failed review writes nothing). The queue item and the `entrega_orq` event carry the same `head`. `provar-red`, the conformity check and the coordinator's E2E call `prove(task, step, head, result)` when they land.
+- A delivery whose cited commit exists in the repository but is not in the branch (the branch name was swapped) does not enter the queue; the `entrega` event carries the warning.
+- `orq pr open` and `scripts/integrar.py` (through `orq integrate check`, before it creates the worktree) compare the tip with the last head: equal passes; a descendant is refused, listing the commits after the proof (subject, author) and saying to run `orq review` again; a tip that is not a descendant (amend, rebase, reset) is refused. No head recorded passes with a notice, so what entered before this ticket is not stuck.
+- `--no-proof "<reason>"` (alias `--sem-prova`) on `pr open` and `integrar.py` goes ahead and writes a `prova` event with step `no_proof`, the reason (`motivo`), the tip and the head it skipped (`anterior`). There is no other new command: `integrate check` is what the script calls.
+- The attestation does not go in the PR body (the no-mistakes HTML comment would be a generator footer, which the publication audit refuses); the data lives in `events.jsonl`.
 
 ## `orq review`: only the no-mistakes review (ticket 146)
 
