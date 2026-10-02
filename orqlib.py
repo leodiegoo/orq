@@ -665,6 +665,9 @@ def integrate_conclude(hash_, branches, dispatch=None):
             notices += [x for x in [release(d).get("aviso")] if x]
         except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as e:
             notices.append(f"release {d}: {e}")
+        for x in _redispatches(event_list, d):  # ticket 329: the dispatches a send-back opened; an unsupervised one may not be in worker-list
+            with contextlib.suppress(ValueError, RuntimeError, subprocess.TimeoutExpired, OSError):
+                release(x)
     d = dispatch or (_integrator_dispatch(event_list) or {}).get("dispatch")
     extra = {"branches": list(branches), "tickets": tickets_}
     if d:
@@ -758,13 +761,16 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
 def _sent_back(events):
     """{dispatch: ts} of the deliveries returned to the worker (`orq send_back`) that don't yet have a new worker_done in the log.
     # ponytail: the log order holds; an old worker_done ingested after the return undoes it (the ingest usually runs before)."""
-    out = {}
+    out, redoes = {}, {}
     for e in events:
         d = e.get("dispatch")
         if e.get("tipo") == "devolver" and d:
             out[d] = e.get("ts")
+            if e.get("novo_dispatch"):
+                redoes[e["novo_dispatch"]] = d  # the return opened a new dispatch: its worker_done is the answer
         elif e.get("tipo") == "worker_done" and d:
             out.pop(d, None)
+            out.pop(redoes.get(d), None)
     return out
 
 
@@ -2433,10 +2439,11 @@ def ingest_final_reports():
     sent_back_list = _sent_back(event_list)
     done_items = {e.get("dispatch") for e in event_list if e.get("tipo") == "worker_done"} - set(sent_back_list)  # sent back: the newest report counts as a new delivery
     runs = {e.get("dispatch"): e.get("run") for e in event_list if e.get("tipo") == "despacho"}
+    reopened = {e["dispatch"] for e in event_list if e.get("tipo") == "devolver" and e.get("novo_dispatch")}  # ticket 329: the worker answers on the new dispatch
     since, fresh = _dt(_read_cursor()["ingest"]["desde"]), 0
     for dispatch, t in _turns_ro().items():
         t = _dict(t)
-        if dispatch in done_items or not t.get("cwd") or not t.get("fim") or not _ts(t.get("inicio")):
+        if dispatch in done_items or dispatch in reopened or not t.get("cwd") or not t.get("fim") or not _ts(t.get("inicio")):
             continue
         file_path = worker_file(t["cwd"], FINAL_REPORT)
         try:
@@ -3177,10 +3184,11 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
     notices = [f"body without the {sec} section (skill /pr)" for sec in PR_SECTIONS if not re.search(rf"^#+\s*{sec}\b", text_value, re.M | re.I)]
     event_list = read_events()
     if target.startswith("ctx_"):
-        dispatch_events = next((e for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("dispatch") == target), None)
+        origin = _origin_of(event_list)  # a dispatch opened by a send-back (ticket 329) answers for the one it redoes
+        dispatch_events = next((e for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("dispatch") == origin(target)), None)
         if not dispatch_events:
             raise ValueError(f"unknown dispatch: {target}")
-        verdict = next((e for e in reversed(event_list) if e.get("tipo") == "conformidade" and e.get("dispatch") == target), None)
+        verdict = next((e for e in reversed(event_list) if e.get("tipo") == "conformidade" and origin(e.get("dispatch")) == origin(target)), None)
         if verdict and not verdict.get("ok"):  # ticket 201: the delivery went back to the worker; the PR waits for the new worker_done
             raise ValueError(f"the delivery of {target} is incomplete (## Conformance): {'; '.join(verdict.get('faltando') or [])}")
         task, wt = dispatch_events.get("task"), _worker_path(orca("worker-show", "--dispatch", target, timeout=10))
@@ -4860,9 +4868,14 @@ def _external_denied(ev, cur):
 
 def hook_external(ev, run):
     """PreToolUse of Bash, in every session (workers included): with night mode on it denies push, PR merge, deploy, commit without hook,
-    `orca worktree rm --force` and `git reset --hard` on the main checkout. The message says to park the work and how to turn it off. When off, nothing changes."""
+    `orca worktree rm --force` and `git reset --hard` on the main checkout. The message says to park the work and how to turn it off. When off, nothing changes.
+    Night or not, it warns when a worker_done leaves with no `orq check-delivery` passing on the current report (ticket 329)."""
     item_name = _external_denied(ev, _cursor_ro())
     if not item_name:
+        if d := _done_unchecked(ev):  # ticket 329: a warning, never a block (Orca spends the capability at the first worker_done)
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": (
+                f"{MARK} this worker_done of {d} goes out with no passing `orq check-delivery` on the current report: if the `## Conformance` lines are incomplete, orq sends the delivery back "
+                "and Orca has already revoked this dispatch's capability. Run `orq check-delivery`, fix what it lists, then send the worker_done (notice, nothing was blocked).")}}
         return None
     reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
               "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
@@ -7082,9 +7095,15 @@ def _steer(task, text_value, target, entry, request):
     return ev
 
 
+MSG_REDISPATCH = ("The coordinator sent your delivery back. Orca revoked the capability of the dispatch that sent worker_done, so a NEW dispatch (fresh preamble with its own "
+                  "capability) arrives in this terminal in a moment, followed by the reason. Do nothing until it arrives; send the new worker_done with the new preamble's command.")
+
+
 def send_back(target, reason, run=None):
-    """Gives the delivery of a completed task back to the worker with the correction `reason`: types it into its terminal (or resumes the session if the terminal is gone, or wakes the
-    hibernated one), records `send_back` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new worker_done) and returns the task to `dispatched`.
+    """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
+    worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
+    terminal running the worker's session (the live one, the hibernated one woken, or `claude --resume` in the same worktree when it is gone) and sends the reason to the new dispatch.
+    Records `devolver` with `novo_dispatch` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new dispatch's worker_done).
     ValueError if `target` (task or dispatch) does not exist in the Run or the worker has no way to receive it."""
     run_ = default_run(run)
     if not run_:
@@ -7093,43 +7112,55 @@ def send_back(target, reason, run=None):
         t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
         if not t:  # task-list zeroes the dispatch_id of the completed task (ticket created with the backlog on); worker-list, which `agents` reads, still links task and dispatch
             t = next(({"id": w["taskId"], "dispatch_id": w["dispatchId"]} for w in _all_workers(run_) if target in (w.get("taskId"), w.get("dispatchId")) and w.get("dispatchId")), None)
+        opened = next((e for e in reversed(read_events()) if e.get("tipo") == "devolver" and e.get("novo_dispatch") and target in (e.get("task"), e.get("novo_dispatch"))), None)
+        if not t and opened:  # the dispatch a send-back opened (ticket 329) may be missing from worker-list, and its terminal is the one the event recorded
+            t = {"id": opened["task"], "dispatch_id": opened["novo_dispatch"]}
         if not t:
             raise ValueError(f"{target} is neither a task nor a dispatch of Run {run_}")
-        d, body_text = t["dispatch_id"], f"The delivery was sent back by the coordinator; redo it and send a new worker_done. Reason: {reason}"
+        d, body_text = t["dispatch_id"], f"The delivery was sent back by the coordinator; redo it and send a new worker_done with this dispatch's command. Reason: {reason}"
         if d in _hibernated():
-            r = wake(d, body_text)
-            if r["estado"] == "falhou":
-                raise ValueError(f"the worker is hibernated and did not wake: {r['aviso']}")
-            via = "acordado"
+            r = wake(d, MSG_REDISPATCH)
+            if r["estado"] in ("falhou", "sem_worktree") or not r.get("novo"):
+                raise ValueError(f"the worker is hibernated and did not wake: {r.get('aviso')}")
+            handle, via = r["novo"], "acordado"
+        elif (handle := _dispatch_terminal(run_, d) or next((e.get("terminal") for e in reversed(read_events()) if e.get("tipo") == "devolver" and e.get("novo_dispatch") == d), None)) and not _dead(handle):
+            via = "terminal"
         else:
-            handle = _dispatch_terminal(run_, d)
-            if handle and not _dead(handle):
-                try:
-                    orca("send", "--run", run_, "--to", f"dispatch:{d}", "--subject", "Delivery sent back", "--body", body_text, "--priority", "high", timeout=10)
-                except RuntimeError as e:
-                    raise ValueError(str(e))
-                via = type_text(handle, _adjustment_notice(handle, reason)) if _dispatch_terminal(run_, d) else "sem_terminal"
-            else:
-                tn = _dict(_turns_ro().get(d))
-                cwd = tn.get("cwd") or _checkpoint(d).get("caminho")
-                if not (tn.get("sessao") and cwd and os.path.isdir(cwd)):
-                    raise ValueError(f"the terminal of {d} is gone and there is no recorded session or worktree to resume: `orq relaunch {d} --note '<reason>'`")
-                try:
-                    cp = _checkpoint(d)
-                except (RuntimeError, subprocess.TimeoutExpired):
-                    cp = {"head": None, "sujo": None}
-                line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": d, "cwd": cwd, "terminal": handle}
-                r = _start_session(line, tn["sessao"], tn.get("modelo"), cp, f"start another worker with: orq relaunch {d} --note 'the session could not be resumed'", body_text,
-                                  tn.get("harness") or "claude", None)
-                if r["estado"] == "falhou":
-                    raise ValueError(r["aviso"])
-                via = "retomado"
-        notice = None
+            tn = _dict(_turns_ro().get(d))
+            cwd = tn.get("cwd") or _checkpoint(d).get("caminho")
+            if not (tn.get("sessao") and cwd and os.path.isdir(cwd)):
+                raise ValueError(f"the terminal of {d} is gone and there is no recorded session or worktree to resume: `orq relaunch {d} --note '<reason>'`")
+            try:
+                cp = _checkpoint(d)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                cp = {"head": None, "sujo": None}
+            line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": d, "cwd": cwd, "terminal": handle}
+            r = _start_session(line, tn["sessao"], tn.get("modelo"), cp, f"start another worker with: orq relaunch {d} --note 'the session could not be resumed'", MSG_REDISPATCH,
+                              tn.get("harness") or "claude", None)
+            if r["estado"] == "falhou":
+                raise ValueError(r["aviso"])
+            handle, via = r["novo"], "retomado"
         try:
-            orca("task-update", "--id", t["id"], "--status", "dispatched", "--run", run_, timeout=20)
+            orca("wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "60000", area="terminal", timeout=70)  # ponytail: tui-idle is satisfied early in a turn; the agent queues what is typed
+            orca("task-update", "--id", t["id"], "--status", "ready", "--run", run_, timeout=20)
+            res = orca("dispatch", "--task", t["id"], "--to", handle, "--run", run_, "--inject", timeout=60)
+        except subprocess.TimeoutExpired as e:  # the dispatch may have opened: reverting the task or repeating would stack a second one
+            raise ValueError(f"orca dispatch of {t['id']} in {handle} gave no answer ({e}): check `orq agents` before repeating `orq send-back {t['id']} \"<reason>\"`")
         except RuntimeError as e:
-            notice = f"task {t['id']} remains {t.get('status')} ({e}): orca orchestration task-update --id {t['id']} --status dispatched"
-        return append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "run": run_, "texto": reason, "via": via, **({"aviso": notice} if notice else {})})
+            with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+                orca("task-update", "--id", t["id"], "--status", "completed", "--run", run_, timeout=20)
+            raise ValueError(f"the new dispatch of {t['id']} did not open in {handle} ({e}): the task is back to completed; repeat `orq send-back {t['id']} \"<reason>\"`")
+        new = _dict(res.get("dispatch")).get("id") or res.get("dispatchId")
+        if not new:
+            raise ValueError(f"orca dispatch answered with no dispatch id: {json.dumps(res)[:300]}")
+        ev = append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "novo_dispatch": new, "terminal": handle, "run": run_, "texto": reason, "via": via})  # before the best-effort part: the link is what the checks follow
+        try:
+            orca("send", "--run", run_, "--to", f"dispatch:{new}", "--subject", "Delivery sent back", "--body", body_text, "--priority", "high", timeout=10)
+            notice = type_text(handle, _adjustment_notice(handle, reason))
+            notice = type_text_busy(handle, _adjustment_notice(handle, reason)) if notice == "ocupado" else notice  # the injected dispatch starts a turn: queue the notice in it
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            notice = f"reason not delivered ({e}): orq steer {t['id']} \"<reason>\""
+        return {**ev, **({"aviso_terminal": notice} if notice not in ("enviado", "ocupado_digitado") else {})}
 
 
 # ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
@@ -7171,7 +7202,9 @@ def conformance_block(items, real):
                  f"(the server boot or the E2E), not only the isolated function, and its line carries `{REAL_ENTRY}`.\n") if real else ""
     return (f"{CONFORMANCE_TITLE}\n\nYour final report (`{FINAL_REPORT}` in the worktree root, or the file of `--report-path`) carries a `## Conformance` section: one line per item "
             "below, with the same number, and the proof in backticks (the red→green test name, `file:line`, or the command and its output), e.g. "
-            "`1. red→green \\`test_x\\` (test_orq.py:120)`. When the worker_done arrives, orq checks it: a missing line sends the delivery back to you with the list, "
+            "`1. red→green \\`test_x\\` (test_orq.py:120)`. Before the worker_done, run `orq check-delivery` (`--report-path <file>` when the report is elsewhere): it reads the report "
+            "against the items and lists what is missing; fix it and run it again until it passes, then send the worker_done (Orca revokes the capability of the dispatch at the first one, "
+            "so a correction after it needs a new dispatch). When the worker_done arrives, orq checks it again: a missing line sends the delivery back to you with the list, "
             f"and it enters neither the integrator queue nor a PR.\n{real_line}\n" + "\n".join(f"{n}. {_quote(i, 200)}" for n, i in enumerate(items, 1)) + "\n")
 
 
@@ -7245,27 +7278,53 @@ def _delivery_text(m, p, disp):
 CONFORMANCE_SEND_BACKS = 2  # after this many send-backs of the same dispatch the next incomplete delivery goes to the coordinator: a false negative does not loop
 
 
+def _origin_of(events):
+    """`d -> the dispatch it redoes`: `send_back` opens a new dispatch (Orca revokes the capability of the one that sent worker_done), and the items, the send-back
+    count and the PR gate keep following the first one."""
+    back = {e["novo_dispatch"]: e["dispatch"] for e in events if e.get("tipo") == "devolver" and e.get("novo_dispatch")}
+
+    def origin(d):
+        while d in back:
+            d = back[d]
+        return d
+    return origin
+
+
+def _redispatches(events, d):
+    """The dispatches the send-backs opened after `d`, oldest first."""
+    nxt = {e["dispatch"]: e["novo_dispatch"] for e in events if e.get("tipo") == "devolver" and e.get("novo_dispatch")}
+    out = []
+    while d in nxt:
+        d = nxt[d]
+        out.append(d)
+    return out
+
+
 def _delivery_conformance(m, p, send=True):
     """worker_done `succeeded` of a dispatch that recorded its items -> `conformidade` event; with something missing, `send_back` with the list (up to
     CONFORMANCE_SEND_BACKS times per dispatch, then an alert). True when the delivery may go on (to the integrator queue, to a PR); a dispatch with no items is not checked.
+    A delivery the coordinator accepted on a mate's word (`accept_delivery`) passes with `conferido_por`.
 
     `send=False` (the prompt hook's `orq inbox --ack`) records the verdict without sending back, which can resume a session: the manager's ingest sends it afterwards."""
     d = p.get("dispatchId")
     if p.get("outcome") != "succeeded" or not d:
         return True
     events = read_events()
-    verdicts = [e for e in events if e.get("tipo") == "conformidade" and e.get("dispatch") == d]
+    origin = _origin_of(events)
+    verdicts = [e for e in events if e.get("tipo") == "conformidade" and origin(e.get("dispatch")) == origin(d)]
     prev = next((e for e in reversed(verdicts) if e.get("msg") == m["id"]), None)
     if prev and (prev.get("ok", True) or prev.get("enviado") or not send):
         return prev.get("ok", True)
-    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == d), None)
+    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == origin(d)), None)
     if not disp or not disp.get("conformidade"):
         return True
-    missing = prev["faltando"] if prev else conformance_missing(disp["conformidade"], disp.get("entrada_real"), _delivery_text(m, p, disp))
-    ev = {"tipo": "conformidade", "msg": m["id"], "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "ok": not missing, "faltando": missing}
+    accepted = next((e for e in reversed(events) if e.get("tipo") == "conformidade_aceita" and origin(e.get("dispatch")) == origin(d)), None)
+    missing = [] if accepted else prev["faltando"] if prev else conformance_missing(disp["conformidade"], disp.get("entrada_real"), _delivery_text(m, p, disp))
+    ev = {"tipo": "conformidade", "msg": m["id"], "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "ok": not missing, "faltando": missing,
+          **({"conferido_por": accepted["por"]} if accepted else {})}
     sent = len({e.get("msg") for e in verdicts if e.get("enviado")})
     if missing and send and sent >= CONFORMANCE_SEND_BACKS:
-        ev["aviso"] = f"sent back {sent} times already: it stays out of the queue for the coordinator (orq send-back {d}, or orq integrate queue add)"
+        ev["aviso"] = f"sent back {sent} times already: it stays out of the queue for the coordinator (orq send-back {d}, orq accept-delivery {d} --by <mate> --summary <text>, or orq integrate queue add)"
         append_event({"tipo": "alerta", "alerta": "conformidade_repetida", "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "msg": m["id"], "faltando": missing})
     elif missing and send:
         try:
@@ -7276,6 +7335,84 @@ def _delivery_conformance(m, p, send=True):
             log(f"conformance: {d}: {ev['aviso']}")
     append_event(ev)
     return not missing
+
+
+def _report_text(cwd, report_path=None):
+    """The report as `check_delivery_report` and the worker_done hook read it: the `--report-path` file and the final-report.md of `cwd`."""
+    return "\n".join(_text_of(os.path.join(cwd or "", os.path.expanduser(f))) for f in (report_path, cwd and worker_file(cwd, FINAL_REPORT)) if f)
+
+
+def _report_hash(text_value):
+    return hashlib.sha1(text_value.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _own_dispatch(events, cwd):
+    """The dispatch this terminal runs (the terminal that `despacho`, `retomada` or `devolver` recorded, newest first), else the one whose turn ran in `cwd`; None if unknown."""
+    handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+    for e in reversed(events):
+        if handle and e.get("terminal") == handle and e.get("tipo") in ("despacho", "retomada", "devolver"):
+            return e.get("novo_dispatch") or e.get("dispatch")
+    return next((d for d, t in reversed(list(_turns_ro().items())) if _dict(t).get("cwd") == cwd), None)
+
+
+def check_delivery_report(dispatch=None, report_path=None, cwd=None):
+    """`orq check-delivery`: the report against the numbered items the dispatch recorded (the same check as the worker_done's, ticket 329), before the worker_done spends the capability.
+    {dispatch, ok, faltando}; `entrega_conferida` records the report's hash, which the PreToolUse hook compares with the report at the worker_done. A dispatch with no items passes."""
+    events, cwd = read_events(), cwd or os.getcwd()
+    d = dispatch or _own_dispatch(events, cwd)
+    if not d:
+        raise ValueError("which dispatch? pass --dispatch <id> (the one in your preamble)")
+    origin = _origin_of(events)
+    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == origin(d)), None)
+    if not disp or not disp.get("conformidade"):
+        return {"dispatch": d, "ok": True, "faltando": []}
+    text_value = _report_text(cwd, report_path)
+    missing = conformance_missing(disp["conformidade"], disp.get("entrada_real"), text_value)
+    append_event({"tipo": "entrega_conferida", "dispatch": d, "hash": _report_hash(text_value), "ok": not missing, "faltando": missing})
+    return {"dispatch": d, "ok": not missing, "faltando": missing}
+
+
+_WORKER_DONE = re.compile(r"orchestration\s+send\b.*--type[ =]worker_done\b")
+_REPORT_PATH_FLAG = re.compile(r"--report-path[ =]['\"]?([^\s'\"]+)")
+
+
+def _done_unchecked(ev):
+    """The dispatch of a `succeeded` worker_done this Bash sends when it has items to prove and no `orq check-delivery` passed on the current report, else None. Reads only the log."""
+    ti = ev.get("tool_input")
+    if ev.get("tool_name") != "Bash" or not isinstance(ti, dict) or not isinstance(ti.get("command"), str) or "worker_done" not in ti["command"]:
+        return None
+    seg = next((s for s in ti["command"].replace("\n", " ").split("&&") if _WORKER_DONE.search(s)), None)  # raw text: cmdnorm blanks quoted arguments
+    m = seg and ID_DISPATCH.search(seg.replace("--dispatch-id=", "--dispatch-id "))
+    if not m or re.search(r"--outcome[ =]['\"]?failed", seg):
+        return None
+    d, events = m.group(1), read_events()
+    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == _origin_of(events)(d)), None)
+    if not disp or not disp.get("conformidade"):
+        return None
+    report = _REPORT_PATH_FLAG.search(seg)
+    h = _report_hash(_report_text(ev.get("cwd") or os.getcwd(), report and report.group(1)))
+    return None if any(e.get("tipo") == "entrega_conferida" and e.get("dispatch") == d and e.get("ok") and e.get("hash") == h for e in events) else d
+
+
+def accept_delivery(target, by, summary, run=None):
+    """A delivery blocked by the conformance gate that a mate already checked against the diff: records `conformidade_aceita` (who checked, and the summary), a passing verdict
+    for the PR gate and the queue entry the worker_done would have had. ValueError if `target` (task or dispatch) has no incomplete delivery."""
+    if not (by or "").strip() or not (summary or "").strip():
+        raise ValueError("accept-delivery needs --by (who checked the diff) and --summary (what they found)")
+    events = read_events()
+    origin = _origin_of(events)
+    done = next((e for e in reversed(events) if e.get("tipo") == "worker_done" and e.get("outcome") == "succeeded" and target in (e.get("dispatch"), e.get("task"))), None)
+    verdict = done and next((e for e in reversed(events) if e.get("tipo") == "conformidade" and origin(e.get("dispatch")) == origin(done["dispatch"])), None)
+    if not verdict or verdict.get("ok"):
+        raise ValueError(f"{target} has no delivery blocked by the conformance gate: nothing to accept")
+    d = done["dispatch"]
+    ev = append_event({"tipo": "conformidade_aceita", "dispatch": d, "task": done.get("task"), "run": run or done.get("run"), "por": by.strip(), "resumo": _quote(summary, 500)})
+    append_event({"tipo": "conformidade", "msg": done.get("msg"), "dispatch": d, "task": done.get("task"), "run": done.get("run"), "ok": True, "faltando": [], "conferido_por": by.strip()})
+    m = {"id": done.get("msg"), "subject": done.get("subject") or "", "body": "", "run_id": done.get("run")}
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError):  # the message itself carries the branch and the commit; without it the worktrees decide
+        m = next((x for x in orca("inbox", "--limit", "200", timeout=20)["messages"] if x.get("id") == done.get("msg")), m)
+    ticket = _orq_delivery(m, {**_payload(m), "dispatchId": d, "taskId": done.get("task"), "outcome": "succeeded"})
+    return {**ev, **({"ticket": ticket} if ticket else {})}
 
 
 def _md_field(txt, item_name):
@@ -7349,9 +7486,10 @@ def scratch_done(plan, events=None):
     done = {t["arquivo"] for t in ts if t["status"] in _SCRATCH_DONE}
     closed = {e.get("ticket") for e in events if e.get("tipo") == "ticket" and e.get("op") == "fechar"}
     done |= {p for t in tickets() if t["num"] in closed for p in linked(t.get("scratch") and [t["scratch"]], t["titulo"])}
-    worker_done = {(e.get("dispatch"), e.get("outcome") == "succeeded") for e in events if e.get("tipo") == "worker_done"}
-    verdict = {e.get("dispatch"): e.get("ok") for e in events if e.get("tipo") == "conformidade"}  # the last one counts
-    delivered = {d for d, ok in worker_done if ok} | ({e.get("dispatch") for e in events if e.get("tipo") == "entrega"} - {d for d, ok in worker_done if not ok})
+    origin = _origin_of(events)  # a dispatch a send-back opened (ticket 329) answers for the one it redoes, the only one with a `despacho` event
+    worker_done = {(origin(e.get("dispatch")), e.get("outcome") == "succeeded") for e in events if e.get("tipo") == "worker_done"}
+    verdict = {origin(e.get("dispatch")): e.get("ok") for e in events if e.get("tipo") == "conformidade"}  # the last one counts
+    delivered = {d for d, ok in worker_done if ok} | ({origin(e.get("dispatch")) for e in events if e.get("tipo") == "entrega"} - {d for d, ok in worker_done if not ok})
     delivered -= {d for d, ok in verdict.items() if not ok} | set(_sent_back(events))  # an `entrega` alone: a sha with no worker_done in the log (older ingests)
     for e in events:
         if e.get("tipo") != "despacho" or e.get("dispatch") not in delivered:
@@ -12883,6 +13021,14 @@ def parser():
     dv.add_argument("target")
     dv.add_argument("reason")
     dv.add_argument("--run")
+    cd = sub.add_parser("check-delivery", help="orq check-delivery [--dispatch <id>] [--report-path <file>]: reads the report against the numbered items of the spec and lists what has no proof; run it before the worker_done (exit 1 with something missing)")
+    cd.add_argument("--dispatch", help="default: the dispatch of this terminal")
+    cd.add_argument("--report-path", help="default: final-report.md of the cwd")
+    ad = sub.add_parser("accept-delivery", help="orq accept-delivery <task|dispatch> --by <who> --summary \"<text>\": lets through a delivery the conformance gate blocked when a mate already checked the diff, recording who did")
+    ad.add_argument("target")
+    ad.add_argument("--by", required=True)
+    ad.add_argument("--summary", required=True)
+    ad.add_argument("--run")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("text_value")
@@ -13296,6 +13442,12 @@ def main(argv=None):
                 print("\n".join(pr_poll(force=a.force)) or "no changes in the PRs")
         elif a.cmd == "send-back":
             print(json.dumps(send_back(a.target, a.reason, a.run), ensure_ascii=False))
+        elif a.cmd == "check-delivery":
+            r = check_delivery_report(a.dispatch, a.report_path)
+            print("delivery complete: every item has a proof" if r["ok"] else "no `## Conformance` line with a proof for:\n" + "\n".join(f"- {x}" for x in r["faltando"]))
+            return 0 if r["ok"] else 1
+        elif a.cmd == "accept-delivery":
+            print(json.dumps(accept_delivery(a.target, a.by, a.summary, a.run), ensure_ascii=False))
         elif a.cmd == "steer":
             ev = steer(a.task, a.text_value, a.run, a.entry)
             print(json.dumps(ev, ensure_ascii=False))
