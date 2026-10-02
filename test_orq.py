@@ -13433,6 +13433,90 @@ def test_ticket96_o_arquivo_do_projeto_de_referencia_reproduz_a_fila_e_os_ambien
         assert orq_mod.transcritos_dirs()[0].endswith("-Users-leo-code-meu-app"), orq_mod.transcritos_dirs()
 
 
+# ticket 93: passagem do coordenador entre harnesses
+
+def _passagem93(a, *args, **env):
+    """`orq passagem coordenador` com gh e engram que não existem (o snapshot não pode chamar a rede nem a máquina)."""
+    return a.orq("passagem", "coordenador", *args, ORQ_GH="/nao/existe/gh", ORQ_ENGRAM="/nao/existe/engram", **env)
+
+
+def _sessao93(a, harness, sid="s_outro", source="startup"):
+    r = a.orq("hook", "session", harness, stdin=json.dumps({"session_id": sid, "source": source, "hook_event_name": "SessionStart"}))
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+
+
+def test_ticket93_passagem_coordenador_grava_o_snapshot_e_quem_o_escreveu():
+    a = Amb(run="run_a")
+    _novo(a, "Ticket do snapshot")
+    r = _passagem93(a, "--para", "codex")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert (out["de"], out["para"]) == ("claude", "codex") and out["arquivo"].endswith(".md"), out
+    md = open(os.path.join(a.home, "handoff", "ultimo.md")).read()
+    assert "## Run ligado\nrun_a" in md and "## Agentes" in md and "Ticket do snapshot" in md, md
+    reg = json.load(open(os.path.join(a.home, "handoff", "passagem.json")))
+    assert (reg["de"], reg["para"], reg["run"]) == ("claude", "codex", "run_a") and abs(reg["ts"] - time.time()) < 60 and not reg.get("aceita"), reg
+
+
+def test_ticket93_passagem_coordenador_descobre_o_harness_de_origem_pelo_terminal():
+    a = Amb(run="run_a")
+    r = _passagem93(a, CLAUDECODE="1")
+    assert r.returncode == 0 and (json.loads(r.stdout)["de"], json.loads(r.stdout)["para"]) == ("claude", "codex"), r
+    b = Amb(run="run_a")
+    r = _passagem93(b, CLAUDECODE="", CODEX_THREAD_ID="t1")
+    assert r.returncode == 0 and (json.loads(r.stdout)["de"], json.loads(r.stdout)["para"]) == ("codex", "claude"), r
+    c = Amb(run="run_a")
+    r = _passagem93(c, CLAUDECODE="")
+    assert r.returncode == 1 and "--para" in r.stderr and not os.path.exists(os.path.join(c.home, "handoff", "passagem.json")), r
+
+
+def test_ticket93_passagem_coordenador_sem_run_ligado_recusa_e_nao_grava():
+    a = Amb(run=None)
+    r = _passagem93(a, "--para", "codex")
+    assert r.returncode == 1 and "sem Run ligado" in r.stderr and not os.path.exists(os.path.join(a.home, "handoff")), r
+
+
+def test_ticket93_hook_session_do_outro_harness_injeta_o_snapshot_recente():
+    a = Amb(run="run_a")
+    _novo(a, "Ticket do snapshot")
+    assert _passagem93(a, "--para", "codex").returncode == 0
+    ctx = _sessao93(a, "codex")
+    assert "Passagem do coordenador (de claude" in ctx and "## Run ligado" in ctx and "Ticket do snapshot" in ctx, ctx
+    assert ctx.index("Tickets abertos") < ctx.index("Passagem do coordenador"), "o status de sempre vem primeiro, a passagem depois"
+    assert json.load(open(os.path.join(a.home, "handoff", "passagem.json")))["aceita"]["sessao"] == "s_outro"
+
+
+def test_ticket93_hook_session_do_mesmo_harness_nao_injeta():
+    a = Amb(run="run_a")
+    assert _passagem93(a, "--para", "codex").returncode == 0
+    assert "Passagem do coordenador" not in _sessao93(a, "claude")
+    assert not json.load(open(os.path.join(a.home, "handoff", "passagem.json"))).get("aceita"), "quem não leu não aceitou"
+
+
+def test_ticket93_hook_session_nao_injeta_passagem_velha_nem_a_que_outra_sessao_ja_pegou():
+    a = Amb(run="run_a")
+    assert _passagem93(a, "--para", "codex").returncode == 0
+    arq = os.path.join(a.home, "handoff", "passagem.json")
+    reg = json.load(open(arq))
+    reg["ts"] = time.time() - 16 * 60
+    json.dump(reg, open(arq, "w"))
+    assert "Passagem do coordenador" not in _sessao93(a, "codex"), "mais de 15 min"
+    reg["ts"] = time.time() - 14 * 60
+    json.dump(reg, open(arq, "w"))
+    assert "Passagem do coordenador" in _sessao93(a, "codex", sid="s_um"), "14 min ainda vale"
+    assert "Passagem do coordenador" not in _sessao93(a, "codex", sid="s_dois"), "a primeira sessão levou"
+    assert "Passagem do coordenador" in _sessao93(a, "codex", sid="s_um", source="resume"), "a mesma sessão, ao reabrir, a relê"
+
+
+def test_ticket93_hook_session_sem_passagem_ou_com_registro_ilegivel_segue_como_antes():
+    a = Amb(run="run_a")
+    assert "Passagem do coordenador" not in _sessao93(a, "codex")
+    os.makedirs(os.path.join(a.home, "handoff"))
+    open(os.path.join(a.home, "handoff", "passagem.json"), "w").write("{isto não é json")
+    assert "Tickets abertos" in _sessao93(a, "codex")
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

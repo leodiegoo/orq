@@ -3,9 +3,12 @@
 
   precompact.py            (stdin: JSON do PreCompact) grava handoff/<data>.md, atualiza ultimo.md e salva no engram
   precompact.py retomar    (stdin: JSON do SessionStart) imprime o ultimo.md como additionalContext se source == compact
+  precompact.py passagem --de H --para H   (`orq passagem coordenador`) grava o mesmo snapshot sem compactar e handoff/passagem.json (quem o escreveu e quando);
+                           o `orq hook session` do outro harness o injeta (ticket 93). Imprime o registro em JSON; sem Run ligado, sai 1 com a causa no stderr
 Só no coordenador (regra de papel do orq.py, importada sem alterá-lo). Fail-open: qualquer erro vira exit 0 e uma linha no orq.log.
 Variáveis para teste: ORQ_HOME, ORQ_ORCA, ORQ_PENDENCIAS (as do orq.py), ORQ_CLI, ORQ_ENGRAM, ORQ_GH, ORQ_DESENHO.
 """
+import argparse
 import json
 import os
 import shlex
@@ -174,9 +177,34 @@ def retomar(ev):
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
 
+def passagem(de, para):
+    """O snapshot do PreCompact sob demanda, para o coordenador que troca de harness. O registro (de, para, ts, Run) é o que o `orq hook session`
+    do outro lado confere: ele só injeta se o `ts` tem menos de 15 min e o `de` não é o harness dele. Sem Engram: o servidor é o mesmo nos dois harnesses."""
+    run = orq.orca("run-current")["run"]
+    if not run:
+        print("orq: sem Run ligado a este terminal: não há estado de coordenador para passar (`orca orchestration run-use --id <run>`)", file=sys.stderr)
+        return 1
+    agora = datetime.now()
+    nome = gravar(montar(run, os.getcwd()), agora)
+    reg = {"arquivo": os.path.basename(nome), "de": de, "para": para, "ts": time.time(), "run": run["id"], "aceita": None}
+    orq._write_json(os.path.join(HANDOFF, "passagem.json"), reg)
+    print(json.dumps(reg, ensure_ascii=False))
+    return 0
+
+
 def main(argv):
     global T0
     T0 = time.monotonic()
+    if argv[1:2] == ["passagem"]:
+        ap = argparse.ArgumentParser(prog="precompact.py passagem")
+        ap.add_argument("--de", required=True)
+        ap.add_argument("--para", required=True)
+        a = ap.parse_args(argv[2:])
+        try:
+            return passagem(a.de, a.para)
+        except Exception as e:  # noqa: BLE001 - comando, não hook: a causa vai para o stderr em vez de sumir no log
+            print(f"orq: passagem do coordenador falhou: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
     try:
         raw = sys.stdin.read()
         ev = json.loads(raw) if raw.strip() else {}
