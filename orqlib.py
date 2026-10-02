@@ -4969,11 +4969,12 @@ def _integrator_pending(events):
     return {"linha": line, "motivo": f"orq: integrator stopped: main did not advance, live tree dirty ({_quote(line, 160)})" + (f"; dirty files: {'; '.join(dirty[:10])}" if dirty else "")}
 
 
-def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_push, pending_item=None):
+def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_push, pending_item=None, mate_to_open=None):
     """The coordinator's next step that does not depend on the user, or None (pure; the Stop with away on blocks the end of the turn while there is one).
 
     In order: delivery (`delivered` worker of an open ticket) outside the integrator queue; integrator cycle with commits without push (`without_push` > 0); `ready-for-agent`
-    ticket with no blocker, P1 or P2, with Modelo/Effort, outside the dispatch queue and with a free slot (a hibernated worker does not occupy a slot)."""
+    ticket with no blocker, P1 or P2, with Modelo/Effort, outside the dispatch queue and with a free slot (a hibernated worker does not occupy a slot); at the end, the proposal to
+    open the mate of a group with no mate that gathered ready tickets (`mate_to_open`: (group, [numbers]) without `mate_auto`, which the manager opens by itself)."""
     by_num, dispatch_index = {t["num"]: t for t in tks}, _dispatch_ticket(events)
     if without := sum(a.get("estado") == "sem_terminal" for a in agent_rows):
         return f"{without} worker(s) lost the terminal without worker_done: `orq resume --dry-run`, then `orq resume`"
@@ -4999,6 +5000,8 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
             continue
         if priority_of(events, t["task"], None, t["titulo"]) < 3 and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"] and not machine_slot(t["modelo"], occupancy, cfg):
             return f"ticket {t['num']} ({_quote(t['titulo'], 50)}) is ready, unblocked and a slot is free: `orq dispatch --ticket {t['num']}`"
+    if mate_to_open:
+        return f"open the mate of group {mate_to_open[0]} ({len(mate_to_open[1])} ready tickets: {', '.join(mate_to_open[1])}): `orq mate open {mate_to_open[0]}`"
     return None
 
 
@@ -5008,7 +5011,9 @@ def _work_without_user(events, now_at):
         agent_rows = reassess(_dict(_read_json(_path("open.json"))).get("agentes") or [], events, now_at, _turns_ro())
         without_push = _no_push()
         pending = _integrator_pending(events)
-        return next_without_user(tickets(), agent_rows, integration_queue(), dispatch_queue_items(), events, machine_cfg(), without_push, pending and pending["motivo"]), pending
+        tks, group_map, queue, machine = tickets(), groups(), dispatch_queue_items(), machine_cfg()
+        mate_to_open = next(((n, nums) for n, nums in mate_proposals(tks, group_map, _mates(), queue, machine) if group_map[n].get("mate_auto") is not True), None)
+        return next_without_user(tks, agent_rows, integration_queue(), queue, events, machine, without_push, pending and pending["motivo"], mate_to_open), pending
     except Exception as e:  # noqa: BLE001 - hook falha aberto
         log(f"trabalho_sem_usuario: {type(e).__name__}: {e}")
         return None, None
@@ -5897,18 +5902,111 @@ def groups_text(group_map, mates, live, event_list, now_at):
     return "\n".join(line_list) or f"no group in {_path(GROUPS_DIR)}"
 
 
-def mate_lines():
-    """The `orq status` lines: one per group with a recorded mate (trabalhando (working), ocioso há N min (idle for N min), dormindo (sleeping) or caiu (down), terminal, unanswered requests). Without a mate, nothing."""
-    mates = _mates()
-    if not mates:
+def mate_ready(tks, group_map, queue):
+    """{group: [ticket numbers]} of the ready tickets that match each group's title prefix: `ready-for-agent`, every blocker closed, outside the dispatch queue."""
+    by_num, queued = {t["num"]: t for t in tks}, {i.get("ticket") for i in queue}
+    found = {n: [] for n in group_map}
+    for t in tks:
+        if t["status"] != STATUS_NEW or t["num"] in queued or any((by_num.get(b) or {}).get("status") != STATUS_CLOSED for b in t["blocked_by"]):
+            continue
+        item_name, _ = group_of(group_map, title=t["titulo"])
+        if item_name:
+            found[item_name].append(t["num"])
+    return found
+
+
+def _ready_min(cfg, machine):
+    """Ready tickets a group without a mate gathers before orq proposes opening it: the group's `mate_ready_min`, otherwise the machine's (default 3)."""
+    v = cfg.get("mate_ready_min")
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else machine["mate_ready_min"]
+
+
+def mate_proposals(tks, group_map, mates, queue, machine):
+    """[(group, [ticket numbers])] of the groups with no mate (neither open nor asleep) that gather `_ready_min` or more ready tickets. Pure."""
+    ready = mate_ready(tks, group_map, queue)
+    return [(n, ready[n]) for n, cfg in group_map.items()
+            if not _dict(mates.get(n)).get("terminal") and not _dict(mates.get(n)).get("dormiu") and len(ready[n]) >= _ready_min(cfg, machine)]
+
+
+def mate_proposal_lap():
+    """The manager's round over the proposals: tells the coordinator once per proposal that a group gathered ready tickets with no mate, and with `"mate_auto": true` in the
+    group opens the mate itself (also once: a failure goes to the coordinator, it does not repeat every round). A group that stops qualifying forgets the mark."""
+    group_map = groups()
+    if not group_map:
         return []
-    live, event_list, now_at = _alive_terminals(), read_events(), datetime.now(timezone.utc)
+    proposals = mate_proposals(tickets(), group_map, _mates(), dispatch_queue_items(), machine_cfg())
+    noticed = _cursor_ro().get("mate_proposal_notified")
+    noticed = noticed if isinstance(noticed, list) else []
+    coord_handle, line_list, done = (_manager_cfg() or {}).get("coordenador"), [], []
+    for item_name, nums in proposals:
+        if item_name in noticed:
+            done.append(item_name)
+            continue
+        if group_map[item_name].get("mate_auto") is True:
+            try:
+                mate_open(item_name)
+                line_list.append(f"mate {item_name}: opened by mate_auto ({len(nums)} ready tickets)")
+                done.append(item_name)
+                continue
+            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                text = f"orq ▸ mate_auto could not open the mate of group {item_name} ({_quote(str(e), 160)}). Run: orq mate open {item_name}"
+        else:
+            text = (f"orq ▸ group {item_name} has {len(nums)} ready tickets ({', '.join(nums)}) and no mate. Open it with: orq mate open {item_name}"
+                    f" (or set \"mate_auto\": true in groups/{item_name}.json)")
+        if coord_handle and notify_coordinator(coord_handle, text) in DELIVERED:
+            done.append(item_name)
+            line_list.append(f"mate {item_name}: proposal reported to the coordinator")
+    if sorted(done) != sorted(noticed):
+        _cursor_mut(lambda c: c.__setitem__("mate_proposal_notified", done))
+    return line_list
+
+
+def mate_lines():
+    """The `orq status` lines: `mate <group>: <state>` per group with a recorded mate (trabalhando (working), ocioso há N min (idle for N min), dormindo (sleeping) or caiu (down),
+    terminal, unanswered requests), and `group <name>: N ready (…) | mate alive|sleeping|down|absent` per group, with the proposal to open the mate when it gathers enough."""
+    group_map = groups()
+    if not group_map:
+        return []
+    mates = _mates()
+    live, event_list, now_at = (_alive_terminals() if mates else None), read_events(), datetime.now(timezone.utc)
+    machine, ready = machine_cfg(), mate_ready(tickets(), group_map, dispatch_queue_items())
     line_list = []
-    for item_name in groups():
+    for item_name, cfg in group_map.items():
         state, terminal, _, pending = _group_mate(item_name, mates, live, event_list, now_at)
         if terminal or state == "sleeping":
             line_list.append(f"mate {item_name}: {state}" + (f" ({terminal})" if terminal else "") + (f" | requests: {', '.join(p['corr'] + ' ' + p['estado'] for p in pending)}" if pending else ""))
+        kind = {"no mate": "absent", "sleeping": "sleeping", "down": "down"}.get(state, "alive")
+        nums = ready[item_name]
+        line_list.append(f"group {item_name}: {len(nums)} ready" + (f" ({', '.join(nums)})" if nums else "") + f" | mate {kind}"
+                         + (f" | propose: orq mate open {item_name}" if kind == "absent" and len(nums) >= _ready_min(cfg, machine) else ""))
     return line_list
+
+
+def dispatch_group(title, ticket=None, project=None, run=None):
+    """(group, reason) of a dispatch that belongs to a group with a configured mate (open or asleep), by title prefix or by the project's folder; (None, reason) otherwise.
+    The mate's own dispatches (ORQ_MATE) never go back up to it."""
+    if os.environ.get("ORQ_MATE"):
+        return None, "dispatch made by a mate"
+    if ticket and not title:
+        tk = next((t for t in tickets() if t["num"] == str(ticket).strip().zfill(2)), None)
+        title = tk and tk["titulo"]
+    project = dispatch_project(project, run)
+    item_name, reason = group_of(groups(), title=title, cwd=project and repo_folder(projects()[project]["repo"]))
+    if not item_name:
+        return None, reason
+    m, live = _dict(_mates().get(item_name)), _alive_terminals()
+    if (m.get("dormiu") and not m.get("terminal")) or (m.get("terminal") and (live is None or m["terminal"] in live)):
+        return item_name, reason
+    return None, f"group {item_name} has no mate open or asleep: the coordinator dispatches"
+
+
+def dispatch_to_mate(item_name, reason, run, title, ticket, spec_file, model, effort):
+    """`orq dispatch` of a group's ticket: asks the group's mate to dispatch it (`orq mate request`, which wakes a sleeping one) instead of starting the worker."""
+    what = f"ticket {str(ticket).zfill(2)}" if ticket else f"{title!r} (spec {spec_file})"
+    r = mate_request(item_name, f"dispatch {what} in your Run: model {model}, effort {effort} (the coordinator's Run is {run}). Answer with the worker's dispatch id.")
+    append_event({"tipo": "mate_dispatch", "grupo": item_name, "corr": r["corr"], "run": run, "motivo": reason, "modelo": model, "effort": effort,
+                  **({"ticket": str(ticket).zfill(2)} if ticket else {"titulo": title})})
+    return {"estado": "mate", "grupo": item_name, "corr": r["corr"], "entrega": r["entrega"], "motivo": reason}
 
 
 def mate_sleep(group_name, reason="manual", agent_rows=None):
@@ -9083,7 +9181,7 @@ def _gate_backlog(tk):
         raise ValueError(f"ticket {tk['num']} is blocked by {', '.join(tk['blocked_by'])}: close the blockers first")
 
 
-def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False):
+def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None):
     """worker-start (with --model and --effort, which the worker-routing-guard hook requires) + `dispatch_mode` event + entry intake.
 
     Returns the ids and the waiter's command; waits for nothing. Refuses, before creating the task, whatever Orca would refuse later.
@@ -9098,6 +9196,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
 
     `service`: the worker is a service (integrator, secondmate) that stays alive after the first worker_done, when Orca revokes its capability. The event
     carries `service: true`: `orq agents` shows it as `service` (never "entregue sem liberar", delivered without release) and the worker reports each cycle with `orq cycle done`.
+
+    `direct`: why the coordinator dispatched on its own a request that belongs to a group with a mate (`--direct`); it goes in the event.
     """
     if priority_level is not None and priority_level not in (1, 2, 3):
         raise ValueError("--priority expects 1 (high), 2 or 3 (low)")
@@ -9199,7 +9299,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
               **({"projeto": project} if project else {}),
-              **({"servico": True} if service else {})}
+              **({"servico": True} if service else {}), **({"direct": direct} if direct else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if agent == "codex":
@@ -9651,6 +9751,7 @@ MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB o
                   "mem_piso_mb": 1024,  # safety floor: not even the exempt Run comes up with free memory below this
                   "runs_isentos": ["Orquestrador*"],  # glob patterns (Run id or objective): orq's own work comes up under pressure and without the worker ceiling; max_caros, max_e2e and mem_piso_mb hold it back
                   "pausar_sob_pressao": False,  # True: under pressure the manager on its own pauses the lowest-priority worker (orq pausar)
+                  "mate_ready_min": 3,  # ready tickets that match a group with no mate before orq proposes opening it (the group's `mate_ready_min` wins)
                   "stop_bloqueia": False}  # True: the coordinator's Stop blocks the end of the turn with any entry that has no effect (GATE_BLOCKERS times per set); turning it on is the user's decision (ticket 27). An entry with no intake in the turn always blocks (ticket 150)
 DISPATCH_QUEUE = "dispatch-queue.json"  # {itens: [...]}: what `orq dispatch_worker` and `orq resume` could not bring up; the manager brings it up by priority
 DISPATCH_QUEUE_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: copy of the spec of a queued dispatch (the coordinator's file may vanish)
@@ -11216,6 +11317,10 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - the mates channel doesn't take down the panel; the next loop tries
         log(f"mates: {type(e).__name__}: {e}")
     try:
+        line_list += mate_proposal_lap()
+    except Exception as e:  # noqa: BLE001 - the proposal to open a mate doesn't take down the panel; the next loop tries
+        log(f"proposta de mate: {type(e).__name__}: {e}")
+    try:
         line_list += machine_round()
     except Exception as e:  # noqa: BLE001 - the dispatch queue doesn't take down the panel; the next loop tries
         log(f"fila de despacho: {type(e).__name__}: {e}")
@@ -12105,6 +12210,7 @@ def parser():
     from_.add_argument("--base-branch")
     _arg(from_, "entrada")
     _arg(from_, "prioridade", type=int, choices=[1, 2, 3], help="1 high to 3 low; without it the one from the title's stream applies (security and production 1, failover, diagnostics and panel 3)")
+    from_.add_argument("--direct", "--direto", action="store_true", help="dispatch here even when the request belongs to a group with a mate (otherwise it goes to the mate); the event records the reason")
     rp = sub.add_parser("run", help="what orq keeps about a Run").add_subparsers(dest="op", required=True).add_parser("project", aliases=["projeto"], help="binds the Run to a project in ORQ_HOME/projects: its dispatches start in the project's repo")
     rp.add_argument("item_name")
     rp.add_argument("--run")
@@ -12467,7 +12573,12 @@ def main(argv=None):
                 return 0
             print("\n".join(night_lines(_cursor_ro(), read_events())) or "night mode off")
         elif a.cmd == "dispatch":
-            r = dispatch_worker(a.run, a.title, a.spec_file, a.model, a.effort, a.worktree, a.name, a.base_branch, a.entry, a.ticket, a.priority_level, a.agent, a.project, service=a.service)
+            group_name, group_reason = (None, None) if a.service else dispatch_group(a.title, a.ticket, a.project, a.run)
+            if group_name and not a.direct:
+                print(json.dumps(dispatch_to_mate(group_name, group_reason, a.run, a.title, a.ticket, a.spec_file, a.model, a.effort), ensure_ascii=False))
+                return 0
+            r = dispatch_worker(a.run, a.title, a.spec_file, a.model, a.effort, a.worktree, a.name, a.base_branch, a.entry, a.ticket, a.priority_level, a.agent, a.project, service=a.service,
+                                direct=f"--direct: group {group_name} ({group_reason})" if group_name else None)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"warning: {r['aviso']}", file=sys.stderr)
