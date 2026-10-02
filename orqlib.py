@@ -210,7 +210,7 @@ PATCH_ARQUIVO = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.
 
 # ---------- puras ----------
 
-AVISOS_ORQ = ("orq: PR ", "orq: Fila do E2E", "orq: uso do plano", "orq: worker ", "orq ▸ pedido ", "orq ▸ mate ")  # o que o painel digita no coordenador (avisa_coordenador)
+AVISOS_ORQ = ("orq: PR ", "orq: Fila do E2E", "orq: uso do plano", "orq: worker ", "orq: coordenador parado ", "orq ▸ pedido ", "orq ▸ mate ")  # o que o painel digita no coordenador (avisa_coordenador)
 
 
 def origem(prompt):
@@ -4670,19 +4670,24 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
     return None
 
 
+def _trabalho_sem_usuario(events, agora):
+    """(próximo passo que não depende do usuário, pendência do integrador) lidos só dos arquivos do orq; (None, None) se algo falha (o Stop falha aberto, o gerente tenta na volta seguinte)."""
+    try:
+        ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
+        sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+        pend = _pendente_do_integrador(events)
+        return proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push, pend and pend["motivo"]), pend
+    except Exception as e:  # noqa: BLE001 - hook falha aberto
+        log(f"trabalho_sem_usuario: {type(e).__name__}: {e}")
+        return None, None
+
+
 def away_bloqueio(events, agora):
     """O motivo para o Stop barrar o fim do turno (away ligado e trabalho que não depende do usuário), ou None. Lê só os arquivos do orq, nunca o Orca;
     qualquer falha deixa parar. Grava `away_bloqueio`: o mesmo motivo barra no máximo AWAY_BLOQUEIOS vezes em AWAY_BLOQUEIO_MIN."""
     if not away_ligado():
         return None
-    try:
-        ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
-        sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
-        pend = _pendente_do_integrador(events)
-        proximo = proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push, pend and pend["motivo"])
-    except Exception as e:  # noqa: BLE001 - hook falha aberto
-        log(f"away_bloqueio: {type(e).__name__}: {e}")
-        return None
+    proximo, pend = _trabalho_sem_usuario(events, agora)
     corte = agora - timedelta(minutes=AWAY_BLOQUEIO_MIN)
     if not proximo or sum(e.get("tipo") == "away_bloqueio" and e.get("motivo") == proximo and (_ts(e.get("ts")) or corte) > corte for e in events) >= AWAY_BLOQUEIOS:
         return None
@@ -6036,6 +6041,42 @@ def avisos_entregar():
         return []
     _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))
     return ["aviso adiado digitado no coordenador, ocioso"]
+
+
+ACORDA_PARADO_MIN = float(os.environ.get("ORQ_ACORDA_PARADO_MIN") or 5)  # o trabalho sem o usuário vale há tanto tempo e o coordenador está parado: o gerente o acorda
+ACORDA_REPETE_MIN = float(os.environ.get("ORQ_ACORDA_REPETE_MIN") or 30)  # o mesmo motivo não é digitado de novo antes disto
+ACORDA_ARQ = "acorda-parado.json"  # {motivo, desde, avisado}: o motivo atual, desde quando o gerente o vê e quando o digitou
+
+
+def acorda_parado(agora=None):
+    """Uma volta do gerente: as mesmas condições do Stop do away (`proximo_sem_usuario` e a obrigação aberta velha) valem há ACORDA_PARADO_MIN e o coordenador
+    está parado no prompt → digita um aviso curto nele, uma vez por motivo a cada ACORDA_REPETE_MIN. O Stop só roda quando o coordenador termina um turno; sem
+    mensagem nova não há turno (ticket 174: o ciclo do integrador, worker de serviço sem capability, ficou 5 h sem ninguém ver). Só com o away ligado (ticket 107).
+    Coordenador ocupado ou com rascunho: nada é marcado e a próxima volta tenta. Motivo que some zera a contagem. Devolve as linhas do painel."""
+    g, agora = _gerente_cfg(), agora or datetime.now(timezone.utc)
+    if not g or not g.get("coordenador") or not away_ligado():
+        return []
+    events = read_events()
+    motivo, _ = _trabalho_sem_usuario(events, agora)
+    if not motivo and (velhas := obrigacoes_a_cobrar(events, agora)):
+        motivo = f"obrigação aberta: {velhas[0]['entrada']} {velhas[0]['chave']} ({velhas[0]['texto']})"
+    arq, ts = _path(ACORDA_ARQ), agora.strftime("%Y-%m-%dT%H:%M:%SZ")
+    est = _dict(_read_json(arq))
+    if not motivo:
+        if est:
+            _write_json(arq, {})
+        return []
+    if est.get("motivo") != motivo:
+        est = {"motivo": motivo, "desde": ts}
+        _write_json(arq, est)
+    minutos = (agora - _dt(est["desde"])).total_seconds() / 60
+    avisado = _ts(est.get("avisado"))
+    if minutos < ACORDA_PARADO_MIN or (avisado and (agora - avisado).total_seconds() < ACORDA_REPETE_MIN * 60):
+        return []
+    if avisa_coordenador(g["coordenador"], f"orq: coordenador parado há {int(minutos)} min com trabalho que não depende do usuário: {motivo}") not in ("enviado", "adiado"):
+        return []
+    _write_json(arq, {**est, "avisado": ts})
+    return [f"coordenador parado com trabalho sem o usuário: aviso digitado ({_cita(motivo, 80)})"]
 
 
 def avisos_do_contexto():
@@ -10453,6 +10494,10 @@ def gerente_absorver():
         linhas += maquina_volta()
     except Exception as e:  # noqa: BLE001 - a fila de despacho não derruba o painel; a próxima volta tenta
         log(f"fila de despacho: {type(e).__name__}: {e}")
+    try:
+        linhas += acorda_parado()
+    except Exception as e:  # noqa: BLE001 - o aviso ao coordenador parado não derruba o painel; a próxima volta tenta
+        log(f"acorda parado: {type(e).__name__}: {e}")
     try:
         linhas += [*acordar_gatilhos(), *hibernar_ociosos()]
     except Exception as e:  # noqa: BLE001 - hibernar é economia, não pode derrubar o painel; a próxima volta tenta

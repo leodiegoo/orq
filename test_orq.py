@@ -16020,6 +16020,89 @@ def test_ticket173_guarda_recusa_def_test_depois_do_main():
     assert _testes_depois_do_main(open(__file__).read()) == [], "def test_ depois do __main__ nunca roda: mova para antes"
 
 
+# ---------- ticket 174: o gerente acorda o coordenador parado quando há trabalho sem o usuário ----------
+
+def _acorda174(away=True, sem_push=2):
+    """Home isolada com gerente.json, um ciclo do integrador e `digita` trocado: devolve (home, enviados, restaura)."""
+    home = tempfile.mkdtemp()
+    antes = (orq_mod.HOME, orq_mod.digita, orq_mod._sem_push, orq_mod.CICLOS_LOG)
+    enviados = []
+    orq_mod.HOME, orq_mod.digita, orq_mod._sem_push = home, lambda h, t: enviados.append((h, t)) or "enviado", lambda: sem_push
+    orq_mod.CICLOS_LOG = os.path.join(home, "sem-ciclos.log")
+    json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
+    if away:
+        _away_ligado(home)
+    orq_mod.append_event({"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"})
+
+    def restaura():
+        orq_mod.HOME, orq_mod.digita, orq_mod._sem_push, orq_mod.CICLOS_LOG = antes
+    return home, enviados, restaura
+
+
+def _em174(minutos):
+    return datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc) + timedelta(minutes=minutos)
+
+
+def test_ticket174_ciclo_com_commits_sem_push_e_coordenador_parado_digita_o_aviso_depois_de_5_min():
+    _, enviados, restaura = _acorda174()
+    try:
+        assert orq_mod.acorda_parado(_em174(0)) == [] and enviados == [], "viu agora: ainda não passou o prazo"
+        assert orq_mod.acorda_parado(_em174(4)) == [] and enviados == []
+        assert len(orq_mod.acorda_parado(_em174(5))) == 1 and len(enviados) == 1, enviados
+        h, texto = enviados[0]
+        assert h == "term_c" and texto.startswith("orq: coordenador parado") and "2 commit(s) sem push" in texto, enviados
+    finally:
+        restaura()
+
+
+def test_ticket174_sem_away_o_gerente_nao_digita_nada():
+    _, enviados, restaura = _acorda174(away=False)
+    try:
+        assert orq_mod.acorda_parado(_em174(0)) == [] and orq_mod.acorda_parado(_em174(60)) == [] and enviados == []
+    finally:
+        restaura()
+
+
+def test_ticket174_o_mesmo_motivo_nao_repete_em_30_min_e_volta_depois():
+    _, enviados, restaura = _acorda174()
+    try:
+        orq_mod.acorda_parado(_em174(0))
+        orq_mod.acorda_parado(_em174(5))
+        assert orq_mod.acorda_parado(_em174(34)) == [] and len(enviados) == 1, "30 min desde o aviso ainda não passaram"
+        assert len(orq_mod.acorda_parado(_em174(35))) == 1 and len(enviados) == 2, enviados
+    finally:
+        restaura()
+
+
+def test_ticket174_coordenador_ocupado_nao_marca_avisado_e_a_proxima_volta_tenta():
+    _, enviados, restaura = _acorda174()
+    try:
+        orq_mod.digita = lambda h, t: "ocupado"
+        orq_mod.acorda_parado(_em174(0))
+        assert orq_mod.acorda_parado(_em174(6)) == []
+        orq_mod.digita = lambda h, t: enviados.append((h, t)) or "enviado"
+        assert len(orq_mod.acorda_parado(_em174(7))) == 1 and len(enviados) == 1, enviados
+    finally:
+        restaura()
+
+
+def test_ticket174_motivo_que_some_zera_a_contagem_dos_5_min():
+    _, enviados, restaura = _acorda174()
+    try:
+        orq_mod.acorda_parado(_em174(0))
+        orq_mod._sem_push = lambda: 0  # o push saiu
+        assert orq_mod.acorda_parado(_em174(3)) == []
+        orq_mod._sem_push = lambda: 1
+        assert orq_mod.acorda_parado(_em174(6)) == [] and enviados == [], "o motivo voltou: conta de novo desde 6"
+        assert len(orq_mod.acorda_parado(_em174(11))) == 1
+    finally:
+        restaura()
+
+
+def test_ticket174_o_aviso_digitado_conta_como_aviso_do_orq_e_nao_como_prompt_do_usuario():
+    assert orq_mod.origem("orq: coordenador parado há 5 min: o ciclo do integrador deixou 2 commit(s) sem push") == "aviso_orq"
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
