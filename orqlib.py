@@ -7964,7 +7964,7 @@ def _dispatch_end(dispatch, w):
     return {"motivo": end_reason(dispatch, read_events(), msgs), **wt}
 
 
-def release(dispatch, run=None):
+def release(dispatch, run=None, all_cwd=False):
     """pending ack of the dispatch, worker-release and, if the state comes back `retained`, `orca terminal close` of the worker's terminal. Records an event.
 
     Only acts on a dispatch that appears in the worker-list (of all Runs, or of `run`); refuses one that is still running.
@@ -7975,7 +7975,7 @@ def release(dispatch, run=None):
     if w.get("dispatchStatus") == "dispatched":
         raise ValueError(f"dispatch {dispatch} is still running: wait for worker_done or use worker-stop")
     with _no_run(w.get("runId")):
-        return _release(dispatch, w)
+        return _release(dispatch, w, all_cwd)
 
 
 def _close_setup(dispatch, w, run_id, handle):
@@ -8005,16 +8005,18 @@ def _close_setup(dispatch, w, run_id, handle):
     return closed_items, notices
 
 
-def _release(dispatch, w):
+def _release(dispatch, w, all_cwd=False):
     """The release body, with the dispatch's Run already commanded by the coordinator (or with the refusal that explains what is missing)."""
     run_id, handle, notices = w.get("runId"), w.get("agentTerminalHandle"), []
     if dispatch in _released(read_events()):
+        again = sweep_notices(terminate_worktree_processes(_dispatch_end(dispatch, w).get("caminho"), all_cwd=True), dispatch) if all_cwd else []  # `--processos` on a released dispatch only sweeps
         return {"tipo": "liberar", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, "terminal": handle, "estado": w.get("terminalState"),
-                "fechado": True, "ack": 0, "aviso": "already released"}  # repeating sends neither worker-release nor terminal close (M13)
+                "fechado": True, "ack": 0, "aviso": "; ".join(again) or "already released"}  # repeating sends neither worker-release nor terminal close (M13)
     deliveries, notice = _dispatch_ack(run_id, dispatch)
     if notice:
         notices.append(notice)
     end = _dispatch_end(dispatch, w)
+    owned = worktree_owned_pids(end.get("caminho"))  # before the terminal closes: afterwards the agent is gone and what it left is below no harness
     try:
         state = orca("worker-release", "--dispatch", dispatch, timeout=30, run=run_id).get("state")
     except RuntimeError as e:
@@ -8040,9 +8042,7 @@ def _release(dispatch, w):
         setup, a_setup = _close_setup(dispatch, w, run_id, handle)
         notices += a_setup
     if state != "release_pending" and not kept and end.get("caminho"):  # terminal kept: someone still uses the worktree
-        r = terminate_worktree_processes(end["caminho"])
-        if r and r["encerrados"]:
-            notices.append(f"{r['encerrados']} worktree process(es) terminated" + (f", {r['kill']} only with KILL" if r["kill"] else ""))
+        notices += sweep_notices(terminate_worktree_processes(end["caminho"], owned=owned, all_cwd=all_cwd), dispatch)
     if state != "release_pending":  # repeating release_pending records the end again; the last one counts
         append_event({"tipo": "fim_dispatch", "dispatch": dispatch, "task": w.get("taskId"), "run": run_id, **end})
     if state != "release_pending":
@@ -10953,14 +10953,41 @@ def _processes(with_cwd=True, include_all=False):
     return ps
 
 
-def terminate_worktree_processes(wt, wait_s=None):
-    """TERM, wait and KILL only on what is left among the processes with cwd inside worktree `wt` (Meteor, node, watchers, docker compose of the E2E stack). Spares the
-    orq process and those above it (the terminal of whoever called: coordinator, manager or integrator); nothing outside the worktree is touched. Returns
-    {"encerrados", "kill"} (kill: those that only fell to KILL) and writes the `processes` event; None without the process list or with a root that is not a worktree."""
+def _linked_root(wt):
+    """The real path of `wt` if it is a linked worktree (`.git` file); None for no path, `/`, home or the main checkout (a `.git` directory runs the coordinator,
+    the manager and the `--worktree current` workers)."""
     root = os.path.realpath(wt) if wt else ""
-    if root in ("", "/", os.path.realpath(HOME)):
+    if root in ("", "/", os.path.realpath(HOME)) or not os.path.isfile(os.path.join(root, ".git")):
         return None
-    if not os.path.isfile(os.path.join(root, ".git")):  # linked worktree only: the main checkout (.git folder) runs the coordinator, manager and --worktree current workers
+    return root
+
+
+def _worker_tree(procs, root):
+    """The pids of every harness process (claude, codex) with `cwd` inside `root` and of everything that starts below them."""
+    return _descendants(procs, [p["pid"] for p in procs if _agent_of(p) and p.get("cwd") and _inside(p["cwd"], root)])
+
+
+def worktree_owned_pids(wt):
+    """The worker's own processes in worktree `wt` right now (`_worker_tree`), to take before the terminal closes: after that the agent is gone and what it left
+    behind is no longer below any harness. Empty with no linked worktree or no process list."""
+    root = _linked_root(wt)
+    return _worker_tree(_processes(include_all=True) or [], root) if root else set()
+
+
+def _process_list(ps):
+    return [{"pid": p["pid"], "comando": (p.get("args") or "")[:200], "cwd": p.get("cwd")} for p in ps]
+
+
+def terminate_worktree_processes(wt, wait_s=None, owned=None, all_cwd=False):
+    """TERM, wait and KILL only on the worker's own processes with cwd inside worktree `wt` (Meteor, node, watchers, docker compose of the E2E stack).
+
+    `cwd` proves where a process is, not whose it is, so the set is the intersection of the cwd and the worker's tree: `owned` (pids taken by `worktree_owned_pids` before
+    the terminal closed) or, without it, what is below a harness process in that worktree now. The rest is listed in the `processes` event and left alone; `all_cwd`
+    (`orq release --processos`) lifts that filter and keeps the circuit breaker. A set over ORQ_ENCERRA_MAX is not terminated: it is recorded (`op: recusado`) and
+    becomes a pending item. Spares the orq process and those above it (the terminal of whoever called). Returns {"encerrados", "kill", "nao_encerrados", "recusado"}
+    and writes the event; None without the process list or with a root that is not a linked worktree."""
+    root = _linked_root(wt)
+    if not root:
         return None
     procs = _processes(include_all=True)
     if procs is None:
@@ -10970,10 +10997,24 @@ def terminate_worktree_processes(wt, wait_s=None):
         protected.add(pid)
         pid = by_pid[pid]["ppid"]
     protected.add(os.getpid())
+    owned = _worker_tree(procs, root) if owned is None else owned
 
     def inside():
         return [p for p in (_processes(include_all=True) or []) if p.get("cwd") and _inside(p["cwd"], root) and p["pid"] not in protected]
-    targets = {p["pid"] for p in inside()}
+    found = inside()
+    mine = [p for p in found if all_cwd or p["pid"] in owned]
+    rest = [p for p in found if p not in mine]
+    res = {"encerrados": 0, "kill": 0, "nao_encerrados": len(rest), "recusado": 0}
+    ev = {"tipo": "processos", "worktree": root, "nao_encerrados": len(rest), **({"restantes": _process_list(rest)} if rest else {})}
+    if len(mine) > END_MAX:
+        append_event({**ev, "op": "recusado", "limite": END_MAX, "lista": _process_list(mine)})
+        try:
+            pending_add(f"processos-{os.path.basename(root)}"[:60], "acao", f"{len(mine)} processes in {root} not terminated (limit {END_MAX})",
+                        detail="A sweep this large means the filter is wrong, not that there are that many to end. See the `processos` event (op recusado) for the list.")
+        except (ValueError, OSError, RuntimeError) as e:
+            log(f"processos: pendencia: {type(e).__name__}: {e}")
+        return {**res, "recusado": len(mine)}
+    targets = {p["pid"] for p in mine}
     for p in targets:
         _signal_name(p, signal.SIGTERM)
     end = time.time() + (END_WAIT_S if wait_s is None else wait_s)
@@ -10983,10 +11024,24 @@ def terminate_worktree_processes(wt, wait_s=None):
         remaining_pids = [p for p in inside() if p["pid"] in targets]
     for p in remaining_pids:  # the cwd is checked again: the pid may have been reused
         _signal_name(p["pid"], signal.SIGKILL)
-    res = {"encerrados": len(targets), "kill": len(remaining_pids)}
-    if targets:
-        append_event({"tipo": "processos", "op": "encerrar", "worktree": root, **res})
+    res.update(encerrados=len(targets), kill=len(remaining_pids))
+    if targets or rest:
+        append_event({**ev, "op": "encerrar", "encerrados": res["encerrados"], "kill": res["kill"], "lista": _process_list(mine)})
     return res
+
+
+def sweep_notices(r, dispatch=None):
+    """The notice lines of a `terminate_worktree_processes` result (None: nothing to say)."""
+    if not r:
+        return []
+    out = []
+    if r["encerrados"]:
+        out.append(f"{r['encerrados']} worktree process(es) terminated" + (f", {r['kill']} only with KILL" if r["kill"] else ""))
+    if r["nao_encerrados"]:
+        out.append(f"{r['nao_encerrados']} worktree process(es) not terminated (not provably the worker's)" + (f": run `orq release {dispatch} --processos`" if dispatch else ""))
+    if r["recusado"]:
+        out.append(f"{r['recusado']} worktree process(es) over ORQ_ENCERRA_MAX ({END_MAX}): none terminated, pending item opened")
+    return out
 
 
 def _descendants(procs, pids):
@@ -11030,6 +11085,7 @@ def _protected(run):
     return {x for x in (os.environ.get("ORCA_TERMINAL_HANDLE"), g.get("coordenador"), g.get("gerente"), coord_handle) if x}
 
 
+END_MAX = int(os.environ.get("ORQ_ENCERRA_MAX") or 12)  # circuit breaker: a sweep of more processes than this ends none
 END_WAIT_S = float(os.environ.get("ORQ_ENCERRA_ESPERA_S") or 5)  # from SIGTERM to SIGKILL on the paused worker's children
 
 
@@ -12287,6 +12343,7 @@ def parser():
     li = sub.add_parser("release", aliases=["liberar"], help="pending ack, worker-release and terminal close if it comes back retained")
     li.add_argument("dispatch")
     li.add_argument("--run")
+    li.add_argument("--processos", "--processes", dest="all_cwd", action="store_true", help="also ends the processes with cwd in the worktree that are not provably the worker's (still capped by ORQ_ENCERRA_MAX)")
     it = sub.add_parser("interrupt", aliases=["interromper"], help="sends the interrupt to the terminal of the running worker (the worker stays alive)")
     it.add_argument("dispatch")
     it.add_argument("--run")
@@ -12659,7 +12716,7 @@ def main(argv=None):
             rs = runs_list(a.include_all)
             print(json.dumps(rs, ensure_ascii=False) if a.json else runs_text(rs))
         elif a.cmd == "release":
-            r = release(a.dispatch, a.run)
+            r = release(a.dispatch, a.run, a.all_cwd)
             print(json.dumps(r, ensure_ascii=False))
             if r["aviso"]:
                 print(f"warning: {r['aviso']}", file=sys.stderr)
