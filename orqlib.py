@@ -10,6 +10,7 @@ import difflib
 import fcntl
 import glob
 import hashlib
+import importlib.util
 import html
 import json
 import os
@@ -427,6 +428,40 @@ def integrar_fila_add(branch, ticket):
         itens[pos:pos + 1] = [novo]
         _write_json(_path(INTEGRAR_FILA), {"itens": itens}, indent=2)
     return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": novo["branch"]})
+
+
+def auditar_publicacao(revs, repo=None):
+    """Motivos pelos quais `revs` (args do `git rev-list`, ex.: `base..head`) não pode ir para a main pública: autor ou committer fora do noreply configurado
+    (`ORQ_AUTOR` ou `git config user.email`), trailer Co-Authored-By ou rodapé de gerador, termo proibido no diff ou na mensagem, `orqlib.py`/`orq.py` sem `README.md` no intervalo.
+    Devolve [] se está limpo (ticket 139). O pre-push e o integrador, antes do FF, rodam este mesmo check."""
+    git = lambda *x: subprocess.run(["git", *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
+    esperado = os.environ.get("ORQ_AUTOR") or git("config", "user.email").strip()
+    termos = []
+    lista = os.environ.get("ORQ_TERMOS") or os.path.expanduser("~/.claude/orquestrador-plan/termos-proibidos.txt")
+    if os.path.exists(lista):
+        spec = importlib.util.spec_from_file_location("audiencia_check", os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "audiencia-check.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        termos = mod.termos(lista)
+    else:
+        print(f"auditar-publicacao: sem {lista}, checagem de termos pulada", file=sys.stderr)
+    motivos, arquivos, primeiro_codigo = [], set(), None
+    for sha in git("rev-list", "--reverse", *revs).split():
+        an, ae, cn, ce, msg = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha).split("\0", 4)
+        achados = [f"autor {an} <{ae}> e committer {cn} <{ce}> têm de ser <{esperado}> (git commit --amend --reset-author, ou git rebase --exec 'git commit --amend --no-edit --reset-author')"
+                   for _ in [0] if {ae, ce} != {esperado}]
+        if re.search(r"^co-authored-by:|generated with|🤖", msg, re.I | re.M):
+            achados.append("trailer Co-Authored-By ou rodapé de gerador na mensagem (git commit --amend para tirar a linha)")
+        adicionado = "\n".join(l[1:] for l in git("show", "--format=", "--unified=0", sha).splitlines() if l.startswith("+") and not l.startswith("+++"))
+        achados += [f"termo proibido /{t.pattern}/ no diff ou na mensagem" for t in termos if t.search(msg) or t.search(adicionado)]
+        mudados = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).split())
+        if primeiro_codigo is None and mudados & {"orqlib.py", "orq.py"}:
+            primeiro_codigo = sha
+        arquivos |= mudados
+        motivos += [f"{sha[:7]} {msg.splitlines()[0] if msg.strip() else ''}: {m}" for m in achados]
+    if primeiro_codigo and "README.md" not in arquivos:
+        motivos.append(f"{primeiro_codigo[:7]}: muda orqlib.py/orq.py e nenhum commit do intervalo toca README.md (documente a mudança)")
+    return motivos
 
 
 def integrar_fila_rm(ticket):
@@ -10074,6 +10109,8 @@ def main(argv=None):
     iga.add_argument("ticket")
     igf.add_parser("rm", help="tira o ticket da fila").add_argument("ticket")
     igf.add_parser("lista").add_argument("--json", action="store_true")
+    au = sub.add_parser("auditar-publicacao", help="orq auditar-publicacao <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
+    au.add_argument("revs", nargs="+", help="args do git rev-list; em branch nova: <head> --not --remotes (depois de --)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
     tn = tk.add_parser("novo", help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
     tn.add_argument("--titulo", required=True)
@@ -10363,6 +10400,10 @@ def main(argv=None):
         elif a.cmd == "integrar":
             itens = list(integracao_fila().values())
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (desde {_hora_local(i['ts'])})" for i in itens) or "fila do integrador vazia")
+        elif a.cmd == "auditar-publicacao":
+            motivos = auditar_publicacao(a.revs)
+            print("\n".join(f"auditar-publicacao: {m}" for m in motivos), file=sys.stderr)
+            return 1 if motivos else 0
         elif a.cmd == "doctor":
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))

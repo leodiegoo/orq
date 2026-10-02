@@ -14277,6 +14277,96 @@ def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_
         assert "recusado" not in subprocess.run(["sh", hook], cwd=wt, capture_output=True, text=True, env={**os.environ, "ORQ_INTEGRADOR": ""}).stderr
 
 
+def _repo_publicacao(t):
+    """Repo temporário com autor noreply e o orq.py ligado por symlink (o pre-push o procura na raiz); devolve (repo, env, base)."""
+    repo = os.path.join(t, "pub")
+    os.makedirs(repo)
+    env = {**os.environ, "ORQ_TERMOS": os.path.join(t, "termos.txt"), "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull}
+    open(env["ORQ_TERMOS"], "w").write("segredoxyz\n")
+    g = lambda *x, **e: subprocess.run(["git", "-C", repo, *x], capture_output=True, text=True, check=True, env={**env, **e}).stdout.strip()  # noqa: E731
+    g("init", "-q", "-b", "main")
+    g("config", "user.name", "Leo")
+    g("config", "user.email", "1+leo@users.noreply.github.com")
+    os.symlink(os.path.join(AQUI, "orq.py"), os.path.join(repo, "orq.py"))
+    os.symlink(os.path.join(AQUI, "falha_segura.py"), os.path.join(repo, "falha_segura.py"))
+    open(os.path.join(repo, "f"), "w").write("x")
+    g("add", "f")
+    g("commit", "-qm", "chore: base")
+    return repo, env, g
+
+
+def _auditar(repo, env, g, msg="feat: x", arq=("f", "y"), **commit_env):
+    base = g("rev-parse", "HEAD")
+    open(os.path.join(repo, arq[0]), "w").write(arq[1])
+    g("add", "-A", "--", arq[0])
+    g("commit", "-qm", msg, **commit_env)
+    return subprocess.run([sys.executable, os.path.join(AQUI, "orq.py"), "auditar-publicacao", f"{base}..HEAD"], cwd=repo, capture_output=True, text=True, env=env)
+
+
+def test_it_should_be_that_a_clean_commit_passes_the_publication_audit():
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        r = _auditar(repo, env, g)
+        assert r.returncode == 0 and not r.stderr.strip(), r.stderr
+
+
+def test_it_should_be_that_a_wrong_author_or_committer_is_refused_with_the_fix():
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        r = _auditar(repo, env, g, GIT_AUTHOR_EMAIL="noreply@anthropic.com", GIT_AUTHOR_NAME="Claude")
+        assert r.returncode == 1 and "noreply@anthropic.com" in r.stderr and "--reset-author" in r.stderr and "feat: x" in r.stderr, r.stderr
+        r = _auditar(repo, env, g, arq=("f", "z"), GIT_COMMITTER_EMAIL="outro@x.com")
+        assert r.returncode == 1 and "outro@x.com" in r.stderr, r.stderr
+
+
+def test_it_should_be_that_a_coauthored_trailer_is_refused():
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        r = _auditar(repo, env, g, msg="feat: x\n\nCo-Authored-By: Claude <noreply@anthropic.com>")
+        assert r.returncode == 1 and "Co-Authored-By" in r.stderr, r.stderr
+
+
+def test_it_should_be_that_a_forbidden_term_in_the_diff_or_message_is_refused_and_a_missing_list_passes():
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        r = _auditar(repo, env, g, arq=("f", "tem SegredoXYZ aqui"))
+        assert r.returncode == 1 and "segredoxyz" in r.stderr, r.stderr
+        r = _auditar(repo, env, g, msg="feat: segredoxyz", arq=("f", "limpo"))
+        assert r.returncode == 1 and "segredoxyz" in r.stderr, r.stderr
+        os.remove(env["ORQ_TERMOS"])
+        r = _auditar(repo, env, g, msg="feat: ok", arq=("f", "tem segredoxyz de novo"))
+        assert r.returncode == 0 and "pulada" in r.stderr, r.stderr
+
+
+def test_it_should_be_that_code_without_readme_is_refused_and_with_readme_passes():
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        r = _auditar(repo, env, g, arq=("orqlib.py", "x = 1\n"))
+        assert r.returncode == 1 and "README.md" in r.stderr, r.stderr
+        open(os.path.join(repo, "README.md"), "w").write("doc")
+        g("add", "README.md")
+        g("commit", "-qm", "docs: readme")
+        r = subprocess.run([sys.executable, os.path.join(AQUI, "orq.py"), "auditar-publicacao", "HEAD~2..HEAD"], cwd=repo, capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+
+
+def test_it_should_be_that_the_pre_push_hook_refuses_a_bad_push_and_lets_a_clean_one_through():
+    hook = os.path.join(AQUI, "githooks", "pre-push")
+    with tempfile.TemporaryDirectory() as t:
+        repo, env, g = _repo_publicacao(t)
+        base = g("rev-parse", "HEAD")
+        zero = "0" * 40
+        push = lambda: subprocess.run(["sh", hook], cwd=repo, input=f"refs/heads/main {g('rev-parse', 'HEAD')} refs/heads/main {base}\n", capture_output=True, text=True, env=env)  # noqa: E731
+        open(os.path.join(repo, "f"), "w").write("a")
+        g("commit", "-qam", "feat: bad", GIT_AUTHOR_EMAIL="noreply@anthropic.com")
+        r = push()
+        assert r.returncode == 1 and "noreply@anthropic.com" in r.stderr, r.stderr
+        g("commit", "--amend", "-qC", "HEAD", "--reset-author")
+        assert push().returncode == 0
+        r = subprocess.run(["sh", hook], cwd=repo, input=f"(delete) {zero} refs/heads/x {base}\n", capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

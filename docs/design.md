@@ -591,6 +591,8 @@ If the inbox call fails, the time and ceiling checks still apply and the failure
 
 It matches only in command position, after stripping heredoc bodies and quoted text, so a commit message or an `echo` that mentions `git push` does not trigger it (the same rule as `worker-routing-guard.py`). It reads `cursor.json` and, for the reset, the local git dir; no Orca call. A commit that fails the pre-commit hook stays as it is: the worker repairs what the hook flagged.
 
+The pre-push hook closes the other half of the same gap (ticket 139): the coordinator used to audit by hand, before each push of `main`, the author of every new commit, the `Co-Authored-By` trailer, the forbidden terms and the README. `auditar_publicacao(revs)` in `orqlib.py` does it as one function so the hook and the integrator share it: the hook feeds it `remote..local` (or `local --not --remotes` for a new branch), the integrator runs `orq auditar-publicacao <base>..<head>` before the FF. The README rule is per range, not per commit, so a code commit followed by its docs commit passes. Without the private terms file the check warns and skips only the terms.
+
 While night mode is on, `orq despachar` starts the worker with `GIT_TERMINAL_PROMPT=0` and `commit.gpgsign=false` through `GIT_CONFIG_*` in the `orca` process environment, adding to any `GIT_CONFIG_COUNT` already set instead of replacing it, and logs the variable names in the `despacho` event (`ambiente`). Limit: the variables go to the `orca` CLI; whether the Orca runtime copies them into the agent terminal is checked by the real-Run test, not by the fake Orca. The hook is regex on the command text: `bash -c "git push"`, a script that pushes, or `gh api` calls are not caught.
 
 ### Morning card

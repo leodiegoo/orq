@@ -1,0 +1,9 @@
+#!/bin/sh
+# ativado por `git config core.hooksPath githooks`
+# Recusa o push se algum commit novo tem autor errado, trailer, termo proibido ou muda o código sem o README (orq auditar-publicacao).
+zero=0000000000000000000000000000000000000000
+while read -r _ local_sha _ remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  if [ "$remote_sha" = "$zero" ]; then set -- "$local_sha" --not --remotes; else set -- "$remote_sha..$local_sha"; fi
+  python3 "$(git rev-parse --show-toplevel)/orq.py" auditar-publicacao -- "$@" || exit 1
+done

@@ -329,6 +329,8 @@ ORQ_BACKLOG=/tmp/ensaio/backlog.md orq backlog
 
 The script writes only to a new file, runs `tasks-axi render`, and exits 1 if Done, blocking edges or ready counts differ from the sources. It also writes a `.tasks.toml` with a high `done_keep` next to the backlog, so the archive never takes tickets orq still reads. Do not install the tasks-axi SessionStart hook (`tasks-axi setup hooks`): it runs in every session and injects the whole panel; `orq hook session` already injects the lines that matter.
 
+Publication audit: `githooks/pre-push` runs `orq auditar-publicacao <base>..<head>` on every ref pushed, and the integrator runs the same command before fast-forwarding `main`, so a bad commit shows up in the cycle and not at the push. It refuses a commit whose author or committer is not the configured noreply (`ORQ_AUTOR`, default `git config user.email`), with a `Co-Authored-By` trailer or generator footer, with a forbidden term (same list as the audience check; no list means a warning and a pass) in the added lines or the message, and a range that changes `orqlib.py`/`orq.py` without touching `README.md`. The refusal names the commit, the reason and the fix (`git commit --amend --reset-author`, or `git rebase --exec`).
+
 ## Projects
 
 One file per project in `~/.claude/orq/projects/<name>.json` (under `ORQ_HOME`, gitignored), read on every call, no cache and no daemon:
