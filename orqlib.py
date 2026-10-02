@@ -1083,7 +1083,7 @@ def dias_desde(ts, agora):
 
 
 def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return os.environ.get("ORQ_AGORA") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # ORQ_AGORA: o relógio simulado dos testes
 
 
 TIMEOUT_ORCA = float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)  # os testes sobem um processo Python por chamada e usam mais (B31)
@@ -3404,6 +3404,8 @@ def _linha_do_log(e, titulo):
                 "detalhe": titulo.get(e.get("task")) or ""}
     if tipo == "resposta_coordenador" and e.get("texto"):
         return {"tipo": "info", "titulo": _cita(e["texto"].strip().splitlines()[0], 90), "detalhe": e["texto"]}
+    if tipo == "resumo_add" and e.get("texto"):
+        return {"tipo": "info", "titulo": _cita(e["texto"].strip().splitlines()[0], 90), "detalhe": e["texto"]}
     if tipo == "resposta_worker" and e.get("texto"):
         return {"tipo": "info", "titulo": "Coordenador respondeu a um worker", "detalhe": e["texto"]}
     if tipo in ("resposta", "resposta_lavish") and e.get("resposta"):
@@ -3660,6 +3662,46 @@ def _ultima_resposta(ev):
     return ""
 
 
+RESUMO_STOP_MIN = 300  # a resposta do coordenador com mais letras que isso é "longa": sem resumo gravado no turno, o Stop grava um
+RESUMO_STOP_MAX = 400  # letras do resumo automático
+
+
+def resumo_add(texto, projeto=None, cwd=None, auto=False):
+    """`orq resumo add`: acrescenta o resumo a <repo do projeto>/.scratch/resumos/<AAAA-MM-DD>.md (dia e hora locais do relógio do orq) e ao log, de onde o
+    digest o tira. A primeira linha é o título (`## HH:MM — …`), o resto o corpo. Devolve o caminho. ValueError sem texto ou sem projeto com repo `path:`."""
+    texto = (texto or "").strip()
+    if not texto:
+        raise ValueError("resumo add: sem texto")
+    ps = projetos()
+    nome = projeto_do_despacho(projeto) if projeto or not cwd else (projeto_por_pasta(ps, os.path.realpath(cwd)) or projeto_do_despacho())
+    repo = (ps.get(nome) or {}).get("repo") or ""
+    if not repo.startswith("path:"):
+        raise ValueError("resumo add: sem projeto com `repo: path:` (use --projeto <nome>; orq projetos lista os que há)")
+    ts = now()
+    local = _dt(ts).astimezone()
+    pasta = os.path.join(os.path.expanduser(repo[5:]), ".scratch", "resumos")
+    os.makedirs(pasta, exist_ok=True)
+    titulo, _, corpo = texto.partition("\n")
+    with open(os.path.join(pasta, local.strftime("%Y-%m-%d") + ".md"), "a", encoding="utf-8") as f:
+        f.write(f"## {local.strftime('%H:%M')} — {titulo.strip()}\n" + (corpo.strip() + "\n" if corpo.strip() else "") + "\n")
+    append_event({"tipo": "resumo_add", "texto": texto, "projeto": nome, **({"auto": True} if auto else {})})
+    return os.path.join(pasta, local.strftime("%Y-%m-%d") + ".md")
+
+
+def _resumo_do_stop(ev, texto):
+    """Resposta longa sem `resumo_add` desde o Stop anterior: grava a primeira linha (até RESUMO_STOP_MAX letras) como resumo do dia. Sem projeto no cwd do Stop, nada."""
+    if len(texto) <= RESUMO_STOP_MIN:
+        return
+    eventos = read_events()
+    ultimo = next((i for i in range(len(eventos) - 1, -1, -1) if eventos[i].get("tipo") == "resposta_coordenador"), -1)
+    if any(e.get("tipo") == "resumo_add" for e in eventos[ultimo + 1:]):
+        return
+    linha = next((x.strip() for x in texto.splitlines() if x.strip()), "")
+    cwd = ev.get("cwd") or os.getcwd()
+    if projeto_por_pasta(projetos(), os.path.realpath(cwd)):
+        resumo_add(linha[:RESUMO_STOP_MAX], cwd=cwd, auto=True)
+
+
 def digest_no_stop(ev):
     """No Stop do coordenador, com o modo ausente ligado: grava a resposta como evento `resposta_coordenador` e atualiza o digest. Fail-open: a
     falha vai para o log e o Stop segue."""
@@ -3668,6 +3710,7 @@ def digest_no_stop(ev):
     try:
         texto = _ultima_resposta(ev)
         if texto:
+            _resumo_do_stop(ev, texto)  # antes da resposta entrar no log: o turno vai do Stop anterior até este
             append_event({"tipo": "resposta_coordenador", "texto": texto[:RESPOSTA_MAX], "sessao": (ev.get("session_id") or "")[:8]})
         digest_gerar()
     except TimeoutError:
@@ -10204,6 +10247,9 @@ def main(argv=None):
     rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
     rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
     rs.add_argument("--noite", action="store_true", help="o cartão da manhã da última noite (até 40 linhas)")
+    rs.add_argument("op", nargs="?", choices=["add"], help="add \"<texto>\": grava o resumo em .scratch/resumos/<data>.md do projeto, com a hora local real")
+    rs.add_argument("texto", nargs="?")
+    rs.add_argument("--projeto", help="com add: o arquivo de ORQ_HOME/projects; sem ele vale o projeto que contém o cwd")
     al = sub.add_parser("alerta", help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
     al.add_parser("visto").add_argument("task")
     ag = sub.add_parser("agentes", help="o estado de cada dispatch em todos os Runs")
@@ -10488,6 +10534,8 @@ def main(argv=None):
             print(texto_status())
         elif a.cmd == "iniciar":
             print(iniciar(a.agente, a.run, a.objetivo, a.assumir))
+        elif a.cmd == "resumo" and a.op == "add":
+            print(resumo_add(a.texto, a.projeto))
         elif a.cmd == "resumo" and a.noite:
             print(cartao_manha())
         elif a.cmd == "resumo":

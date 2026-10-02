@@ -14592,6 +14592,57 @@ def test_ticket140_aviso_do_orca_sugere_orq_caixa():
     assert r.returncode == 0 and "orq caixa run_zz --ack" in r.stdout, (r.stdout, r.stderr)
 
 
+# ---- ticket 144: orq resumo add ----
+
+def _resumo_env():
+    """Um projeto `app` com o repo numa pasta temporária, o relógio em 2026-10-01 21:15 UTC (TZ=UTC) e o away ligado."""
+    a = Amb(run="run_a", TZ="UTC", ORQ_AGORA="2026-10-01T21:15:00Z")
+    repo = os.path.join(a.tmp.name, "repo")
+    os.makedirs(repo)
+    _projeto(a, "app", {"repo": f"path:{repo}"})
+    return a, os.path.join(repo, ".scratch", "resumos", "2026-10-01.md")
+
+
+def test_ticket144_resumo_add_grava_no_arquivo_do_dia_com_a_hora_do_relogio_e_entra_no_digest():
+    a, arq = _resumo_env()
+    a.orq("away", "on")
+    r = a.orq("resumo", "add", "orq publicado\n119 e 127 prontos", "--projeto", "app")
+    assert r.returncode == 0, r.stderr
+    assert open(arq).read() == "## 21:15 — orq publicado\n119 e 127 prontos\n\n", open(arq).read()
+    a.orq("resumo", "add", "segundo", "--projeto", "app", ORQ_AGORA="2026-10-01T21:40:00Z")
+    assert open(arq).read().endswith("## 21:40 — segundo\n\n")
+    a.orq("digest")
+    assert [x["titulo"] for x in _atual(a)["linha"]] == ["orq publicado", "segundo"], _atual(a)["linha"]
+
+
+def test_ticket144_resumo_add_sem_projeto_conhecido_recusa():
+    a, _ = _resumo_env()
+    r = a.orq("resumo", "add", "x", "--projeto", "nao-existe")
+    assert r.returncode == 1 and "nao-existe" in r.stderr, r
+
+
+def test_ticket144_stop_com_away_grava_o_resumo_curto_quando_o_coordenador_nao_gravou():
+    a, arq = _resumo_env()
+    a.orq("away", "on")
+    longa = "Primeira linha do resumo.\n" + "detalhe " * 100
+    _stop(a, last_assistant_message=longa, cwd=os.path.dirname(os.path.dirname(os.path.dirname(arq))))
+    assert open(arq).read() == "## 21:15 — Primeira linha do resumo.\n\n", open(arq).read()
+    assert [e["texto"] for e in a.events() if e["tipo"] == "resumo_add"] == ["Primeira linha do resumo."]
+
+
+def test_ticket144_stop_nao_duplica_quando_o_coordenador_ja_gravou_no_turno_e_ignora_resposta_curta():
+    a, arq = _resumo_env()
+    a.orq("away", "on")
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(arq)))
+    _stop(a, last_assistant_message="curta", cwd=repo)
+    assert not os.path.exists(arq), "resposta curta não vira resumo"
+    a.orq("resumo", "add", "o meu", "--projeto", "app")
+    _stop(a, last_assistant_message="longa. " * 100, cwd=repo)
+    assert open(arq).read().count("##") == 1, open(arq).read()
+    _stop(a, last_assistant_message="outra longa. " * 100, cwd=repo)
+    assert open(arq).read().count("##") == 2, "o turno seguinte, sem resumo gravado, ganha o automático"
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
