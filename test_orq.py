@@ -15919,19 +15919,6 @@ def test_ticket102_completa_nao_repete_o_ticket_que_ja_saiu_para_um_grupo():
     assert "t09" not in {i["id"] for i in backlog_mod.ler(saida)}
 
 
-if __name__ == "__main__":
-    filtro = sys.argv[1] if len(sys.argv) > 1 else ""
-    testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
-    falhas = []
-    for nome, fn in testes:
-        try:
-            fn()
-            print(f"ok      {nome}")
-        except Exception as e:  # noqa: BLE001 - o relatório mostra todas as falhas de uma vez
-            falhas.append(nome)
-            print(f"FALHOU  {nome}: {type(e).__name__}: {str(e)[-400:]!r}")
-    print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
-    sys.exit(1 if falhas else 0)
 
 
 
@@ -16031,6 +16018,7 @@ def test_ticket173_guarda_recusa_def_test_depois_do_main():
     assert _testes_depois_do_main('def test_a(): pass\nif __name__ == "__main__":\n    pass\n'.replace("pass\nif", "pass\n\nif")) == []
     assert _testes_depois_do_main('\nif __name__ == "__main__":\n    pass\n\ndef test_tarde(): pass\n') == ["test_tarde"]
     assert _testes_depois_do_main(open(__file__).read()) == [], "def test_ depois do __main__ nunca roda: mova para antes"
+
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
