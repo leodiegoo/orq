@@ -88,3 +88,5 @@ hook-failed.json
 limpar-fechados.json
 revisao-nm.json
 retro/
+fila-despacho/
+.scratch/
