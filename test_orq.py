@@ -13305,6 +13305,134 @@ def test_ticket128_serve_instalar_grava_o_launchd_e_desinstalar_tira():
     assert "bootstrap" in chamadas and "bootout" in chamadas, chamadas
 
 
+# ---- ticket 96: fila do E2E e transcritos vêm do arquivo do projeto ----
+
+class _Casa:
+    """ORQ_HOME, ~/.cache e a pasta de transcritos do Claude trocados por pastas temporárias, e a fila/transcritos de ambiente soltos."""
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.tmp.name
+        self.home, self.cache, self.claude = os.path.join(t, "orq"), os.path.join(t, "cache"), os.path.join(t, "claude-projects")
+        self.antes = (orq_mod.HOME, orq_mod.PROJETOS, orq_mod.TRANSCRITOS, {k: os.environ.pop(k, None) for k in ("E2E_LOCK_DIR", "XDG_CACHE_HOME")})
+        orq_mod.HOME, orq_mod.PROJETOS, orq_mod.TRANSCRITOS = self.home, self.claude, None
+        os.environ["XDG_CACHE_HOME"] = self.cache
+        return self
+
+    def projeto(self, nome, dado):
+        os.makedirs(os.path.join(self.home, "projects"), exist_ok=True)
+        json.dump(dado, open(os.path.join(self.home, "projects", f"{nome}.json"), "w"))
+
+    def __exit__(self, *a):
+        orq_mod.HOME, orq_mod.PROJETOS, orq_mod.TRANSCRITOS, env = self.antes
+        for k, v in env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.tmp.cleanup()
+
+
+def test_ticket96_projetos_le_fila_e2e_e_transcritos_e_recusa_o_que_nao_e_texto():
+    with _Casa() as c:
+        c.projeto("bom", {"repo": "path:/r/bom", "fila_e2e": "~/.cache/bom-e2e/queue", "transcritos": "/t/bom"})
+        c.projeto("sem", {"repo": "path:/r/sem"})
+        c.projeto("ruim", {"repo": "path:/r/ruim", "fila_e2e": ["a"]})
+        c.projeto("ruim2", {"repo": "path:/r/ruim2", "transcritos": 3})
+        ps = orq_mod.projetos()
+        assert (ps["bom"]["fila_e2e"], ps["bom"]["transcritos"], ps["bom"]["erro"]) == ("~/.cache/bom-e2e/queue", "/t/bom", None), ps["bom"]
+        assert (ps["sem"]["fila_e2e"], ps["sem"]["transcritos"], ps["sem"]["erro"]) == (None, None, None), ps["sem"]
+        assert "fila_e2e" in ps["ruim"]["erro"] and "transcritos" in ps["ruim2"]["erro"], (ps["ruim"], ps["ruim2"])
+
+
+def test_ticket96_fila_e2e_sem_argumento_le_a_fila_declarada_no_projeto():
+    with _Casa() as c:
+        fila = os.path.join(c.cache, "meu-app-e2e", "queue")
+        c.projeto("meu-app", {"repo": "path:/r/ma", "fila_e2e": os.path.join(c.cache, "meu-app-e2e", "queue")})
+        assert orq_mod.fila_e2e() is None, "fila vazia"
+        _ticket_e2e(fila, "0000000001-1", 1, vivo=True, inicio=1000)
+        f = orq_mod.fila_e2e(agora=1000 + 600)
+        assert (f["projeto"], f["min"]) == ("e2e-x", 10), f
+        _ticket_e2e(fila, "0000000002-2", 2, vivo=True, inicio=1100)
+        assert orq_mod.fila_e2e(agora=1000 + 600)["esperam"] == 1
+
+
+def test_ticket96_fila_e2e_expande_o_til_do_caminho_do_projeto():
+    with _Casa() as c:
+        os.environ["HOME"], home = c.tmp.name, os.environ["HOME"]
+        try:
+            c.projeto("p", {"repo": "path:/r/p", "fila_e2e": "~/q"})
+            _ticket_e2e(os.path.join(c.tmp.name, "q"), "0000000001-1", 1, vivo=True, inicio=1000)
+            assert orq_mod.fila_e2e(agora=1060)["min"] == 1
+        finally:
+            os.environ["HOME"] = home
+
+
+def test_ticket96_projeto_sem_fila_e2e_nao_mostra_fila_mesmo_com_uma_no_cache_da_maquina():
+    with _Casa() as c:
+        _ticket_e2e(os.path.join(c.cache, "outro-e2e", "queue"), "0000000001-1", 1, vivo=True, inicio=1000)
+        c.projeto("p", {"repo": "path:/r/p"})
+        assert orq_mod.fila_e2e(agora=2000) is None, "a fila de outro projeto não é a deste"
+        assert orq_mod.linha_e2e(orq_mod.fila_e2e(agora=2000)) == ""
+
+
+def test_ticket96_fila_e2e_explicita_e_a_variavel_ganham_do_projeto_e_a_presa_ganha_da_que_anda():
+    with _Casa() as c:
+        a, b = os.path.join(c.cache, "a-e2e", "queue"), os.path.join(c.cache, "b-e2e", "queue")
+        c.projeto("a", {"repo": "path:/r/a", "fila_e2e": a})
+        c.projeto("b", {"repo": "path:/r/b", "fila_e2e": b})
+        _ticket_e2e(a, "0000000001-1", 1, vivo=True, inicio=1000)
+        _ticket_e2e(b, "0000000001-1", 1, vivo=False, inicio=1000)
+        assert orq_mod.fila_e2e(agora=1100)["presa"], "a fila presa de um projeto aparece mesmo depois de uma que anda"
+        assert orq_mod.fila_e2e(a, agora=1100)["presa"] is None, "o argumento ganha"
+        os.environ["E2E_LOCK_DIR"] = a
+        assert orq_mod.fila_e2e(agora=1100)["presa"] is None, "E2E_LOCK_DIR ganha dos projetos"
+
+
+def test_ticket96_transcritos_vem_da_pasta_do_repo_do_projeto_e_o_campo_transcritos_ganha():
+    with _Casa() as c:
+        c.projeto("p", {"repo": "path:/Users/me/code/my-app"})
+        c.projeto("q", {"repo": "path:/r/q", "transcritos": os.path.join(c.tmp.name, "pasta-q")})
+        c.projeto("x", {"repo": "name:sem-pasta"})
+        pasta = os.path.join(c.claude, "-Users-me-code-my-app")
+        assert pasta in orq_mod.transcritos_dirs() and os.path.join(c.tmp.name, "pasta-q") in orq_mod.transcritos_dirs(), orq_mod.transcritos_dirs()
+        assert not [d for d in orq_mod.transcritos_dirs() if "sem-pasta" in d], "seletor sem pasta não gera pasta"
+        os.makedirs(pasta)
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        open(os.path.join(pasta, sid + ".jsonl"), "w").close()
+        assert orq_mod._sessao_do_coordenador(sid[:8]) == os.path.join(pasta, sid + ".jsonl")
+        try:
+            orq_mod._sessao_do_coordenador("bbbbbbbb")
+        except ValueError as e:
+            assert "nenhum" in str(e)
+        else:
+            raise AssertionError("sessão que nenhuma pasta tem recusa")
+
+
+def test_ticket96_a_variavel_orq_transcritos_ainda_vale_sozinha_e_duas_pastas_com_o_mesmo_id_recusam():
+    with _Casa() as c:
+        c.projeto("p", {"repo": "path:/r/p", "transcritos": os.path.join(c.tmp.name, "p")})
+        c.projeto("q", {"repo": "path:/r/q", "transcritos": os.path.join(c.tmp.name, "q")})
+        for n in ("p", "q"):
+            os.makedirs(os.path.join(c.tmp.name, n))
+            open(os.path.join(c.tmp.name, n, "cccccccc-1.jsonl"), "w").close()
+        try:
+            orq_mod._sessao_do_coordenador("cccccccc")
+        except ValueError as e:
+            assert "mais de um" in str(e)
+        else:
+            raise AssertionError("o mesmo id em dois projetos é ambíguo")
+        orq_mod.TRANSCRITOS = os.path.join(c.tmp.name, "p")
+        assert orq_mod.transcritos_dirs() == [os.path.join(c.tmp.name, "p")]
+        assert orq_mod._sessao_do_coordenador("cccccccc").startswith(os.path.join(c.tmp.name, "p"))
+
+
+def test_ticket96_o_arquivo_do_projeto_de_referencia_reproduz_a_fila_e_os_ambientes_de_hoje():
+    with _Casa() as c:
+        c.projeto("meu-app", {"repo": "path:/Users/leo/code/meu-app", "fila_e2e": "~/.cache/meu-app-e2e/queue",
+                                   "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao"})
+        p = orq_mod.projetos()["meu-app"]
+        assert p["erro"] is None and p["ambientes"] == ["development", "staging", "main"] and p["producao"] == "main", p
+        assert p["fila_e2e"] == "~/.cache/meu-app-e2e/queue"
+        assert orq_mod.transcritos_dirs()[0].endswith("-Users-leo-code-meu-app"), orq_mod.transcritos_dirs()
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

@@ -48,7 +48,7 @@ ID_HEADER = 12  # o header do AskUserQuestion aceita até 12 caracteres
 SUSPEITA_S = 3  # resposta a menos de 3 s de uma notificação vista pelo hook de prompt
 JANELA_ORCA_S = 5  # mensagem entregue pelo Orca a ±5 s da resposta (inbox do Orca)
 JANELA_AUDITORIA_S = 2  # orq auditar-respostas: entrega a até 2 s da resposta, no transcrito
-TRANSCRITOS = os.environ.get("ORQ_TRANSCRITOS") or os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))  # o Claude Code nomeia a pasta do projeto com o cwd, cada caractere fora de [A-Za-z0-9] vira "-"
+TRANSCRITOS = os.environ.get("ORQ_TRANSCRITOS")  # força a pasta de transcritos do coordenador; sem ela vêm dos projetos (`transcritos_dirs`)
 PROJETOS = os.environ.get("ORQ_PROJETOS") or os.path.expanduser("~/.claude/projects")  # onde o Claude Code guarda o transcrito de cada sessão, inclusive a do worker (M9)
 TRANSCRITO_DIAS = 3  # o orq liberar só procura o transcrito do worker entre os arquivos mexidos nos últimos 3 dias
 LEITURA_INICIAL = 200_000  # bytes do começo do transcrito onde está o prompt do despacho
@@ -2393,14 +2393,19 @@ def _pid_vivo(pid):
 
 
 def fila_e2e(fila=None, agora=None, limite_min=E2E_SESSAO_MIN):
-    """A fila global do E2E do repositório de produto (scripts/e2e-lock.sh: um ticket `<ordem>-<pid>` por chegada em ~/.cache/<projeto>-e2e/queue), só lida.
+    """A fila global do E2E do repositório de produto (scripts/e2e-lock.sh: um ticket `<ordem>-<pid>` por chegada na pasta `fila_e2e` do projeto), só lida.
 
     Devolve None com a fila vazia, senão {ticket, worktree, projeto, comando, min, esperam, presa}. O dono é o primeiro ticket; `presa` é o
     motivo quando ele não anda: nenhum pid do ticket vivo e sem sessão (dono morto, o próximo a esperar o limparia), ou sessão aberta por
     `start` sem processo de teste vivo há mais de `limite_min` minutos. Limite: não olha o Docker, então uma stack aberta de propósito
-    por mais de `limite_min` sem teste também aparece como presa."""
-    import glob  # só aqui: fora do topo para não pesar nos hooks
-    fila = fila or os.environ.get("E2E_LOCK_DIR") or next(iter(sorted(glob.glob(os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "*-e2e", "queue")))), "")
+    por mais de `limite_min` sem teste também aparece como presa.
+
+    Sem `fila` nem E2E_LOCK_DIR, lê a `fila_e2e` de cada arquivo de projeto (projeto sem o campo não tem fila) e devolve a primeira presa, senão a
+    primeira que não está vazia. Limite: uma fila só aparece; duas presas ao mesmo tempo mostram a do projeto de nome menor até soltar."""
+    fila = fila or os.environ.get("E2E_LOCK_DIR")
+    if not fila:
+        achadas = [f for f in (fila_e2e(os.path.expanduser(d["fila_e2e"]), agora, limite_min) for d in projetos().values() if isinstance(d.get("fila_e2e"), str)) if f]
+        return next((f for f in achadas if f["presa"]), achadas[0] if achadas else None)
     agora = time.time() if agora is None else agora
     tickets = []
     for nome in sorted(os.listdir(fila)) if os.path.isdir(fila) else []:
@@ -6695,11 +6700,12 @@ def _ambientes_do_arquivo(d):
 
 
 def projetos():
-    """Os arquivos ORQ_HOME/projects/<nome>.json, lidos a cada chamada (sem cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "erro"}}.
+    """Os arquivos ORQ_HOME/projects/<nome>.json, lidos a cada chamada (sem cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "fila_e2e", "transcritos", "erro"}}.
 
     Só `repo` é obrigatório; `harness` ausente vale claude e `grupo` só agrupa a listagem. `ambientes` é a lista ordenada `[{"branch", "producao"?}]` do
     projeto (a de produção é a marcada, senão a última) e `fluxo` é `promocao` ou `direto`; sem o bloco `ambientes` vem None e vale o padrão do remoto
-    (`fluxo_do_projeto`). Arquivo ilegível, sem `repo`, com harness que o orq não despacha ou com ambientes malformados fica na lista com `erro`
+    (`fluxo_do_projeto`). `fila_e2e` é a pasta da fila do E2E do projeto (`fila_e2e()`; sem ela o projeto não mostra fila) e `transcritos` a pasta de
+    transcritos do coordenador (`transcritos_dirs()`; sem ela vale a que o Claude Code nomeia com o `repo: path:`). Arquivo ilegível, sem `repo`, com harness que o orq não despacha ou com ambientes malformados fica na lista com `erro`
     (o `orq projetos` mostra o motivo) e nunca é escolhido sozinho."""
     pasta, achados = _path("projects"), {}
     for f in sorted(os.listdir(pasta)) if os.path.isdir(pasta) else []:
@@ -6710,14 +6716,17 @@ def projetos():
             with open(os.path.join(pasta, f)) as fh:
                 d = json.load(fh)
         except (OSError, ValueError) as e:
-            achados[nome] = {"repo": None, "harness": None, "grupo": None, "ambientes": None, "producao": None, "fluxo": None, "erro": f"json ilegível ({type(e).__name__})"}
+            achados[nome] = {"repo": None, "harness": None, "grupo": None, "ambientes": None, "producao": None, "fluxo": None, "fila_e2e": None, "transcritos": None, "erro": f"json ilegível ({type(e).__name__})"}
             continue
         d = _dict(d)
         harness = d.get("harness") or "claude"
         amb, producao, fluxo, erro_amb = _ambientes_do_arquivo(d)
+        sem_texto = next((k for k in ("fila_e2e", "transcritos") if k in d and (not isinstance(d[k], str) or not d[k])), None)
         erro = ("sem repo (o seletor do Orca: path:, id: ou name:)" if not isinstance(d.get("repo"), str) or not d["repo"] else
-                f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else erro_amb)
-        achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": amb, "producao": producao, "fluxo": fluxo, "erro": erro}
+                f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else
+                f"{sem_texto} não é um caminho (texto)" if sem_texto else erro_amb)
+        achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": amb, "producao": producao, "fluxo": fluxo,
+                         "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": erro}
     return achados
 
 
@@ -7138,6 +7147,19 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     return out
 
 
+def transcritos_dirs():
+    """As pastas onde procurar o transcrito do coordenador: ORQ_TRANSCRITOS sozinha, senão a de cada projeto (o campo `transcritos`, senão a que o
+    Claude Code nomeia com o `repo: path:` dele; seletor id:/name: não tem pasta) e a do cwd, nessa ordem e sem repetir."""
+    if TRANSCRITOS:
+        return [TRANSCRITOS]
+    def pasta(caminho):  # o Claude Code nomeia a pasta com o caminho, cada caractere fora de [A-Za-z0-9] vira "-"
+        return os.path.join(PROJETOS, re.sub(r"[^A-Za-z0-9]", "-", caminho))
+    dirs = [os.path.expanduser(d["transcritos"]) if d.get("transcritos") else
+            pasta(os.path.realpath(os.path.expanduser(d["repo"][5:]))) if (d.get("repo") or "").startswith("path:") else None
+            for d in projetos().values() if not d.get("erro")]
+    return list(dict.fromkeys(filter(None, [*dirs, pasta(os.getcwd())])))
+
+
 def _sessao_do_coordenador(sessao):
     """Caminho do transcrito: o id dado (ou prefixo dele) ou, sem id, a última sessão de coordenador registrada em cursor.json."""
     if not sessao:
@@ -7147,10 +7169,11 @@ def _sessao_do_coordenador(sessao):
         sessao = list(runs)[-1]
     if _dict(_cursor_ro().get("harnesses")).get(sessao) == "codex":
         raise ValueError(f"a sessão {sessao[:8]} é de um coordenador no Codex, que não tem AskUserQuestion: não há resposta de caixa para auditar (as de `orq perguntar` ficam em resposta_lavish)")
-    achados = sorted(f for f in os.listdir(TRANSCRITOS) if f.endswith(".jsonl") and f.startswith(sessao)) if os.path.isdir(TRANSCRITOS) else []
+    dirs = transcritos_dirs()
+    achados = sorted(os.path.join(d, f) for d in dirs if os.path.isdir(d) for f in os.listdir(d) if f.endswith(".jsonl") and f.startswith(sessao))
     if len(achados) != 1:
-        raise ValueError(f"transcrito de {sessao!r} em {TRANSCRITOS}: {'nenhum' if not achados else 'mais de um'}")
-    return os.path.join(TRANSCRITOS, achados[0])
+        raise ValueError(f"transcrito de {sessao!r} em {', '.join(dirs)}: {'nenhum' if not achados else 'mais de um'}")
+    return achados[0]
 
 
 def respostas_so_recomendada(caminho):
@@ -9823,6 +9846,7 @@ def main(argv=None):
             else:
                 print("\n".join(f"{n}  {d['repo'] or '-'}  {d['harness'] or '-'}" + (f"  grupo {d['grupo']}" if d["grupo"] else "") +
                                 (f"  ambientes {' > '.join(d['ambientes'])} ({d['fluxo']}, produção {d['producao']})" if d["ambientes"] else "") +
+                                (f"  fila do E2E {d['fila_e2e']}" if d["fila_e2e"] else "") +
                                 (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
         elif a.cmd == "servico":
             print(json.dumps(servico_marcar(a.dispatch), ensure_ascii=False))
