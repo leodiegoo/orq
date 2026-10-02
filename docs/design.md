@@ -220,6 +220,8 @@ stateDiagram-v2
 
 Binding the Run. `ticket new`, `ticket close`, `steer`, `release` and `doctor tasks` run inside `_no_run(run)`: when the coordinator does not command the Run, orq runs `run-use` for it under the coordinator's own handle and, on exit, binds back the Run that was bound before (Orca binds one Run per terminal). With the manager linked to this coordinator it does not switch: the coordinator's terminal owns the loose Runs and a `run-use` to a manager Run would take it out, so the old refusal (`orq manager bind --terminal … --run …`) stands.
 
+Giving the Run back (ticket 347). A manual `run-use` of a Run the manager holds moves Orca's binding to the coordinator, and the manager stops commanding it. `hook_stop` calls `give_run_back_to_manager` once the turn really ends (no block, not a mate): if the Run bound to the coordinator's own terminal is in `manager.json`, it runs `manager_bind` for it with the manager's terminal and records `gerente`/`op: devolver`. The failure is logged and the Stop goes on, like the other Stop side effects.
+
 ## Pending list
 
 The user's own to-do items live in `pendencias.json`, which a dashboard can watch. orq is the only writer: `orq pend add`, `orq pend edit` and `orq pend done` change the file under a lock and log each change as a `pend` event. With `ORQ_BACKLOG` set the items live in a tasks-axi backlog instead and `pendencias.json` is only a mirror (see "Backlog in the tasks-axi format").
