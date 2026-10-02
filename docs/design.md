@@ -1065,6 +1065,14 @@ Friday 16:00 local, an Orca automation in the project workspace, so it only runs
 
 Cost: the collector is local and free (log read, transcripts read, one `gh pr view` per PR of the week); the analysis is one Sonnet turn of a few minutes, once a week. On demand it is the same skill, without `--save`.
 
+### Quoted evidence is checked in code (ticket 209)
+
+A model's claim is only a fact when its quote is in the transcript (the backpass lesson: `analyze.js` drops a claim whose quote is not in the trace; a paraphrase yields fewer findings, never a false one). In orq the rule was text only (step 2 of `orq-retro`, the "session and excerpt" of the navigability automation); ticket 201 was a subagent claim taken as fact. Now:
+
+- `orq retro citacoes <report.md>` (an `op` of `retro` beside `gaps`/`reject`/`accept`, the report in `ref`; `citations` is the English name) pairs each pointer (`transcript:<file>:<line>` or `<file>:<line>`) with the quote on the same line (quotes, backticks, curly quotes) or the `>` block / code fence right under it, and looks for the quote in that line of the file. Spaces are collapsed, so a line break inside the quote still matches; a JSON transcript line is also read with its escaped `\n` and `\"` undone. A quote under 8 characters is skipped, not flagged (`ponytail:` ceiling: a short fake slips through). Relative files resolve from the report's folder. Output: `confere`, `not found`, `file missing`; exit 1 if any is not `confere`; no pointer prints `citações: 0`.
+- `orq ingest` (`flag_citations`, from `ingest_automations` and `complete_reports`) runs the same check on each automation report and, when something does not match, records `citacao_nao_confere` (`ref`, `caminho`, `n`) and notifies the coordinator. No pointers or all matching writes nothing.
+- `orq-retro` step 7 runs the command on the report before finishing. Proposed, not applied (`orca automations edit` needs the user's ok): add to the navigability automation prompt "before finishing, run `orq retro citacoes <your report>` and fix what does not match".
+
 ## Non-goals and known limits
 
 Non-goals: replacing Orca's task store, scheduling work in code (the model decides what to dispatch and with which model), and shipping a UI. A dashboard can read `pendencias.json`, `events.jsonl` and `open.json`, but none is included here.
