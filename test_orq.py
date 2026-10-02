@@ -9112,6 +9112,7 @@ def _tela_no_gerente52(a, tela="tela-permissao.txt"):
     _multi(a, {"run_a": "term_ger"}, ["run_a"])
     a.set("workers.json", [_w48("term_w1", agente="claude")])
     _turno48(a, ctx_term_w1=("sess-w1", None))
+    a.set("terminals.json", ["term_ger", "term_w1", "term_coord"])  # o terminal do worker está vivo: sem ele o estado é sem_terminal
     a.set("screens.json", {"term_w1": _tela52(tela)})
 
 
@@ -15016,3 +15017,44 @@ def test_ticket135_servico_marcar_recusa_dispatch_inexistente_ou_liberado():
     assert r.returncode == 1 and "liberado" in r.stderr, r.stderr
 
 
+
+# ---------- ticket 158: worker que perdeu o terminal ----------
+
+def _w158(handle="term_w"):
+    return {"dispatchId": "ctx_w", "taskId": "task_w", "runId": "run_a", "dispatchStatus": "dispatched", "agentTerminalHandle": handle}
+
+
+def _estado158(vivos, hibernados=None, pausados=None, w=None):
+    return orq_mod.monta_agentes([w or _w158()], [], [], datetime.now(timezone.utc), vivos=vivos, hibernados=hibernados, pausados=pausados)[0]
+
+
+def test_ticket158_monta_agentes_marca_sem_terminal_o_dispatch_aberto_fora_dos_vivos():
+    ag = _estado158(["term_outro"])
+    assert ag["estado"] == "sem_terminal"
+    assert "orq retomar --dry-run" in orq_mod.texto_agentes([ag]) and "orq steer" not in orq_mod.texto_agentes([ag])
+
+
+def test_ticket158_hibernado_pausado_e_terminal_vivo_nao_viram_sem_terminal():
+    assert _estado158(["term_outro"], hibernados={"ctx_w": {"desde": "2026-10-01T10:00:00Z"}})["estado"] == "hibernado"
+    assert _estado158(["term_outro"], pausados={"ctx_w": {}})["estado"] != "sem_terminal"
+    assert _estado158(["term_w"])["estado"] != "sem_terminal"
+
+
+def test_ticket158_orca_sem_resposta_nao_muda_nada():
+    assert _estado158(None)["estado"] != "sem_terminal"
+
+
+def test_ticket158_a_linha_do_prompt_aparece_com_o_cache_e_some_quando_o_worker_volta():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    a.set("../orq/aberto.json", _aberto_ag("sem_terminal"))
+    ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "1 worker(s) perderam o terminal sem worker_done: orq retomar --dry-run" in ctx, ctx
+    a.set("../orq/aberto.json", _aberto_ag("rodando"))
+    ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "perderam o terminal" not in ctx, ctx
+
+
+def test_ticket158_o_stop_com_away_conta_o_sem_terminal_como_trabalho_sem_usuario():
+    ags = [{"dispatch": "ctx_w", "task": "task_w", "estado": "sem_terminal"}]
+    assert "perderam o terminal" in orq_mod.proximo_sem_usuario([], ags, {}, [], [], {}, None)

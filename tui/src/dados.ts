@@ -22,7 +22,7 @@ export type Estado = {
 
 const VIVO_S = 90 // o PAINEL_LIMITE_MIN_S do orq: carimbo mais velho que isso é gerente parado
 const ESTADO_FRESCO_S = 60
-const ANDA = new Set(["rodando", "perguntando", "travado", "parado", "nao_comecou", "aguardando_integracao", "hibernado"])
+const ANDA = new Set(["rodando", "perguntando", "travado", "parado", "nao_comecou", "sem_terminal", "aguardando_integracao", "hibernado"])
 const RUIDO = new Set(["intake", "entrada", "heartbeat_absorvido", "gate_aviso"])
 
 const lerJson = (p: string): any => {
@@ -149,7 +149,7 @@ function blocoMaquina(e: Estado): Bloco {
     l
       ? `carga ${l.carga ?? "?"} / ${cfg.carga_max}   memória livre ${l.mem_livre_mb ?? "?"} MB (mín ${cfg.mem_livre_min_mb})   livre ${l.livre_pct ?? "?"}% (mín ${cfg.livre_pct_min}%)`
       : "sem leitura da máquina (o serve grava a cada volta; rode orq gerente serve)",
-    `workers ${vagas?.ocupadas ?? workers(e).lista.filter((a) => ANDA.has(a.estado) && a.estado !== "hibernado").length} / ${cfg.max_workers}` +
+    `workers ${vagas?.ocupadas ?? workers(e).lista.filter((a) => ANDA.has(a.estado) && a.estado !== "hibernado" && a.estado !== "sem_terminal").length} / ${cfg.max_workers}` +
       (vagas?.max_caros !== undefined ? `   caros ${vagas.caros ?? 0} / ${vagas.max_caros}` : ""),
   ]
   const alta = l && ((l.carga ?? 0) > cfg.carga_max || (l.mem_livre_mb ?? Infinity) < cfg.mem_livre_min_mb || (l.livre_pct ?? 100) < cfg.livre_pct_min)

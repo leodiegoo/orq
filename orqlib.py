@@ -86,7 +86,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "limite": 1, "nao_comecou": 2, "parado": 3, "perguntando": 4, "rodando": 5, "aguardando_integracao": 6, "entregue": 7, "servico": 8, "hibernado": 9, "encerrado": 10, "liberado": 11}
+ORDEM_AGENTES = {"travado": 0, "limite": 1, "sem_terminal": 2, "nao_comecou": 3, "parado": 4, "perguntando": 5, "rodando": 6, "aguardando_integracao": 7, "entregue": 8, "servico": 9, "hibernado": 10, "encerrado": 11, "liberado": 12}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -412,6 +412,13 @@ def _sem_terminal(w, liberados, vivos):
     return w.get("dispatchStatus") != "dispatched" and (w.get("dispatchId") in liberados or (vivos is not None and w.get("agentTerminalHandle") not in vivos))
 
 
+def _perdeu_terminal(w, vivos, pausados, hibernados):
+    """Dispatch `dispatched` (sem worker_done) cujo terminal não está no `orca terminal list` e que não está pausado nem hibernado: o que a queda do Orca deixou
+    para o `orq retomar`. `vivos` None (o Orca não respondeu ou cortou a lista) não prova nada: False."""
+    d = w.get("dispatchId")
+    return vivos is not None and w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and d not in (pausados or {}) and d not in (hibernados or {})
+
+
 def integracao_fila():
     """{ticket: {branch, ticket, ts}} das branches que esperam o integrador (integrar-fila.json, alimentado por `orq integrar fila add`)."""
     return {i["ticket"]: i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict) and i.get("ticket")}
@@ -514,7 +521,7 @@ def ciclo_feito(dispatch, hash_, nota=None):
     return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {})})
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None, limites=None):
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None, limites=None, pausados=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
@@ -557,6 +564,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
                 estado = "nao_comecou"
             if (limites or {}).get(d) and estado != "perguntando":
                 estado = "limite"
+            if _perdeu_terminal(w, vivos, pausados, hibernados):  # sem terminal nenhum steer chega: o que falta é o `orq retomar`
+                estado, espera, motivo = "sem_terminal", None, None
         else:
             espera = motivo = None
             feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
@@ -569,9 +578,9 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
         if espera:
             ag["espera"] = espera
         _marca_integracao_e_servico(ag, integracao, tickets_de, servicos)
-        if (perguntas_tela or {}).get(d) and w.get("dispatchStatus") == "dispatched":
+        if (perguntas_tela or {}).get(d) and w.get("dispatchStatus") == "dispatched" and estado != "sem_terminal":
             ag["pergunta"] = perguntas_tela[d]
-        if telas.get(d):
+        if telas.get(d) and estado != "sem_terminal":
             ag["tela"], ag["tela_ts"] = telas[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
         if (limites or {}).get(d) and w.get("dispatchStatus") == "dispatched":
             ag["limite"], ag["limite_ts"] = limites[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3196,10 +3205,16 @@ def telas_avisar():
     return linhas
 
 
+def linha_sem_terminal(aberto):
+    """"N worker(s) perderam o terminal sem worker_done: orq retomar --dry-run" do cache do aberto.json (nenhuma chamada ao Orca), ou vazio."""
+    n = sum(a.get("estado") == "sem_terminal" for a in _dict(aberto).get("agentes") or [] if isinstance(a, dict))
+    return f"{n} worker(s) perderam o terminal sem worker_done: orq retomar --dry-run" if n else ""
+
+
 def estado(entrada=None):
-    events, cur = read_events(), _cursor_ro()
-    txt = resumo(events, _read_json(_path("aberto.json")), _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
-    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets()), linha_espera_despacho(tickets(), events)])])
+    events, cur, aberto = read_events(), _cursor_ro(), _read_json(_path("aberto.json"))
+    txt = resumo(events, aberto, _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
+    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *filter(None, [linha_sem_terminal(aberto)]), *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets()), linha_espera_despacho(tickets(), events)])])
 
 
 # ---------- digest e modo ausente ----------
@@ -3440,7 +3455,7 @@ def _estado_de_gente(a):
     if a["estado"] == "rodando":
         return a.get("fase") or "rodando"
     return {"travado": "travado", "limite": "parado no limite do plano", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou", "aguardando_integracao": "aguardando integração",
-            "hibernado": f"hibernado desde {_hora_local(a.get('hibernado_desde'))}"}.get(a["estado"], a["estado"])
+            "sem_terminal": "sem terminal", "hibernado": f"hibernado desde {_hora_local(a.get('hibernado_desde'))}"}.get(a["estado"], a["estado"])
 
 
 def _linha_do_log(e, titulo):
@@ -4311,6 +4326,8 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
     Na ordem: entrega (worker `entregue` de ticket aberto) fora da fila do integrador; ciclo do integrador com commits sem push (`sem_push` > 0); ticket
     `ready-for-agent` sem bloqueio, P1 ou P2, com Modelo/Effort, fora da fila de despacho e com slot livre (o worker hibernado não ocupa slot)."""
     por_num, de_dispatch = {t["num"]: t for t in tks}, _ticket_do_dispatch(events)
+    if sem := sum(a.get("estado") == "sem_terminal" for a in ags):
+        return f"{sem} worker(s) perderam o terminal sem worker_done: `orq retomar --dry-run`, depois `orq retomar`"
     for a in ags:
         n = de_dispatch.get(a.get("dispatch")) or de_dispatch.get(a.get("task"))
         if a.get("estado") == "entregue" and n and n not in integracao and (por_num.get(n) or {}).get("status") != STATUS_FECHADO:
@@ -6413,7 +6430,8 @@ def agentes(run=None, todos=False, agora=None):
     det = _detalhes(ws)
     lidas = _ler_telas([w for w in ws if w.get("dispatchId") not in hib], det)  # o terminal do hibernado não existe: nada a ler
     ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), {d: a["espera"] for d, a in lidas.items() if a["espera"]},
-                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]}, hib, limites={d: a["limite"] for d, a in lidas.items() if a["limite"]})
+                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]}, hib, limites={d: a["limite"] for d, a in lidas.items() if a["limite"]},
+                        pausados=_dict(_cursor_ro().get("pausados")))
     nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
     for a in ags:
         if a["dispatch"] in nao_lidos:
@@ -6437,7 +6455,9 @@ def texto_agentes(ags):
         ref = a.get("ultimo_heartbeat") or a.get("desde")
         hb = (f"{a.get('fase') or '-'} {_hora_local(a['ultimo_heartbeat'])} (há {a['idade_s'] // 60} min)" if a.get("ultimo_heartbeat") and a.get("idade_s") is not None
               else f"sem heartbeat (desde {_hora_local(ref)})" if ref and a["estado"] in ("rodando", "travado", "perguntando") else "")
-        if a["estado"] == "nao_comecou":
+        if a["estado"] == "sem_terminal":
+            hb = "perdeu o terminal sem worker_done"
+        elif a["estado"] == "nao_comecou":
             hb = f"não começou: nenhum turno {a['idade_s'] // 60} min depois do despacho ({_hora_local(a.get('desde'))})"
         elif a["estado"] == "limite":
             hb = f"limite do plano: {a['limite']}"
@@ -6466,7 +6486,9 @@ def texto_agentes(ags):
             linhas.append(f'            -> orq responder-tela {a["task"]} <opção>')
         if a.get("alerta"):
             linhas.append(f"            ALERTA: {a['alerta']} (o worker não leu o ajuste depois de {STEER_TENTATIVAS} avisos; um check sem --ack esconde as mensagens novas)")
-        if a["estado"] in ("travado", "nao_comecou", "parado"):
+        if a["estado"] == "sem_terminal":
+            linhas.append("            -> orq retomar --dry-run (o terminal sumiu antes do worker_done; o steer não tem para onde chegar)")
+        elif a["estado"] in ("travado", "nao_comecou", "parado"):
             linhas.append(f'            -> orq steer {a["task"]} "<ajuste>" --run {a["run"]}')
         elif a["estado"] == "entregue":
             linhas.append(f"            -> orq liberar {a['dispatch']}" if not a.get("retido") else f"            retido: {a['retido']} (o orq liberar não fecha)")
@@ -8848,8 +8870,7 @@ def retomar(dry_run=False, run=None):
             res["gerente"] = {**res["gerente"], "novo": novo, "estado": "religado"}
     pausados = _dict(_cursor_ro().get("pausados"))  # pausados pelo orçamento de uso voltam com `retomar --pausados`, não aqui
     hib = _hibernados()  # hibernados também não: o terminal fechado foi de propósito, e quem os acorda é o orq acordar (ou o steer, o responder, a pendência, o merge)
-    cand = [w for w in _workers_todos(run) if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") not in vivos and w.get("dispatchId") not in pausados
-            and w.get("dispatchId") not in hib]
+    cand = [w for w in _workers_todos(run) if _perdeu_terminal(w, vivos, pausados, hib)]
     det, turnos, eventos = _detalhes(cand), _turnos_ro(), read_events()
     despachos = {e.get("dispatch"): e for e in eventos if e.get("tipo") == "despacho"}
     por_d, subir = {}, []
