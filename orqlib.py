@@ -2001,13 +2001,19 @@ def _resolve_gate(gate, resolucao, run=None):
     """
     try:
         with trava_gerente():
-            orca("gate-resolve", "--id", gate, "--resolution", resolucao, run=run)
+            res = orca("gate-resolve", "--id", gate, "--resolution", resolucao, run=run)
     except RuntimeError as e:
         log(f"gate-resolve {gate}: recusado: {e}")
         append_event({"tipo": "gate_falha", "gate": gate, "erro": str(e)})
         return False
     except Exception as e:  # noqa: BLE001
         log(f"gate-resolve {gate}: {type(e).__name__}: {e}")
+        return False
+    # o destino confirma o recebimento com status resolved; qualquer outra coisa é resposta ambígua e falha fechada (lição #6169)
+    status = ((res.get("gate") or res) if isinstance(res, dict) else {}).get("status")
+    if status != "resolved":
+        log(f"gate-resolve {gate}: resposta ambígua do Orca (status {status!r}), gate tratado como não entregue")
+        append_event({"tipo": "gate_falha", "gate": gate, "erro": f"status {status!r}, esperado 'resolved'"})
         return False
     append_event({"tipo": "gate_resolvido", "gate": gate})
     return True
@@ -2170,14 +2176,32 @@ def pend_edit(id_, **campos):
     return _mutar_pend(edita, lambda item: {"tipo": "pend", "op": "edit", "pend": id_, "campos": sorted(campos)})
 
 
-def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
+class EntregaNaoConfirmada(ValueError):
+    """O gate do Orca não confirmou o recebimento da resposta: a pendência segue aberta."""
+
+
+def pend_done(id_, resposta=None, atual=_DESCONHECIDO, confirmar=False):
     """Fecha (remove) uma pendência aberta e resolve o gate dela, se houver. `resposta` fica no evento e na resolução.
 
     Sem `resposta`, vale a última resposta livre dada ao header (AskUserQuestion ou Lavish): o texto do usuário chega ao worker destravado.
     O gate é do Run em que nasceu (`gate_run`): se o coordenador não comanda esse Run o Orca o recusaria, então não tenta, e o item
     devolvido traz `aviso`; o próximo ingest resolve quando o coordenador voltar a comandá-lo. `atual` é o Run ligado ao terminal próprio, se o chamador já o sabe.
+
+    Com `confirmar`, a pendência com gate só fecha depois de o Orca confirmar o gate resolvido (lição #6169): coordenador que não comanda o
+    Run, gate recusado ou resposta ambígua levantam EntregaNaoConfirmada e nada é removido nem gravado, então rodar de novo refaz.
     """
     resposta = resposta or ultima_livre(read_events(), id_)
+    if confirmar:
+        item = next((i for i in _load_pend()["itens"] if i.get("id") == id_), None)
+        if item is None:
+            raise ValueError(f"pendência {id_} não existe em pendencias.json")
+        if item.get("gate"):
+            run = item.get("gate_run")
+            with trava_gerente():
+                if run and not run_do_coordenador(run, atual):
+                    raise EntregaNaoConfirmada(aviso_gate(item["gate"], run))
+                if not _resolve_gate(item["gate"], resposta or "fechada sem resposta", run):
+                    raise EntregaNaoConfirmada(f"o Orca não confirmou o gate {item['gate']} de {id_}: a pendência segue aberta")
 
     def rm(itens):
         for i, item in enumerate(itens):
@@ -2188,7 +2212,7 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
     item = _mutar_pend(rm, lambda it: {"tipo": "pend", "op": "done", "pend": id_, **({"resposta": resposta} if resposta else {}), **({"task": it["task"]} if it.get("task") else {}),
                                        **({"gate": it["gate"]} if it.get("gate") else {}),
                                        **({"gate_run": it["gate_run"]} if it.get("gate") and it.get("gate_run") else {})})
-    if item.get("gate"):
+    if item.get("gate") and not confirmar:
         run = item.get("gate_run")
         with trava_gerente():  # conferir e resolver na mesma ligação (M15)
             if run and not run_do_coordenador(run, atual):
@@ -5060,19 +5084,26 @@ def lavish_resposta(caminho):
             alvos = [header] if pend is not None else []
         else:
             alvos = [header] if explicita and pend is not None and pend.get("tipo") == "decisao" else []
-        fechou = []
+        fechou, nao_entregue = [], False
         for alvo in alvos:
             gr = pends[alvo].get("gate_run")
             if gr and atual is _DESCONHECIDO and not _do_gerente(gr):
                 atual = _run_proprio()  # antes de gravar: o Orca fora do ar não deixa a pendência fechada sem o evento
             try:
-                feito_ = pend_done(alvo, None if feito else resposta, atual)
+                feito_ = pend_done(alvo, None if feito else resposta, atual, confirmar=True)
+            except EntregaNaoConfirmada as e:  # o destino não confirmou: nada fecha e nada é gravado, rodar de novo refaz
+                avisos.append(str(e))
+                nao_entregue = True
+                continue
             except ValueError as e:  # outro orq fechou no meio
                 log(f"lavish-resposta: {e}")
                 continue
             fechou.append(alvo)
             if feito_.get("aviso"):
                 avisos.append(feito_["aviso"])
+        if nao_entregue and not fechou:
+            saida.append({"item": id_, "efeito": "nao entregue"})
+            continue
         append_event({"tipo": "resposta_lavish", "item": id_, "header": header, "resposta": resposta, "disposicao": disp, "lote": lote,
                       **({} if explicita else {"livre": True}), **({"fechou": fechou} if fechou else {})})
         if fechou:

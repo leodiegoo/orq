@@ -308,7 +308,7 @@ elif cmd == "gate-resolve":
     if opt("--id") not in mapa or mapa[opt("--id")] != bound:
         falha("Gate not found: " + str(opt("--id")))
     open(os.path.join(d, "gates.log"), "a").write(json.dumps(a) + "\\n")
-    res = {"gate": {"id": opt("--id"), "status": "resolved"}}
+    res = {"gate": {"id": opt("--id"), "status": os.environ.get("FAKE_GATE_STATUS", "resolved")}}
 elif cmd in ("worker-show", "worker-release"):
     ws = ler("workers.json", [])
     w = next((w for w in ws if w.get("dispatch", "ctx_" + w["handle"]) == opt("--dispatch")), None)
@@ -2447,7 +2447,37 @@ def test_lavish_resposta_com_gate_de_outro_run_avisa():
     a.set("run.json", {"id": "run_b"})
     r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}]))
     assert r.returncode == 0 and "gate_1" in r.stderr and "run-use --id run_a" in r.stderr, r
-    assert "gate-dec" not in _ids_pend(a) and not _calls(a, "gate-resolve")
+    assert "gate-dec" in _ids_pend(a) and not _calls(a, "gate-resolve"), "sem o destino confirmar, a decisão segue aberta"
+    assert not [e for e in a.events() if e["tipo"] == "resposta_lavish"], "nada gravado: rodar de novo refaz"
+    assert json.loads(r.stdout)["itens"][0]["efeito"] == "nao entregue"
+
+
+def test_ticket100_gate_recusado_deixa_a_decisao_aberta_e_a_segunda_rodada_fecha():
+    a = Amb()
+    _gate_pend(a)
+    arq = _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}])
+    r = a.orq("lavish-resposta", arq, FAKE_FAIL="gate-resolve")
+    assert r.returncode == 0 and json.loads(r.stdout)["itens"][0]["efeito"] == "nao entregue", r
+    assert "gate-dec" in _ids_pend(a) and not [e for e in a.events() if e["tipo"] == "resposta_lavish"]
+    r = a.orq("lavish-resposta", arq)
+    assert json.loads(r.stdout)["itens"][0]["efeito"] == "fechou" and "gate-dec" not in _ids_pend(a), r
+
+
+def test_ticket100_resposta_ambigua_do_orca_falha_fechada():
+    a = Amb()
+    _gate_pend(a)
+    r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}]), FAKE_GATE_STATUS="pending")
+    assert r.returncode == 0 and json.loads(r.stdout)["itens"][0]["efeito"] == "nao entregue", r
+    assert "gate-dec" in _ids_pend(a) and "ambígua" in a.log()
+    assert [e for e in a.events() if e["tipo"] == "gate_falha"], "a recusa fica no registro"
+
+
+def test_ticket100_gate_confirmado_fecha_a_decisao():
+    a = Amb()
+    _gate_pend(a)
+    r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}]))
+    assert json.loads(r.stdout)["itens"][0]["efeito"] == "fechou" and "gate-dec" not in _ids_pend(a)
+    assert len(_calls(a, "gate-resolve")) == 1
 
 
 # ---------- hook PreToolUse de AskUserQuestion (seção 16) ----------

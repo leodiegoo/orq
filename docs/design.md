@@ -541,6 +541,8 @@ Codex has no `AskUserQuestion`. Its `request_user_input` exists but is available
 3. Opens it with `lavish-axi` and in an Orca browser tab (`orca tab create --url <session url>`; a failure only adds a warning with the URL).
 4. Waits on `lavish-axi poll` (`--espera-min`, 30 by default, `ORQ_PERGUNTAR_MIN`) and feeds the output to `lavish_resposta`, so the rules are the same as the widget's: an explicit choice closes the decision and resolves its gate, free text keeps it open.
 
+Delivery is confirmed before the decision closes (lesson #6169): `pend_done(confirmar=True)` resolves the gate first and removes the pending item only if Orca answers `gate.status == "resolved"`. Anything else (refusal, timeout, a Run the coordinator does not command, an ambiguous reply) raises `EntregaNaoConfirmada`, fails closed, writes no `resposta_lavish` event (so the same batch can be run again) and the item reports `nao entregue`.
+
 A timeout, a session ended without sending, or an empty choice leave the pending item open and print a warning. On Claude Code it coexists with `AskUserQuestion`, which the guard still refuses while a worker runs (and the refusal now names this command); on Codex it is the default path. Because it blocks, the coordinator runs it as the harness's tracked background job and the finished job wakes it.
 
 ## Prompts stuck on a worker's screen
