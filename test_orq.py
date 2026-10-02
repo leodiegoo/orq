@@ -7311,12 +7311,15 @@ def test_away_external_denies_merge_into_production_and_force_push_and_allows_th
                       ("git push origin 2>&1 --force feat/x", "push-force"), ("git push origin &>log HEAD:main", "push-env"), ("git push origin >&log HEAD:main", "push-env"),
                       (">/dev/null git push --force origin HEAD:main", "push-force"), ("git status && 2>/dev/null git push origin HEAD:main", "push-env"),
                       ("true &&>/dev/null git push --force origin HEAD:main", "push-force"), ("> out git push origin HEAD:main", "push-env"),
-                      ("git push origin >|log HEAD:main", "push-env"), (">|log git push --force origin HEAD:main", "push-force")):
+                      ("git push origin >|log HEAD:main", "push-env"), (">|log git push --force origin HEAD:main", "push-force"),
+                      ("\\git push --force origin HEAD:main", "push-force"), ("/usr/bin/git push --force origin HEAD:main", "push-force"),
+                      ("/opt/homebrew/bin/gh pr merge 12 --base main", "merge-prod"), ("B=main; git push origin HEAD:$B", "push-other"),
+                      ("git push origin HEAD:ma'i'n", "push-other"), ("gh pr merge 12 --base \"$B\"", "merge-unknown"), ("gh pr merge $PR --squash", "merge-unknown")):
         out = _external(a, cmd, cwd=r)
         assert out and out["permissionDecision"] == "deny", cmd
         assert f"line `{line}`" in out["permissionDecisionReason"] and "orq pend add" in out["permissionDecisionReason"], (cmd, out["permissionDecisionReason"])
     for cmd in ("git push -u origin feat/x", "git push", "git push origin HEAD", "git push origin feat/x:feat/x", "gh pr create --base development --fill",
-                "gh pr merge 12 --base development --squash", "gh pr merge 12 --base=staging", "git status", "gh pr view 12", "git push --help", f"cd {r} && git push -u origin feat/x", "git add -A && git commit -m x && git push origin HEAD", f"cd {r} || exit 1; git push -u origin feat/x 2>&1", "git push origin feat/x 2>/dev/null", "git push origin feat/x > out.log"):
+                "gh pr merge 12 --base development --squash", "gh pr merge 12 --base=staging", "git status", "gh pr view 12", "git push --help", f"cd {r} && git push -u origin feat/x", "git add -A && git commit -m x && git push origin HEAD", f"cd {r} || exit 1; git push -u origin feat/x 2>&1", "git push origin feat/x 2>/dev/null", "git push origin feat/x > out.log", 'gh pr merge 12 --base development -t "feat: x" -b "body"'):
         assert _external(a, cmd, cwd=r) is None, cmd
     subprocess.run(["git", "-C", r, "config", "push.default", "upstream"], check=True)
     out = _external(a, "git push", cwd=r)

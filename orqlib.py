@@ -6130,7 +6130,7 @@ def _away_push(ev, m):
         args = shlex.split(m.group(2), comments=True)
     except ValueError:
         return "push-other"
-    if ev.get("_dir_unknown"):
+    if ev.get("_dir_unknown") or re.search(r'[$`]|""', m.group(2)):  # `HEAD:$B`, `ma'i'n` (blanked to `ma""n`): the shell picks the destination, not the text
         return "push-other"
     args = _no_redirects(args)
     flags, pos = [a for a in args if a.startswith("-")], [a for a in args if not a.startswith("-")]
@@ -6195,10 +6195,8 @@ def _pr_base(d, selector, repo):
 def _away_merge(ev, m):
     """The AWAY_EXTERNAL line of a `gh pr merge`: its base comes from `--base`, otherwise from `gh pr view`. Only an environment before production passes."""
     d = ev.get("cwd") or os.getcwd()
-    try:
-        args = shlex.split(f"{m.group(1)} {m.group(2)}", comments=True)
-    except ValueError:
-        return "merge-unknown"
+    args = f"{m.group(1)} {m.group(2)}".split()  # cmdnorm already blanked quotes to `""`, so a token with `"`, `$` or a backtick is the shell's to decide
+    args = args[:next((k for k, a in enumerate(args) if a.startswith("#")), len(args))]
     if ev.get("_dir_unknown"):
         return "merge-unknown"
     opts, selector, i = {}, None, 0
@@ -6212,6 +6210,8 @@ def _away_merge(ev, m):
         elif not k.startswith("-") and selector is None:
             selector = args[i]
         i += 1
+    if any(re.search(r'[$`"]', v or "") for v in (selector, opts.get("--base"), opts.get("-B"), opts.get("--repo"), opts.get("-R"))):
+        return "merge-unknown"
     base = opts.get("--base") or opts.get("-B") or _pr_base(d, selector, opts.get("--repo") or opts.get("-R"))
     if not base:
         return "merge-unknown"
