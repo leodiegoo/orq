@@ -5360,6 +5360,37 @@ def test_gerente_absorver_nao_solta_run_recente_com_mensagem_ou_o_ultimo():
     assert b.orq("gerente", "absorver").returncode == 0 and _gerente_runs(b) == ["run_b"], "o gerente nunca fica sem Run"
 
 
+def _consultas_de_run(a):
+    return len(_calls(a, "run-show")) + len(_calls(a, "task-list"))
+
+
+def test_ticket134_volta_com_dez_runs_sem_mudanca_consulta_o_orca_so_na_primeira():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    runs = [f"run_{i}" for i in range(10)]
+    _multi(a, {"run_0": "term_ger"}, runs)
+    a.set("runs.json", [_run_ativo(a, r) for r in runs])
+    assert a.orq("gerente", "absorver").returncode == 0
+    primeira = _consultas_de_run(a)
+    assert primeira == 20, "sem cache: run-show + task-list por Run"
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert _consultas_de_run(a) == primeira, "a segunda volta (Runs vivos, sem mudança) não consulta de novo"
+    assert _gerente_runs(a) == runs
+
+
+def test_ticket134_run_que_parou_de_verdade_continua_detectado_depois_da_validade():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger", ORQ_RUN_PARADO_CACHE_S="0.5")
+    _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
+    a.set("runs.json", [_run_ativo(a), _run_ativo(a, "run_b")])
+    a.orq("gerente", "absorver")
+    assert _gerente_runs(a) == ["run_a", "run_b"]
+    a.set("tasks_run_b.json", [{"id": "task_x", "status": "completed", "created_at": VELHO, "completed_at": "2026-09-01T10:05:00Z"}])
+    a.orq("gerente", "absorver")
+    assert _gerente_runs(a) == ["run_a", "run_b"], "dentro da validade o cache segura a soltura"
+    time.sleep(0.6)
+    a.orq("gerente", "absorver")
+    assert _gerente_runs(a) == ["run_a"], "vencida a validade, o Run parado é solto"
+
+
 def test_despachar_religa_run_que_o_gerente_soltou():
     a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger", "run_b": "term_ger"}, ["run_a", "run_b"])

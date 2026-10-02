@@ -105,6 +105,7 @@ GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com
 RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
 RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
 RUN_TESTE = re.compile(r"teste|descart[aá]vel", re.I)  # objetivo de Run de teste: nunca aparece por padrão
+RUN_PARADO_CACHE_S = float(os.environ.get("ORQ_RUN_PARADO_CACHE_S") or 300)  # um Run visto vivo não é reconferido (run-show + task-list) antes disso; a soltura atrasa no máximo isso
 GERENTE_PRESO_S = float(os.environ.get("ORQ_GERENTE_PRESO_S") or 120)  # o painel fica no Run do aviso até o coordenador confirmar, ou por este prazo
 _DESCONHECIDO = object()  # "ainda não perguntei ao Orca qual é o Run ligado"
 MUTA_RUN = {"worker-start", "send", "check", "reply", "task-create", "task-update"}  # o Orca só aceita estes do terminal ligado ao Run do --run
@@ -9100,13 +9101,20 @@ def _absorver_run(run, liga):
     return linha, (None if not msgs or so_heartbeats(msgs) else msgs)
 
 
+RUN_PARADO_CACHE = "run-parado.json"  # {run: quando foi visto vivo pela última vez}
+
+
 def _run_parado(run, sobrou):
     """Motivo para soltar o Run do gerente, ou None: sem task aberta, sem mensagem (`sobrou`) e sem atividade há RUN_PARADO_MIN minutos."""
     if sobrou:
         return None
+    vistos = _read_json(_path(RUN_PARADO_CACHE), {})
+    if time.time() - vistos.get(run, 0) < RUN_PARADO_CACHE_S:
+        return None
     r = resumo_run((orca("run-show", "--id", run)["run"] or {"id": run}) | {"id": run}, orca("task-list", "--run", run)["tasks"])
     ultima = _ts(r["ultima"])
     if r["abertas"] or not ultima or datetime.now(timezone.utc) - ultima < timedelta(minutes=RUN_PARADO_MIN):
+        _write_json(_path(RUN_PARADO_CACHE), {**vistos, run: time.time()})
         return None
     return f"sem task aberta nem mensagem há mais de {RUN_PARADO_MIN:g} min (última atividade {r['ultima']})"
 

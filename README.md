@@ -162,7 +162,7 @@ Closed PRs without a merge (ticket 104). When every PR linked to a task is close
 | `~/.claude/orq/retro/` | the numbers of each saved `orq retro --gravar` round (no cases) | `ORQ_HOME` |
 | `~/.codex/config.toml` | `orq despachar --agente codex` adds `trust_level = "trusted"` for the repository root and the new worktree | `ORQ_CODEX_CONFIG` (or `CODEX_HOME`) |
 
-`orq auditar-respostas` reads the coordinator's transcripts from `ORQ_TRANSCRITOS`. By default that is the Claude Code project folder for the current directory (`~/.claude/projects/` plus the cwd with every character outside `[A-Za-z0-9]` turned into `-`), so run it from the coordinator's working directory or set the variable. Other knobs: `ORQ_ORCA` (path to the Orca binary), `ORQ_ORCA_TIMEOUT` (seconds per Orca call, default 2.5), `ORQ_NO_BG=1` (no background refresh), `ORQ_GERENTE_PRESO_S`, `ORQ_OCIOSO_MS`, `ORQ_STEER_ESPERA_S`, `ORQ_WAIT_POLL`, `ORQ_WAIT_MAX`.
+`orq auditar-respostas` reads the coordinator's transcripts from `ORQ_TRANSCRITOS`. By default that is the Claude Code project folder for the current directory (`~/.claude/projects/` plus the cwd with every character outside `[A-Za-z0-9]` turned into `-`), so run it from the coordinator's working directory or set the variable. Other knobs: `ORQ_ORCA` (path to the Orca binary), `ORQ_RUN_PARADO_CACHE_S` (seconds a live Run is not re-checked for release, default 300), `ORQ_ORCA_TIMEOUT` (seconds per Orca call, default 2.5), `ORQ_NO_BG=1` (no background refresh), `ORQ_GERENTE_PRESO_S`, `ORQ_OCIOSO_MS`, `ORQ_STEER_ESPERA_S`, `ORQ_WAIT_POLL`, `ORQ_WAIT_MAX`.
 
 ## Usage
 
