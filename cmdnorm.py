@@ -10,7 +10,8 @@ _HEREDOC = re.compile(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\
 _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 _SEPARATOR = re.compile(r"[;&|(){}\n]+")
 _KEYWORD = re.compile(r"(?:!|do|then|else|elif|if|while|until)\s+")  # a loop or an `if` runs the command that follows
-_PREFIX = re.compile(r"^(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+-\S+)*|command|time|sudo|nohup|exec)\s+)+")
+_PREFIX = re.compile(r"^(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+(?:-[CPSu]\s*\S+|--chdir[=\s]\S+|-\S+))*|command|time|sudo|nohup|exec)\s+)+")
+_ENV_CHDIR = re.compile(r"\benv\b.*?\s(?:-C\s*|--chdir[=\s])(\S+)")  # `env -C dir cmd` runs cmd in dir: it becomes a `cd dir` segment
 
 
 def no_text(cmd):
@@ -26,7 +27,10 @@ def segments(cmd):
         seg = seg.strip()
         while m := _KEYWORD.match(seg):
             seg = seg[m.end():]
-        seg = _PREFIX.sub("", seg, count=1).strip()
+        if m := _PREFIX.match(seg):
+            c = _ENV_CHDIR.search(m.group(0))
+            out += [f"cd {c.group(1)}"] if c else []
+            seg = seg[m.end():].strip()
         if seg:
             out.append(seg)
     return out

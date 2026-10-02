@@ -6135,7 +6135,8 @@ def _away_push(ev, m):
         return "no-verify"
     if any(f.startswith("--force") or re.fullmatch(r"-[a-z]*f[a-z]*", f) for f in flags) or any(r.startswith("+") for r in pos[1:]):
         return "push-force"
-    if not set(flags) <= _PUSH_FLAGS or re.search(r"(?:^|\s)(?:-c|--config-env)\b", m.group(1) or "") or "GIT_CONFIG" in ev["tool_input"]["command"]:
+    if (not set(flags) <= _PUSH_FLAGS or re.search(r"(?:^|\s)(?:-c|--config-env|--git-dir|--work-tree|--namespace)\b", m.group(1) or "")
+            or re.search(r"GIT_CONFIG|GIT_DIR|GIT_WORK_TREE|GIT_NAMESPACE", ev["tool_input"]["command"])):
         return "push-other"
     remote, head = (pos[0] if pos else "origin"), (_git(d, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
     cfg = dict(line.split(" ", 1) for line in (_git(d, "config", "--get-regexp", r"^(remote\..*\.(push|mirror)|push\.default)$") or "").splitlines() if " " in line)
@@ -6214,9 +6215,10 @@ def _away_line(seg, ev):
 
 
 def _asks_help(seg):
-    """Is the segment a `--help` read? Only a whole `--help` token before any `#` comment counts: `git push --force # --help` still pushes."""
+    """Is the segment a `--help` read? Only a whole `--help` token before any `#` comment, and not the value of an option (`-t --help`, `-m --help`): those still run."""
     toks = seg.split()
-    return "--help" in toks[:next((k for k, t in enumerate(toks) if t.startswith("#")), len(toks))]
+    toks = toks[:next((k for k, t in enumerate(toks) if t.startswith("#")), len(toks))]
+    return any(t == "--help" and not toks[k - 1].startswith("-") for k, t in enumerate(toks) if k)
 
 
 def _external_denied(ev, cur):
@@ -6232,10 +6234,10 @@ def _external_denied(ev, cur):
     segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
     if away:
         for seg in segs:
-            if m := re.match(r"cd(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
+            if m := re.match(r"(?:cd|pushd)(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
                 ev = {**ev, "cwd": os.path.join(ev.get("cwd") or os.getcwd(), os.path.expanduser(m.group(1) or "~"))}
                 continue
-            if re.match(_EXT_GIT + r"(?:checkout|switch)(?![-\w])", seg):  # the hook runs before the command: HEAD still names the old branch
+            if re.match(_EXT_GIT + r"(?:checkout|switch|symbolic-ref|branch\s.*(?:-[a-zA-Z]*[mM]|--move))(?![-\w])", seg) or re.match(_EXT_GH + r"pr\s+checkout\b", seg):  # the hook runs before the command: HEAD still names the old branch
                 ev = {**ev, "_head_moves": True}
             try:
                 line = _away_line(seg, ev)

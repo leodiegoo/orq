@@ -7297,7 +7297,11 @@ def test_away_external_denies_merge_into_production_and_force_push_and_allows_th
                       ("git push --delete origin feat/x", "push-other"), ("git push origin refs/heads/*:refs/heads/*", "push-other"), ("git push origin v1.0", "push-other"),
                       ("git -c remote.origin.push=+HEAD:refs/heads/main push origin", "push-other"), ("GIT_CONFIG_COUNT=1 git push origin feat/x", "push-other"),
                       ("git push --no-verify origin feat/x", "no-verify"), ("gh workflow run deploy.yaml", "workflow"), ("git commit -anm x", "no-verify"),
-                      ("orca worktree rm --worktree x --force --run-hooks", "worktree-rm"), ("cd x && git push", "push-other"), ("git checkout main && git push", "push-other")):
+                      ("orca worktree rm --worktree x --force --run-hooks", "worktree-rm"), ("cd x && git push", "push-other"), ("git checkout main && git push", "push-other"), ("git branch -M main && git push origin HEAD", "push-other"),
+                      ("gh pr checkout 12 && git push", "push-other"), ("gh pr merge 12 --squash -t --help --base main", "merge-prod"),
+                      ("git commit --no-verify -m --help", "no-verify"), ("env -C /x git push --force origin HEAD:main", "push-force"),
+                      (f"env -C {a.tmp.name} git push origin main", "push-other"), ("git --git-dir=/x/.git push origin feat/x", "push-other"),
+                      ("GIT_DIR=/x/.git git push origin feat/x", "push-other")):
         out = _external(a, cmd, cwd=r)
         assert out and out["permissionDecision"] == "deny", cmd
         assert f"line `{line}`" in out["permissionDecisionReason"] and "orq pend add" in out["permissionDecisionReason"], (cmd, out["permissionDecisionReason"])
