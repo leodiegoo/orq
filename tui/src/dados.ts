@@ -28,10 +28,10 @@ const RUIDO = new Set(["intake", "entrada", "heartbeat_absorvido", "gate_aviso"]
 
 type Mapa = { chaves: Record<string, string>; valores: Record<string, Record<string, string>>; arquivos: Record<string, string> }
 
-// o mapa mora só no orqlib.py (CHAVES_PT, VALORES_PT, ARQ_ANTIGO): lido uma vez, do orq ao lado desta pasta
+// o mapa mora só no orqlib.py (KEYS_PT, VALUES_PT, OLD_FILE): lido uma vez, do orq ao lado desta pasta
 const MAPA: Mapa = (() => {
   const orq = join(dirname(import.meta.dir), "..")
-  const py = "import json, orqlib as o; print(json.dumps({'chaves': o.CHAVES_PT, 'valores': o.VALORES_PT, 'arquivos': o.ARQ_ANTIGO}))"
+  const py = "import json, orqlib as o; print(json.dumps({'chaves': o.KEYS_PT, 'valores': o.VALUES_PT, 'arquivos': o.OLD_FILE}))"
   const r = Bun.spawnSync(["python3", "-c", py], { cwd: orq, env: { ...process.env, ORQ_NO_BG: "1" } })
   return JSON.parse(r.stdout.toString())
 })()
