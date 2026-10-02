@@ -74,7 +74,7 @@ def secao_agentes():
 
 def secao_pendencias():
     try:
-        itens = json.load(open(orq.PEND)).get("itens", [])
+        itens = orq._pend_ro()["itens"]  # o pendencias.json, ou o backlog com ORQ_BACKLOG
     except Exception:
         return "(pendencias.json ilegível)"
     if not itens:

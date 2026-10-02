@@ -23,6 +23,8 @@ import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
+import backlog
+
 
 def ThreadPoolExecutor(n):  # import tardio: concurrent.futures custa ~11 ms e só o painel e o ingest usam (ticket 49)
     from concurrent.futures import ThreadPoolExecutor as _T
@@ -40,6 +42,8 @@ LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
+BACKLOG = os.environ.get("ORQ_BACKLOG")  # backlog.md do tasks-axi (ticket 101): com ele as pendências moram lá e o pendencias.json vira só o espelho que o painel lê
+BACKLOG_TICKETS = os.environ.get("ORQ_BACKLOG_TICKETS")  # tickets() também lê do backlog; só até os comandos de ticket escreverem nele (M5)
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
 HOOK_TIMEOUT = 3
 TIPOS_PEND = ("acao", "decisao", "avisar")
@@ -1865,8 +1869,18 @@ def ingest():
 
 # ---------- pendencias.json (único escritor) ----------
 
+def _pend_do_backlog():
+    """As pendências vivas do backlog (repo `pend`, fora de Done) no formato que o pendencias.json guardava, na ordem do arquivo."""
+    return [backlog.pend_de_item(i) for i in backlog.ler(BACKLOG) if i["repo"] == "pend" and i["estado"] != "done"]
+
+
 def _load_pend():
-    """Itens do pendencias.json; arquivo ausente é vazio, arquivo quebrado levanta ValueError (nunca é sobrescrito)."""
+    """Itens do pendencias.json (ou do backlog, com ORQ_BACKLOG); arquivo ausente é vazio, arquivo quebrado levanta ValueError (nunca é sobrescrito)."""
+    if BACKLOG:
+        try:
+            return {"itens": _pend_do_backlog()}
+        except OSError as e:
+            raise ValueError(f"backlog ilegível: {e}")
     try:
         with open(PEND) as f:
             d = json.load(f)
@@ -1879,22 +1893,101 @@ def _load_pend():
     return d
 
 
+def _pend_ro():
+    """Como `_read_json(PEND)` para quem só lê (resumo, digest, cartão da noite): None se a fonte não abre."""
+    if BACKLOG:
+        try:
+            return {"itens": _pend_do_backlog()}
+        except OSError:
+            return None
+    return _read_json(PEND)
+
+
+def _pend_para_backlog(item):
+    """(título, corpo, (motivo, kind, until)) com que uma pendência entra no backlog. Recusa título que a gramática leria como tag e id que o tasks-axi não aceita."""
+    i = backlog.pend_a_item(item)
+    if backlog._tags(i["titulo"])[0] != i["titulo"]:
+        raise ValueError(f"o título termina numa tag do backlog (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): reescreva {i['titulo']!r}")
+    if not backlog.ID_RE.match(i["id"]):
+        raise ValueError(f"id de pendência no backlog: letras, dígitos, . _ - ({i['id']!r})")
+    if i["titulo"].startswith("-"):
+        raise ValueError(f"o título não pode começar com '-' (a CLI o leria como opção): reescreva {i['titulo']!r}")
+    return i["titulo"], i["corpo"], (i["hold"]["motivo"], i["hold"]["kind"], i["hold"]["until"])
+
+
+def _backlog_add(item):
+    """`add` + `hold` de uma pendência. Sem o hold ela nasceria sem o `ate`: se ele falha, o `add` é desfeito."""
+    titulo, corpo, (motivo, kind, ate) = _pend_para_backlog(item)
+    backlog.cli(BACKLOG, "add", item["id"], titulo, "--kind", item["tipo"], "--repo", "pend", *(["--body", corpo] if corpo else []))
+    try:
+        backlog.cli(BACKLOG, "hold", item["id"], "--reason", motivo, "--kind", kind, *(["--until", ate] if ate else []))
+    except backlog.BacklogErro:
+        backlog.cli(BACKLOG, "rm", item["id"])
+        raise
+
+
+def _backlog_recria(item, antigo):
+    """Troca o registro do id por um novo (`rm` + `add` + `hold`): é o caminho de id que já foi pendência fechada e de edição que esvazia o corpo,
+    porque o `update` não aceita `--body` vazio. Se o registro novo falha, o antigo volta (ponytail: o `since` recomeça hoje)."""
+    _pend_para_backlog(item)  # recusa título e id inválidos antes de apagar qualquer coisa
+    backlog.cli(BACKLOG, "rm", item["id"])
+    try:
+        _backlog_add(item)
+    except Exception:
+        with contextlib.suppress(backlog.BacklogErro, ValueError):
+            _backlog_add(antigo)
+        raise
+
+
+def _grava_backlog(antes, depois, nota=None):
+    """Aplica pela CLI a diferença entre as pendências vivas de antes e de depois: sumiu = `done` (com `nota`), nova = `add` + `hold`, mudou = `update` + `hold`.
+
+    O `add` repetido a CLI aceitaria sem dizer nada, então o id é conferido aqui: id de pendência fechada recomeça (`rm` + `add`), id de ticket ou de
+    pendência viva é recusado.
+    """
+    a, d = {i["id"]: i for i in antes}, {i["id"]: i for i in depois}
+    todos = {i["id"]: i for i in backlog.ler(BACKLOG)}
+    for id_ in a:
+        if id_ not in d:
+            backlog.cli(BACKLOG, "done", id_, "--no-prune", *(["--note", nota] if nota else []))
+    for id_, item in d.items():
+        velho = todos.get(id_)
+        if id_ not in a:
+            if velho and not (velho["repo"] == "pend" and velho["estado"] == "done"):
+                raise ValueError(f"pendência {id_} já existe")
+            _backlog_recria(item, item) if velho else _backlog_add(item)
+        elif item != a[id_]:
+            titulo, corpo, (motivo, kind, ate) = _pend_para_backlog(item)
+            if not corpo and velho and velho["corpo"]:
+                _backlog_recria(item, a[id_])
+                continue
+            backlog.cli(BACKLOG, "update", id_, "--title", titulo, "--kind", item["tipo"], *(["--body", corpo] if corpo else []))
+            backlog.cli(BACKLOG, "hold", id_, "--reason", motivo, "--kind", kind, *(["--until", ate] if ate else []))  # o hold novo troca o anterior
+
+
 def _mutar_pend(fn, evento=None):
     """Lê, aplica fn(itens) e grava com tmp + rename, tudo sob flock: dois orq ao mesmo tempo não perdem item.
 
     Com `evento(resultado)`, o evento entra no mesmo passo: as duas gravações ficam fora do alcance do alarme do hook.
+    Com ORQ_BACKLOG a gravação é a diferença aplicada pela CLI do tasks-axi (a `resposta` do evento vai como nota no `done` do que sumiu) e o pendencias.json é regenerado
+    do backlog para o painel; o par escrita e evento deixa de ser atômico (o ingest reconcilia o gate que ficar sem `gate_resolvido`).
     """
     with contextlib.ExitStack() as pilha:
         pilha.enter_context(_trava("pend.lock"))
         if evento:
             pilha.enter_context(_trava("cursor.lock"))
         d = _load_pend()
+        antes = json.loads(json.dumps(d["itens"]))
         out = fn(d["itens"])
-        d["atualizadoEm"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        ev = evento(out) if evento else None
         with _sem_alarme():
+            if BACKLOG:
+                _grava_backlog(antes, d["itens"], (ev or {}).get("resposta"))
+                d = {"itens": _pend_do_backlog()}
+            d["atualizadoEm"] = datetime.now().astimezone().isoformat(timespec="seconds")
             _write_json(PEND, d, indent=2)
-            if evento:
-                _grava_evento(evento(out))
+            if ev:
+                _grava_evento(ev)
     return out
 
 
@@ -1973,13 +2066,8 @@ def pend_lista(todas=False, hoje=None):
     return linhas
 
 
-def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None, ate=None, run=None):
-    """Acrescenta uma pendência do usuário (formato do painel; `espera` opcional) e registra o evento.
-
-    Com `task`, a decisão trava a task: cria o gate no Orca, no Run da task (`run`, senão o do coordenador; run_padrao recusa o gerente com
-    vários Runs), e guarda o id na pendência (o hook ask o resolve).
-    """
-    id_, titulo = (id_ or "").strip(), (titulo or "").strip()
+def _valida_pend(id_, tipo, titulo, espera=None, ate=None, task=None):
+    """As recusas de `pend add` e `pend edit` que não dependem do Orca."""
     if not id_ or not titulo:
         raise ValueError("pend add pede --id e --titulo")
     if tipo not in TIPOS_PEND:
@@ -1995,6 +2083,16 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
             raise ValueError(f"--ate pede AAAA-MM-DD ({ate!r})")
     if task and tipo != "decisao":
         raise ValueError("--task só vale para decisão (o gate trava a task até a resposta)")
+
+
+def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=None, espera=None, task=None, ate=None, run=None):
+    """Acrescenta uma pendência do usuário (formato do painel; `espera` opcional) e registra o evento.
+
+    Com `task`, a decisão trava a task: cria o gate no Orca, no Run da task (`run`, senão o do coordenador; run_padrao recusa o gerente com
+    vários Runs), e guarda o id na pendência (o hook ask o resolve).
+    """
+    id_, titulo = (id_ or "").strip(), (titulo or "").strip()
+    _valida_pend(id_, tipo, titulo, espera, ate, task)
     gate = gate_run = None
     if task:
         run = run_padrao(run)
@@ -2033,6 +2131,45 @@ def pend_add(id_, tipo, titulo, detalhe=None, frente=None, link=None, comando=No
         raise
 
 
+def backlog_estado():
+    """`orq backlog`: onde está o backlog, se a CLI é a versão que o orq exige e quantos itens há. Sem ORQ_BACKLOG diz que as pendências seguem no pendencias.json."""
+    if not BACKLOG:
+        return {"backlog": "desligado (ORQ_BACKLOG vazio): as pendências seguem em " + PEND}
+    itens = backlog.ler(BACKLOG)
+    try:
+        backlog.confere_versao(backlog.binario())
+        cli = f"{backlog.VERSAO} ok"
+    except backlog.BacklogErro as e:
+        cli = f"recusada: {e}"
+    cont = {e: sum(1 for i in itens if i["estado"] == e) for e in ("queued", "in_flight", "done")}
+    return {"backlog": BACKLOG, "tasks-axi": cli, "itens": len(itens), **cont, "pendencias vivas": len(_pend_do_backlog()),
+            "prontos": len([i for i in backlog.prontos(itens) if i["repo"] != "pend"]), "tickets lidos do backlog": bool(BACKLOG_TICKETS)}
+
+
+def pend_edit(id_, **campos):
+    """Corrige uma pendência viva: `titulo`, `detalhe`, `frente`, `link`, `comando`, `espera` e `ate` (texto vazio apaga o campo). O id, o tipo e o gate não mudam.
+
+    Registra o evento `pend`/`edit` com os nomes dos campos. No backlog o `update` troca título e corpo e o `hold` leva o `ate` novo.
+    """
+    campos = {k: v for k, v in campos.items() if v is not None}
+    if not campos:
+        raise ValueError("pend edit pede ao menos um campo (--titulo, --detalhe, --frente, --link, --comando, --espera, --ate)")
+
+    def edita(itens):
+        item = next((i for i in itens if i.get("id") == id_), None)
+        if not item:
+            raise ValueError(f"pendência {id_} não existe entre as vivas")
+        for k, v in campos.items():
+            v = " ".join(v.split()) if k == "titulo" else v.strip()
+            item.pop(k, None)
+            if v:
+                item[k] = v
+        _valida_pend(id_, item.get("tipo"), item.get("titulo"), item.get("espera"), item.get("ate"))
+        return item
+
+    return _mutar_pend(edita, lambda item: {"tipo": "pend", "op": "edit", "pend": id_, "campos": sorted(campos)})
+
+
 def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
     """Fecha (remove) uma pendência aberta e resolve o gate dela, se houver. `resposta` fica no evento e na resolução.
 
@@ -2046,7 +2183,7 @@ def pend_done(id_, resposta=None, atual=_DESCONHECIDO):
         for i, item in enumerate(itens):
             if item.get("id") == id_:
                 return itens.pop(i)
-        raise ValueError(f"pendência {id_} não existe em pendencias.json")
+        raise ValueError(f"pendência {id_} não existe em {'o backlog' if BACKLOG else 'pendencias.json'}")
 
     item = _mutar_pend(rm, lambda it: {"tipo": "pend", "op": "done", "pend": id_, **({"resposta": resposta} if resposta else {}), **({"task": it["task"]} if it.get("task") else {}),
                                        **({"gate": it["gate"]} if it.get("gate") else {}),
@@ -2803,7 +2940,7 @@ def telas_avisar():
 
 def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
-    txt = resumo(events, _read_json(_path("aberto.json")), _read_json(PEND), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
+    txt = resumo(events, _read_json(_path("aberto.json")), _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
     return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets())])])
 
 
@@ -3072,7 +3209,7 @@ def _linha_do_log(e, titulo):
 
 def tickets_do_painel(ts, aberto):
     """`tickets_orq` do digest: os tickets abertos (não resolved nem wontfix) com grupo (pronto, bloqueado, andamento), os bloqueios ainda
-    abertos, a task e o estado do worker vivo dela; mais os 5 resolvidos mais recentes, com a data do arquivo."""
+    abertos, a task e o estado do worker vivo dela; mais os 5 resolvidos mais recentes, com a data do fechamento (a do backlog, ou a do arquivo)."""
     vivos = {a.get("task"): _estado_de_gente(a) for a in _dict(aberto).get("agentes") or [] if a.get("estado") in ANDA}
     fechado = ("resolved", "wontfix")
     abertos = {t["num"] for t in ts if t["status"] not in fechado}
@@ -3087,8 +3224,8 @@ def tickets_do_painel(ts, aberto):
     feitos = []
     for t in ts:
         if t["status"] == "resolved":
-            with contextlib.suppress(OSError):
-                feitos.append({"num": t["num"], "titulo": t["titulo"], "em": datetime.fromtimestamp(os.path.getmtime(t["arquivo"])).strftime("%Y-%m-%d"),
+            with contextlib.suppress(OSError, TypeError):  # sem data de fechamento (backlog) e sem arquivo, o ticket fica fora dos resolvidos
+                feitos.append({"num": t["num"], "titulo": t["titulo"], "em": t.get("fechado_em") or datetime.fromtimestamp(os.path.getmtime(t["arquivo"])).strftime("%Y-%m-%d"),
                                "arquivo": t["arquivo"]})
     return {"abertos": saida, "resolvidos": sorted(feitos, key=lambda x: (x["em"], x["num"]), reverse=True)[:5]}
 
@@ -3198,7 +3335,7 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     agora = agora or datetime.now(timezone.utc)
     events, ausente = read_events(), _dict(_cursor_ro().get("ausente")) or None
     janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
-    d = monta_digest(events, _prs_ro(), _read_json(PEND), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
+    d = monta_digest(events, _prs_ro(), _pend_ro(), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
                     {"max_workers": maquina_cfg()["max_workers"], "fila": len(fila_despacho_itens())})
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rodadas()[-4:]]  # as últimas rodadas do `orq retro --gravar`
     os.makedirs(_path(DIGEST), exist_ok=True)
@@ -3556,7 +3693,7 @@ def cartao_manha(agora=None):
             vivos[e["dispatch"]] = estado_worktree(_checkpoint(e["dispatch"]).get("caminho"))
         except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as x:
             log(f"cartão: worker-show {e['dispatch']}: {x}")
-    return "\n".join(cartao_noite(events, _cursor_ro(), _read_json(PEND), agora, vivos))
+    return "\n".join(cartao_noite(events, _cursor_ro(), _pend_ro(), agora, vivos))
 
 
 # ---- modo noite: ações externas e ambiente do worker ----
@@ -4032,6 +4169,9 @@ def hook_ask(ev, run):
                 feito = pend_done(i, resposta if header != "ja-fez" else None, _DESCONHECIDO if runs_do_gerente() else run["id"])
             except ValueError as e:  # outro orq fechou no meio: as próximas perguntas seguem
                 log(f"ask: {e}")
+            except backlog.BacklogErro as e:  # o tasks-axi recusou: a resposta já está no log e a decisão segue aberta
+                log(f"ask: {e}")
+                avisos.append(f"não consegui fechar {i} no backlog ({e}): feche com orq pend done {shlex.quote(i)}")
             else:
                 if feito.get("aviso"):
                     avisos.append(feito["aviso"])
@@ -4819,7 +4959,7 @@ def intake(e, efeito, ref=None, run=None, nota=None):
         if not ref:
             raise ValueError(f"{efeito} pede o id da pendência")
         # uma decisão respondida já saiu do arquivo: vale também a pendência que o registro viu ser criada
-        no_arquivo = any(i.get("id") == ref for i in (_read_json(PEND, {}) or {}).get("itens", []))
+        no_arquivo = any(i.get("id") == ref for i in (_pend_ro() or {}).get("itens", []))
         no_log = any(x.get("tipo") == "pend" and x.get("op") == "add" and x.get("pend") == ref for x in eventos)
         if not (no_arquivo or no_log):
             raise ValueError(f"pendência {ref} não existe em pendencias.json nem no registro de eventos")
@@ -5414,8 +5554,22 @@ def le_ticket(caminho):
             "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
 
 
+def _tickets_do_backlog():
+    """Os tickets do backlog no formato de `tickets()` (ver `backlog.ticket_de_item`); `arquivo` é o `spec:` relativo à pasta que guarda ISSUES."""
+    try:
+        itens = backlog.ler(BACKLOG)
+    except OSError as e:
+        log(f"backlog: {type(e).__name__}: {e}")
+        return []
+    por_id = {i["id"]: i for i in itens}
+    achados = [t for i in itens if (t := backlog.ticket_de_item(i, por_id, os.path.dirname(ISSUES)))]
+    return sorted(achados, key=lambda t: int(t["num"]))
+
+
 def tickets():
-    """Todos os tickets de ISSUES, por número. Ticket ilegível vai para o log e fica de fora: o resumo da sessão não cai por causa dele."""
+    """Todos os tickets de ISSUES, por número (ou do backlog, com ORQ_BACKLOG e ORQ_BACKLOG_TICKETS). Ticket ilegível vai para o log e fica de fora: o resumo da sessão não cai por causa dele."""
+    if BACKLOG and BACKLOG_TICKETS:
+        return _tickets_do_backlog()
     try:
         nomes = sorted((n for n in os.listdir(ISSUES) if _NUM_ARQ.match(n)), key=lambda n: int(n.split("-")[0]))
     except OSError:
@@ -9539,6 +9693,12 @@ def main(argv=None):
     pd = p.add_parser("done")
     pd.add_argument("id")
     pd.add_argument("--resposta")
+    pe = p.add_parser("edit", help='orq pend edit <id> [--titulo T] [--detalhe D] [--frente F] [--link L] [--comando C] [--espera E] [--ate AAAA-MM-DD]; "" apaga o campo')
+    pe.add_argument("id")
+    for k in ("titulo", "detalhe", "frente", "link", "comando", "espera", "ate"):
+        pe.add_argument(f"--{k}")
+    bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens")
+    bl.add_argument("--json", action="store_true")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("texto")
@@ -9823,11 +9983,16 @@ def main(argv=None):
                 print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate, a.run), ensure_ascii=False))
             elif a.op == "lista":
                 print("\n".join(pend_lista(a.todas)) or "nenhuma pendência")
+            elif a.op == "edit":
+                print(json.dumps(pend_edit(a.id, titulo=a.titulo, detalhe=a.detalhe, frente=a.frente, link=a.link, comando=a.comando, espera=a.espera, ate=a.ate), ensure_ascii=False))
             else:
                 feito = pend_done(a.id, a.resposta)
                 print(json.dumps(feito, ensure_ascii=False))
                 if feito.get("aviso"):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
+        elif a.cmd == "backlog":
+            r = backlog_estado()
+            print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"{k}: {v}" for k, v in r.items()))
         elif a.cmd == "pr":
             if a.op == "ligar":
                 print(json.dumps(pr_ligar(a.task, a.url, a.issue, a.tag, a.nota), ensure_ascii=False))
@@ -9864,7 +10029,7 @@ def main(argv=None):
         elif a.cmd == "resumo":
             if a.desde:
                 _dt(a.desde)  # ValueError vira exit 1
-            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _read_json(PEND), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
+            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _pend_ro(), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
         elif a.cmd == "agentes":
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]

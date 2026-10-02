@@ -13582,6 +13582,442 @@ def test_ticket90_coordenador_ocupado_nao_digita_o_aviso_do_limite_e_a_proxima_v
     assert len(_avisos_enviados(a)) == 1
 
 
+# ---------- ticket 101: o backlog do tasks-axi (M1 leitor e escritor, M2 migração, M3 pendências, M4 digest) ----------
+
+import backlog as backlog_mod  # noqa: E402
+
+CONVERTE = os.path.join(AQUI, "scripts", "converte-backlog.py")
+
+
+def _bl_json(caminho, *args):
+    return json.loads(backlog_mod.cli(caminho, *args, "--json"))["task"]
+
+
+def _amb_bl(**env):
+    """Ambiente com ORQ_BACKLOG: as pendências de partida (freio-prod, avisar-x) entram pelo próprio `orq pend add`."""
+    a = Amb(**env)
+    a.env["ORQ_BACKLOG"] = os.path.join(a.tmp.name, "data", "backlog.md")
+    a.set("../pendencias.json", {"itens": []})
+    for id_, tipo in (("freio-prod", "decisao"), ("avisar-x", "avisar")):
+        r = a.orq("pend", "add", "--id", id_, "--tipo", tipo, "--titulo", id_.replace("-", " "))
+        assert r.returncode == 0, r.stderr
+    return a
+
+
+def _bl_itens(a):
+    return {i["id"]: i for i in backlog_mod.ler(a.env["ORQ_BACKLOG"])}
+
+
+def test_ticket101_contrato_o_leitor_concorda_com_o_tasks_axi_real():
+    """Roda o tasks-axi 0.2.6 de verdade (sem ele o teste falha: é a prova de que a gramática lida ainda é a da CLI)."""
+    p = os.path.join(tempfile.mkdtemp(), "backlog.md")
+    ops = [("add", "a1", "Primeiro (com parênteses): e dois pontos", "--kind", "ticket", "--repo", "orq", "--priority", "2", "--body", "spec: issues/01-a.md\norca: task_1 run_1\n\nParágrafo\n  indentado"),
+           ("add", "b2", "Segundo", "--kind", "decisao", "--repo", "pend"),
+           ("add", "c3", "Terceiro", "--blocked-by", "a1"),
+           ("hold", "b2", "--reason", "decisão pendente", "--kind", "captain", "--until", "2999-01-01"),
+           ("hold", "c3", "--reason", "vencido", "--kind", "external", "--until", "2000-01-01"),
+           ("start", "a1"),
+           ("block", "b2", "--by", "a1"),
+           ("add", "d4", "Quarto"),
+           ("done", "d4", "--no-prune", "--pr", "https://github.com/o/r/pull/42"),
+           ("done", "b2", "--no-prune", "--note", "linha um\nlinha dois"),
+           ("update", "a1", "--title", "Primeiro, renomeado", "--body", "spec: issues/01-a.md"),
+           ("unhold", "c3"),
+           ("add", "e5", "Quinto, livre")]
+    for op in ops:
+        t = _bl_json(p, *op)
+        i = _bl_itens_de(p)[t["id"]]
+        por_id = _bl_itens_de(p)
+        assert i["titulo"] == t["title"] and i["kind"] == t["kind"] and i["repo"] == t["repo"] and i["prioridade"] == t["priority"], (op, i, t)
+        assert {"queued": "queued", "in_flight": "in_flight", "done": "done"}[i["estado"]] == t["state"], (op, i, t)
+        assert (i["closed"] if i["estado"] == "done" else i["since"]) == (t["closed"] if t["state"] == "done" else t["created"]), (op, i, t)
+        assert i["bloqueios"] == [d["id"] for d in t["deps"] if d["type"] == "blocked-by"] and i["corpo"] == (t["body"] or ""), (op, i, t)
+        h = t["hold"]
+        assert (i["hold"] and {"reason": i["hold"]["motivo"], "kind": i["hold"]["kind"], "until": i["hold"]["until"]}) == (h and {"reason": h["reason"], "kind": h.get("kind"), "until": h.get("until")}) or (not i["hold"] and not h), (op, i, t)
+        assert backlog_mod.bloqueado(i, por_id) == (t["blocked"] and t["state"] != "done") and backlog_mod.hold_ativo(i) == t["held"], (op, i, t)
+    antes = open(p).read()
+    backlog_mod.cli(p, "render")
+    assert open(p).read() == antes, "o arquivo que a CLI escreve já está na forma canônica"
+    ids = re.findall(r"^  ([^,\s]+),", backlog_mod.cli(p, "ready").split("ready[", 1)[1], re.M)
+    assert ids == [i["id"] for i in backlog_mod.prontos(backlog_mod.ler(p))] == ["e5"], ids
+    sem_branco = lambda t: [l for l in t.replace("(merged ", "(done ").splitlines() if l.strip()]  # noqa: E731 - a CLI não separa as seções e troca done por merged quando há link de PR
+    assert sem_branco(backlog_mod.emite(backlog_mod.ler(p))) == sem_branco(antes), "emite reproduz o que a CLI escreve"
+
+
+def _bl_itens_de(p):
+    return {i["id"]: i for i in backlog_mod.ler(p)}
+
+
+def test_ticket101_leitor_gramatica_secoes_tags_corpo_e_formas_antigas():
+    src = """# Backlog
+
+Nota solta no preâmbulo, fora de seção.
+
+## In flight
+- **velho** - Linha legada (repo: orq) (since 2026-09-01)
+  corpo legado
+- [ ] novo - Titulo (com parenteses) (kind: ticket) (priority: 3) (orq + repo: extra) (since 2026-09-02)
+
+  spec: a.md
+
+  segundo parágrafo
+nota solta no meio
+## Queued
+- [ ] q1 - Espera (repo: x) blocked-by: velho - porque sim
+- [ ] q2 - Outro blocked-by: fantasma (hold: motivo longo) (hold-kind: parked) (hold-until: 2999-12-31)
+## Done (arquivo)
+- [x] d1 - Feito (merged 2026-09-03)
+## Outra coisa
+- [ ] z - não é item
+"""
+    it = {i["id"]: i for i in backlog_mod.interpreta(src)}
+    assert list(it) == ["velho", "novo", "q1", "q2", "d1"], list(it)
+    assert (it["velho"]["estado"], it["velho"]["repo"], it["velho"]["since"], it["velho"]["corpo"]) == ("in_flight", "orq", "2026-09-01", "corpo legado")
+    n = it["novo"]
+    assert (n["titulo"], n["kind"], n["prioridade"], n["repo"]) == ("Titulo (com parenteses)", "ticket", 3, "extra"), n
+    assert n["corpo"] == "\nspec: a.md\n\nsegundo parágrafo", repr(n["corpo"])
+    assert it["q1"]["bloqueios"] == ["velho"] and it["q1"]["titulo"] == "Espera" and it["q1"]["repo"] == "x"
+    assert it["q2"]["bloqueios"] == ["fantasma"] and it["q2"]["hold"] == {"motivo": "motivo longo", "kind": "parked", "until": "2999-12-31"}
+    assert (it["d1"]["estado"], it["d1"]["closed"]) == ("done", "2026-09-03")
+    por_id = it
+    assert backlog_mod.bloqueado(it["q1"], por_id) and not backlog_mod.bloqueado(it["q2"], por_id), "bloqueador que não existe conta como resolvido"
+    assert backlog_mod.hold_ativo(it["q2"]) and not backlog_mod.hold_ativo({"estado": "queued", "hold": {"motivo": "x", "until": "2000-01-01"}}) and not backlog_mod.hold_ativo({"estado": "queued", "hold": {"motivo": "x", "until": date_hoje()}}), "no dia da data o hold já solta"
+    assert backlog_mod.interpreta("") == [] and backlog_mod.ler("/nao/existe/backlog.md") == []
+
+
+def date_hoje():
+    return datetime.now().date().isoformat()
+
+
+def test_ticket101_meta_do_corpo_vai_e_volta_sem_confundir_com_o_detalhe():
+    ch = backlog_mod.META_PEND
+    corpo = backlog_mod.corpo_com_meta({"frente": "cache", "link": "http://x", "espera": "a b\nc"}, "link: isto é detalhe\nsegunda linha", ch)
+    assert corpo == "frente: cache\nlink: http://x\nespera: a b c\n\nlink: isto é detalhe\nsegunda linha", corpo
+    meta, resto = backlog_mod.meta_corpo(corpo, ch)
+    assert meta == {"frente": "cache", "link": "http://x", "espera": "a b c"} and resto == "link: isto é detalhe\nsegunda linha"
+    sem = backlog_mod.corpo_com_meta({}, "link: parece meta", ch)
+    assert backlog_mod.meta_corpo(sem, ch) == ({}, "link: parece meta"), "a linha em branco na frente protege o detalhe"
+    assert backlog_mod.corpo_com_meta({}, None, ch) == "" and backlog_mod.meta_corpo("", ch) == ({}, "")
+
+
+def test_ticket101_leitor_do_backlog_inteiro_cabe_no_teto_do_hook():
+    itens = [{"id": f"t{n}", "titulo": f"orq: ticket {n} com um título de tamanho normal", "estado": ("done", "queued", "in_flight")[n % 3], "kind": "ticket", "repo": "orq",
+              "bloqueios": [f"t{n - 1}"] if n else [], "since": "2026-10-01", "closed": "2026-10-01", "corpo": f"spec: issues/{n}.md\norca: task_{n} run_{n}"} for n in range(600)]
+    p = os.path.join(tempfile.mkdtemp(), "backlog.md")
+    open(p, "w").write(backlog_mod.emite(itens))
+    t0 = time.perf_counter()
+    lidos = backlog_mod.ler(p)
+    ms = (time.perf_counter() - t0) * 1000
+    assert len(lidos) == 600 and ms < 40, f"{ms:.1f} ms para 600 itens: o teto do hook é 100 ms com tudo junto"
+
+
+def _fake_tasks_axi(versao):
+    d = tempfile.mkdtemp()
+    exe = os.path.join(d, "tasks-axi")
+    open(exe, "w").write(f'#!/bin/sh\n[ "$1" = "--version" ] && echo {versao} && exit 0\necho "escreveu" >> "{d}/chamadas"\n')
+    os.chmod(exe, 0o755)
+    return exe, d
+
+
+def test_ticket101_escrita_recusa_versao_errada_file_e_symlink():
+    exe, d = _fake_tasks_axi("0.2.5")
+    antes = os.environ.get("ORQ_TASKS_AXI")
+    os.environ["ORQ_TASKS_AXI"] = exe
+    try:
+        try:
+            backlog_mod.cli(os.path.join(d, "b.md"), "add", "x", "y")
+            assert False, "devia recusar"
+        except backlog_mod.BacklogErro as e:
+            assert "0.2.5" in str(e) and "npm i -g tasks-axi@0.2.6" in str(e), e
+        assert not os.path.exists(os.path.join(d, "chamadas")), "a CLI na versão errada nem chega a escrever"
+    finally:
+        os.environ.pop("ORQ_TASKS_AXI") if antes is None else os.environ.__setitem__("ORQ_TASKS_AXI", antes)
+    for args in (("--file", "x.md"), ("--file=x.md",)):
+        try:
+            backlog_mod.cli(os.path.join(d, "b.md"), "list", *args)
+            assert False
+        except ValueError as e:
+            assert "ORQ_BACKLOG" in str(e)
+    real = os.path.join(d, "real.md")
+    open(real, "w").write("# Backlog\n")
+    os.symlink(real, os.path.join(d, "elo.md"))
+    try:
+        backlog_mod.cli(os.path.join(d, "elo.md"), "list")
+        assert False
+    except backlog_mod.BacklogErro as e:
+        assert "symlink" in str(e)
+
+
+def test_ticket101_estados_dos_tickets_seguem_os_status_do_orq():
+    assert backlog_mod.ESTADO_TICKET == {"queued": orq_mod.STATUS_NOVO, "in_flight": orq_mod.STATUS_ANDAMENTO, "done": orq_mod.STATUS_FECHADO}
+
+
+# ---- M2: a conversão ----
+
+def _issues_101(a):
+    """Cinco tickets: 01 resolvido, 02 bloqueado pelo 01 (resolvido), 03 bloqueado pelo 02, 04 em andamento, 05 com 'Blocked by: none (… 30/09)'."""
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    os.makedirs(a.home, exist_ok=True)
+    tks = [("01", "orq: Base", "resolved", "(nenhum)", "task_a1", "run_a", ""), ("02", "orq: Segundo", "ready-for-agent", "01", None, None, ""),
+           ("03", "Terceiro sem prefixo", "ready-for-agent", "02", "task_c3", "run_a", "Modelo: claude-opus-5-5\nEffort: high\nissue: #2045\n"),
+           ("04", "Em curso", "claimed", "(nenhum)", "task_d4", "run_a", ""), ("05", "Paralelo", "ready-for-agent", "none (roda em paralelo numa worktree própria, 30/09)", None, None, "")]
+    for nn, titulo, status, bl, task, run, extra in tks:
+        cab = f"# {nn}: {titulo}\n\nStatus: {status}\nBlocked by: {bl}\n" + (f"Run: {run}\n" if run else "") + (f"Task: {task}\n" if task else "") + extra
+        open(os.path.join(a.env["ORQ_ISSUES"], f"{nn}-x.md"), "w").write(cab + "\n## What to build\n\ncorpo\n")
+    _evs(a, {"ts": "2026-09-20T10:00:00Z", "tipo": "ticket", "op": "novo", "ticket": "01"}, {"ts": "2026-09-25T10:00:00Z", "tipo": "ticket", "op": "fechar", "ticket": "01"},
+         {"ts": "2026-09-21T10:00:00Z", "tipo": "ticket", "op": "novo", "ticket": "02"})
+
+
+def _converte(a, saida, *extra):
+    return subprocess.run([sys.executable, CONVERTE, "--saida", saida, "--issues", a.env["ORQ_ISSUES"], "--pendencias", a.env["ORQ_PENDENCIAS"],
+                           "--eventos", os.path.join(a.home, "events.jsonl"), *extra], capture_output=True, text=True, env=a.env, timeout=60)
+
+
+def test_ticket101_m2_converte_emite_o_backlog_confere_as_contagens_e_so_escreve_em_arquivo_novo():
+    a = Amb()
+    _issues_101(a)
+    a.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao", "titulo": "Freio (teto) de prod?", "detalhe": "linha 1\nlinha 2", "frente": "cache", "desde": "2026-09-30"},
+                                          {"id": "esp-x", "tipo": "acao", "titulo": "Girar a chave", "espera": "time de ops (Alice)", "ate": "2999-01-01", "link": "http://x", "desde": "2026-09-29"}]})
+    saida = os.path.join(a.tmp.name, "data", "backlog.md")
+    r = _converte(a, saida)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "5 tickets (1 Done), 2 pendências, 2 bloqueios, 2 prontos" in r.stdout, r.stdout
+    it = _bl_itens_de(saida)
+    assert it["t01"]["estado"] == "done" and it["t01"]["closed"] == "2026-09-25" and it["t02"]["since"] == "2026-09-21", "datas dos eventos"
+    assert it["t02"]["bloqueios"] == ["t01"] and it["t03"]["bloqueios"] == ["t02"] and it["t05"]["bloqueios"] == [], "só os números do começo do campo"
+    assert it["t02"]["repo"] == "orq" and it["t03"]["repo"] is None and it["t04"]["estado"] == "in_flight"
+    assert sorted(i["id"] for i in backlog_mod.prontos(backlog_mod.ler(saida)) if i["kind"] == "ticket") == ["t02", "t05"]
+    meta, _ = backlog_mod.meta_corpo(it["t03"]["corpo"], backlog_mod.META_TICKET)
+    assert meta == {"spec": "issues/03-x.md", "orca": "task_c3 run_a", "modelo": "claude-opus-5-5", "effort": "high", "issue": "2045"}, meta
+    assert it["esp-x"]["hold"] == {"motivo": "esperando time de ops Alice", "kind": "external", "until": "2999-01-01"} and it["esp-x"]["repo"] == "pend"
+    assert open(os.path.join(a.tmp.name, "data", ".tasks.toml")).read().count("done_keep = 100000") == 1
+    r2 = _converte(a, saida)
+    assert r2.returncode == 1 and "já existe" in r2.stderr, "não sobrescreve o backlog que existe"
+    assert _converte(a, saida, "--forcar").returncode == 0
+
+
+def test_ticket101_m2_tickets_do_backlog_sao_os_dos_arquivos_exceto_o_bloqueador_ja_resolvido():
+    a = Amb()
+    _issues_101(a)
+    a.set("../pendencias.json", {"itens": []})
+    saida = os.path.join(a.tmp.name, "data", "backlog.md")
+    assert _converte(a, saida).returncode == 0
+    velhos = (orq_mod.ISSUES, orq_mod.BACKLOG, orq_mod.BACKLOG_TICKETS)
+    try:
+        orq_mod.ISSUES, orq_mod.BACKLOG, orq_mod.BACKLOG_TICKETS = a.env["ORQ_ISSUES"], saida, None
+        arq = {t["num"]: t for t in orq_mod.tickets()}
+        orq_mod.BACKLOG_TICKETS = "1"
+        bl = {t["num"]: t for t in orq_mod.tickets()}
+    finally:
+        orq_mod.ISSUES, orq_mod.BACKLOG, orq_mod.BACKLOG_TICKETS = velhos
+    assert list(arq) == list(bl) == ["01", "02", "03", "04", "05"]
+    for n in arq:
+        assert {k: v for k, v in arq[n].items() if k != "blocked_by"} == {k: v for k, v in bl[n].items() if k not in ("blocked_by", "fechado_em")}, (n, arq[n], bl[n])
+    assert arq["02"]["blocked_by"] == ["01"] and bl["02"]["blocked_by"] == [], "o bloqueador resolvido não bloqueia mais"
+    assert arq["05"]["blocked_by"] == ["30", "09"] and bl["05"]["blocked_by"] == [], "o achado do ticket 72: o leitor antigo lia 30 e 09 do comentário"
+    assert bl["03"]["blocked_by"] == ["02"] and bl["03"]["modelo"] == "claude-opus-5-5" and bl["03"]["issue"] == 2045 and bl["03"]["task"] == "task_c3" and bl["03"]["run"] == "run_a"
+
+
+# ---- M3: pendências no backlog ----
+
+def test_ticket101_m3_pend_add_done_grava_no_backlog_espelha_o_json_e_registra_o_evento():
+    a = _amb_bl()
+    r = a.orq("pend", "add", "--id", "avisar-alice", "--tipo", "avisar", "--titulo", "Avisar o Alice", "--espera", "Alice", "--frente", "cache")
+    assert r.returncode == 0, r.stderr
+    it = _bl_itens(a)["avisar-alice"]
+    assert (it["repo"], it["kind"], it["estado"]) == ("pend", "avisar", "queued") and it["hold"]["kind"] == "external" and "frente: cache" in it["corpo"] and "espera: Alice" in it["corpo"]
+    espelho = _pend(a)
+    assert [i["id"] for i in espelho["itens"]] == ["freio-prod", "avisar-x", "avisar-alice"] and "atualizadoEm" in espelho
+    assert list(espelho["itens"][2]) == ["id", "tipo", "titulo", "frente", "desde", "espera"], espelho["itens"][2]
+    assert a.orq("pend", "add", "--id", "outra", "--tipo", "acao", "--titulo", "X", "--detalhe", "d", "--link", "l", "--comando", "c").returncode == 0
+    r = a.orq("pend", "done", "avisar-alice", "--resposta", "avisei")
+    assert r.returncode == 0, r.stderr
+    assert [i["id"] for i in _pend(a)["itens"]] == ["freio-prod", "avisar-x", "outra"], "fechada sai da lista viva"
+    fim = _bl_itens(a)["avisar-alice"]
+    assert fim["estado"] == "done" and fim["corpo"].endswith("avisei"), "a resposta fica no corpo e o histórico no backlog"
+    evs = [e for e in a.events() if e["tipo"] == "pend" and e["pend"] in ("avisar-alice", "outra")]
+    assert [(e["op"], e["pend"]) for e in evs] == [("add", "avisar-alice"), ("add", "outra"), ("done", "avisar-alice")] and evs[2]["resposta"] == "avisei"
+    assert not [f for f in os.listdir(os.path.dirname(a.env["ORQ_PENDENCIAS"])) if f.startswith("tmp")]
+
+
+def test_ticket101_m3_recusas_como_no_json_e_sem_evento_nem_item_pela_metade():
+    a = _amb_bl()
+    n_eventos = len([e for e in a.events() if e["tipo"] == "pend"])
+    for args, texto in ((("--id", "id-com-mais-de-12", "--tipo", "decisao", "--titulo", "X"), "12"), (("--id", "freio-prod", "--tipo", "acao", "--titulo", "dup"), "já existe"),
+                        (("--id", "t01", "--tipo", "acao", "--titulo", "X", "--ate", "amanhã"), "AAAA-MM-DD"), (("--id", "com espaço", "--tipo", "acao", "--titulo", "X"), "letras, dígitos"),
+                        (("--id", "tag", "--tipo", "acao", "--titulo", "termina assim (repo: x)"), "tag do backlog"),
+                        (("--id", "traco", "--tipo", "acao", "--titulo", "-x como opção"), "começar com '-'")):
+        r = a.orq("pend", "add", *args)
+        assert r.returncode == 1 and texto in r.stderr, (args, r.stderr)
+    assert a.orq("pend", "done", "nao-existe").returncode == 1
+    assert sorted(_bl_itens(a)) == ["avisar-x", "freio-prod"] and len([e for e in a.events() if e["tipo"] == "pend"]) == n_eventos
+    assert a.orq("pend", "add", "--id", "doze-chars-1", "--tipo", "decisao", "--titulo", "X").returncode == 0, "12 cabe"
+
+
+def test_ticket101_m3_pend_add_concorrente_nao_perde_item():
+    a = _amb_bl()
+    with ThreadPoolExecutor(6) as ex:
+        rs = list(ex.map(lambda i: a.orq("pend", "add", "--id", f"c{i}", "--tipo", "acao", "--titulo", f"t{i}"), range(6)))
+    assert all(r.returncode == 0 for r in rs), [r.stderr for r in rs]
+    assert {f"c{i}" for i in range(6)} <= {i["id"] for i in _pend(a)["itens"]} and len(_pend(a)["itens"]) == 8 and len(_bl_itens(a)) == 8
+
+
+def test_ticket101_m3_id_de_pendencia_fechada_recomeca_e_o_de_ticket_ou_viva_e_recusado():
+    a = _amb_bl()
+    assert a.orq("pend", "done", "freio-prod", "--resposta", "sim").returncode == 0
+    r = a.orq("pend", "add", "--id", "freio-prod", "--tipo", "decisao", "--titulo", "De novo", "--detalhe", "outro")
+    assert r.returncode == 0, r.stderr
+    it = _bl_itens(a)["freio-prod"]
+    assert it["estado"] == "queued" and it["titulo"] == "De novo" and "sim" not in it["corpo"] and [i["id"] for i in _pend(a)["itens"]].count("freio-prod") == 1
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "add", "t77", "um ticket", "--kind", "ticket")
+    r = a.orq("pend", "add", "--id", "t77", "--tipo", "acao", "--titulo", "X")
+    assert r.returncode == 1 and "já existe" in r.stderr
+    r = a.orq("pend", "add", "--id", "avisar-x", "--tipo", "acao", "--titulo", "X")
+    assert r.returncode == 1 and "já existe" in r.stderr, "pendência viva"
+
+
+def test_ticket101_m3_pend_edit_corrige_titulo_detalhe_ate_e_espera_e_registra_o_evento():
+    a = _amb_bl()
+    assert a.orq("pend", "add", "--id", "rot", "--tipo", "acao", "--titulo", "Girar chave", "--espera", "ops", "--ate", "2999-01-01", "--detalhe", "d1").returncode == 0
+    r = a.orq("pend", "edit", "rot", "--titulo", "Girar a chave de staging", "--espera", "", "--ate", "2998-02-02")
+    assert r.returncode == 0, r.stderr
+    it = _bl_itens(a)["rot"]
+    assert it["titulo"] == "Girar a chave de staging" and it["hold"]["kind"] == "captain" and it["hold"]["until"] == "2998-02-02" and "espera" not in it["corpo"] and it["corpo"].endswith("d1")
+    r = a.orq("pend", "edit", "rot", "--detalhe", "")
+    assert r.returncode == 0 and _bl_itens(a)["rot"]["corpo"] == "" and "detalhe" not in [i for i in _pend(a)["itens"] if i["id"] == "rot"][0], r.stderr
+    (ev1, ev2) = [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "edit"]
+    assert ev1["campos"] == ["ate", "espera", "titulo"] and ev2["campos"] == ["detalhe"]
+    assert a.orq("pend", "edit", "rot").returncode == 1 and a.orq("pend", "edit", "nao-existe", "--titulo", "x").returncode == 1
+    r = a.orq("pend", "edit", "freio-prod", "--espera", "alguém")
+    assert r.returncode == 1 and "espera" in r.stderr, "decisão não tem espera"
+    assert [i["id"] for i in _pend(a)["itens"]].count("rot") == 1
+
+
+def test_ticket101_m3_lista_esconde_ate_futura_e_mostra_a_vencida_como_antes():
+    a = _amb_bl()
+    a.orq("pend", "add", "--id", "futura", "--tipo", "acao", "--titulo", "Depois", "--ate", "2999-01-01")
+    a.orq("pend", "add", "--id", "hoje", "--tipo", "acao", "--titulo", "Hoje", "--ate", date_hoje())
+    a.orq("pend", "add", "--id", "espera", "--tipo", "avisar", "--titulo", "Espera", "--espera", "Alice")
+    vivas = a.orq("pend", "lista").stdout
+    assert "hoje" in vivas and "futura" not in vivas and "espera  avisar" not in vivas, vivas
+    todas = a.orq("pend", "lista", "--todas").stdout
+    assert "futura  acao  Depois  [Depois: até 2999-01-01]" in todas and "[Depois: esperando Alice]" in todas, todas
+
+
+def test_ticket101_m3_hook_ask_fecha_a_decisao_pelo_backlog_e_guarda_a_resposta():
+    a = _amb_bl()
+    q = [_pergunta("freio-prod", [("Teto por pod (Recomendado)", "x"), ("Sem freio", "y")])]
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Teto por pod (Recomendado)"}))
+    assert (r.returncode, r.stdout) == (0, ""), r
+    assert [i["id"] for i in _pend(a)["itens"]] == ["avisar-x"] and _bl_itens(a)["freio-prod"]["estado"] == "done"
+    done = [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "done"]
+    assert done[0]["pend"] == "freio-prod" and done[0]["resposta"] == "Teto por pod (Recomendado)"
+    a2 = _amb_bl()
+    q2 = [_pergunta("freio-prod", [("A", "x"), ("B", "y")])]
+    texto = "nenhum dos dois, vamos ver com o time de dados"
+    r = a2.orq("hook", "ask", stdin=_ask(q2, {q2[0]["question"]: texto}, onde="tool_input"))
+    assert [i["id"] for i in _pend(a2)["itens"]] == ["freio-prod", "avisar-x"], "texto livre não fecha"
+    assert "resposta livre em freio-prod" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ticket101_m3_gate_da_decisao_resolve_como_hoje_e_o_gate_fica_no_corpo():
+    a = _amb_bl(run="run_a")
+    a.prompt("decide o freio")
+    _gate_pend(a)
+    it = _bl_itens(a)["gate-dec"]
+    meta, _ = backlog_mod.meta_corpo(it["corpo"], backlog_mod.META_PEND)
+    assert meta["gate"] == "gate_1" and meta["gate_run"] == "run_a" and meta["task"], meta
+    assert [i for i in _pend(a)["itens"] if i["id"] == "gate-dec"][0]["gate"] == "gate_1"
+    r = a.orq("pend", "done", "gate-dec", "--resposta", "Sim")
+    assert r.returncode == 0, r.stderr
+    assert _resolucoes(a) == ["Sim"] and [e["gate"] for e in a.events() if e["tipo"] == "gate_resolvido"] == ["gate_1"]
+    assert _bl_itens(a)["gate-dec"]["estado"] == "done"
+
+
+def test_ticket101_m3_leituras_nao_chamam_o_tasks_axi_e_a_escrita_sem_ele_recusa_sem_gravar():
+    a = _amb_bl()
+    sem = {"ORQ_TASKS_AXI": "/nao/existe/tasks-axi"}
+    assert a.orq("pend", "lista", **sem).stdout.count("\n") == 2
+    r = a.prompt("oi", **sem)
+    assert r.returncode == 0 and "Com você: 2" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
+    assert a.orq("status", **sem).returncode == 0
+    antes = open(a.env["ORQ_BACKLOG"]).read()
+    r = a.orq("pend", "add", "--id", "novo", "--tipo", "acao", "--titulo", "X", **sem)
+    assert r.returncode == 1 and "tasks-axi" in r.stderr and open(a.env["ORQ_BACKLOG"]).read() == antes
+    exe, d = _fake_tasks_axi("0.2.5")
+    r = a.orq("pend", "done", "avisar-x", ORQ_TASKS_AXI=exe)
+    assert r.returncode == 1 and "0.2.6" in r.stderr and open(a.env["ORQ_BACKLOG"]).read() == antes and not os.path.exists(os.path.join(d, "chamadas"))
+    q = [_pergunta("freio-prod", [("A", "x"), ("B", "y")])]
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "A"}), ORQ_TASKS_AXI=exe)
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert r.returncode == 0 and "não consegui fechar freio-prod no backlog" in ctx and "orq pend done freio-prod" in ctx, (r.stdout, r.stderr)
+    assert "freio-prod" in _bl_itens(a) and _bl_itens(a)["freio-prod"]["estado"] == "queued", "a decisão segue aberta"
+    assert len([e for e in a.events() if e["tipo"] == "pend" and e["pend"] in ("novo", "avisar-x") and e["op"] == "done"]) == 0
+
+
+def test_ticket101_m3_orq_backlog_diz_o_estado_e_sem_a_variavel_diz_que_esta_desligado():
+    a = _amb_bl()
+    out = json.loads(a.orq("backlog", "--json").stdout)
+    assert out["tasks-axi"] == "0.2.6 ok" and out["queued"] == 2 and out["pendencias vivas"] == 2 and out["tickets lidos do backlog"] is False, out
+    off = a.orq("backlog", ORQ_BACKLOG="")
+    assert "desligado" in off.stdout and off.returncode == 0
+
+
+def test_ticket101_m3_lavish_resposta_fecha_a_decisao_no_backlog():
+    a = _amb_bl()
+    r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "freio-prod", "resposta": "Teto por pod", "disposicao": "escolha"}]))
+    assert r.returncode == 0, r.stderr
+    assert [i["id"] for i in _pend(a)["itens"]] == ["avisar-x"] and _bl_itens(a)["freio-prod"]["estado"] == "done"
+    assert _bl_itens(a)["freio-prod"]["corpo"].endswith("Teto por pod")
+
+
+def test_ticket101_m3_precompact_lista_as_pendencias_do_backlog_e_nao_do_espelho():
+    import precompact
+    a = _amb_bl()
+    a.set("../pendencias.json", {"itens": []})
+    velho = orq_mod.BACKLOG
+    orq_mod.BACKLOG = a.env["ORQ_BACKLOG"]
+    try:
+        txt = precompact.secao_pendencias()
+    finally:
+        orq_mod.BACKLOG = velho
+    assert "freio-prod [decisao]" in txt and "avisar-x [avisar]" in txt, txt
+
+
+# ---- M4: digest e painel ----
+
+def test_ticket101_m4_digest_monta_pendencias_e_tickets_orq_do_backlog_com_o_mesmo_contrato():
+    a = Amb(run="run_a")
+    _issues_101(a)
+    a.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao", "titulo": "Freio", "detalhe": "d", "desde": "2026-09-30"},
+                                          {"id": "futura", "tipo": "acao", "titulo": "Adiada", "ate": "2999-01-01", "desde": "2026-09-30"}]})
+    os.makedirs(os.path.join(a.home, "..", "orq"), exist_ok=True)
+    a.set("../orq/aberto.json", _aberto_ag("rodando"))
+    base = _json_digest(a)
+    saida = os.path.join(a.tmp.name, "data", "backlog.md")
+    assert _converte(a, saida).returncode == 0
+    a.env["ORQ_BACKLOG"], a.env["ORQ_BACKLOG_TICKETS"] = saida, "1"
+    a.set("../pendencias.json", {"itens": []})  # o espelho vazio e a pasta de tickets removida provam que a fonte é o backlog
+    shutil.rmtree(a.env["ORQ_ISSUES"])
+    novo = _json_digest(a)
+    assert sorted(novo) == sorted(base) and novo["pendencias"] == base["pendencias"]
+    assert [(p["id"], p["depois"]) for p in novo["pendencias"]] == [("freio-prod", False), ("futura", True)]
+    assert sorted(novo["tickets_orq"]) == sorted(base["tickets_orq"]) == ["abertos", "resolvidos"]
+    ab = {t["num"]: t for t in novo["tickets_orq"]["abertos"]}
+    assert sorted(ab) == ["02", "03", "04", "05"] and ab["02"]["grupo"] == "pronto" and ab["04"]["grupo"] == "andamento", ab
+    assert (ab["03"]["grupo"], ab["03"]["bloqueios"]) == ("bloqueado", ["02"]) and ab["04"]["task"] == "task_d4" and ab["03"]["arquivo"].endswith("issues/03-x.md")
+    assert [(t["num"], t["em"]) for t in novo["tickets_orq"]["resolvidos"]] == [("01", "2026-09-25")], "a data é a do fechamento no backlog, não a do arquivo"
+    assert json.load(open(a.env["ORQ_PENDENCIAS"]))["itens"] == [], "o digest só lê: o espelho não foi tocado"
+
+
+def test_ticket101_m4_resumo_e_cartao_leem_as_pendencias_do_backlog():
+    a = _amb_bl()
+    assert "Com você: 2" in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    a.set("../pendencias.json", {"itens": []})
+    assert "Com você: 2" in json.loads(a.prompt("de novo").stdout)["hookSpecificOutput"]["additionalContext"], "o espelho vazio não conta: vale o backlog"
+    assert a.orq("resumo").returncode == 0
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

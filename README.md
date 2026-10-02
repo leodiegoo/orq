@@ -99,7 +99,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - Tickets as markdown files (`orq ticket novo|fechar|lista`), each backed by an Orca task with dependencies. Closing a ticket frees what waited on it: `orq ticket fechar` removes the number from the `Blocked by:` line of every dependent, moves the dependent's Orca task from `blocked` to `ready`, and reports the ones left with no blocker as `liberados` (also a line in `orq status` — `liberados: 88, 91 (P1, P2)` — until the ticket is dispatched). A freed ticket of priority 1 or 2 whose header declares `Modelo:` and `Effort:` goes into the dispatch queue (ticket 79) and the manager starts it when a slot opens; without them the command only warns, and priority 3 never starts by itself.
 - `orq doctor tasks [--dry-run] [--json]` crosses the open Orca tasks of every Run with the tickets: a `blocked` or `pending` task whose ticket is resolved becomes `completed` with `supersededBy`, and one with no ticket is listed for the coordinator to decide.
 - No manual `run-use`. `orq ticket novo`, `steer`, `liberar` (and `ticket fechar`, `doctor tasks`) bind the Run of the task themselves and, when they finish, bind back the Run that was bound before. With the agent manager linked nothing is switched (that would take the coordinator out of the Run the manager holds); the refusal still names `orq gerente ligar`.
-- A pending list for the user (`orq pend add|done`), stored as JSON for a dashboard to read. A decision can hold an Orca gate on a task until it is answered.
+- A pending list for the user (`orq pend add|lista|done|edit`), stored as JSON for a dashboard to read, or in a tasks-axi backlog (`ORQ_BACKLOG`, see "Backlog"). A decision can hold an Orca gate on a task until it is answered.
 - AskUserQuestion guard. While any worker is running, the question widget is refused and the decision goes through a separate page (see [design](docs/design.md#askuserquestion-guard)). It is the `python3 ~/.claude/orq/orq.py hook ask` PreToolUse hook (matcher `AskUserQuestion`), already in `settings.hooks.example.json`; with away mode on the same hook denies the box even with no worker running (ticket 126), so there is nothing new to register in `settings.json`.
 - Compaction handoff. `precompact.py` snapshots the coordinator's state on PreCompact and injects it back after `/compact`; `orq hook session` injects status and open tickets on every session start.
 - `worker-routing` skill plus a PreToolUse guard that refuses `orca orchestration worker-start`, `orq despachar` or an Agent call without an explicit model and effort.
@@ -111,7 +111,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 - [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
 - git
 
-Optional: `gh` (open PRs in the handoff, branch cleanup), `engram` (the handoff is also saved there), and `lavish-axi` if you want to use the decision page the guard points to. `orq perguntar` runs `lavish-axi` itself; the rest only parses its `poll` output in `orq lavish-resposta`.
+Optional: Node 20+ and `tasks-axi@0.2.6` (`npm i -g tasks-axi@0.2.6`), only if you set `ORQ_BACKLOG` (see "Backlog"); `gh` (open PRs in the handoff, branch cleanup), `engram` (the handoff is also saved there), and `lavish-axi` if you want to use the decision page the guard points to. `orq perguntar` runs `lavish-axi` itself; the rest only parses its `poll` output in `orq lavish-resposta`.
 
 ## Install
 
@@ -154,7 +154,8 @@ Closed PRs without a merge (ticket 104). When every PR linked to a task is close
 | `~/.claude/orq/` | runtime state: `events.jsonl`, `cursor.json`, `aberto.json`, `gerente.json`, `gerente-vivo` (the manager panel's heartbeat), locks, `handoff/` (all gitignored) | `ORQ_HOME` |
 | `~/.claude/orquestrador-plan/issues/` | tickets, `NN-<slug>.md` | `ORQ_ISSUES` |
 | `~/.claude/orquestrador-plan/desenho.md` | your own design notes; orq only prints this path at session start and in the handoff | `ORQ_MAPA`, `ORQ_DESENHO` (precompact) |
-| `~/.claude/dashboard/data/pendencias.json` | the user's pending list | `ORQ_PENDENCIAS` |
+| `~/.claude/dashboard/data/pendencias.json` | the user's pending list (with `ORQ_BACKLOG`, a mirror the dashboard reads) | `ORQ_PENDENCIAS` |
+| `backlog.md` (you pick the path, outside this repo) | the tasks-axi backlog: pending items, and a snapshot of the tickets until stage 2 | `ORQ_BACKLOG` (`ORQ_BACKLOG_TICKETS=1` reads tickets from it too, `ORQ_TASKS_AXI` the binary) |
 | `~/.claude/logs/orq.log` | errors from hooks that failed open | `ORQ_LOG` |
 | `~/.claude/projects/` | Claude Code transcripts, read by `orq liberar` and `orq retro` | `ORQ_PROJETOS` |
 | `~/.claude/orq/groups/` | one JSON per group of projects with a secondmate (ticket 80) | `ORQ_HOME` |
@@ -247,10 +248,11 @@ The user's pending list:
 ```sh
 $ orq pend add --id pick-db --tipo decisao --titulo "Postgres or SQLite for sessions?" --task task_abc123
 $ orq pend add --id rotate-key --tipo acao --titulo "Rotate the staging API key" --espera "ops team"
+$ orq pend edit rotate-key --titulo "Rotate the production API key" --ate 2026-10-10
 $ orq pend done pick-db --resposta "Postgres"
 ```
 
-`--tipo` is `acao`, `decisao` or `avisar`. A decision id is at most 12 characters because it doubles as the AskUserQuestion `header`, and answering that question closes it. `--task` creates an Orca gate that holds the task until the decision closes.
+`--tipo` is `acao`, `decisao` or `avisar`. A decision id is at most 12 characters because it doubles as the AskUserQuestion `header`, and answering that question closes it. `--task` creates an Orca gate that holds the task until the decision closes. `orq pend edit <id>` corrects `--titulo`, `--detalhe`, `--frente`, `--link`, `--comando`, `--espera` and `--ate` of a live item (an empty value clears the field) and logs a `pend`/`edit` event.
 
 Status at any time (the same summary the prompt hook injects):
 
@@ -303,6 +305,24 @@ python3 scripts/limpar-mergeados.py --self-test
 Editing orq: hooks and the manager panel execute `~/.claude/orq/orq.py` while it runs, so a half-edited file stops them (the panel once died ten laps in a row on a `NameError`). Work in a separate worktree (`git worktree add ../orq-<topic>`), run the tests there, and move the live copy only through `scripts/integrar.py <branch>...` (never `git merge`, `git pull` or `git checkout` inside `~/.claude/orq`): it merges in `~/.claude/orq-wt/integra-<branches>`, runs the tests there and advances `main` by fast-forward only when they pass; on a conflict you resolve in that worktree, commit, and run `integrar.py --avancar <worktree>`. If `orqlib.py` still fails to import, the hooks (`orq.py hook`, `precompact.py`, `limpar-mergeados-hook.py`) exit 0 with no output and log `import falhou` to `~/.claude/logs/orq.log` instead of breaking the worker's turn. See `docs/design.md`, "Integrating branches outside the live checkout". The panel writes `gerente-vivo` on every lap from its own shell; `orq status`, `orq resumo` and the prompt hook warn when it is older than 60 s.
 
 Audience check: `git config core.hooksPath githooks` runs `scripts/audiencia-check.py` before each commit. It scans tracked files for the terms in a private list outside the repo (`ORQ_TERMOS`, default `~/.claude/orquestrador-plan/termos-proibidos.txt`: one term per line, `re:` prefix for a regex) and prints `file:line`. Without the list it skips with a warning.
+
+## Backlog
+
+Optional, stage 1 of moving the register to [tasks-axi](https://github.com/kunchenguid/tasks-axi) (ticket 101; design in `docs/design.md`, "Backlog in the tasks-axi format"). With `ORQ_BACKLOG` unset nothing changes. With it set to a `backlog.md` path:
+
+- The pending list lives in the backlog (`repo: pend`, one item per pending entry, the user's hold as a tasks-axi hold). `orq pend add|lista|done|edit`, the AskUserQuestion hook, `orq lavish-resposta`, `orq perguntar`, the status line, the digest and the compaction handoff all read and write it, and `pendencias.json` is regenerated after every change for the dashboard.
+- Reads are done in Python (`backlog.py`, about 7 ms for the whole backlog); the hooks never start `tasks-axi`. Writes call the `tasks-axi` CLI and are refused unless `tasks-axi --version` is exactly `0.2.6`. A symlinked `backlog.md` is refused too.
+- `orq backlog [--json]` shows the path, whether the CLI version is the right one, and the counts.
+- `ORQ_BACKLOG_TICKETS=1` also makes `tickets()` read the backlog (so the digest's `tickets_orq` and the session summary come from it). Use it only after stage 2: `orq ticket novo|fechar` and `orq despachar` still write the ticket files, so until then the tickets in the backlog are a snapshot.
+
+Migrate with a rehearsal on a fresh file, then point `ORQ_BACKLOG` at it:
+
+```sh
+python3 ~/.claude/orq/scripts/converte-backlog.py --saida /tmp/ensaio/backlog.md   # reads ORQ_ISSUES, ORQ_PENDENCIAS, events.jsonl; never writes them
+ORQ_BACKLOG=/tmp/ensaio/backlog.md orq backlog
+```
+
+The script writes only to a new file, runs `tasks-axi render`, and exits 1 if Done, blocking edges or ready counts differ from the sources. It also writes a `.tasks.toml` with a high `done_keep` next to the backlog, so the archive never takes tickets orq still reads. Do not install the tasks-axi SessionStart hook (`tasks-axi setup hooks`): it runs in every session and injects the whole panel; `orq hook session` already injects the lines that matter.
 
 ## Projects
 
