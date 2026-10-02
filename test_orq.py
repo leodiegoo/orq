@@ -13287,3 +13287,47 @@ if __name__ == "__main__":
     print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
     sys.exit(1 if falhas else 0)
 
+
+
+
+
+# ---------- ticket 135: orq servico marcar ----------
+
+def _legado135(a):
+    """O integrador despachado antes do --servico: worker_done dado, terminal aberto, despacho sem a marca, ticket 83 aberto."""
+    _tk105(a, "83", "Integrador legado", status="claimed", task="task_term_int", extra=MODELO105)
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude"}])
+    a.caixa(("worker_done", {"taskId": "task_term_int", "dispatchId": "ctx_term_int"}))
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_term_int", "dispatch": "ctx_term_int", "titulo": "Integrador", "ticket": "83"}) + "\n")
+    with open(os.path.join(a.home, "aberto.json"), "w") as f:  # o cache que o Stop lê
+        json.dump({"agentes": list(_agentes(a).values())}, f)
+
+
+def test_ticket135_dispatch_legado_sem_servico_aparece_no_stop_ate_marcar():
+    a = Amb(run="run_a")
+    a.orq("away", "on")
+    _legado135(a)
+    out = _stop126(a)
+    assert out["decision"] == "block" and "ctx_term_int" in out["reason"] and "ticket 83" in out["reason"], out
+    assert _agentes(a)["ctx_term_int"]["estado"] == "entregue"
+    r = a.orq("servico", "marcar", "ctx_term_int")
+    assert r.returncode == 0, r.stderr
+    assert _agentes(a)["ctx_term_int"]["estado"] == "servico"
+    assert "ctx_term_int" not in _stop126(a).get("reason", ""), "marcado, o Stop não o cita mais"
+    assert "serviço, nenhum ciclo ainda" in a.orq("agentes").stdout and "orq liberar" not in a.orq("agentes").stdout
+
+
+def test_ticket135_servico_marcar_recusa_dispatch_inexistente_ou_liberado():
+    a = Amb(run="run_a")
+    r = a.orq("servico", "marcar", "ctx_nao_existe")
+    assert r.returncode == 1 and "conhecido" in r.stderr and not [e for e in a.events() if e["tipo"] == "servico_marcado"], r.stderr
+    _agentes_env(a)
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_l1", "dispatch": "ctx_term_l1"}) + "\n" +
+                json.dumps({"tipo": "liberar", "dispatch": "ctx_term_l1", "fechado": True}) + "\n")
+    r = a.orq("servico", "marcar", "ctx_term_l1")
+    assert r.returncode == 1 and "liberado" in r.stderr, r.stderr
+

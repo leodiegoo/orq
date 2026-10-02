@@ -439,12 +439,23 @@ def _ticket_do_dispatch(events):
 
 
 def _servicos(events):
-    """{dispatch: último ciclo {ts, hash, nota} ou None} dos dispatches que o `orq despachar --servico` marcou (integrador, secondmate)."""
-    out = {e["dispatch"]: None for e in events if e.get("tipo") == "despacho" and e.get("servico") and e.get("dispatch")}
+    """{dispatch: último ciclo {ts, hash, nota} ou None} dos dispatches que o `orq despachar --servico` ou o `orq servico marcar` marcou (integrador, secondmate)."""
+    out = {e["dispatch"]: None for e in events if (e.get("tipo") == "despacho" and e.get("servico") or e.get("tipo") == "servico_marcado") and e.get("dispatch")}
     for e in events:
         if e.get("tipo") == "ciclo" and e.get("dispatch") in out:
             out[e["dispatch"]] = {k: e.get(k) for k in ("ts", "hash", "nota")}
     return out
+
+
+def servico_marcar(dispatch):
+    """Faz de um dispatch já despachado (antes de existir `--servico`) um dispatch de serviço: grava `servico_marcado`, que `_servicos` lê como o `--servico` do despacho.
+    ValueError se o dispatch não existe (nem despacho no log nem agente no aberto.json) ou já foi liberado."""
+    events = read_events()
+    if dispatch not in {e.get("dispatch") for e in events if e.get("tipo") == "despacho"} | {a.get("dispatch") for a in _dict(_read_json(_path("aberto.json"))).get("agentes") or [] if isinstance(a, dict)}:
+        raise ValueError(f"{dispatch} não é um dispatch conhecido (orq agentes)")
+    if dispatch in _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}:
+        raise ValueError(f"{dispatch} já foi liberado")
+    return append_event({"tipo": "servico_marcado", "dispatch": dispatch})
 
 
 def ciclo_feito(dispatch, hash_, nota=None):
@@ -9505,6 +9516,8 @@ def main(argv=None):
     fl.add_argument("--json", action="store_true")
     de.add_argument("--servico", action="store_true", help="worker de serviço (integrador, secondmate): segue vivo depois do worker_done e reporta cada ciclo com orq ciclo feito")
     cc = sub.add_parser("ciclo", help="worker de serviço: reporta um ciclo terminado (sem capability do Orca)").add_subparsers(dest="op", required=True)
+    sv = sub.add_parser("servico", help="marca como serviço um dispatch que já existe").add_subparsers(dest="op", required=True).add_parser("marcar", help="orq servico marcar <dispatch>: o mesmo efeito do --servico no despacho")
+    sv.add_argument("dispatch")
     cf = cc.add_parser("feito", help="orq ciclo feito --dispatch <id> --hash <commit> [--nota <texto>]")
     cf.add_argument("--dispatch", required=True)
     cf.add_argument("--hash", required=True)
@@ -9784,6 +9797,8 @@ def main(argv=None):
                 print("\n".join(f"{n}  {d['repo'] or '-'}  {d['harness'] or '-'}" + (f"  grupo {d['grupo']}" if d["grupo"] else "") +
                                 (f"  ambientes {' > '.join(d['ambientes'])} ({d['fluxo']}, produção {d['producao']})" if d["ambientes"] else "") +
                                 (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
+        elif a.cmd == "servico":
+            print(json.dumps(servico_marcar(a.dispatch), ensure_ascii=False))
         elif a.cmd == "ciclo":
             print(json.dumps(ciclo_feito(a.dispatch, a.hash, a.nota), ensure_ascii=False))
         elif a.cmd == "integrar" and a.acao == "add":
