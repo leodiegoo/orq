@@ -16836,6 +16836,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("steer t txt --entrada e1", "steer t txt --entry e1"),
     ("pr ligar t http://u --nota n", "pr link t http://u --note n"),
     ("pr abrir d --titulo T --corpo c.md --ambientes a,b", "pr open d --title T --body c.md --environments a,b"),
+    ("pr evidencia 7 --antes a --depois d --cenarios c.json", "pr evidence 7 --before a --after d --scenarios c.json"),
     ("pr lista --task t", "pr list --task t"),
     ("pr desligar t http://u", "pr unlink t http://u"),
     ("pr poll --forcar", "pr poll --force"),
@@ -18592,6 +18593,145 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
     assert found == [("01", True), ("04", False)], found
     r = a.orq("phase", "#2039 fase 1")
     assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
+# ---------- ticket 219: visual evidence of the PR ----------
+
+FAKE_GH219 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+a = sys.argv[1:]
+open(os.path.join(d, "gh.log"), "a").write(json.dumps(a) + "\\n")
+data = json.load(open(os.path.join(d, "gh.json")))
+state_file = os.path.join(d, "comments.json")
+comments = json.load(open(state_file)) if os.path.exists(state_file) else []
+body = next((x[5:] for x in a if x.startswith("body=")), None)
+if a[0] == "pr" and a[1] == "view":
+    print(json.dumps(data[a[2]]))
+elif "/contents/" in a[1]:
+    print(json.dumps({"type": "file", "size": 5}))
+elif a[1].endswith("/comments?per_page=100"):
+    print(json.dumps(comments))
+elif "/issues/comments/" in a[1]:
+    c = next(c for c in comments if str(c["id"]) == a[1].rsplit("/", 1)[1])
+    c["body"] = body
+    json.dump(comments, open(state_file, "w")); print(json.dumps(c))
+else:
+    c = {"id": len(comments) + 1, "body": body, "html_url": "https://github.com/acme/app/pull/300#issuecomment-%d" % (len(comments) + 1)}
+    json.dump(comments + [c], open(state_file, "w")); print(json.dumps(c))
+"""
+PR219 = "https://github.com/acme/app/pull/300"
+
+
+def _ui219(diff="web/app/page.tsx", evidence="y"):
+    a = _open_pr143()
+    with open(os.path.join(a.tmp.name, "git143"), "a") as f:
+        f.write('elif a[0] == "diff":\n    print(os.environ.get("FAKE_DIFF", ""))\n')
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json")) as f:
+        project = json.load(f)
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
+        json.dump({**project, "caminhos_ui": ["web/app/**"]}, f)
+    a.env["FAKE_DIFF"] = diff
+    open(a.body_text, "w").write(f"## Summary\nx\n\n## Evidence\n{evidence}\n\n## Merge Danger\nz\n")
+    return a
+
+
+def test_ticket219_pr_open_refuses_empty_evidence_when_diff_touches_ui_paths():
+    a = _ui219(evidence="")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 1 and "Evidence" in r.stderr and "web/app/page.tsx" in r.stderr, r
+    assert not [c for c in _log143(a, "git.log") if c[0] == "push"] and not _log143(a, "gh.log"), "nothing goes up"
+
+
+def test_ticket219_pr_open_accepts_na_with_reason_and_opens_no_obligation():
+    a = _ui219(evidence="n/a: copy change only")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    assert not [e for e in a.events() if e.get("tipo") == "obrigacao"]
+    a = _ui219(evidence="n/a:")
+    assert _open_pr(a, "--ambientes", "development").returncode == 1, "n/a without a reason is empty"
+
+
+def test_ticket219_pr_open_ignores_evidence_when_diff_has_no_ui_path():
+    a = _ui219(diff="server/x.py", evidence="")
+    assert _open_pr(a, "--ambientes", "development").returncode == 0
+
+
+def test_ticket219_pr_open_with_ui_diff_creates_the_evidencia_obligation():
+    a = _ui219()
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    (o,) = [e for e in a.events() if e.get("tipo") == "obrigacao" and e["op"] == "nova"]
+    assert (o["chave"], o["url"], o["task"]) == ("evidencia", PR219, "task_feat"), o
+
+
+def _evidence219(extra_obligation=True):
+    a = Env(run="run_a")
+    _neo(a)
+    path = os.path.join(a.tmp.name, "gh219")
+    open(path, "w").write(FAKE_GH219)
+    os.chmod(path, 0o755)
+    a.env["ORQ_GH"] = path
+    remote = os.path.join(a.tmp.name, "remote.git")
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    a.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{remote}.insteadOf", GIT_CONFIG_VALUE_0="https://github.com/acme/app.git")
+    a.remote = remote
+    _pr(a, PR219)
+    assert a.orq("pr", "ligar", "task_feat", PR219).returncode == 0
+    for side in ("antes", "depois"):
+        os.makedirs(os.path.join(a.tmp.name, side))
+        open(os.path.join(a.tmp.name, side, "home.png"), "wb").write(side.encode())
+    a.dirs = [os.path.join(a.tmp.name, "antes"), os.path.join(a.tmp.name, "depois")]
+    a.scenarios = os.path.join(a.tmp.name, "cenarios.json")
+    json.dump([{"name": "home", "before": "fail", "after": "pass", "live": True, "evidence": "home.png"},
+               {"name": "settings", "before": "untested", "after": "untested", "live": False}], open(a.scenarios, "w"))
+    if extra_obligation:
+        with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"tipo": "entrada", "id": "e900", "origem": "evidencia", "texto": "x", "task": "task_feat"}) + "\n")
+            f.write(json.dumps({"tipo": "obrigacao", "op": "nova", "entrada": "e900", "chave": "evidencia", "texto": "x", "task": "task_feat", "url": PR219}) + "\n")
+    return a
+
+
+def _evidence219_run(a):
+    return a.orq("pr", "evidencia", PR219, "--antes", a.dirs[0], "--depois", a.dirs[1], "--cenarios", a.scenarios)
+
+
+def _remote219(a, *args):
+    return subprocess.run(["git", "-C", a.remote, *args], capture_output=True, text=True).stdout.split()
+
+
+def test_ticket219_pr_evidence_creates_orphan_branch_pins_links_to_sha_and_comments_once():
+    a = _evidence219()
+    r = _evidence219_run(a)
+    assert r.returncode == 0, r.stderr
+    (sha,) = _remote219(a, "rev-parse", "evidence/pr-300")
+    assert _remote219(a, "rev-list", "--parents", "evidence/pr-300") == [sha], "orphan branch: one commit with no parent"
+    assert _remote219(a, "ls-tree", "-r", "--name-only", sha) == ["pr-300/after-home.png", "pr-300/before-home.png"]
+    comments = json.load(open(os.path.join(a.fake, "comments.json")))
+    assert len(comments) == 1 and f"blob/{sha}/pr-300/after-home.png?raw=true" in comments[0]["body"], comments
+    assert "## Evidence: inconclusive" in comments[0]["body"] and "not run live" in comments[0]["body"], comments[0]["body"]
+    assert f"ref={sha}" in open(os.path.join(a.fake, "gh.log")).read(), "each file is checked at the SHA"
+    r2 = _evidence219_run(a)
+    assert r2.returncode == 0 and len(json.load(open(os.path.join(a.fake, "comments.json")))) == 1, "re-running updates, does not duplicate"
+    assert _remote219(a, "rev-parse", "evidence/pr-300") == [sha], "same files, same commit"
+    open(os.path.join(a.dirs[1], "home.png"), "wb").write(b"changed")
+    assert _evidence219_run(a).returncode == 0
+    (new,) = _remote219(a, "rev-parse", "evidence/pr-300")
+    assert new != sha and _remote219(a, "rev-list", "--parents", new) == [new, sha, sha], "the old SHA stays in history"
+
+
+def test_ticket219_pr_evidence_closes_the_evidencia_obligation_with_the_comment_url():
+    a = _evidence219()
+    assert _evidence219_run(a).returncode == 0
+    (done,) = [e for e in a.events() if e.get("tipo") == "obrigacao" and e["op"] == "feito"]
+    assert (done["chave"], done["prova"]) == ("evidencia", PR219 + "#issuecomment-1"), done
+
+
+def test_ticket219_evidence_verdict_never_turns_untested_or_not_live_into_pass():
+    v = orq_mod.evidence_verdict
+    assert v([]) == "no-surface"
+    assert v([{"after": "pass", "live": True}]) == "go"
+    assert v([{"after": "pass", "live": False}]) == "inconclusive"
+    assert v([{"after": "untested", "live": True}]) == "inconclusive"
+    assert v([{"after": "pass", "live": True}, {"after": "fail", "live": True}]) == "no-go"
 
 
 if __name__ == "__main__":
