@@ -3,10 +3,12 @@
 // O disco está em inglês (fase 2 da migração); a TUI lê com as chaves pt, como o orq: paraPt troca as chaves e valores pelo mapa do orqlib.py.
 import { existsSync, openSync, readFileSync, readSync, statSync, closeSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { idadeTexto, limitesDo, minutosDesde, nivelDe, type Idade } from "./idade"
 
 type Json = Record<string, any>
 
-export type Bloco = { id: string; titulo: string; linhas: string[] }
+/** `idades[i]` pinta a linha `i` na escala de cor da idade (ticket 345); sem ela a linha fica na cor do texto. */
+export type Bloco = { id: string; titulo: string; linhas: string[]; idades?: (Idade | undefined)[] }
 
 export type Estado = {
   agora: number
@@ -121,6 +123,12 @@ const idade = (iso: string | null | undefined, agora: number): string => {
   return s < 120 ? `${s} s` : s < 7200 ? `${Math.round(s / 60)} min` : `${Math.round(s / 3600)} h`
 }
 
+// a escala (machine.json) e os fatores por tipo (digest.idade) são os do orq; sem eles, os padrões
+const idadeDe = (e: Estado, desde: string | null | undefined, tipo: string, prioridade?: number): Idade | undefined => {
+  const min = minutosDesde(desde, e.agora)
+  return min === undefined ? undefined : { min, limites: limitesDo(e.maquinaCfg.age_colors, tipo, prioridade, e.digest?.idade?.fatores) }
+}
+
 const hora = (iso: string): string => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? "--:--" : d.toTimeString().slice(0, 5)
@@ -147,29 +155,44 @@ function workers(e: Estado): { lista: Json[]; fonte: string } {
 function blocoWorkers(e: Estado): Bloco {
   const { lista, fonte } = workers(e)
   const vivos = lista.filter((a) => ANDA.has(a.estado))
+  const idades = vivos.map((a) => idadeDe(e, a.desde, a.estado === "aguardando_integracao" ? "entrega" : "worker", a.prioridade))
   const linhas = vivos.map(
     (a) => `${corta(a.titulo ?? a.dispatch ?? "?", 52).padEnd(52)} ${String(a.modelo ?? "?").padEnd(18)} ${corta(String(a.fase ?? a.estado), 22).padEnd(22)} ${idade(a.desde, e.agora)}`,
   )
-  return { id: "workers", titulo: `Workers vivos (${vivos.length})${fonte}`, linhas: linhas.length ? linhas : ["nenhum"] }
+  return { id: "workers", titulo: `Workers vivos (${vivos.length})${fonte}`, linhas: linhas.length ? linhas : ["nenhum"], idades: linhas.length ? idades : undefined }
 }
 
 function blocoFilas(e: Estado): Bloco {
   const linhas: string[] = []
-  linhas.push(`integrador: ${e.integrar.length ? e.integrar.map((i) => `${i.ticket ? i.ticket + " " : ""}${i.branch}`).join(", ") : "vazia"}`)
-  linhas.push(`despacho: ${e.despacho.length ? e.despacho.map((i) => corta(i.titulo ?? i.id, 40)).join("; ") : "vazia"}`)
+  const idades: (Idade | undefined)[] = []
+  const add = (l: string, i?: Idade) => (linhas.push(l), idades.push(i))
+  const integrar = e.integrar.map((i) => ({ texto: `${i.ticket ? i.ticket + " " : ""}${i.branch}`, idade: idadeDe(e, i.ts, "integracao") }))
+  const despacho = e.despacho.map((i) => ({ texto: corta(i.titulo ?? i.id, 40), idade: idadeDe(e, i.ts, "fila", i.prioridade) }))
+  const velho = [...integrar, ...despacho].flatMap((i) => (i.idade ? [i.idade] : [])).sort((a, b) => b.min - a.min)[0]
+  if (velho) add(`fila: ${integrar.length + despacho.length} itens, o mais antigo ${idadeTexto(velho.min)}${nivelDe(velho) === "crit" ? " ▲" : ""}`, velho)
+  for (const [nome, itens] of [["integrador", integrar], ["despacho", despacho]] as const) {
+    if (!itens.length) add(`${nome}: vazia`)
+    for (const i of itens) add(`${nome}: ${i.texto}${i.idade ? "  " + idadeTexto(i.idade.min) : ""}`, i.idade)
+  }
   const passos = (e.digest?.fila ?? []).filter((p: Json) => !p.feito)
-  linhas.push(`merge: ${passos.length ? "" : "nada pendente"}`)
+  add(`merge: ${passos.length ? "" : "nada pendente"}`)
   for (const p of passos.slice(0, 5)) {
     const prs = (p.prs ?? []).filter((x: Json) => x.estado === "OPEN").map((x: Json) => `#${x.numero}→${x.base}`)
-    linhas.push(`  ${p.passo}. ${corta(p.nome ?? "", 70)}${prs.length ? "  " + prs.join(" ") : ""}`)
+    add(`  ${p.passo}. ${corta(p.nome ?? "", 70)}${prs.length ? "  " + prs.join(" ") : ""}`)
   }
-  return { id: "filas", titulo: "Filas", linhas }
+  return { id: "filas", titulo: "Filas", linhas, idades }
 }
 
 function blocoPendencias(e: Estado): Bloco {
   const pend = (e.digest?.pendencias ?? []).filter((p: Json) => !p.depois)
   const linhas = pend.slice(0, 8).map((p: Json) => `[${p.tipo}] ${corta(p.titulo ?? p.id, 90)}${p.desde ? `  (desde ${p.desde})` : ""}`)
-  return { id: "pendencias", titulo: `Pendências do usuário (${pend.length})`, linhas: linhas.length ? linhas : ["nenhuma"] }
+  const idades = pend.slice(0, 8).map((p: Json) => idadeDe(e, p.desde, "pendencia"))
+  for (const o of (e.digest?.idade?.obrigacoes ?? []).slice(0, 8)) {
+    const idade = idadeDe(e, o.desde, "obrigacao")
+    linhas.push(`[obrigação] ${o.entrada} ${o.chave}: ${corta(o.texto ?? "", 70)}${idade ? "  " + idadeTexto(idade.min) : ""}`)
+    idades.push(idade)
+  }
+  return { id: "pendencias", titulo: `Pendências do usuário (${pend.length})`, linhas: linhas.length ? linhas : ["nenhuma"], idades: linhas.length ? idades : undefined }
 }
 
 function blocoMaquina(e: Estado): Bloco {

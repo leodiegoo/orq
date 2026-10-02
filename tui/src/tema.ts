@@ -3,12 +3,12 @@
 import { spawnSync } from "node:child_process"
 
 export type Tema = "light" | "dark"
-export type Paleta = { fundo: string; texto: string; secundario: string; borda: string }
+export type Paleta = { fundo: string; texto: string; secundario: string; borda: string; idade: { warn: string; hot: string; crit: string } }
 
 // `fundo` só serve de referência para o teste de contraste; a TUI não o pinta.
 export const PALETAS: Record<Tema, Paleta> = {
-  dark: { fundo: "#1e1e1e", texto: "#e6e6e6", secundario: "#a0a0a0", borda: "#a0a0a0" },
-  light: { fundo: "#ffffff", texto: "#1f2328", secundario: "#57606a", borda: "#57606a" },
+  dark: { fundo: "#1e1e1e", texto: "#e6e6e6", secundario: "#a0a0a0", borda: "#a0a0a0", idade: { warn: "#d29922", hot: "#db6d28", crit: "#f85149" } }, // paleta GitHub escura, a mesma do painel
+  light: { fundo: "#ffffff", texto: "#1f2328", secundario: "#57606a", borda: "#57606a", idade: { warn: "#9a6700", hot: "#bc4c00", crit: "#cf222e" } }, // paleta GitHub clara
 }
 
 const luz = (hex: string): number => {
