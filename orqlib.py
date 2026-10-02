@@ -4565,6 +4565,9 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
             return f"o worker {a['dispatch']} entregou o ticket {n} e a entrega não foi integrada: `orq integrar fila add <branch> {n}`, depois libere o worker"
     if pendente:
         return pendente
+    desistido = away_desistidos(tks, events)
+    if desistido:
+        return desistido
     ciclo = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
     if ciclo and sem_push:
         return f"o ciclo do integrador ({str(ciclo.get('hash'))[:8]}) deixou {sem_push} commit(s) sem push: audite o diff e dê o push"
@@ -6398,6 +6401,15 @@ def ticket_fechar(numero, answer):
     return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso, "liberados": liberados}
 
 
+def _worktree_do_liberado(t):
+    """(worktree, name) com que o ticket liberado sobe da fila: `current` para ticket do orq (o bloco de worktree dele já diz onde trabalhar) e, para o de
+    projeto, worktree nova com `--name` do título (kebab, sem acento, até 40 letras): o Orca recusa new-top-level sem nome. Projeto do Run inválido levanta ValueError."""
+    projeto = projeto_do_despacho(None, t["run"])
+    if ticket_do_orq(t["titulo"], projeto):
+        return "current", None
+    return "new-top-level", _slug(t["titulo"])[:40].strip("-")
+
+
 def _libera_dependentes(n):
     """O ticket `n` acabou de ser resolvido: tira o número do `Blocked by:` de quem dependia dele (e os outros bloqueios já resolvidos).
 
@@ -6431,7 +6443,8 @@ def _libera_dependentes(n):
             avisos.append(f"ticket {t['num']} (P{prio}) liberado, fora da fila de despacho ({espera}): despache com orq despachar --ticket {t['num']}")
         elif prio < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
             try:
-                item["fila"] = _enfileirar_despacho(f"ticket {n} resolvido: liberou o {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], None, None, None, None, t, prio, "claude")["fila"]
+                wt, nome = _worktree_do_liberado(t)
+                item["fila"] = _enfileirar_despacho(f"ticket {n} resolvido: liberou o {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, nome, None, None, t, prio, "claude")["fila"]
             except (OSError, ValueError) as e:
                 avisos.append(f"ticket {t['num']} liberado, mas não entrou na fila de despacho ({e}): despache com orq despachar --ticket {t['num']}")
         elif prio < 3:
@@ -8922,6 +8935,38 @@ def _sobe_da_fila(it):
     return f"fila: {it['titulo']} retomado: {r['estado']}" + (f" ({r['aviso']})" if r.get("aviso") else "")
 
 
+def _comando_desistido(it):
+    """O comando para despachar à mão o item que a fila largou."""
+    if it.get("ticket"):
+        return f"orq despachar --ticket {it['ticket']}"
+    return f"orq despachar --run {it.get('run')} --titulo {shlex.quote(it.get('titulo') or '')} --spec-arquivo <spec>"
+
+
+def _avisa_desistiu(it, falhas, erro, cmd):
+    """Digita no coordenador, uma vez (o item sai da fila na desistência), que a fila largou o item, com o erro e o comando para despachar à mão. O Stop do
+    away segue cobrando até o item ser despachado (away_desistidos). Coordenador ocupado ou sem gerente: sobra o Stop."""
+    coord = it.get("coord") or _gerente_cfg().get("coordenador")
+    if coord:
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, OSError):
+            avisa_coordenador(coord, f"orq: a fila desistiu de {_cita(it.get('titulo'), 40)} ({falhas} erros). Despache à mão: {cmd}. Erro: {_cita(str(erro), 100)}")
+
+
+def away_desistidos(tks, events):
+    """Motivo (ou None) para o Stop do away: item que a fila de despacho largou (`desistiu`) e ninguém despachou depois. Ticket que saiu de ready ou foi
+    despachado (evento `despacho` com o ticket) sai; item sem ticket sai com um `despacho` do mesmo Run e título."""
+    abertos, por_num = {}, {t["num"]: t for t in tks}
+    for e in events:
+        if e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu":
+            abertos[e.get("ticket") or (e.get("run"), e.get("titulo"))] = e
+        elif e.get("tipo") == "despacho":
+            abertos.pop(e.get("ticket") or (e.get("run"), e.get("titulo")), None)
+    for k, e in abertos.items():
+        if e.get("ticket") and (por_num.get(k) or {}).get("status") != STATUS_NOVO:
+            continue
+        return f"a fila de despacho desistiu de {_cita(e.get('titulo'), 60)} ({_cita(str(e.get('erro')), 120)}): `{e.get('comando')}`"
+    return None
+
+
 def despacho_drenar(cfg=None, agora=None, so_isentos=False):
     """Uma volta da fila: sobe, por prioridade, o primeiro item que cabe (um por volta, para a memória mostrar o que o anterior custou antes do próximo).
 
@@ -8955,7 +9000,9 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
             segurado = str(e).startswith(("uso do plano", "modo noite"))
             falhas = it.get("falhas", 0) + (0 if segurado else 1)
             if falhas >= FALHAS_FILA:
-                fila_despacho_rm(it["id"], "desistiu", erro=str(e))
+                cmd = _comando_desistido(it)
+                fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), run=it.get("run"), comando=cmd)
+                _avisa_desistiu(it, falhas, e, cmd)
                 linhas.append(f"fila: {it['titulo']} saiu da fila depois de {falhas} erros ({e}); despache de novo à mão")
                 continue
             _fila_despacho_mut(lambda xs, it=it, falhas=falhas, segurado=segurado: [x.update(falhas=falhas, nao_antes=agora + ESPERA_SEGURADO_S if segurado else 0)

@@ -362,6 +362,8 @@ elif cmd == "worker-start":
     open(os.path.join(d, "started-env.log"), "a").write(json.dumps({k: os.environ.get(k) for k in ("GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1")}) + "\\n")
     if os.environ.get("FAKE_FAIL_START_MODEL") and os.environ["FAKE_FAIL_START_MODEL"] == opt("--model"):
         falha("model not available: " + str(opt("--model")))
+    if os.environ.get("FAKE_REQUIRE_NAME") and opt("--worktree") != "current" and not opt("--name") and not opt("--retry-of"):
+        falha("New worktrees require --name")  # como o Orca real: worktree nova sem nome
     ws = ler("workers.json", [])
     n = len(ws) + 1
     tid = opt("--task") or "task_novo%d" % n  # --task despacha uma task que já existe (a do ticket) em vez de criar outra
@@ -15357,6 +15359,59 @@ def test_ticket154_integrar_py_com_teste_vermelho_nao_fecha_nada():
     assert r.returncode != 0
     assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
     assert "Status: claimed" in _lido(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "ciclo")]
+def _liberado170(a, titulo="orq: Passagem escrita"):
+    """O 87 fecha e libera o 88 (P2, com Modelo/Effort), que entra na fila de despacho; o gerente está ligado e a frota vazia."""
+    _gerente(a)
+    _frota79(a)
+    _tk105(a, "87", "Origem", "claimed", task="task_87")
+    _tk105(a, "88", titulo, bloqueado="87", task="task_88", extra=MODELO105)
+    _tasks105(a, ("task_87", "dispatched"), ("task_88", "blocked"))
+    assert a.orq("ticket", "fechar", "87", "--answer", "feito").returncode == 0
+
+
+def test_ticket170_ticket_do_orq_liberado_sobe_da_fila_com_worktree_current():
+    a = _painel79()
+    _liberado170(a)
+    (it,) = _fila79(a)
+    assert it["worktree"] == "current" and "nome" not in it, it
+    a.orq("gerente", "absorver", FAKE_REQUIRE_NAME="1")
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == "current" and "--name" not in arg and not _fila79(a), arg
+
+
+def test_ticket170_ticket_de_projeto_liberado_sobe_com_name_do_titulo_em_kebab_sem_acento():
+    antes = orq_mod.projeto_do_despacho
+    orq_mod.projeto_do_despacho = lambda nome=None, run=None: "projeto-x"
+    try:
+        wt, nome = orq_mod._worktree_do_liberado({"run": "run_a", "titulo": "Ação nº 3: relatório de variação muito longo para caber"})
+    finally:
+        orq_mod.projeto_do_despacho = antes
+    assert wt == "new-top-level" and nome == "acao-no-3-relatorio-de-variacao-muito-lo" and len(nome) <= 40, (wt, nome)
+
+
+def test_ticket170_ticket_sem_projeto_liberado_tambem_sobe_com_name():
+    a = _painel79()
+    _liberado170(a, "Relatório de variação")
+    (it,) = _fila79(a)
+    assert (it["worktree"], it["nome"]) == ("new-top-level", "relatorio-de-variacao"), it
+    a.orq("gerente", "absorver", FAKE_REQUIRE_NAME="1")
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--name") + 1] == "relatorio-de-variacao", arg
+
+
+def test_ticket170_erro_do_worker_start_avisa_o_coordenador_uma_vez_e_o_stop_do_away_cobra_ate_despachar():
+    a = _painel79()
+    _liberado170(a)
+    for _ in range(orq_mod.FALHAS_FILA + 2):
+        a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL="claude-sonnet-5-5")
+    assert not _fila79(a) and [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu"
+    (aviso,) = [e[e.index("--text") + 1] for e in _avisos_enviados(a) if "desistiu" in e[e.index("--text") + 1]]
+    assert "desistiu" in aviso and "orq despachar --ticket 88" in aviso and "model not available" in aviso, aviso
+    a.orq("away", "on")
+    out = _stop126(a)
+    assert out["decision"] == "block" and "desistiu" in out["reason"] and "orq despachar --ticket 88" in out["reason"], out
+    assert a.orq("despachar", "--run", "run_a", "--ticket", "88", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--worktree", "current").returncode == 0
+    assert orq_mod.away_desistidos(orq_mod.tickets(), a.events()) is None
 
 
 if __name__ == "__main__":

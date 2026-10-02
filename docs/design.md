@@ -408,6 +408,15 @@ Where it shows. `orq status` prints `Máquina: 3/4 workers (2/2 caros), 1 vagas 
 
 Known limits. `retomar` does not hold the lock while it resumes many workers, so a drain lap during it can overshoot the ceiling by one. A relaunch counts the live set at the start, not after the stop. Load average lags: a burst of builds shows up after the next worker is already starting, which is why the queue drains one item per lap.
 
+## A freed ticket never leaves the queue silent (ticket 170)
+
+On 01/10 the closing of tickets 101 and 141 queued 167 and 154 for automatic dispatch, and the manager gave both up within a minute with `New worktrees require --name`: the queue emptied, the tickets stayed `ready`, and nobody was told. Two causes, two fixes.
+
+- `_libera_dependentes` used `new-top-level` with no `--name`. `_worktree_do_liberado` now picks `current` for an orq ticket (ticket 136 already tells the worker where to work) and, for a project ticket, `new-top-level` plus `--name` from the title: `_slug`, cut to 40 letters, trailing dash removed.
+- `desistiu` was only an event. `despacho_drenar` now writes `ticket`, `run` and the hand-dispatch command into the event, and `_avisa_desistiu` types one notice into the coordinator (the item leaves the queue, so it cannot repeat). `away_desistidos` feeds `proximo_sem_usuario`, so the away Stop hook blocks while a `desistiu` has no later `despacho` for the same ticket (or Run and title) and the ticket is still `ready`.
+
+Known limit: a busy coordinator loses the typed notice; the Stop block is the net.
+
 ## Hibernating idle workers (ticket 60)
 
 A worker is a live `claude` (node plus the session's MCP servers) and keeps its memory while it waits at the prompt for hours: delivered and not released, waiting for the user's decision, for a PR merge, for someone else's E2E. Hibernating records the session and closes the terminal; waking resumes the same session. It reuses what `orq pausar` (ticket 51) and `orq retomar` (ticket 48) already do, and the state lives in `cursor.json` `hibernados` (`{dispatch: {task, run, titulo, agente, modelo, effort, sessao, cwd, terminal, entregue, motivo, desde, rss_liberado_mb}}`), so it survives an Orca crash. Orca does not learn about it: the task stays as it was, and `worktrees_ocupadas` still protects the worktree.
