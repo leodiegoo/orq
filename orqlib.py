@@ -7712,13 +7712,15 @@ def _steer(task, text_value, target, entry, request):
     return ev
 
 
-def send_back(target, reason, run=None):
+def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`: types it into its terminal (or resumes the session if the terminal is gone, or wakes the
     hibernated one), records `send_back` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new worker_done) and returns the task to `dispatched`.
     ValueError if `target` (task or dispatch) does not exist in the Run or the worker has no way to receive it."""
     run_ = default_run(run)
     if not run_:
         raise ValueError("no Run bound: pass --run and run run-use --id <r>")
+    if achado:  # `--achado`: the reason cites a review finding, so it carries the invariant rule
+        reason = f"{reason} {INVARIANT_RULE}"
     with _no_run(run_):
         t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
         if not t:  # task-list zeroes the dispatch_id of the completed task (ticket created with the backlog on); worker-list, which `agents` reads, still links task and dispatch
@@ -13416,12 +13418,50 @@ def _nm_usage(since):
     return {"achados": ach or 0, "tokens": {"entrada": entry_event or 0, "saida": sai or 0, "cache_lido": cl or 0, "cache_criado": cc or 0}}
 
 
-def review(task):
-    """`orq review <task>`: only the no-mistakes review in the task's worktree, with the cheap model from orq's NM_HOME.
+NM_DECISIONS_MAX = 4096  # the "decisions already taken" section of the intent
+INVARIANT_RULE = ("Fix the invariant, not the instance: before editing, write down the invariant the finding violates, list every place it holds (other path, other command, "
+                  "other consumer) and fix all of them in this same round, without building new machinery.")
 
-    `task` is the task id or the ticket number. Refuses on `pause` or `segura` from `orq usage` (any priority: the review is optional spend), under machine
-    pressure and without an expensive slot. The intent is the whole ticket text (or the dispatch title), through stdin (`--intent -`), never cut. Returns {task, worktree, modelo, effort, duracao_s, intent_bytes, nm_versao, achados, tokens, saida}
-    and records `revisao_nm` in events.jsonl. `output` is what `axi run` printed: the findings and the gate it stopped at."""
+
+def parse_decision(spec):
+    """`"<finding>=corrigir|ignorar[:reason]"` -> (finding, "corrigir"|"ignorar", reason); ValueError if it does not have that form."""
+    achado, _, rest = spec.partition("=")
+    decisao, _, reason = rest.partition(":")
+    if not achado.strip() or decisao.strip() not in ("corrigir", "ignorar"):
+        raise ValueError(f"--decidir expects \"<file:line or finding id>=corrigir|ignorar[:reason]\", got {spec!r}")
+    return achado.strip(), decisao.strip(), reason.strip()
+
+
+def review_intent(intent, decisions, new_commits):
+    """The ticket `intent` plus, when there are any, the recorded decisions of the branch (latest per finding, within NM_DECISIONS_MAX, oldest first) and the commits made
+    after the last reviewed head (`new_commits`: ["<sha> <subject>"]). Without either the intent comes back unchanged."""
+    out, size, kept = intent, 0, {}
+    for d in reversed(decisions):
+        kept.setdefault(d["achado"], d)
+    lines = []
+    for d in kept.values():  # newest first: what overflows the budget is the oldest
+        line = f"- {d['achado']}: {d['decisao']}" + (f" ({d['motivo']})" if d.get("motivo") else "")
+        if size + len(line) + 1 > NM_DECISIONS_MAX:
+            break
+        lines.append(line)
+        size += len(line) + 1
+    if lines:
+        out += ("\n\n## Decisions already taken, do not reopen\nThe coordinator decided these findings on earlier reviews of this branch; a recorded decision outranks the "
+                "intent text above. `ignorar` = discarded, do not report it again; `corrigir` = accepted, check it was fixed.\n" + "\n".join(reversed(lines)))
+    if new_commits:
+        out += ("\n\n## Commits since the last review\nThese commits are new code: review them with the same rigor as the rest. Fix summaries and tests from the same cycle "
+                "are claims, not proof.\n" + "\n".join(f"- {c}" for c in new_commits[:30]))
+    return out
+
+
+def _review_branch(wt, task):
+    """(branch, head) of the worktree; the branch falls back to the task id when git does not answer."""
+    branch = (_git(wt, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+    return (branch if branch and branch != "HEAD" else task), (_git(wt, "rev-parse", "HEAD") or "").strip() or None
+
+
+def _review_target(task):
+    """(ticket, task id, dispatch event, worktree) of `task` (id or ticket number); ValueError if it has no dispatch or the worktree is gone."""
     tk = next((t for t in tickets() if task in (t["num"], t["task"]) or task.zfill(2) == t["num"]), None)
     task = tk["task"] if tk and tk["task"] else task
     ev = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == task), None)
@@ -13430,12 +13470,35 @@ def review(task):
     wt = _worker_path(orca("worker-show", "--dispatch", ev["dispatch"], timeout=10))
     if not wt or not os.path.isdir(wt):
         raise ValueError(f"Orca does not give the worktree of dispatch {ev['dispatch']} ({wt or 'no path'}): was the folder already cleaned?")
+    return tk, task, ev, wt
+
+
+def review_decide(task, specs):
+    """`orq review <task> --decidir ...`: records one `achado_decisao` per spec on the task's branch and returns the events; the review itself does not run."""
+    _, task, _, wt = _review_target(task)
+    branch, _ = _review_branch(wt, task)
+    decisions = [parse_decision(s) for s in specs]
+    return [append_event({"tipo": "achado_decisao", "task": task, "branch": branch, "achado": a, "decisao": d, "motivo": m}) for a, d, m in decisions]
+
+
+def review(task):
+    """`orq review <task>`: only the no-mistakes review in the task's worktree, with the cheap model from orq's NM_HOME.
+
+    `task` is the task id or the ticket number. Refuses on `pause` or `segura` from `orq usage` (any priority: the review is optional spend), under machine
+    pressure and without an expensive slot. The intent is the whole ticket text (or the dispatch title), through stdin (`--intent -`), never cut. Returns {task, worktree, modelo, effort, duracao_s, intent_bytes, nm_versao, achados, tokens, saida}
+    and records `revisao_nm` in events.jsonl. `output` is what `axi run` printed: the findings and the gate it stopped at."""
+    tk, task, ev, wt = _review_target(task)
     usage_check(2)
     if tk:
         body_text = open(tk["arquivo"], encoding="utf-8").read().split("\n## ", 1)
         intent = _nm_intent(tk["titulo"], body_text[1]) if len(body_text) > 1 else tk["titulo"]
     else:
         intent = ev.get("titulo") or task
+    branch, head = _review_branch(wt, task)
+    events = read_events()
+    last = next((e for e in reversed(events) if e.get("tipo") == "revisao_nm" and e.get("branch") == branch and e.get("head") and not e.get("erro")), None)
+    new_commits = [c for c in (_git(wt, "rev-list", "--reverse", "--format=%h %s", "--no-commit-header", f"{last['head']}..HEAD") or "").splitlines() if c] if last else []
+    intent = review_intent(intent, [e for e in events if e.get("tipo") == "achado_decisao" and e.get("branch") == branch], new_commits)
     model, effort = _nm_model()
     os.makedirs(NM_HOME, exist_ok=True)
     if not os.path.exists(os.path.join(NM_HOME, "config.yaml")):
@@ -13462,7 +13525,7 @@ def review(task):
     usage = _nm_usage(t0)
     head = (_git(wt, "rev-parse", "HEAD") or "").strip() or None
     res = {"task": task, "worktree": wt, "head": head, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), "intent_bytes": len(intent.encode()), "nm_versao": nm_version, **usage, "saida": output}
-    append_event({"tipo": "revisao_nm", **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
+    append_event({"tipo": "revisao_nm", "branch": branch, **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
     if error:
         raise RuntimeError(error)
     if head:
@@ -13619,6 +13682,7 @@ def parser():
     dv.add_argument("target")
     dv.add_argument("reason")
     dv.add_argument("--run")
+    dv.add_argument("--achado", action="store_true", help="the reason cites a review finding: adds the invariant rule (write the invariant, list every place it holds, fix all in one round)")
     pr_ = sub.add_parser("prove-red", aliases=["provar-red"], help="orq prove-red <ticket|task> [--command CMD]: runs the test files the branch created or changed against the merge-base with the base (red expected) and then on the head, and records the `red_proof` event")
     pr_.add_argument("target")
     _arg(pr_, "comando", help="the test command, {file} is the file (default: python3 {file} for .py, npx --no-install jest {file} for JavaScript; the project's `tests.command` otherwise)")
@@ -13914,6 +13978,7 @@ def parser():
     rv = sub.add_parser("review", aliases=["revisar"], help="only the no-mistakes review in the task's worktree (ticket 146), with the cheap model of orq's NM_HOME; refuses on usage pause/hold and with no expensive slot")
     rv.add_argument("task", help="the task id or the ticket number")
     rv.add_argument("--json", action="store_true")
+    rv.add_argument("--decidir", "--decide", action="append", metavar="FINDING=corrigir|ignorar[:reason]", help="records a decision on a finding of this branch (repeatable) and does not run the review; the next review gets it in the intent")
     mq = sub.add_parser("machine", aliases=["maquina"], help="the machine budget (ticket 79): what it has now, what orq decides and the slots. `orq machine set <key> <value>` adjusts maquina.json")
     mq.add_argument("op", nargs="?", choices=["set"])
     mq.add_argument("key_name", nargs="?")
@@ -14051,7 +14116,7 @@ def main(argv=None):
             else:
                 print("\n".join(pr_poll(force=a.force)) or "no changes in the PRs")
         elif a.cmd == "send-back":
-            print(json.dumps(send_back(a.target, a.reason, a.run), ensure_ascii=False))
+            print(json.dumps(send_back(a.target, a.reason, a.run, a.achado), ensure_ascii=False))
         elif a.cmd == "prove-red":
             r = prove_red_ticket(a.target, a.command, a.worktree, a.base, a.timeout)
             print("\n".join([f"{f['arquivo']}: {RED_STATE[f['resultado']]}" + (f" ({f['motivo']})" if f.get("motivo") else "") for f in r["files"]]
@@ -14355,8 +14420,12 @@ def main(argv=None):
             ps = [p for p in mate_pending(read_events(), _mates(), datetime.now(timezone.utc)) if not a.group_name or p["grupo"] == a.group_name]
             print("\n".join(f"{p['corr']} {p['grupo']} {p['estado']}: {_quote(p['texto'])}" for p in ps) or "no unanswered request")
         elif a.cmd == "review":
-            r = review(a.task)
-            print(json.dumps(r, ensure_ascii=False) if a.json else review_text(r))
+            if a.decidir:
+                evs = review_decide(a.task, a.decidir)
+                print(json.dumps(evs, ensure_ascii=False) if a.json else "\n".join(f"recorded: {e['achado']} = {e['decisao']} (branch {e['branch']})" for e in evs))
+            else:
+                r = review(a.task)
+                print(json.dumps(r, ensure_ascii=False) if a.json else review_text(r))
         elif a.cmd == "machine" and a.op == "set":
             if not a.key_name or a.value is None:
                 raise ValueError("orq machine set <key> <value>")
