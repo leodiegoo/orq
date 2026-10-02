@@ -4446,7 +4446,7 @@ def no_terminal_line(open_state):
 def state(entry=None, include_old=False):
     events, cur, open_state = read_events(), _cursor_ro(), _read_json(_path("open.json"))
     txt = summary(events, open_state, _pending_ro(), entry, cursor=cur, turns=_turns_ro(), panel=panel_notice(), include_old=include_old)
-    return "\n".join([*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events), *filter(None, [released_line(events, tickets()), dispatch_wait_line(tickets(), events)])])
+    return "\n".join([*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events), *filter(None, [released_line(events, tickets()), dispatch_wait_line(tickets(), events)]), *wave_lines()])
 
 
 # ---------- digest e modo ausente ----------
@@ -8143,7 +8143,7 @@ def read_ticket(path):
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
             "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
             "projeto": _campo(cab, "Project") or _campo(cab, "Projeto") or None,
-            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None}
+            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None, "wave": None, "role": None}  # waves live only in the backlog (ticket 342)
 
 
 def _tickets_in_backlog():
@@ -8254,7 +8254,7 @@ def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
                 *(x for b in blockers for x in ("--blocked-by", f"t{b}")), "--body", body_text)
 
 
-def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None, project=None):
+def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None, project=None, wave=None, after=None):
     """Creates `ISSUES/NN-<slug>.md` from the title and the spec file, and the Orca task (`--task-title` equal to the title, a short `--spec` that
     points to the file, `--deps` with the tasks of the Blocked by still open). The `task_id` stays in the ticket, which is the only source of the content.
 
@@ -8265,6 +8265,9 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     written after the task: if the `add` fails, the file goes away and the task is completed with `desfeito` (undone). `model`, `effort`, `dispatch_mode` and `waiting` are the
     optional header fields (or the item's meta). `project` (`Project:`) is where the released ticket starts: `--project`, otherwise the Run's, otherwise the one that contains the
     coordinator's cwd; with none, no line (ticket 315).
+
+    `wave` N (or `after` <milestone>, which names the wave through its milestone; ticket 342) puts the task in a wave: it is blocked by the wave's milestone and the wave's join becomes
+    blocked by it. Only with tickets in the backlog; a wave whose join already closed takes no more tasks.
     """
     title = " ".join((title or "").split())
     if not title:
@@ -8285,8 +8288,26 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         body_text = f"## What to build\n\n{body_text}"
     existing = {t["num"]: t for t in tickets()}
     blockers = list(dict.fromkeys(n.zfill(2) for n in re.findall(r"\d+", blocked_by or "")))
+    join = None
+    if wave or after:
+        if not no_backlog:
+            raise ValueError("waves live in the backlog: set ORQ_BACKLOG and ORQ_BACKLOG_TICKETS")
+        if after:
+            m = existing.get(str(after).strip().zfill(2))
+            if not m or m.get("role") != "milestone":
+                raise ValueError(f"--after takes the number of a wave's milestone, and {after} is not one (orq wave list)")
+            wave = m["wave"]
+        w = next((x for x in waves() if x["wave"] == int(wave)), None)
+        if not w:
+            raise ValueError(f"wave {wave} does not exist: create it with orq wave new \"<name>\"")
+        if w["join"]["status"] == STATUS_CLOSED:
+            raise ValueError(f"wave {wave} is closed (its join {w['join']['num']} already closed): put the task in a later wave")
+        blockers = list(dict.fromkeys([*blockers, w["milestone"]["num"]]))
+        join = w["join"]["num"]
     target = default_run(run)
     meta = _meta_ticket(model, effort, dispatch_mode, waiting, dispatch_project(project, target))
+    if join:  # the wave of the task (ticket 342), after the meta that ticket 315 builds from the target Run
+        meta = {**meta, "wave": str(wave)}
     deps, notices = [], []
     for n in blockers:
         t = existing.get(n)
@@ -8324,6 +8345,11 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         if no_backlog:
             try:
                 _backlog_ticket_add(number, title, blockers, path, task, target, meta)
+                if join:  # the join waits for this task too
+                    try:
+                        backlog.cli(BACKLOG, "block", f"t{join}", "--by", f"t{number}")
+                    except backlog.BacklogError as e:
+                        notices.append(f"the join {join} of wave {wave} does not wait for this ticket ({e}): tasks-axi block t{join} --by t{number}")
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.remove(path)
@@ -8357,9 +8383,10 @@ def ticket_close(numero, answer):
     if _tickets_in_backlog():
         backlog.cli(BACKLOG, "done", _item_of_ticket(n)["id"], "--no-prune")
         try:
-            with open(t["arquivo"], encoding="utf-8") as f:
-                txt = f.read()
-            _write(t["arquivo"], txt.rstrip("\n") + f"\n\n## Answer\n\n{answer_text}\n")
+            if not t.get("role"):  # a wave's milestone or join has no spec file
+                with open(t["arquivo"], encoding="utf-8") as f:
+                    txt = f.read()
+                _write(t["arquivo"], txt.rstrip("\n") + f"\n\n## Answer\n\n{answer_text}\n")
         except (OSError, TypeError) as e:  # the item is already Done: the answer stays in the log and in the notice
             notice = f"the ## Answer did not make it into the ticket file ({getattr(e, 'strerror', None) or 'ticket without a spec'}): {_quote(answer_text, 80)}"
     else:
@@ -8388,7 +8415,8 @@ def ticket_close(numero, answer):
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in released]})
     for o in [o for o in open_obligations(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
         _close_obligation(o, "feito", prova=f"ticket {n} {STATUS_CLOSED}")  # orq fulfils it on its own and only records it
-    return {"ticket": n, "status": STATUS_CLOSED, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": closed_item, "aviso": notice, "liberados": released}
+    swept = wave_sweep()  # the close may have emptied the blockers of a join or of the next wave's milestone
+    return {"ticket": n, "status": STATUS_CLOSED, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": closed_item, "aviso": notice, "liberados": released, **({"ondas": swept} if swept else {})}
 
 
 def ticket_edit(numero, **fields):
@@ -8416,6 +8444,80 @@ def ticket_edit(numero, **fields):
     return {"ticket": n, "campos": sorted(fresh)}
 
 
+# ---------- waves and milestones (ticket 342): the delivery order as layers of the backlog ----------
+
+def waves():
+    """The waves, by number: [{wave, milestone, join, tasks}], each a ticket of `tickets()` (`tasks` is the list of those that carry `wave: N` and no role).
+
+    Wave N is the milestone (blocks the wave's tasks), the tasks and the join (blocked by the milestone and by every task). The next wave's milestone is blocked by this join, so the delivery
+    order is the order of the waves and the PRs' merge order (`merge_order`, from `Blocked by`) follows it with no extra rule."""
+    found = {}
+    for t in tickets():
+        if t.get("wave"):
+            w = found.setdefault(t["wave"], {"wave": t["wave"], "milestone": None, "join": None, "tasks": []})
+            if t["role"] == "milestone":
+                w["milestone"] = t
+            elif t["role"] == "join":
+                w["join"] = t
+            else:
+                w["tasks"].append(t)
+    return [found[k] for k in sorted(found) if found[k]["milestone"] and found[k]["join"]]
+
+
+def wave_new(name):
+    """Creates wave N+1: the milestone (blocked by the previous wave's join, if any) and the join (blocked by the milestone, so an empty wave does not close). The tickets are
+    plain backlog tickets with no spec and no Orca task; `ticket new --wave N` puts the tasks in. Returns {wave, milestone, join}."""
+    name = " ".join((name or "").split())
+    if not name:
+        raise ValueError("wave without a name")
+    if not _tickets_in_backlog():
+        raise ValueError("waves live in the backlog: set ORQ_BACKLOG and ORQ_BACKLOG_TICKETS")
+    if p := backlog.problem_title(name):
+        raise ValueError(p)
+    with _lock("ticket.lock"):  # the same lock as ticket new: no number is picked twice
+        ws = waves()
+        number = max((w["wave"] for w in ws), default=0) + 1
+        milestone, join = (f"{_largest_ticket() + k:02d}" for k in (1, 2))
+        for num, role, blockers in ((milestone, "milestone", [ws[-1]["join"]["num"]] if ws else []), (join, "join", [milestone])):
+            backlog.cli(BACKLOG, "add", f"t{num}", f"Wave {number}: {name} ({role})", "--kind", "ticket", *(x for b in blockers for x in ("--blocked-by", f"t{b}")),
+                        "--body", backlog.body_with_meta({"wave": number, "role": role}, None, backlog.META_TICKET))
+    append_event({"tipo": "ticket", "op": "onda", "onda": number, "marco": milestone, "juncao": join, "titulo": name})
+    wave_sweep()
+    return {"wave": number, "milestone": milestone, "join": join}
+
+
+def wave_sweep():
+    """Closes the milestones and joins whose blockers are all integrated, one by one (each close can free the next), and returns their numbers. A join with no task never closes:
+    an empty wave waits for its tasks. Nothing to do without waves, and the hooks pay one read of the backlog for it."""
+    closed = []
+    if not _tickets_in_backlog():
+        return closed
+    while True:
+        t = next((x for w in waves() for x in (w["milestone"], w["join"]) if x["status"] != STATUS_CLOSED and not x["blocked_by"] and (x["role"] == "milestone" or w["tasks"])), None)
+        if not t:
+            return closed
+        ticket_close(t["num"], "every blocker integrated")  # recurses into wave_sweep; the loop reads the backlog again and ends
+        closed.append(t["num"])
+
+
+def _wave_name(milestone):
+    return re.sub(r"^Wave \d+: | \(milestone\)$", "", milestone["titulo"])
+
+
+def wave_lines():
+    """One line per wave for `orq status` and the panel: closed (its join integrated), open (the milestone closed, tasks running) or waiting (blocked by the previous wave), with the
+    tasks integrated out of the total, what blocks the wave and the tasks still open. Empty without waves."""
+    out = []
+    for w in waves():
+        done = [t for t in w["tasks"] if t["status"] == STATUS_CLOSED]
+        state = "closed" if w["join"]["status"] == STATUS_CLOSED else "open" if w["milestone"]["status"] == STATUS_CLOSED else "waiting"
+        rest = [t["num"] for t in w["tasks"] if t["status"] != STATUS_CLOSED]
+        waits = w["milestone"]["blocked_by"]
+        out.append(f"wave {w['wave']} {_quote(_wave_name(w['milestone']), 40)}: {state}, {len(done)}/{len(w['tasks'])} integrated"
+                   + (f"; waits for {', '.join(waits)}" if waits else "") + (f"; open: {', '.join(rest)}" if rest else ""))
+    return out
+
+
 def _released_worktree(t, project):
     """(worktree, name) with which the released ticket goes up from the queue: `current` for an orq ticket with no project (its worktree block already says where to work) and, for
     a project one, a new worktree in the project's repo with `--name` from the title (kebab, no accents, up to 40 letters): Orca refuses new-top-level without a name. `current`
@@ -8440,7 +8542,7 @@ def _release_dependents(n, before=None):
     no_backlog = _tickets_in_backlog()
     depended = {x["num"] for x in (before or ts) if n in x["blocked_by"]}
     for t in ts:
-        if (t["num"] not in depended if no_backlog else n not in t["blocked_by"]) or t["status"] == STATUS_CLOSED:
+        if (t["num"] not in depended if no_backlog else n not in t["blocked_by"]) or t["status"] == STATUS_CLOSED or t.get("role"):  # a wave's milestone or join is closed by `wave_sweep`, never dispatched
             continue
         remaining_blocks = [b for b in t["blocked_by"] if b != n and status.get(b) != STATUS_CLOSED]
         if not no_backlog:
@@ -12817,7 +12919,7 @@ def manager_state_write(line_list):
         log(f"gerente estado: agentes: {type(e).__name__}: {e}")
         agent_rows = None
     _write_json(_path(SERVE_STATE), {"ts": now(), "pid": int(os.environ.get("ORQ_SERVE_PID") or 0) or None, "terminal": _manager_cfg().get("gerente"),
-                                      "linhas": [x for x in line_list.splitlines() if x], "agentes": agent_rows,
+                                      "linhas": [x for x in line_list.splitlines() if x], "agentes": agent_rows, "ondas": wave_lines(),
                                       "maquina": {"cfg": machine_cfg(), "leitura": machine_read()}})
 
 
@@ -13617,7 +13719,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
          "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "provar-red": "prove-red", "revisar": "review", "caixa": "inbox",
-         "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase"},
+         "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase", "onda": "wave"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
     "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink", "evidencia": "evidence"},
@@ -13632,6 +13734,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "integrate": {"fila": "queue", "concluir": "conclude"},
     "integrate queue": {"lista": "list"},
     "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
+    "wave": {"novo": "new", "lista": "list"},
     "manager": {"ligar": "bind", "desligar": "unbind", "checar": "check", "subir": "spawn", "absorver": "absorb", "intervalo": "interval"},
     "doctor": {"antigos": "old"},
     "dispatch-queue": {"lista": "list", "descartar": "discard"},
@@ -13924,9 +14027,14 @@ def parser():
         _arg(tn, k, help=h)
     tn.add_argument("--effort", help="its effort")
     _arg(tn, "projeto", help="the project the released ticket starts in (`Project:`); without it the Run's or the coordinator's cwd project applies")
+    tn.add_argument("--wave", type=int, help="puts the task in wave N: blocked by the wave's milestone, and the wave's join waits for it (ticket 342)")
+    tn.add_argument("--after", help="the number of a wave's milestone: same as --wave of that wave")
     tf = tk.add_parser("close", aliases=["fechar"], help="writes the Answer, sets resolved and completes the task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="text or the path of a file")
+    wv = sub.add_parser("wave", aliases=["onda"], help="the delivery order in waves: each wave is a milestone that blocks its parallel tasks and a join that every task blocks").add_subparsers(dest="op", required=True)
+    wv.add_parser("new", aliases=["novo"], help="creates the next wave's milestone and join").add_argument("name")
+    wv.add_parser("list", aliases=["lista"], help="the waves, what each waits for and the tasks still open").add_argument("--json", action="store_true")
     dc = sub.add_parser("doctor", help="checks orq's state against Orca and fixes what it can").add_subparsers(dest="op", required=True)
     dt = dc.add_parser("tasks", help="completes the blocked/pending task of a resolved ticket (supersededBy) and lists the one with no ticket")
     dt.add_argument("--dry-run", action="store_true", help="only lists")
@@ -14357,9 +14465,15 @@ def main(argv=None):
         elif a.cmd == "doctor":
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_tasks_text(r, a.dry_run))
+        elif a.cmd == "wave":
+            if a.op == "new":
+                print(json.dumps(wave_new(a.name), ensure_ascii=False))
+            else:
+                print(json.dumps([{"wave": w["wave"], "milestone": w["milestone"]["num"], "join": w["join"]["num"], "tasks": [t["num"] for t in w["tasks"]]} for w in waves()], ensure_ascii=False) if a.json
+                      else "\n".join(wave_lines()) or "no wave")
         elif a.cmd == "ticket":
             if a.op == "new":
-                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting, a.project)
+                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting, a.project, a.wave, a.after)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicit("tarefa", r["task"], r["run"])
             elif a.op == "edit":

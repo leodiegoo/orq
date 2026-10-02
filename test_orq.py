@@ -17226,6 +17226,8 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("integrar concluir --hash h b1 b2", "integrate conclude --hash h b1 b2"),
     ("auditar-publicacao a..b", "audit-publication a..b"),
     ("ticket novo --titulo T --spec-arquivo s.md --modelo m --despacho manual --espera e", "ticket new --title T --spec-file s.md --model m --dispatch manual --waiting e"),
+    ("onda novo X", "wave new X"),
+    ("onda lista --json", "wave list --json"),
     ("ticket fechar 1 --answer a", "ticket close 1 --answer a"),
     ("ticket editar 1 --modelo m --despacho d --espera e", "ticket edit 1 --model m --dispatch d --waiting e"),
     ("ticket lista --todos", "ticket list --all"),
@@ -19863,6 +19865,62 @@ def test_ticket230_stop_and_prompt_hooks_stay_under_100_ms_with_a_slow_orca():
             break
         time.sleep(0.1)
     assert len(_creates(a)) == 1
+
+
+# ---------- ticket 342: waves and milestones (the delivery order as layers of the backlog) ----------
+
+def _wave_new(a, name):
+    r = a.orq("wave", "new", name)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def test_ticket342_wave_of_three_parallel_tasks_waits_for_the_milestone_and_leaves_together():
+    a = _env_tk()
+    assert _wave_new(a, "Base") == {"wave": 1, "milestone": "01", "join": "02"}
+    it = _bl_items(a)
+    assert (it["t01"]["estado"], it["t02"]["estado"], it["t02"]["bloqueios"]) == ("done", "queued", ["t01"]), "wave 1 has no one to wait for; an empty join does not close"
+    assert _meta_tk(it["t01"]) == {"wave": "1", "role": "milestone"} and it["t01"]["titulo"] == "Wave 1: Base (milestone)"
+    first = json.loads(_new(a, "Foundation", "--wave", "1").stdout)["ticket"]
+    assert first == "03" and _bl_items(a)["t03"]["bloqueios"] == ["t01"] and _bl_items(a)["t02"]["bloqueios"] == ["t01", "t03"]
+    assert _wave_new(a, "Core") == {"wave": 2, "milestone": "04", "join": "05"}
+    parallel = [json.loads(_new(a, f"Parallel {k}", "--wave", "2").stdout)["ticket"] for k in (1, 2, 3)]
+    assert parallel == ["06", "07", "08"]
+    it = _bl_items(a)
+    assert it["t04"]["bloqueios"] == ["t02"], "the milestone of wave 2 waits for the join of wave 1"
+    assert all(it[f"t{n}"]["bloqueios"] == ["t04"] for n in parallel), "the three are blocked by the same milestone"
+    assert it["t05"]["bloqueios"] == ["t04", "t06", "t07", "t08"], "the join waits for the milestone and for the three"
+    ready = {i["id"] for i in backlog_mod.ready(list(it.values()))}
+    assert not ready & {"t04", "t06", "t07", "t08"}, ready
+    status = a.orq("status").stdout
+    assert "wave 1 Base: open, 0/1 integrated; open: 03" in status and "wave 2 Core: waiting, 0/3 integrated; waits for 02; open: 06, 07, 08" in status, status
+    out = json.loads(a.orq("ticket", "fechar", "03", "--answer", "integrated").stdout)
+    assert out["ondas"] == ["02"], "the last task of wave 1 closes its join, which closes wave 2's milestone"
+    it = _bl_items(a)
+    assert [it[k]["estado"] for k in ("t02", "t04")] == ["done", "done"]
+    ready = {i["id"] for i in backlog_mod.ready(list(it.values()))}
+    assert {"t06", "t07", "t08"} <= ready, "the three leave together when the milestone closes"
+    assert it["t05"]["estado"] == "queued"
+    for n in ("06", "07"):
+        a.orq("ticket", "fechar", n, "--answer", "integrated")
+        assert _bl_items(a)["t05"]["estado"] == "queued", "the join closes only with the three integrated"
+    a.orq("ticket", "fechar", "08", "--answer", "integrated")
+    assert _bl_items(a)["t05"]["estado"] == "done"
+    assert "wave 2 Core: closed, 3/3 integrated" in a.orq("status").stdout
+    assert _new(a, "Late", "--wave", "2").returncode == 1, "a closed wave takes no more tasks"
+
+
+def test_ticket342_after_names_the_wave_by_its_milestone_and_refuses_what_is_not_one():
+    a = _env_tk()
+    _wave_new(a, "Base")
+    _new(a, "Not a milestone")
+    assert _new(a, "Via after", "--after", "01").returncode == 0
+    assert _bl_items(a)["t04"]["bloqueios"] == ["t01"] and _bl_items(a)["t02"]["bloqueios"] == ["t01", "t04"]
+    r = _new(a, "Wrong", "--after", "03")
+    assert r.returncode == 1 and "not one" in r.stderr, r.stderr
+    r = _new(a, "No wave", "--wave", "9")
+    assert r.returncode == 1 and "wave 9 does not exist" in r.stderr, r.stderr
+    assert _new(a, "Outside the backlog", "--wave", "1", ORQ_BACKLOG_TICKETS="").returncode == 1
 
 
 if __name__ == "__main__":

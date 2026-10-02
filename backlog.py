@@ -16,7 +16,7 @@ TOML = '[markdown]\ndone_keep = 100000\n'  # the `.tasks.toml` of a backlog fold
 CLI_TIMEOUT_S = 20
 HOLD_KINDS = ("captain", "external", "load", "parked", "future")
 META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # `key_name: value` lines at the top of the pending item's body
-META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera", "scratch", "projeto")  # same for the ticket; `orca: task_x run_y` is the bridge to Orca
+META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera", "scratch", "projeto", "wave", "role")  # same for the ticket (`wave: N` and `role: milestone|join` mark the tickets of a wave, ticket 342); `orca: task_x run_y` is the bridge to Orca
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 ID_RE = re.compile(rf"^{_ID}$")
@@ -212,6 +212,7 @@ def ticket_of_item(i, by_id, root):
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
             "despacho": meta.get("despacho"), "espera": meta.get("espera"), "projeto": meta.get("projeto"),  # the `Despacho:` and `Espera:` headers (ticket 142)
             "scratch": meta.get("scratch"),  # the `.scratch/<feature>/issues/NN-*.md` the ticket was born from (ticket 201)
+            "wave": int(meta["wave"]) if meta.get("wave", "").isdigit() else None, "role": meta.get("role"),  # ticket 342: the wave the ticket belongs to; `role` is milestone or join for the wave's own tickets
             "fechado_em": i["closed"]}
 
 

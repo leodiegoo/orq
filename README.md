@@ -352,6 +352,19 @@ $ orq ticket close 02 --answer notes/login-done.md
 
 Without a ticket, `orq dispatch --run r --title "..." --spec-file f --model m --effort e` creates the task itself. The spec for `ticket new` must contain a `## Acceptance criteria` section. A ticket file header uses the lines `Status:`, `Blocked by:`, `Run:`, `Task:`, and the optional `Model:`, `Effort:`, `Dispatch:`, `Waiting:` and `Project:` (model, effort, dispatch policy, wait condition, project; the older `Modelo:`, `Despacho:`, `Espera:` and `Projeto:` are read too). `ticket new` writes `Project:` from `--project`, then the Run's project, then the project that contains the coordinator's directory; with none it writes no line.
 
+Delivery order in waves (needs the tickets in the backlog). The tasks that can run in parallel share one blocker, a milestone, and a join waits for all of them:
+
+```sh
+$ orq wave new "Core"                            # Wave 2: milestone (blocked by wave 1's join) and join
+$ orq ticket new --title "Parser" --spec-file a.md --wave 2     # blocked by the milestone; the join now waits for it
+$ orq ticket new --title "Writer" --spec-file b.md --after 04   # same wave, named by its milestone's number
+$ orq wave list
+wave 1 Base: closed, 1/1 integrated
+wave 2 Core: waiting, 0/2 integrated; waits for 02; open: 06, 07
+```
+
+The milestone and the join are backlog tickets with no spec and no worker. When the last blocker of one is integrated, orq closes it by itself (`orq ticket close` of the last task is enough), and that frees what waited on it: the milestone of wave N+1 waits for the join of wave N, so the waves go out in order, the tasks of a wave leave together, and the worker cap decides how many start. A join with no task never closes, so an empty wave waits for its tasks; a wave whose join closed takes no more. `orq status` and the manager panel list the waves; the PRs' merge order (`orq queue`) already follows `Blocked by`, so it follows the waves too.
+
 Workers:
 
 ```sh
@@ -622,6 +635,7 @@ The Portuguese command names still work as aliases until the aliases are removed
 | `limpar`, `worktrees limpar`, `devolver`, `revisar`, `caixa` | `clean`, `worktrees clean`, `send-back`, `review`, `inbox` |
 | `provar-red` | `prove-red` |
 | `ticket novo`, `fechar`, `editar`, `lista` | `ticket new`, `close`, `edit`, `list` |
+| `onda novo`, `lista` | `wave new`, `list` |
 | `lavish-resposta`, `perguntar`, `auditar-respostas`, `auditar-publicacao` | `lavish-answer`, `ask`, `audit-answers`, `audit-publication` |
 | `gerente ligar`, `desligar`, `checar`, `subir`, `absorver`, `intervalo` | `manager bind`, `unbind`, `check`, `spawn`, `absorb`, `interval` |
 | `retomar`, `hibernar`, `acordar`, `pausar`, `prioridade`, `uso` | `resume`, `hibernate`, `wake`, `pause`, `priority`, `usage` |

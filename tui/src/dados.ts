@@ -417,9 +417,16 @@ function blocoEventos(e: Estado): Bloco {
 
 const JANELA_MIN = 10 // linhas do backlog que sobram à vista mesmo com os outros blocos cheios (o fim da tela, eventos e máquina, é que cortam)
 
-/** Os sete blocos. O backlog vem logo depois do gerente e ocupa o que sobra da altura (a janela rola com `vista.offset`); cada linha dele é cortada na largura. */
+// as ondas (ticket 342) vêm prontas do serve, uma linha por onda; sem ondas o bloco não aparece
+function blocoOndas(e: Estado): Bloco {
+  const linhas = (fresco(e) ? e.gerente?.ondas ?? [] : []).map((l: unknown) => corta(String(l), 120))
+  return { id: "ondas", titulo: `Ondas (${linhas.length})`, linhas }
+}
+
+/** Os sete blocos (e o das ondas, quando o serve manda alguma). O backlog vem logo depois do gerente e ocupa o que sobra da altura (a janela rola com `vista.offset`); cada linha dele é cortada na largura. */
 export function montarBlocos(e: Estado, vista: Vista = VISTA0, tela: Tamanho = { largura: 100, altura: 60 }): Bloco[] {
-  const outros = [blocoGerente(e), blocoWorkers(e), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
+  const ondas = blocoOndas(e)
+  const outros = [blocoGerente(e), blocoWorkers(e), ...(ondas.linhas.length ? [ondas] : []), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
   const util = tela.largura - 4 // borda e margem da caixa
   const gasto = outros.reduce((n, b) => n + b.linhas.reduce((m, l) => m + Math.max(1, Math.ceil(texto(l).length / util)), 2), 0) // linha comprida quebra
   const janela = Math.max(JANELA_MIN, tela.altura - gasto - 2 - 1 - 1) // borda do backlog, linha de filtro, rodapé
