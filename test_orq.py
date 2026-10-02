@@ -287,7 +287,7 @@ elif cmd == "worker-list":
               "resource": None if w.get("sem_resource") else {"ownershipState": w.get("ownership", "owned"), "retainedReason": w.get("reason"), "terminalHandle": w["handle"],
                                                             "originDispatchId": w.get("origem", w.get("dispatch", "ctx_" + w["handle"])), "ownerDispatchId": w.get("dono", w.get("dispatch", "ctx_" + w["handle"])),
                                                             **({"worktreeId": "id::" + w["worktree"]} if w.get("worktree") else {})}}
-             for w in ler("workers.json", [])]
+             for w in ler("workers.json", []) if not (os.environ.get("FAKE_LISTA_ATRASADA") and w["handle"].startswith("term_novo"))]  # worker-list atrasado: não mostra o que acabou de subir
     itens, prox = pagina([w for w in todos if not run or w["runId"] == run])
     res = {"workers": itens, "page": {"limit": int(opt("--limit", 100)), "hasMore": bool(prox), "nextCursor": prox},
            "scope": {"run": run, "source": "flag" if opt("--run") else "bound" if bound else "all"}}
@@ -9562,8 +9562,8 @@ def _libera79(a, *handles):
     a.set("terminals.json", [h for h in json.load(open(os.path.join(a.fake, "terminals.json"))) if h not in handles])
 
 
-def _desp79(a, titulo, prio, modelo=SONNET):
-    return a.orq("despachar", "--run", "run_a", "--titulo", titulo, "--spec-arquivo", _spec(a), "--modelo", modelo, "--effort", "medium", "--prioridade", str(prio))
+def _desp79(a, titulo, prio, modelo=SONNET, **env):
+    return a.orq("despachar", "--run", "run_a", "--titulo", titulo, "--spec-arquivo", _spec(a), "--modelo", modelo, "--effort", "medium", "--prioridade", str(prio), **env)
 
 
 def _fila79(a):
@@ -12895,8 +12895,9 @@ def test_ticket126_proximo_sem_usuario_ticket_ready_pede_prioridade_modelo_e_vag
 
 
 def test_ticket126_maquina_ocupacao_nao_conta_o_worker_hibernado():
-    antes = (orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados)
+    antes = (orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados, orq_mod.read_events)
     try:
+        orq_mod.read_events = lambda: []  # sem isto lê o events.jsonl real, onde um despacho recente também ocupa vaga
         orq_mod._terminais_vivos = lambda: None  # sem lista de terminais todo `dispatched` contava como vivo
         orq_mod._workers_todos = lambda: [{"dispatchId": "dH", "dispatchStatus": "dispatched", "agentTerminalHandle": "term_h"},
                                           {"dispatchId": "dV", "dispatchStatus": "dispatched", "agentTerminalHandle": "term_v"}]
@@ -12904,7 +12905,46 @@ def test_ticket126_maquina_ocupacao_nao_conta_o_worker_hibernado():
         orq_mod._detalhes = lambda faltam: {w["dispatchId"]: {"modelo": "claude-sonnet-5-5"} for w in faltam}
         assert set(orq_mod.maquina_ocupacao()["vivos"]) == {"dV"}
     finally:
-        orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados = antes
+        orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados, orq_mod.read_events = antes
+
+
+def _teto145(a, vivos=1):
+    _frota79(a, vivos=[(f"Vivo {n}", SONNET) for n in range(vivos)])
+    json.dump({"max_workers": 6}, open(os.path.join(a.home, "maquina.json"), "w"))
+
+
+def test_ticket145_seis_despachos_seguidos_com_o_worker_list_atrasado_sobem_cinco_e_enfileiram_um():
+    a = _painel79()
+    _gerente(a)
+    _teto145(a)
+    for n in range(6):
+        assert _desp79(a, f"Ticket {n}", 2, FAKE_LISTA_ATRASADA="1").returncode == 0
+    assert len(_titulos_iniciados79(a)) == 5, "1 ocupada + 5 = 6/6: o sexto não cabe"
+    assert [i["titulo"] for i in _fila79(a)] == ["Ticket 5"]
+
+
+def test_ticket145_dois_despachos_simultaneos_com_uma_vaga_sobem_um():
+    a = _painel79()
+    _gerente(a)
+    _teto145(a, vivos=5)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(2) as ex:
+        rs = list(ex.map(lambda t: _desp79(a, t, 2, FAKE_LISTA_ATRASADA="1"), ("Um", "Dois")))
+    assert all(r.returncode == 0 for r in rs), [r.stderr for r in rs]
+    assert len(_titulos_iniciados79(a)) == 1 and len(_fila79(a)) == 1
+
+
+def test_ticket145_despacho_antigo_que_o_worker_list_nao_mostra_nao_ocupa_vaga():
+    antes = (orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados, orq_mod.read_events)
+    try:
+        orq_mod._terminais_vivos = lambda: None
+        orq_mod._workers_todos = lambda: []
+        orq_mod._hibernados = lambda: {}
+        orq_mod.read_events = lambda: [{"tipo": "despacho", "dispatch": "dNovo", "modelo": "m", "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+                                       {"tipo": "despacho", "dispatch": "dVelho", "modelo": "m", "ts": "2020-01-01T00:00:00Z"}]
+        assert set(orq_mod.maquina_ocupacao()["vivos"]) == {"dNovo"}
+    finally:
+        orq_mod._terminais_vivos, orq_mod._workers_todos, orq_mod._hibernados, orq_mod.read_events = antes
 
 
 def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_primeiro_com_o_link():

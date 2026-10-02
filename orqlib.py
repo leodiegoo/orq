@@ -8450,19 +8450,31 @@ def modelo_caro(modelo, cfg=None):
     return bool(modelo) and any(fnmatch.fnmatch(str(modelo).lower(), p.lower()) for p in (cfg or maquina_cfg())["modelos_caros"])
 
 
+JANELA_DESPACHO_RECENTE = 120  # s: quanto o despacho gravado em events.jsonl vale como vaga ocupada enquanto o worker-list não o mostra
+
+
 def maquina_ocupacao():
     """{vivos: {dispatch: modelo}, dispatched: {dispatch}}: os workers com terminal vivo no Orca (todos os Runs) e os dispatches ainda `dispatched`.
 
     O modelo vem do evento de despacho ou de retomada e, na falta dele, do worker-show; sem lista de terminais confiável todo `dispatched` conta como vivo."""
     terminais = _terminais_vivos()
-    ws = [w for w in _workers_todos() if w.get("dispatchStatus") == "dispatched"]
+    todos = _workers_todos()
+    ws = [w for w in todos if w.get("dispatchStatus") == "dispatched"]
     hibernados = _hibernados()  # o terminal fechado de propósito não ocupa vaga, nem quando a lista de terminais falha
     vivos = [w for w in ws if w.get("dispatchId") not in hibernados and (terminais is None or w.get("agentTerminalHandle") in terminais)]
-    modelos = {e["dispatch"]: e["modelo"] for e in read_events() if e.get("tipo") in ("despacho", "retomada") and e.get("dispatch") and e.get("modelo")}
+    eventos = read_events()
+    modelos = {e["dispatch"]: e["modelo"] for e in eventos if e.get("tipo") in ("despacho", "retomada") and e.get("dispatch") and e.get("modelo")}
     faltam = [w for w in vivos if w["dispatchId"] not in modelos]
     if faltam:
         modelos |= {d: x["modelo"] for d, x in _detalhes(faltam).items() if x.get("modelo")}
-    return {"vivos": {w["dispatchId"]: modelos.get(w["dispatchId"]) for w in vivos}, "dispatched": {w["dispatchId"] for w in ws}}
+    ocup = {w["dispatchId"]: modelos.get(w["dispatchId"]) for w in vivos}
+    listados = {w.get("dispatchId") for w in todos}
+    corte = datetime.now(timezone.utc) - timedelta(seconds=JANELA_DESPACHO_RECENTE)
+    for e in eventos:  # o worker-list atrasa: o despacho de segundos atrás ainda não aparece e a vaga dele ficaria livre para o próximo (ticket 145)
+        d = e.get("dispatch")
+        if e.get("tipo") in ("despacho", "retomada") and d and d not in listados and d not in hibernados and e.get("ts") and _dt(e["ts"]) >= corte:
+            ocup[d] = e.get("modelo")
+    return {"vivos": ocup, "dispatched": {w["dispatchId"] for w in ws} | set(ocup)}
 
 
 def maquina_vaga(modelo, ocup=None, cfg=None, isento=False):
