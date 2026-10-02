@@ -3223,6 +3223,79 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
     return urls, notices
 
 
+def _task_folder(task, event_list):
+    """The repository folder of the project of the task's dispatch, otherwise the cwd."""
+    run = next((e.get("run") for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("task") == task), None)
+    try:
+        p = projects().get(dispatch_project(None, run)) or {}
+    except ValueError:
+        p = {}
+    return (repo_folder(p["repo"]) if p.get("repo") else None) or os.getcwd()
+
+
+def _join_and(names):
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+PRODUCTION_OPS = ("production_opened", "production_failed")  # what ends the attempt to open a task's production PR: once only
+
+
+def _open_production(task, prod, before, item_list, event_list):
+    """Opens the production PR of `task`: title and body of the first environment's PR, with the line of who already entered on top, through `pr_open` (merge-tree
+    against production, push, `gh pr create`, link to the task). Any failure (conflict, gh, a worktree that vanished) becomes the `production_failed` event, the
+    notice to the coordinator and no new attempt: no push and PR repeated every lap. Returns the panel line."""
+    with _lock("pr-production.lock"):
+        if any(e.get("tipo") == "pr" and e.get("op") in PRODUCTION_OPS and e.get("task") == task for e in read_events()):
+            return None
+        first = item_list[0]
+        body_file = None
+        try:
+            r = subprocess.run([GH, "pr", "view", first["url"], "--json", "title,body,headRefName"], capture_output=True, text=True, timeout=PR_GH_S)
+            seen = json.loads(r.stdout) if r.returncode == 0 else None
+            if not isinstance(seen, dict) or not seen.get("title"):
+                raise ValueError(f"gh did not bring the title and body of PR #{first['numero']}")
+            line = f"{_join_and(before)} already entered ({', '.join('#' + str(i['numero']) for i in item_list)})"
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+                f.write(f"{line}\n\n{(seen.get('body') or '').strip()}\n")
+            body_file = f.name
+            urls, _ = pr_open(seen.get("headRefName") or first.get("head") or "", seen["title"], body_file, [prod], _task_folder(task, event_list))
+            append_event({"tipo": "pr", "op": "production_opened", "task": task, "url": urls[0], "inherited_from": first["url"]})
+            text, panel_line = f"orq: opened the {prod} PR of {task} ({urls[0]}): {line}.", f"{task}: {prod} PR opened by itself ({urls[0]})"
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            append_event({"tipo": "pr", "op": "production_failed", "task": task, "motivo": str(e)[:300]})
+            text = f"orq: did not open the {prod} PR of {task}: {e}. Fix it and open it with orq pr open."
+            panel_line = f"{task}: {prod} PR not opened ({e})"
+        finally:
+            if body_file:
+                os.remove(body_file)
+    g = _manager_cfg()
+    if g and g.get("coordenador"):
+        notify_coordinator(g["coordenador"], text, context=False)
+    return panel_line
+
+
+def pr_production_open():
+    """One panel lap (ticket 184): a feature of a `promocao` flow with a merged PR in every environment before production, no open PR and no PR into production
+    (not even one closed without merge: that is a human call) gets its production PR opened by itself (`_open_production`). It reads only prs.json
+    and the log until it finds a candidate. Returns the panel lines."""
+    event_list = read_events()
+    handled = {e.get("task") for e in event_list if e.get("tipo") == "pr" and e.get("op") in PRODUCTION_OPS}
+    by_task, lines = {}, []
+    for i in _prs_ro()["itens"]:
+        by_task.setdefault(i["task"], []).append(i)
+    for task, item_list in by_task.items():
+        fx = task_flow(task, event_list)
+        prod = fx["producao"]
+        before = fx["ambientes"][:fx["ambientes"].index(prod)] if prod in fx["ambientes"] else []
+        if task in handled or fx["fluxo"] != "promocao" or not before or any(i["estado"] == "aberto" or i.get("base") == prod for i in item_list):
+            continue
+        entered = {i["base"]: i for i in item_list if i["estado"] == "mergeado" and i.get("base") in before}
+        if set(entered) == set(before):
+            lines.append(_open_production(task, prod, before, [entered[a] for a in before], event_list))
+    return [l for l in lines if l]
+
+
 def pr_list(task=None):
     """Lines of `orq pr listing`: task, PR with base and state, issue and URL."""
     return [f"{i['task']}  {_pr_segment(i)}" + (f"  (issue #{i['issue']})" if i.get("issue") else "") + f"  {i['url']}"
@@ -3693,7 +3766,8 @@ def deploy_verify(now_at=None):
         if not dep or now_at - seen.get(key_name, 0) < PR_POLL_S:
             continue
         seen[key_name] = now_at
-        cmd = dep[0].replace("{base}", shlex.quote(o.get("base") or "")).replace("{sha}", shlex.quote(o.get("sha") or ""))
+        cmd = (dep[0].replace("{base}", shlex.quote(o.get("base") or "")).replace("{sha}", shlex.quote(o.get("sha") or ""))
+               .replace("{orq}", shlex.quote(os.path.dirname(os.path.abspath(__file__)))))
         try:
             r = subprocess.run(cmd, shell=True, cwd=dep[1], capture_output=True, text=True, timeout=DEPLOY_ERROR_S)
             rc, output = r.returncode, (r.stdout or "").strip().splitlines()
@@ -11583,7 +11657,7 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - an unreadable screen doesn't take down the panel; the next loop tries
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round()]
+        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round()]
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:

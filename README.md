@@ -185,7 +185,7 @@ Step by step:
 3. `group` is free text that only groups the listing.
 4. `environments` is the ordered list of the project's branches; the one marked `production` is production (the last one when none is marked). `flow` is `"promocao"` when the same feature branch opens one PR into each environment in order, or `"direto"` for a single PR into production (the flow values keep their Portuguese spelling). With no `environments` block the project has one environment, the remote's default branch, and the direct flow. A malformed block makes the file show as invalid in `orq projects`. Nothing in orq names `development`, `staging` or `main`: `orq pr`, `orq queue`, the digest, the merge obligations and the base of new worktrees all read this block.
 5. `e2e_queue` is the folder of the project's E2E queue (one `<order>-<pid>` ticket per arrival; `~` is expanded). `orq status`, the digest and the stuck-queue notice read it. Without the key there is no queue line. `E2E_LOCK_DIR` forces one folder.
-6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered) and `{sha}` (its merge commit) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
+6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered), `{sha}` (its merge commit) and `{orq}` (orq's clone) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
 
@@ -463,6 +463,16 @@ Some close by themselves, with the proof orq saw:
 ```json
 {"repo": "path:~/code/my-app", "deploy_check": "my-deploy-status --env {base} --commit {sha}"}
 ```
+
+`{orq}` stands for orq's own clone (shell-quoted), so a project file can point at a script that ships with orq without hardcoding where the clone lives: `{orq}/scripts/<script>`.
+
+For projects on ZCloud (quave-one), `scripts/quave-deploy-check.py --env {base} --sha {sha} --ids <environment>=<appEnvId>[+<appEnvId>],…` is that command (ticket 184). The quave-one speaks MCP over HTTP, so the script posts a `tools/call get-app-env-status` to `https://mcp.quave.cloud/` (`QUAVE_MCP_URL` overrides it) with the Bearer token of `QUAVE_MCP_TOKEN` or of the `quave-one` server in `~/.claude.json`, with no Claude involved. The deploy covers the commit when `latestDeployment.gitCommitId` is the commit or a descendant of it (local git, in the project's folder). Exit 0: every id is DEPLOYED on it, and the proof is `v<version> <commit>`; exit 2: not covered yet, still building, or the quave-one did not answer; exit 1: the deploy that covers the commit failed; exit 3: it could not ask (no token, no id for that environment, no commit, HTTP error). `+` joins ids that must all be deployed. The ids live only in `projects/<name>.json`, which is state and stays out of the repository:
+
+```json
+{"deploy_check": "python3 {orq}/scripts/quave-deploy-check.py --env {base} --sha {sha} --ids development=<appEnvId>,staging=<appEnvId>,main=<appEnvId>+<appEnvId>"}
+```
+
+The production PR opens by itself (ticket 184). On each manager lap, a feature of a `promocao` project that has a merged PR in every environment before production, no open PR and no PR into production (not even one closed without merge) gets `orq pr open` for production: the title of the first environment's PR and its body, with the line `development and staging already entered (#a, #b)` on top. That opens the PR through the usual checks (`merge-tree` against production, push, `gh pr create`, link to the task, which closes the `proximo` obligation). It tries once per task: a conflict, a missing worktree or a gh failure records `pr`/`production_failed`, warns the coordinator and does not retry, so the fix is `merge/<feature>-<environment>` and a manual `orq pr open`.
 
 ## Backlog
 
