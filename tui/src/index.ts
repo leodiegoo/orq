@@ -1,15 +1,18 @@
 // orq gerente tui: só leitura. Relê os arquivos do ORQ_HOME a cada ORQ_TUI_S segundos (3 por padrão); q ou Ctrl+C sai.
+// Tema: --theme light|dark|auto ou ORQ_TUI_THEME; auto pergunta ao terminal (OSC 11), depois COLORFGBG e o tema do macOS.
 import { createCliRenderer } from "@opentui/core"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { lerEstado, montarBlocos } from "./dados"
 import { criarTela } from "./tela"
+import { detectarTema } from "./tema"
 
 const home = process.env.ORQ_HOME || join(homedir(), ".claude", "orq")
 const intervalo = Number(process.env.ORQ_TUI_S || 3) * 1000
 
 const renderer = await createCliRenderer({ exitOnCtrlC: true })
-const atualizar = criarTela(renderer, `orq gerente tui — ${home} — q sai`)
+const tema = await detectarTema({ argv: process.argv, env: process.env, osc: () => renderer.waitForThemeMode(500) })
+const atualizar = criarTela(renderer, `orq gerente tui — ${home} — q sai`, tema)
 
 const volta = () => {
   try {

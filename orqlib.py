@@ -10984,7 +10984,7 @@ def serve_desinstalar():
     return serve_status()
 
 
-def gerente_tui():
+def gerente_tui(theme=None):
     """`orq gerente tui`: a TUI em tui/ (OpenTUI sobre Bun), só leitura dos arquivos do ORQ_HOME. Sem Bun ou sem as dependências, diz como instalar."""
     tui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tui")
     bun = shutil.which("bun")
@@ -10995,7 +10995,7 @@ def gerente_tui():
     if not os.path.isdir(os.path.join(tui, "node_modules")):
         print(f"the TUI dependencies are missing: cd {shlex.quote(tui)} && bun install", file=sys.stderr)
         return 1
-    return subprocess.run([bun, "run", os.path.join(tui, "src", "index.ts")], env={**os.environ, "ORQ_HOME": HOME}).returncode
+    return subprocess.run([bun, "run", os.path.join(tui, "src", "index.ts")], env={**os.environ, "ORQ_HOME": HOME, **({"ORQ_TUI_THEME": theme} if theme else {})}).returncode
 
 # ---------- retro: o coletor de sinais de falha (ticket 78) ----------
 
@@ -11780,7 +11780,8 @@ def parser():
     for op, ajuda in (("parar", "stops the serve (and the launchd until the next login)"),
                       ("instalar", "writes and loads the launchd agent: starts at login and restarts if it dies"), ("desinstalar", "removes the launchd agent")):
         _arg(gvo, op, action="store_true", help=ajuda)
-    ge.add_parser("tui", help="opens the TUI (OpenTUI, needs Bun) that follows the manager, the workers and the queues; read-only")
+    gt = ge.add_parser("tui", help="opens the TUI (OpenTUI, needs Bun) that follows the manager, the workers and the queues; read-only")
+    gt.add_argument("--theme", choices=["light", "dark", "auto"], default="auto", help="color palette; auto asks the terminal (OSC 11), then COLORFGBG and the macOS appearance")
     rt = sub.add_parser("resume", aliases=["retomar"], help="after an outage: spawns the agent manager and resumes, with claude --resume, the workers without worker_done that lost their terminal")
     rt.add_argument("--dry-run", action="store_true", help="only lists")
     rt.add_argument("--run", help="only the dispatches of this Run")
@@ -12153,7 +12154,7 @@ def main(argv=None):
                 else:
                     gerente_serve(a.voltas)
             elif a.op == "tui":
-                return gerente_tui()
+                return gerente_tui(None if a.theme == "auto" else a.theme)
             else:
                 dono = serve_dono()
                 if dono and str(dono) != os.environ.get("ORQ_SERVE_PID"):
