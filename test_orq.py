@@ -16904,6 +16904,8 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("devolver t m", "send-back t m"),
     ("steer t txt --entrada e1", "steer t txt --entry e1"),
     ("pr ligar t http://u --nota n", "pr link t http://u --note n"),
+    ("pr abrir feat/x --titulo T --corpo b.md --sem-prova m", "pr open feat/x --title T --body b.md --no-proof m"),
+    ("integrar check feat/x --sem-prova m", "integrate check feat/x --no-proof m"),
     ("pr abrir d --titulo T --corpo c.md --ambientes a,b", "pr open d --title T --body c.md --environments a,b"),
     ("pr evidencia 7 --antes a --depois d --cenarios c.json", "pr evidence 7 --before a --after d --scenarios c.json"),
     ("pr lista --task t", "pr list --task t"),
@@ -18897,6 +18899,165 @@ def test_ticket220_pr_1285_shape_pr_green_except_the_check_that_the_base_has_fai
     i = _prs_by_number(a)[1216]
     assert i["ci"]["falhas"] == ["deploy-oci-tests"] and i["ci"]["falhas_na_base"] == ["deploy-oci-tests"] and i["ci"]["base_vermelha_desde"] == "2026-08-21T09:00:00Z"
     assert orq_mod._pr_contract(i)["bloqueadaPelaBase"] is True
+# ---------- ticket 222: the proof pinned to the head ----------
+
+def _git222(repo, *args):
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", repo, *args], env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _commit222(repo, text_value, msg):
+    open(os.path.join(repo, "f"), "a").write(text_value)
+    _git222(repo, "add", "-A")
+    _git222(repo, "commit", "-qm", msg)
+    return _git222(repo, "rev-parse", "HEAD")
+
+
+def _repo222(base, branch="feat/orq-x"):
+    """Repository with `branch` carrying one commit on top of main. Returns (repo, sha of the branch)."""
+    repo = os.path.join(base, "repo222")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    _commit222(repo, "a\n", "base")
+    _git222(repo, "checkout", "-qb", branch)
+    return repo, _commit222(repo, "b\n", "feat: the delivery")
+
+
+def _queue222(a, branch, head, ticket="07"):
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "integrar-fila.json"), {"itens": [{"branch": branch, "ticket": ticket, "ts": "2026-01-01T00:00:00Z", **({"head": head} if head else {})}]})
+
+
+def test_ticket222_integrate_check_equal_head_passes_and_commit_after_the_proof_is_refused_with_the_list():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", head)
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 0 and not r.stderr, r
+    _commit222(repo, "c\n", "fix: sneaked in after the review")
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 1 and "sneaked in after the review (t)" in r.stderr and "orq review" in r.stderr and "--no-proof" in r.stderr, r
+    assert not [e for e in a.events() if e["tipo"] == "prova"], "recusar não grava nada"
+
+
+def test_ticket222_integrate_check_refuses_amend_and_no_proof_goes_ahead_and_records_the_reason():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", head)
+    _git222(repo, "commit", "-q", "--amend", "-m", "feat: amended")
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 1 and "not a descendant" in r.stderr, r
+    r = a.orq("integrar", "check", "feat/orq-x", "--sem-prova", "amended the message only")
+    assert r.returncode == 0 and "amended the message only" in r.stderr, r
+    (e,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (e["passo"], e["resultado"], e["motivo"], e["ticket"], e["anterior"]) == ("no_proof", "waived", "amended the message only", "07", head), e
+    assert e["head"] == _git222(repo, "rev-parse", "feat/orq-x")
+
+
+def test_ticket222_integrate_check_without_recorded_head_or_outside_the_queue_only_warns():
+    repo, _ = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", None)
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 0 and "no proven commit" in r.stderr, r
+    r = a.orq("integrar", "check", "main")
+    assert r.returncode == 0 and not r.stderr, "fora da fila: o integrador segue como antes"
+
+
+def test_ticket222_integrar_py_refuses_before_creating_the_worktree():
+    alive, env, g = _alive_repo55({"feat/b1": {"b1.txt": "1\n"}})
+    head = g("rev-parse", "feat/b1").stdout.strip()
+    g("checkout", "-q", "feat/b1")
+    open(os.path.join(alive, "b1.txt"), "a").write("2\n")
+    g("commit", "-qam", "after the review")
+    g("checkout", "-q", "main")
+    os.makedirs(env["ORQ_HOME"])
+    json.dump({"itens": [{"branch": "feat/b1", "ticket": "07", "ts": "2026-01-01T00:00:00Z", "head": head}]}, open(os.path.join(env["ORQ_HOME"], "integrar-fila.json"), "w"))
+    integrate = os.path.join(alive, "scripts", "integrar.py")
+    before = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrate, "feat/b1"], cwd=alive, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "after the review" in r.stderr and not os.path.exists(env["ORQ_WT_DIR"]), r.stdout + r.stderr
+    r = subprocess.run([sys.executable, integrate, "feat/b1", "--sem-prova", "reviewed by hand"], cwd=alive, env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and g("rev-parse", "HEAD").stdout != before, r.stdout + r.stderr
+
+
+def test_ticket222_worker_done_records_the_head_in_the_queue_item_and_the_events():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, branch="feat/orq-x", commit=head)
+    assert a.orq("ingest").returncode == 0
+    (item,) = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
+    assert item["head"] == head, item
+    (e,) = [e for e in a.events() if e["tipo"] == "entrega_orq"]
+    assert e["head"] == head, e
+    (pv,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (pv["task"], pv["passo"], pv["head"], pv["resultado"]) == ("task_t141", "delivery", head, "ok"), pv
+
+
+def test_ticket222_worker_done_with_a_commit_that_is_not_in_the_branch_does_not_enter_the_queue():
+    repo, _ = _repo222(tempfile.mkdtemp())
+    _git222(repo, "checkout", "-q", "main")
+    _git222(repo, "checkout", "-qb", "feat/outra")
+    other = _commit222(repo, "x\n", "feat: other work")
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, branch="feat/orq-x", commit=other)
+    assert a.orq("ingest").returncode == 0
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "nome de branch trocado: fica fora da fila"
+    (e,) = [e for e in a.events() if e["tipo"] == "entrega" and "wrong branch name" in str(e.get("avisos"))]
+    assert not [e for e in a.events() if e["tipo"] == "prova"], e
+
+
+def _open_pr222(wt_branch="feat/algo"):
+    a = _open_pr143(branch=wt_branch)
+    wt = os.path.join(a.tmp.name, "wt")
+    subprocess.run(["git", "init", "-q", "-b", "main", wt], check=True)
+    _commit222(wt, "a\n", "base")
+    _git222(wt, "checkout", "-qb", wt_branch)
+    head = _commit222(wt, "b\n", "feat: the work")
+    return a, wt, head
+
+
+def test_ticket222_pr_open_passes_on_the_proven_head_and_refuses_commits_after_it_and_amend():
+    a, wt, head = _open_pr222()
+    a.events_add = lambda **ev: open(os.path.join(a.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    a.events_add(tipo="prova", task="task_feat", passo="review", head=head, resultado="ok", ts="2026-01-01T00:00:00Z")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    _commit222(wt, "c\n", "fix: after the proof")
+    b, wt2, head2 = _open_pr222()
+    b.events_add = lambda **ev: open(os.path.join(b.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    b.events_add(tipo="prova", task="task_feat", passo="review", head=head2, resultado="ok", ts="2026-01-01T00:00:00Z")
+    _commit222(wt2, "c\n", "fix: after the proof")
+    r = _open_pr(b, "--ambientes", "development")
+    assert r.returncode == 1 and "fix: after the proof (t)" in r.stderr and "orq review" in r.stderr, r
+    assert not [c for c in _log143(b, "git.log") if c[0] == "push"] and not _log143(b, "gh.log"), "nada sobe"
+    r = _open_pr(b, "--ambientes", "development", "--sem-prova", "docs only")
+    assert r.returncode == 0 and "docs only" in r.stderr, r
+    (e,) = [e for e in b.events() if e["tipo"] == "prova" and e["passo"] == "no_proof"]
+    assert (e["task"], e["motivo"], e["anterior"]) == ("task_feat", "docs only", head2), e
+    c, wt3, head3 = _open_pr222()
+    c.events_add = lambda **ev: open(os.path.join(c.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    c.events_add(tipo="prova", task="task_feat", passo="review", head=head3, resultado="ok", ts="2026-01-01T00:00:00Z")
+    _git222(wt3, "commit", "-q", "--amend", "-m", "feat: rewritten")
+    r = _open_pr(c, "--ambientes", "development")
+    assert r.returncode == 1 and "not a descendant" in r.stderr, r
+
+
+def test_ticket222_pr_open_without_a_recorded_head_only_warns():
+    a, wt, head = _open_pr222()
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0 and "no proven commit" in r.stderr, r
+
+
+def test_ticket222_review_records_the_proof_at_the_worktree_head():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    subprocess.run(["git", "init", "-q", "-b", "main", a.wt], check=True)
+    head = _commit222(a.wt, "a\n", "feat: reviewed")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    (pv,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (pv["task"], pv["passo"], pv["head"], pv["resultado"]) == ("task_term_r1", "review", head, "findings"), pv
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert e["head"] == head, e
 
 
 if __name__ == "__main__":

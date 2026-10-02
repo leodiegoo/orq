@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Integrates orq branches in a worktree of its own; the live main (the clone that runs) only advances by fast-forward, with green tests.
 
-  integrar.py <branch>...     creates ORQ_WT_DIR/integra-<branches> from main, merges each branch, runs the tests and advances main
+  integrar.py <branch>... [--no-proof REASON]
+                              refuses a queued branch whose tip is not the commit its delivery proved (`orq integrate check`), unless --no-proof (alias --sem-prova) gives the reason;
+                              creates ORQ_WT_DIR/integra-<branches> from main, merges each branch, runs the tests and advances main
   integrar.py --avancar <wt>  after resolving a conflict (and committing) in the worktree: checks, runs the tests and advances main
 
 After the fast-forward it calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
@@ -95,8 +97,19 @@ def clean(viva):
     print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
 
 
-def integrate(branches):
+def check_proof(viva, branches, no_proof):
+    """A queued branch with commits after its proof, or rewritten, does not enter the cycle (ticket 222)."""
+    cmd = [sys.executable, os.path.join(viva, "orq.py"), "integrate", "check", *branches, *(["--no-proof", no_proof] if no_proof else [])]
+    r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})  # orq.py runs inside the live main: no __pycache__ dirties the tree
+    if r.returncode:
+        die(r.stderr.strip() or r.stdout.strip())
+    if r.stderr.strip():
+        print(r.stderr.strip(), file=sys.stderr)
+
+
+def integrate(branches, no_proof=None):
     viva = alive()
+    check_proof(viva, branches, no_proof)
     clean(viva)
     slug = re.sub(r"[^\w.-]+", "-", "-".join(branches))[:60]
     wt = os.path.join(os.environ.get("ORQ_WT_DIR") or orqpaths.WT, f"integra-{slug}")
@@ -118,9 +131,15 @@ def integrate(branches):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    no_proof = None
+    for flag in ("--no-proof", "--sem-prova"):
+        if flag in args:
+            i = args.index(flag)
+            no_proof = "".join(args[i + 1:i + 2]) or die(f"{flag} needs a reason")
+            del args[i:i + 2]
     if len(args) == 2 and args[0] == "--avancar":
         advance(args[1])
     elif args and not args[0].startswith("-"):
-        integrate(args)
+        integrate(args, no_proof)
     else:
         die(__doc__)
