@@ -17199,6 +17199,97 @@ def test_ticket228_the_pin_should_leave_the_other_hooks_and_the_file_formatting_
     assert after.replace(sys.executable, "python3") == before, "same file, only the interpreter changed"
 
 
+def _ready_tickets(a, *titles):
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    for i, title in enumerate(titles, 1):
+        open(os.path.join(a.env["ORQ_ISSUES"], f"{i:02d}-t.md"), "w").write(f"# {i:02d}: {title}\n\nStatus: ready-for-agent\n")
+
+
+def _dispatch_orq(a, *extra):
+    return a.orq("despachar", "--run", "run_a", "--titulo", "orq: ticket do grupo", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium", *extra)
+
+
+def test_ticket181_dispatch_of_a_group_ticket_should_go_to_the_mate_request_instead_of_starting_a_worker():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    r = _dispatch_orq(a)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["estado"] == "mate" and out["grupo"] == "orq" and out["corr"] == "p1" and out["entrega"] == "enviado", out
+    assert not os.path.exists(os.path.join(a.fake, "started.log")), "no worker-start: the mate dispatches"
+    text_value = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
+    full = open(text_value.rsplit("full text at ", 1)[1].strip()).read() if "full text at " in text_value else text_value  # a long notice is typed as a pointer to its file
+    assert "orq ▸ request p1" in text_value and "claude-sonnet-5-5" in full and "orq: ticket do grupo" in full, text_value
+    ev = next(e for e in a.events() if e.get("tipo") == "mate_dispatch")
+    assert ev["grupo"] == "orq" and ev["corr"] == "p1" and "title" in ev["motivo"], ev
+    other = a.orq("despachar", "--run", "run_a", "--titulo", "dados: fora do grupo", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium")
+    assert "estado" not in json.loads(other.stdout) and os.path.exists(os.path.join(a.fake, "started.log")), "a title outside the groups is dispatched by the coordinator"
+
+
+def test_ticket181_dispatch_with_direct_should_start_the_worker_and_record_the_reason():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    r = _dispatch_orq(a, "--direto")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["taskId"] == "task_novo1"
+    assert len(_log(a, "started.log")) == 1
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert "--direct" in ev["direct"] and "orq" in ev["direct"] and "title" in ev["direct"], ev
+    assert not any(e.get("tipo") == "mate_pedido" for e in a.events())
+
+
+def test_ticket181_dispatch_of_a_group_without_a_mate_should_start_the_worker_as_before():
+    a = Env()
+    _group(a)
+    r = _dispatch_orq(a)
+    assert r.returncode == 0 and json.loads(r.stdout)["taskId"] == "task_novo1", r.stdout + r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert "direct" not in ev
+
+
+def test_ticket181_group_without_a_mate_with_three_ready_tickets_should_propose_it_once_and_status_should_show_it():
+    a = Env()
+    _group(a)
+    _ready_tickets(a, "orq: um", "orq: dois", "dados: fora")
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    with InProcess(a):
+        assert orq_mod.mate_proposal_lap() == []  # two ready tickets of the group: below the default of 3
+    assert [x for x in a.orq("status").stdout.splitlines() if x.startswith("group ")] == ["group orq: 2 ready (01, 02) | mate absent"]
+    _ready_tickets(a, "orq: um", "orq: dois", "orq: tres")
+    assert [x for x in a.orq("status").stdout.splitlines() if x.startswith("group ")] == ["group orq: 3 ready (01, 02, 03) | mate absent | propose: orq mate open orq"]
+    with InProcess(a):
+        assert any("proposal reported" in x for x in orq_mod.mate_proposal_lap())
+        assert orq_mod.mate_proposal_lap() == []  # once
+        group_map, tks = orq_mod.groups(), orq_mod.tickets()
+        proposals = orq_mod.mate_proposals(tks, group_map, {}, [], orq_mod.machine_cfg())
+        assert proposals == [("orq", ["01", "02", "03"])]
+        assert "orq mate open orq" in orq_mod.next_without_user(tks, [], [], [], [], orq_mod.machine_cfg(), 0, None, proposals[0])
+    texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert len(texts) == 1 and "group orq has 3 ready tickets" in texts[0] and "orq mate open orq" in texts[0], texts
+
+
+def test_ticket181_group_with_mate_auto_should_have_its_mate_opened_by_the_manager():
+    a = Env()
+    _group(a, mate_auto=True, mate_ready_min=2)
+    _ready_tickets(a, "orq: um", "orq: dois")
+    opened = []
+    with InProcess(a):
+        real = orq_mod.mate_open
+        orq_mod.mate_open = lambda g: opened.append(g) or {"grupo": g}
+        try:
+            assert any("opened by mate_auto" in x for x in orq_mod.mate_proposal_lap())
+            assert orq_mod.mate_proposal_lap() == []
+        finally:
+            orq_mod.mate_open = real
+        group_map = orq_mod.groups()
+        assert orq_mod.mate_proposals(orq_mod.tickets(), group_map, {"orq": {"terminal": "t"}}, [], orq_mod.machine_cfg()) == [], "a group with a mate is not proposed"
+    assert opened == ["orq"]
+
+
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
