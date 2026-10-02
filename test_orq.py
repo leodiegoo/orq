@@ -16378,6 +16378,8 @@ PARES129 = [  # (argv em pt, argv em inglês): um par de cada comando, subcomand
     ("revisar t", "review t"),
     ("maquina set k 1", "machine set k 1"),
     ("fila-despacho lista", "dispatch-queue list"),
+    ("fila-despacho descartar fd1 --motivo m", "dispatch-queue discard fd1 --reason m"),
+    ("worktrees limpar --dry-run", "worktrees clean --dry-run"),
     ("fila-despacho rm i", "dispatch-queue rm i"),
     ("caixa --todas", "inbox --all"),
     ("runs --todos", "runs --all"),

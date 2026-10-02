@@ -11553,7 +11553,7 @@ def parser():
     igc.add_argument("--dispatch", help="o dispatch do integrador (padrão: o serviço de título integrador ainda não liberado)")
     igc.add_argument("branches", nargs="+")
     wl = sub.add_parser("worktrees", help="orq worktrees limpar [--dry-run]: remove as worktrees do orq-wt já contidas na origin/main").add_subparsers(dest="op", required=True)
-    wl.add_parser("clean", aliases=["limpar"]).add_argument("--dry-run", action="store_true")
+    wl.add_parser("clean", aliases=["limpar"], help="remove as worktrees do orq-wt já contidas na origin/main").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
     au.add_argument("revs", nargs="+", help="args do git rev-list; em branch nova: <head> --not --remotes (depois de --)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
