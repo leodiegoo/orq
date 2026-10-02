@@ -70,7 +70,7 @@ def _configured_backlog():
 
 BACKLOG = _configured_backlog()  # tasks-axi's backlog.md (ticket 101): with it the pending items live there and pendencias.json becomes just the mirror the panel reads
 BACKLOG_TICKETS = os.environ["ORQ_BACKLOG_TICKETS"] if "ORQ_BACKLOG_TICKETS" in os.environ else (os.path.exists(os.path.join(HOME, "backlog.tickets")) or None)  # tickets live in the backlog (M5); the file is the machine's switch, like backlog.path, and an empty variable turns it off
-EFFECTS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
+EFFECTS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate", "lembrete")
 HOOK_TIMEOUT = int(os.environ.get("ORQ_HOOK_TIMEOUT") or 3)  # seconds of alarm per hook; the tests shorten it
 WARN_KINDS = ("session", "prompt", "stop")  # the coordinator hooks whose failure warns the user (ticket 228); the per-tool ones fail in silence, as the log
 MSG_NO_CONTEXT = "[orq] orq context did not load: run `orq status`"
@@ -1613,7 +1613,7 @@ ESCALATION_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqu
 VALUES_EN = {  # key (in pt) -> the stored values that change; the rest (free text, ids, gh and Orca states) passes as is
     "tipo": {**TYPES_EN, **PENDING_EN, **ESCALATION_EN},
     "pend_tipo": PENDING_EN, "tipo_mate": ESCALATION_EN, "fila_tipo": {"despacho": "dispatch"},
-    "efeito": {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "pend": "pending"},
+    "efeito": {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "pend": "pending", "lembrete": "reminder"},
     "parada": {"orcamento": "budget", "decisao": "decision", "limite": "limit"},  # `end --stopped-by`
     "motivo": {"entregue": "delivered", "falhou": "failed", "parou: orçamento": "stopped: budget", "parou: decisão pendente": "stopped: pending decision",  # the release's end_reason
                "parou: limite de uso": "stopped: usage limit", "sem worker_done": "no worker_done", "motivo desconhecido": "unknown reason"},
@@ -6434,6 +6434,102 @@ def deliver_notices():
     return ["deferred notice typed into the coordinator, idle"]
 
 
+REMINDERS = "reminders.json"  # {seq, rems: [{id, what, due, made, status: open|fired|canceled, fired}]}: survives a manager or machine restart
+REMIND_LATE_S = 120  # fired later than this after its time, the notice says by how much (the machine slept, the manager was down)
+_REMIND_IN = re.compile(r"^(?:(\d+)h)?(?:(\d+)m?)?$")
+
+
+def remind_due(in_=None, at=None, now_at=None):
+    """The UTC stamp a reminder is due: `in_` is a delay (`90m`, `1h30`, `2h`, `45`), `at` a local `HH:MM` (today, or tomorrow when it has passed)."""
+    now_at = now_at or _dt(now())
+    if bool(in_) == bool(at):
+        raise ValueError("pass exactly one of --in (90m, 1h30, 2h) or --at (HH:MM)")
+    if in_:
+        m = _REMIND_IN.match(in_.strip().lower())
+        if not m or not any(m.groups()):
+            raise ValueError(f"invalid --in: {in_!r} (use 90m, 1h30 or 2h)")
+        minutes = int(m[1] or 0) * 60 + int(m[2] or 0)
+        if minutes <= 0:
+            raise ValueError("--in must be longer than zero")
+        return (now_at + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m = re.match(r"^(\d{1,2}):(\d{2})$", at.strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError(f"invalid --at: {at!r} (use HH:MM, 24 h)")
+    local = now_at.astimezone()
+    target = local.replace(hour=int(m[1]), minute=int(m[2]), second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _reminders_mut(fn):
+    with _lock("reminders.lock"):
+        d = _dict(_read_json(_path(REMINDERS)))
+        d.setdefault("rems", [])
+        out = fn(d)
+        _write_json(_path(REMINDERS), d)
+        return out
+
+
+def remind_add(what, in_=None, at=None):
+    """Creates a reminder; returns it."""
+    if not (what or "").strip():
+        raise ValueError("the reminder needs a text")
+    due = remind_due(in_, at)
+
+    def add(d):
+        d["seq"] = int(d.get("seq") or 0) + 1
+        item = {"id": f"l{d['seq']}", "what": what.strip(), "due": due, "made": now(), "status": "open"}
+        d["rems"].append(item)
+        return item
+    item = _reminders_mut(add)
+    append_event({"tipo": "lembrete", "op": "add", "lembrete": item["id"], "due": due})
+    return item
+
+
+def remind_cancel(id_):
+    """Cancels an open reminder; raises ValueError when it does not exist or is no longer open."""
+    def cancel(d):
+        item = next((i for i in d["rems"] if i.get("id") == id_), None)
+        if not item or item.get("status") != "open":
+            raise ValueError(f"no open reminder {id_}")
+        item["status"] = "canceled"
+        return item
+    item = _reminders_mut(cancel)
+    append_event({"tipo": "lembrete", "op": "cancel", "lembrete": id_})
+    return item
+
+
+def remind_list(all_listing=False):
+    """One line per reminder, soonest first; `all_listing` also shows the fired and canceled ones."""
+    items = _dict(_read_json(_path(REMINDERS))).get("rems") or []
+    return [f"{i['id']}  {_hora_local(i['due'])} ({i['due']})  {i['status']}  {i['what']}" for i in sorted(items, key=lambda x: x["due"]) if all_listing or i.get("status") == "open"]
+
+
+def remind_round(now_at=None):
+    """One manager tick: fires each open reminder whose time has come. Marks it fired before notifying, so it goes out once even if the notice fails. The macOS
+    notification (with sound) always goes; the short notice typed into the coordinator only with away on (ticket 107). A late one says by how much."""
+    now_at = now_at or _dt(now())
+
+    def fire(d):
+        done = [i for i in d["rems"] if i.get("status") == "open" and _dt(i["due"]) <= now_at]
+        for i in done:
+            i.update(status="fired", fired=now())
+        return done
+    if not any(i.get("status") == "open" and _dt(i["due"]) <= now_at for i in _dict(_read_json(_path(REMINDERS))).get("rems") or []):
+        return []
+    lines, g = [], _manager_cfg()
+    for i in _reminders_mut(fire):
+        late = int((now_at - _dt(i["due"])).total_seconds())
+        text_value = f"Reminder: {i['what']}" + (f" (late by {late // 60} min)" if late > REMIND_LATE_S else "")
+        fail_safe._notify(text_value, sound="Glass")
+        append_event({"tipo": "lembrete", "op": "fired", "lembrete": i["id"], "atraso_s": late})
+        if _dict(_cursor_ro().get("ausente")) and g.get("coordenador"):
+            notify_coordinator(g["coordenador"], f"orq: {text_value}.")
+        lines.append(f"{text_value} [{i['id']}]")
+    return lines
+
+
 WAKE_STOPPED_MIN = float(os.environ.get("ORQ_ACORDA_PARADO_MIN") or 5)  # work without the user has been going on this long and the coordinator is idle: the manager wakes it
 WAKE_REPEAT_MIN = float(os.environ.get("ORQ_ACORDA_REPETE_MIN") or 30)  # the same reason is not typed again before this
 WAKE_FILE = "acorda-parado.json"  # {motivo, desde, avisado}: the current reason, since when the manager sees it and when it typed it
@@ -11204,7 +11300,7 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - an unreadable screen doesn't take down the panel; the next loop tries
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices()]
+        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round()]
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
@@ -11879,7 +11975,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
          "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
-         "transcrito": "transcript", "servico": "service"},
+         "transcrito": "transcript", "servico": "service", "lembrar": "remind"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
     "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink"},
@@ -11902,7 +11998,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
 }
 # the `choices` values (pt -> en): the CLI accepts both and delivers the pt one, which is what the code records today
 STOP_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
-EFFECT_EN = {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded"}
+EFFECT_EN = {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "lembrete": "reminder"}
 HOOK_EN = {"lugar": "place", "externas": "external", "prligar": "prlink"}  # the installed hooks call the pt name and it holds forever: no log
 
 
@@ -12086,6 +12182,11 @@ def parser():
     _arg(ps, "modelo", help="the model on the other harness (goes together with --effort); without it the worker-routing equivalence table applies")
     ps.add_argument("--effort")
     ps.add_argument("--run")
+    rm = sub.add_parser("remind", aliases=["lembrar"], help='reminders: orq remind "<text>" --in 1h30 | --at 15:00; orq remind list [--all]; orq remind cancel <id>. The manager fires them with a macOS notification')
+    rm.add_argument("op_or_text", nargs="+")
+    rm.add_argument("--in", dest="in_", help="90m, 1h30, 2h")
+    rm.add_argument("--at", help="local HH:MM (tomorrow if it has passed)")
+    rm.add_argument("--all", action="store_true")
     nt = sub.add_parser("night", aliases=["noite"], help="night mode: orq night on --until HH:MM [--max-dispatches N] [--max-failures 3] | off | (no op: state)")
     nt.add_argument("op", nargs="?", choices=["on", "off", "ligar", "desligar"])
     _arg(nt, "ate")
@@ -12459,6 +12560,16 @@ def main(argv=None):
             print("\n".join(away_lines(_cursor_ro())))
         elif a.cmd == "away":
             print("\n".join(away(a.op)))
+        elif a.cmd == "remind":
+            words = a.op_or_text
+            if words[0] in ("list", "lista"):
+                print("\n".join(remind_list(a.all)) or "no open reminders")
+            elif words[0] in ("cancel", "cancelar"):
+                print(json.dumps(remind_cancel(words[1] if len(words) > 1 else ""), ensure_ascii=False))
+            else:
+                item = remind_add(" ".join(words), a.in_, a.at)
+                print(json.dumps(item, ensure_ascii=False))
+                _implicit("lembrete")
         elif a.cmd == "night":
             if a.op == "on":
                 night_on(a.until_at, a.max_dispatches, a.max_failures)

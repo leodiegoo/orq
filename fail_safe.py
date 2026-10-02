@@ -81,12 +81,12 @@ def write_marker(data):
     os.replace(tmp, path)
 
 
-def _notify(text):
-    """macOS notification (text by argv, never spliced into the script); ORQ_ALARME=off turns it off."""
+def _notify(text, sound=None):
+    """macOS notification (text by argv, never spliced into the script); ORQ_ALARME=off turns it off. `sound` is a system sound name (the reminders use it)."""
     if os.environ.get("ORQ_ALARME") == "off":
         return
     try:
-        subprocess.run([os.environ.get("ORQ_OSASCRIPT") or "osascript", "-e", "on run argv", "-e", 'display notification (item 1 of argv) with title "orq"', "-e", "end run", "--", text],
+        subprocess.run([os.environ.get("ORQ_OSASCRIPT") or "osascript", "-e", "on run argv", "-e", 'display notification (item 1 of argv) with title "orq"' + (' sound name "%s"' % sound if sound else ""), "-e", "end run", "--", text],
                        capture_output=True, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
         pass
