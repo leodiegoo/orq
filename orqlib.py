@@ -3998,14 +3998,15 @@ def tickets_do_painel(ts, aberto):
     vivos = {a.get("task"): _estado_de_gente(a) for a in _dict(aberto).get("agentes") or [] if a.get("estado") in ANDA}
     fechado = ("resolved", "wontfix")
     abertos = {t["num"] for t in ts if t["status"] not in fechado}
-    saida = []
+    saida, projetos = [], grupos()
     for t in ts:
         if t["status"] in fechado:
             continue
         bloqueios = [n for n in t["blocked_by"] if n in abertos]
         grupo = "bloqueado" if bloqueios else "andamento" if t["status"] == "claimed" else "pronto"
         saida.append({"num": t["num"], "titulo": t["titulo"], "status": t["status"], "grupo": grupo, "bloqueios": bloqueios,
-                      "task": t["task"], "worker": vivos.get(t["task"]), "arquivo": t["arquivo"]})
+                      "task": t["task"], "worker": vivos.get(t["task"]), "arquivo": t["arquivo"],
+                      "projeto": grupo_de(projetos, titulo=t["titulo"])[0]})
     feitos = []
     for t in ts:
         if t["status"] == "resolved":

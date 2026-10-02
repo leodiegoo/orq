@@ -7916,6 +7916,17 @@ def test_digest_lista_os_tickets_abertos_por_status_com_bloqueio_e_os_5_ultimos_
     assert re.fullmatch(r"\d{4}-\d\d-\d\d", t["resolvidos"][0]["em"])
 
 
+def test_digest_ticket_traz_o_projeto_pelo_prefixo_do_titulo_e_null_sem_grupo():
+    a = Amb(run="run_a")
+    os.makedirs(os.path.join(a.home, "groups"))
+    with open(os.path.join(a.home, "groups", "orq.json"), "w") as f:
+        json.dump({"projetos": [], "prefixos": ["orq:"]}, f)
+    _tk_status(a, "01", "orq: com grupo", "ready-for-agent")
+    _tk_status(a, "02", "sem grupo", "ready-for-agent")
+    ab = {x["num"]: x for x in _json_digest(a)["tickets_orq"]["abertos"]}
+    assert (ab["01"]["projeto"], ab["02"]["projeto"]) == ("orq", None), ab
+
+
 def test_digest_sem_tickets_manda_tickets_orq_vazio():
     assert _json_digest(Amb(run="run_a"))["tickets_orq"] == {"abertos": [], "resolvidos": []}
 
