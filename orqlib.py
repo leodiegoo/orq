@@ -26,6 +26,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import backlog
+import cmdnorm
 
 
 def ThreadPoolExecutor(n):  # late import: concurrent.futures costs ~11 ms and only the panel and the ingest use it (ticket 49)
@@ -2829,7 +2830,7 @@ _PR_STATE = {"aberto": "open", "mergeado": "✓", "fechado": "closed"}
 def _pr_state(url):
     """{state, mergedAt, baseRefName} of the PR through gh, or None if gh does not exist, fails, times out or there is no network."""
     try:
-        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName,title,body"], capture_output=True, text=True, timeout=PR_GH_S)
+        r = subprocess.run([GH, "pr", "view", url, "--json", "state,mergedAt,baseRefName,headRefName,title,body"], capture_output=True, text=True, timeout=PR_GH_S)
         d = json.loads(r.stdout) if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
@@ -2936,7 +2937,7 @@ def _pr_segment(i):
     return f"#{i.get('numero')} {i.get('base') or '?'} {_PR_STATE.get(i.get('estado'), i.get('estado'))}"
 
 
-def pr_link(task, url, issue=None, tag=None, note=None):
+def pr_link(task, url, issue=None, tag=None, note=None, head=None):
     """Links a PR to the task (the same feature has one per environment). Queries gh once, without insisting: with no response the PR enters `open_state` and without a base,
     and the poll completes it. A PR already merged or closed enters resolved and notified: whoever links it already knows. It does not check the task in Orca (no network here)."""
     if not re.fullmatch(r"task_\w+", task or ""):
@@ -2951,7 +2952,7 @@ def pr_link(task, url, issue=None, tag=None, note=None):
             raise ValueError(f"PR #{already.get('numero')} is already linked to task {already['task']}")
         state = _gh_state(seen_item) or "aberto"
         item = {"task": task, "url": url, "numero": int(url.rsplit("/", 1)[1]), "base": seen_item.get("baseRefName"), "estado": state,
-                "ligado_em": now(), "avisado": state != "aberto", **({"resolvido_em": now()} if state != "aberto" else {}),
+                **({"head": head or seen_item["headRefName"]} if head or seen_item.get("headRefName") else {}), "ligado_em": now(), "avisado": state != "aberto", **({"resolvido_em": now()} if state != "aberto" else {}),
                 **({"issue": int(issue)} if issue else {}), **({"titulo": seen_item["title"]} if seen_item.get("title") else {}),
                 **({"tag": tag} if tag else {}), **({"nota": note} if note else {}),
                 **({"por": _first_paragraph(seen_item["body"])} if (seen_item.get("body") or "").strip() else {})}
@@ -3025,14 +3026,24 @@ def _worker_path(res):
     return _deep_get(res, "terminal", "worktreePath") or (wid.split("::", 1)[1] if isinstance(wid, str) and "::" in wid else None)
 
 
-def branch_task(head, wt, events):
-    """The dispatch task that owns branch `head`, or None. First by the `--name` of the new worktree (no network); then by the worktree where the
+def named_task(head, events, prs):
+    """The task that owns branch `head` without asking Orca or the network, or None: by the `--name` of the new worktree (with or without the user prefix Orca adds,
+    on either side), or by a PR of the same branch that is already linked (the PR to production after the ones to the other environments). Several tasks: the newest."""
+    if not head:
+        return None
+    mine = _no_user_prefix(head)
+    for e in (e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("task") and e.get("nome")):
+        if mine == _no_user_prefix(e["nome"]) or head.endswith("/" + e["nome"]):
+            return e["task"]
+    return next((i["task"] for i in reversed((prs or {}).get("itens") or []) if i.get("head") and _no_user_prefix(i["head"]) == mine), None)
+
+
+def branch_task(head, wt, events, prs=None):
+    """The dispatch task that owns branch `head`, or None. First by name or by a PR of the same branch (named_task, no network); then by the worktree where the
     branch is (`wt`), which Orca reports in worker-show, among the PR_DISPATCHES most recent dispatches. Two tasks in the same worktree (`current`): the newest."""
     dispatch_events = [e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("task")]
-    for e in dispatch_events:
-        item_name = e.get("nome")
-        if item_name and head and (head == item_name or head.endswith("/" + item_name)):
-            return e["task"]
+    if task := named_task(head, events, prs):
+        return task
     target = os.path.realpath(wt) if wt else None
     for e in dispatch_events[:PR_DISPATCHES] if target else []:
         try:
@@ -3063,10 +3074,10 @@ def pr_auto(url, head=None, wt=None, cwd=None):
     if not head:
         head = _pr_head(url)
         wt = wt or (_worktrees_by_branch(cwd).get(head) if head and cwd else None)
-    task = branch_task(head, wt, read_events())
+    task = branch_task(head, wt, read_events(), _prs_ro())
     if not task and head and head.startswith("merge/"):  # conflict branch: merge/<feature>-<ambiente> belongs to the feature's task
-        task = branch_task(re.sub(rf"-({'|'.join(map(re.escape, _known_environments()))})$", "", head[len("merge/"):]), wt, read_events())
-    item = pr_link(task, url) if task else orphan_pr(url, head)
+        task = branch_task(re.sub(rf"-({'|'.join(map(re.escape, _known_environments()))})$", "", head[len("merge/"):]), wt, read_events(), _prs_ro())
+    item = pr_link(task, url, head=head) if task else orphan_pr(url, head)
     if task:
         queue_auto(item)
     return item
@@ -4580,23 +4591,16 @@ def night_environment(base=None):
     return {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": NIGHT_GIT_CONFIG[0], f"GIT_CONFIG_VALUE_{n}": NIGHT_GIT_CONFIG[1]}
 
 
-_EXT_PRE = r"(?:^|[;&|(\n]\s*)(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env|command|time|sudo)\s+)*"  # only in command position, like the worker-routing-guard
-_EXT_GIT = _EXT_PRE + r"git((?:\s+-\S+(?:\s+\S+)?)*)\s+"
-_EXT_GH = _EXT_PRE + r"gh(?:\s+-\S+(?:\s+\S+)?)*\s+"
-NIGHT_EXTERNAL = [  # (what is denied, a regex over the command without quotes or heredoc)
+_EXT_GIT = r"^git((?:\s+-\S+(?:\s+\S+)?)*)\s+"  # the regexes run on one cmdnorm segment: command position, no rtk/env/VAR= prefix
+_EXT_GH = r"^gh(?:\s+-\S+(?:\s+\S+)?)*\s+"
+NIGHT_EXTERNAL = [  # (what is denied, a regex over a segment of the command)
     ("git push", re.compile(_EXT_GIT + r"push(?![-\w])")),
     ("gh pr merge", re.compile(_EXT_GH + r"pr\s+merge(?![-\w])")),
     ("gh workflow run (deploy)", re.compile(_EXT_GH + r"workflow\s+run(?![-\w])")),
     ("git commit --no-verify", re.compile(_EXT_GIT + r"commit(?![-\w])[^;&|\n]*?\s(?:--no-verify|-[aeiopqsuvz]*n[a-zA-Z]*)(?=\s|$)")),
-    ("orca worktree rm --force", re.compile(_EXT_PRE + r"orca\s+worktree\s+rm(?![-\w])[^;&|\n]*\s(?:--force|-f)(?![-\w])")),
+    ("orca worktree rm --force", re.compile(r"^orca\s+worktree\s+rm(?![-\w])[^;&|\n]*\s(?:--force|-f)(?![-\w])")),
 ]
 _EXT_RESET = re.compile(_EXT_GIT + r"reset(?![-\w])[^;&|\n]*\s--hard(?![-\w])")
-
-
-def _no_text(cmd):
-    """The command without heredoc bodies or quoted text: what is in there (a commit message, an echo) is not a command."""
-    cmd = re.sub(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", r"\3", cmd, flags=re.S)
-    return re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
 
 
 def _external_denied(ev, cur):
@@ -4605,9 +4609,9 @@ def _external_denied(ev, cur):
     if (ev.get("tool_name") != "Bash" or not isinstance(ev.get("tool_input"), dict) or not isinstance(ev["tool_input"].get("command"), str)
             or "--help" in ev["tool_input"]["command"]):
         return None
-    cmd = _no_text(ev["tool_input"]["command"])
-    found_item = next((item_name for item_name, rx in NIGHT_EXTERNAL if rx.search(cmd)), None)
-    m = None if found_item else _EXT_RESET.search(cmd)
+    segs = cmdnorm.segments(ev["tool_input"]["command"])
+    found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
+    m = None if found_item else next(filter(None, map(_EXT_RESET.search, segs)), None)
     if not (found_item or m) or not night_active(cur):
         return None
     if found_item:
@@ -5184,7 +5188,7 @@ def hook_guard(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
 
 
-WRITE_PLACE = re.compile(r"(^|[;&|(]\s*)((\w+=\S*|rtk(?:\s+proxy)?|env|command|time|sudo)\s+)*git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # M18: prefixes before git
+WRITE_PLACE = re.compile(r"^git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # on a cmdnorm segment
 GIT_C_PLACE = re.compile(r"\s-C\s+(\S+)")
 
 
@@ -5193,11 +5197,11 @@ def hook_place(ev, run):
     default branch or with the cwd in a worktree that is not the coordinator's (CLAUDE_PROJECT_DIR). Only looks at write commands: git commit/push and file edits."""
     tool_name, ti = ev.get("tool_name"), ev.get("tool_input") or {}
     if tool_name == "Bash":
-        m = WRITE_PLACE.search(ti.get("command") or "")
+        m = next(filter(None, map(WRITE_PLACE.search, cmdnorm.segments(ti.get("command") or ""))), None)
         if not m:
             return None
         d = ev.get("cwd") or os.getcwd()
-        c = GIT_C_PLACE.search(m.group(4) or "")  # `git -C <dir> commit` writes to <dir>, not to the cwd
+        c = GIT_C_PLACE.search(m.group(1) or "")  # `git -C <dir> commit` writes to <dir>, not to the cwd
         if c:
             d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
             d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
@@ -5236,7 +5240,7 @@ def hook_session(ev, run):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
 
 
-PR_CREATE = re.compile(r"\bgh(?:-axi)?\s+pr\s+create\b")
+PR_CREATE = re.compile(r"^gh(?:-axi)?\s+pr\s+create\b")  # on a cmdnorm segment
 PR_HEAD = re.compile(r"(?<!\S)(?:--head[=\s]+|-H[=\s]*)['\"]?([^\s'\"]+)")
 PR_CD = re.compile(r"(?<![\w-])cd\s+(\S+)\s*&&")
 
@@ -5248,7 +5252,7 @@ def _orq_cli(*args):
         signal.alarm(0)  # only tests get here: with the machine loaded the hook's alarm would cut the child off midway
         subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
     else:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _worktrees_by_branch(cwd):
@@ -5266,7 +5270,7 @@ def hook_pr_link(ev, run):
     outside the hook) or puts it under "PR sem tarefa". The branch is the one from `--head` or from the cwd (with `cd <dir> &&` in front, that one's). Only reads prs.json."""
     ti, resp = ev.get("tool_input") or {}, ev.get("tool_response")
     cmd = ti.get("command") or ""
-    if ev.get("tool_name") != "Bash" or not PR_CREATE.search(cmd):
+    if ev.get("tool_name") != "Bash" or not any(map(PR_CREATE.search, cmdnorm.segments(cmd))):
         return None
     urls = PR_RE.findall((resp.get("stdout") or "") if isinstance(resp, dict) else str(resp or ""))
     if not urls:
@@ -5294,10 +5298,34 @@ def hook_pr_link(ev, run):
     for url, head in by_url.items():
         wt = wts.get(head)
         _orq_cli("pr", "auto", url, *(["--head", head] if head else ["--cwd", cwd]), *(["--wt", wt] if wt else []))
-    which = ", ".join(f"#{u.rsplit('/', 1)[1]} ({by_url[u] or 'unknown branch'})" for u in urls)
-    msg = (f"{MARK} PR {which}: orq links them to the task that owns the branch; with no owner it goes under "
-           "\"PR without task\" in `orq status`. Check with `orq pr list`.")
-    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": _pr_link_notice(by_url)}}
+
+
+PR_LINK_WAIT_S = 1.5  # how long the hook waits for the background `orq pr auto` before it says "still resolving": the hook has HOOK_TIMEOUT s in all
+
+
+def _pr_link_notice(by_url):
+    """What really happened to each PR of the hook, read from prs.json after a short wait: linked to a task, under "PR without a task" (with the command that links it)
+    or still resolving. It never says "linked" for what is not."""
+    deadline = time.time() + PR_LINK_WAIT_S
+    while True:
+        d = _prs_ro()
+        done_state = {u: next((("task", i["task"]) for i in d["itens"] if i["url"] == u), None) or next((("orphan", None) for x in d.get("sem_task") or [] if x.get("url") == u), None)
+                      for u in by_url}
+        if all(done_state.values()) or time.time() >= deadline:
+            break
+        time.sleep(0.1)
+    lines = []
+    for url, head in by_url.items():
+        n, branch = url.rsplit("/", 1)[1], head or "unknown branch"
+        kind, task = done_state[url] or (None, None)
+        if kind == "task":
+            lines.append(f"PR #{n} ({branch}) linked to task {task}.")
+        elif kind == "orphan":
+            lines.append(f"PR #{n} ({branch}) is without task: no dispatch owns this branch, so it sits under \"PR without task\" in `orq status`. Link it: `orq pr link <task> {url}`.")
+        else:
+            lines.append(f"PR #{n} ({branch}) is not linked yet: orq is still looking for its task. Check `orq pr list`; if it ends under \"PR without task\", `orq pr link <task> {url}`.")
+    return f"{MARK} " + " ".join(lines)
 
 
 def guard_worker():

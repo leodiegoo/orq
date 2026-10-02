@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """PreToolUse: blocks a worker dispatch without an explicit model (worker-routing skill)."""
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # ~/.claude/hooks/ links here; cmdnorm lives next to orqlib
+import cmdnorm  # noqa: E402
 
 REASON = (
     "Worker dispatch without an explicit model. Load the worker-routing skill, "
@@ -39,9 +43,8 @@ if tool == "Bash":
             if missing:
                 deny(" (missing " + " and ".join(missing) + " in worker-start)")
     # orq despachar calls worker-start internally: without --modelo and --effort it does not even start, but the refusal comes from here with the skill's text
-    # only in command position (start, or after ; & | ( , and then an optional python3): the same text inside quotes (a --body, an echo, a commit) does not count
-    without_quotes = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', '""', cmd)
-    if re.search(r"(?:^|[;&|(]\s*)(?:python3?\s+)?(?:\S*/)?orq(?:\.py)?\s+(?:dispatch|despachar)\b", without_quotes) and "--help" not in cmd:
+    # only in command position, with or without rtk/env in front (cmdnorm), and then an optional python3: the same text inside quotes (a --body, an echo, a commit) does not count
+    if any(re.search(r"^(?:python3?\s+)?(?:\S*/)?orq(?:\.py)?\s+(?:dispatch|despachar)\b", seg) for seg in cmdnorm.segments(cmd)) and "--help" not in cmd:
         missing = [f for f in ("--model", "--effort") if f not in cmd]
         if missing:
             deny(" (missing " + " and ".join(missing) + " in orq dispatch)")

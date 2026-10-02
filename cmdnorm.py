@@ -1,0 +1,32 @@
+"""One reading of a Bash command for every orq hook that matches patterns on it (ticket 250). stdlib only.
+
+`rtk git push`, `rtk proxy gh pr merge`, `env X=1 git push`, `for b in a b; do rtk git push; done`: the verdict has to be the same as for the bare command, so
+no hook runs a regex on the raw `tool_input.command`. They ask for `segments(cmd)` and match with `^` on each one.
+ponytail: regex, no shell parser. `bash -c "git push"` and `$(git push)` inside quotes pass; a real parser if that ever bites.
+"""
+import re
+
+_HEREDOC = re.compile(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
+_SEPARATOR = re.compile(r"[;&|(){}\n]+")
+_KEYWORD = re.compile(r"(?:!|do|then|else|elif|if|while|until)\s+")  # a loop or an `if` runs the command that follows
+_PREFIX = re.compile(r"(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+-\S+)*|command|time|sudo|nohup|exec)\s+)+")
+
+
+def no_text(cmd):
+    """The command without heredoc bodies or quoted text: what is in there (a commit message, an echo) is not a command."""
+    return _QUOTED.sub('""', _HEREDOC.sub(r"\3", cmd))
+
+
+def segments(cmd):
+    """Each simple command of `cmd`, in command position, without `rtk`, `rtk proxy`, `env`, `VAR=x`, `command`, `time`, `sudo` or a leading `do`/`then`.
+    Quotes and heredocs are blanked first. `a && rtk proxy git push` gives ["a", "git push"]."""
+    out = []
+    for seg in _SEPARATOR.split(no_text(cmd)):
+        seg = seg.strip()
+        while m := _KEYWORD.match(seg):
+            seg = seg[m.end():]
+        seg = _PREFIX.sub("", seg, count=1).strip()
+        if seg:
+            out.append(seg)
+    return out

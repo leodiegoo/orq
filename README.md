@@ -268,13 +268,15 @@ orq does its work in hooks, so the hooks are the one thing you must register. Bo
 | `PreToolUse` (`Bash`) | `orq hook external` | denies push, merge, deploy and other external actions in night mode |
 | `PreToolUse` (`Bash\|Edit\|Write…`) | `orq hook place` | warns (never blocks) about a write in the wrong place: the main checkout off its default branch, or a worktree that is not the coordinator's |
 | `PreToolUse` (`Bash\|Agent`) | `worker-routing-guard.py` | refuses a dispatch with no explicit model and effort |
-| `PostToolUse` (`Bash`) | `orq hook prlink` | links a PR to its task when the coordinator runs `gh pr create` |
+| `PostToolUse` (`Bash`) | `orq hook prlink` | links a PR to its task when the coordinator runs `gh pr create` (also as `rtk proxy gh pr create`, in a loop); says "linked" only when it did, otherwise that the PR has no task and the `orq pr link` to run |
 | `PostToolUse` (`AskUserQuestion`) | `orq hook ask` | records the answer |
 | `PreCompact` / `SessionStart` (`compact`) | `precompact.py` | snapshots the coordinator's state and injects it back after `/compact` |
 
 Claude Code: merge the `hooks` section of `settings.hooks.example.json` into `~/.claude/settings.json`. The example commands call `python3 ~/.claude/orq/orq.py hook <kind>`; change the path if you cloned elsewhere. `orq start` refuses to run if a hook of the orq is missing from the harness's hooks file.
 
 Codex: `orq hooks-codex` appends the missing groups from `codex.hooks.example.json` to `~/.codex/hooks.json` at the end of each event, and never reorders or removes anything. Codex records hook trust by position, so inserting a group in the middle would unset the trust of the ones after it. Then review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Until they are trusted the orq does not see that terminal, and `orq status`, `orq agents` and the coordinator's session preamble start with a warning that says so. The Codex commands take a trailing `codex` argument (`orq hook prompt codex`).
+
+Every hook that reads the Bash command (`external`, `place`, `prlink`, `worker-routing-guard.py`) goes through `cmdnorm.py`, which removes `rtk`, `rtk proxy`, `env VAR=x`, `command`, `time`, `sudo` and loop keywords and splits compound commands, so `rtk git push` is judged exactly like `git push`.
 
 Hook names in English are `prompt`, `stop`, `ask`, `guard`, `session`, `place`, `external` and `prlink`. The old names `lugar`, `externas` and `prligar` are accepted for good, so hooks you installed earlier keep working without a new trust step. The hook path is fail-open: if `orqlib.py` fails to import, or the hook raises, it exits 0 with no output and logs the error to `orq.log` instead of breaking the turn.
 
@@ -417,7 +419,7 @@ Also available: `orq ingest [--refresh]`, `orq alert seen <task>`, `orq lavish-a
 
 The question "can I merge?" is answered by `orq queue list`: each step shows ready, the red check by name, a conflict (also between steps of the queue) or CI running, plus the next step to merge. GitHub ties checks to the commit, and one branch opens a PR per environment, so a red check from another environment's deploy workflow shows as "failure in another environment" and does not count.
 
-- `orq pr link <task> <url> [--issue N]` registers the PRs of a feature. The `prlink` PostToolUse hook does it by itself when the coordinator runs `gh pr create`, and the PR joins the merge queue.
+- `orq pr link <task> <url> [--issue N]` registers the PRs of a feature. The `prlink` PostToolUse hook does it by itself when the coordinator runs `gh pr create`, and the PR joins the merge queue. `orq pr auto` finds the task by the worktree name (with or without the `leodiegoo/` prefix), by an already linked PR of the same branch (the PR to main after development and staging) or by the worktree; with no owner the PR goes under "PR without a task" and the hook warns.
 - `orq pr open <dispatch|branch> --title "<conventional commit>" --body <file> [--environments development,staging]` publishes the delivery: it drops the user prefix Orca puts on the branch, runs `git merge-tree` against each environment and stops before any push on a conflict, pushes, opens one PR per environment in the project's order, links each to the task and prints the full links. It refuses an empty body, a generator footer or `Co-Authored-By`, and a title that is not a Conventional Commit. Production is only opened once the environments before it have a merged PR for the task.
 - `orq pr poll` (also every manager lap, at most every 2 minutes) wakes the coordinator only when a linked PR is merged or closed. The next PR is only suggested, never opened.
 - `orq queue add|done|rm|list` is the merge order the coordinator declares (each step: name, why, PR numbers); without one, the order comes from the tickets' `Blocked by`. `orq integrate queue add <branch> <ticket>|rm|list` is the separate queue of the integrator, which advances the orq's own `main` outside the live checkout.

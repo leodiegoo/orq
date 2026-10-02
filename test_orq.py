@@ -16808,6 +16808,104 @@ def test_doctor_old_is_the_name_and_antigos_the_alias():
     assert orq_mod.normalize_aliases(old_name, ["doctor", "antigos"]) and old_name.op == "old"
 
 
+
+# ---------- ticket 250: the hooks read the command through cmdnorm (rtk, env, loops) and pr auto finds the owner ----------
+
+PREFIXES_250 = ["", "rtk ", "rtk proxy ", "env X=1 ", "FOO=bar rtk proxy ", "command ", "time ", "sudo rtk "]
+
+
+def test_it_should_give_the_same_segments_for_a_command_with_and_without_rtk_or_env():
+    import cmdnorm
+    for bare in ("git push -u origin x", "gh pr merge 12", "git -C /r commit -m x"):
+        want = cmdnorm.segments(bare)
+        assert want and want[0].startswith(bare.split()[0]), bare
+        for pre in PREFIXES_250:
+            assert cmdnorm.segments(pre + bare) == want, (pre, bare)
+            assert cmdnorm.segments(f"cd /w && {pre}{bare}") == ["cd /w", *want], (pre, bare)
+            assert cmdnorm.segments(f"for b in a b; do {pre}{bare}; done") == ["for b in a b", *want, "done"], (pre, bare)
+    assert cmdnorm.segments("echo 'git push'") == ["echo \"\""] and cmdnorm.segments("git commit -F - <<'EOF'\nx\ngit push\nEOF") == ["git commit -F -"]
+
+
+def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
+    a = Env(run="run_a")
+    _night(a)
+    for cmd in EXTERNAL_COMMANDS:
+        bare = cmd.removeprefix("rtk ")
+        for pre in PREFIXES_250:
+            for wrapped in (pre + bare, f"for b in a b; do {pre}{bare}; done", f"if true; then {pre}{bare}; fi"):
+                out = _external(a, wrapped)
+                assert out and out["permissionDecision"] == "deny", wrapped
+    for cmd in ("git status", "gh pr view 12", "git commit -m x"):
+        for pre in PREFIXES_250:
+            assert _external(a, pre + cmd) is None, pre + cmd
+
+
+def test_it_should_give_place_the_same_verdict_with_and_without_rtk():
+    a = Env(run="run_a")
+    a.prompt("oi")
+    p, _ = _repo(a.tmp.name, branch="feat/outra")
+    for pre in PREFIXES_250:
+        for cmd in ("git commit -m x", "git push", "git -C /r commit"):
+            assert "wrong place" in _notice(_place(a, p, cmd=pre + cmd)), pre + cmd
+            assert "wrong place" in _notice(_place(a, p, cmd=f"for b in a; do {pre}{cmd}; done")), pre + cmd
+        assert _notice(_place(a, p, cmd=pre + "git status")) == "", pre
+
+
+def test_it_should_give_the_worker_routing_guard_the_same_verdict_with_and_without_rtk():
+    guard = os.path.join(HERE, "hooks", "worker-routing-guard.py")
+
+    def run_cmd(cmd):
+        r = subprocess.run([sys.executable, guard], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}}), capture_output=True, text=True)
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else "allow"
+
+    for pre in PREFIXES_250:
+        assert run_cmd(pre + "orq despachar --run r --titulo T --spec-arquivo f") == "deny", pre
+        assert run_cmd(f"for i in 1 2; do {pre}orq dispatch --run r --title T; done") == "deny", pre
+        assert run_cmd(pre + "orq despachar --run r --titulo T --modelo m --effort low") == "allow", pre
+        assert run_cmd(pre + "orq agentes --json") == "allow", pre
+
+
+def test_it_should_link_a_pr_created_by_rtk_proxy_inside_a_loop():
+    a, p, w = _environment_46()
+    a.set("workers.json", [])
+    _dispatch_by_name(a, "task_e2e", "fix/e2e-x", "ctx_e")
+    cmd = "for b in development staging; do rtk proxy gh pr create --head leodiegoo/fix/e2e-x --base $b --title x; done"
+    r = _post_pr(a, p, cmd=cmd, output=PR1 + "\n" + PR2 + "\n")
+    assert {i["url"]: i["task"] for i in _prs_json(a)["itens"]} == {PR1: "task_e2e", PR2: "task_e2e"}
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "linked to task task_e2e" in ctx and "without task" not in ctx, ctx
+
+
+def test_it_should_say_a_pr_has_no_task_and_how_to_link_it_instead_of_saying_linked():
+    a, p, w = _environment_46()
+    a.set("workers.json", [])
+    r = _post_pr(a, p, cmd="rtk proxy gh pr create --head fix/ninguem --base main")
+    assert [x["url"] for x in _prs_json(a)["sem_task"]] == [PR1] and _prs_json(a)["itens"] == []
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "is without task" in ctx and f"orq pr link <task> {PR1}" in ctx and "linked to task" not in ctx, ctx
+
+
+def test_it_should_find_the_task_by_the_name_without_the_user_prefix_on_either_side():
+    ev = [{"tipo": "despacho", "task": "task_a", "nome": "leodiegoo/ci/retry-flakes"}, {"tipo": "despacho", "task": "task_b", "nome": "fix/outra"}]
+    assert orq_mod.named_task("ci/retry-flakes", ev, None) == "task_a"
+    assert orq_mod.named_task("leodiegoo/ci/retry-flakes", ev, None) == "task_a"
+    assert orq_mod.named_task("leodiegoo/fix/outra", ev, None) == "task_b"
+    assert orq_mod.named_task("fix/nenhuma", ev, None) is None and orq_mod.named_task(None, ev, None) is None
+
+
+def test_it_should_let_the_pr_to_main_inherit_the_task_of_the_pr_to_development_of_the_same_branch():
+    prs = {"itens": [{"task": "task_a", "url": PR1, "head": "leodiegoo/fix/renomeada"}, {"task": "task_b", "url": PR2}]}
+    assert orq_mod.branch_task("fix/renomeada", None, [], prs) == "task_a"
+    assert orq_mod.branch_task("fix/renomeada", None, [], {"itens": [{"task": "task_b", "url": PR2}]}) is None
+
+
+def test_it_should_keep_the_head_of_the_branch_in_the_linked_pr_so_the_next_pr_inherits_it():
+    a, p, w = _environment_46()
+    a.set("workers.json", [])
+    _dispatch_by_name(a, "task_e2e", "fix/e2e-x", "ctx_e")
+    _post_pr(a, p, cmd="gh pr create --head fix/e2e-x --base development")
+    assert _prs_json(a)["itens"][0]["head"] == "fix/e2e-x"
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
