@@ -1,6 +1,6 @@
 ---
 name: orq-retro
-description: Analyzes an `orq retro` round and proposes changes to the orq environment (checks, text, worker-routing calibration). Use in the weekly orq retro or when the user asks to learn from worker failures.
+description: Analyzes an `orq retro` round and proposes changes to the orq environment (checks, text, worker-routing calibration, skill triggers). Use in the weekly orq retro or when the user asks to learn from worker failures.
 ---
 
 # orq retro
@@ -12,14 +12,18 @@ The collector (`orq retro`) counts failure signals without an LLM. This skill re
 1. Run `orq retro --json` (the weekly trigger adds `--save`; on demand it does not save). The default window is 7 days; `--since YYYY-MM-DD` changes it.
 2. For each signal with `n > 0`, open the pointer of at least one case before claiming anything: `sed -n <line>p <orq clone>/events.jsonl`, the transcript line, the PR. A signal only becomes a proposal once the cause is read in the pointer.
 3. Separate signal from **noise**: a dirty tree with the same count on every `liberado_sujo` of the main checkout is dirt that was already there, not the worker's; a high `entrada_sem_tratamento` measures the coordinator's habit, not a bug; a steer from before the first `steer_end` in the log predates the read proof. Noise cases go in a single line.
-4. Classify each proposal into exactly one class:
+4. Give each proposal a **cause** and exactly one **class**.
+   - **Cause** (`causa`): ask what led to the error, not what it looks like. Did the orq's briefing, preamble or command lead the worker astray? Then `causa: orq`: the ticket goes to the orq Run (`run_e9410bf401fb`) and never becomes a line in the project's AGENTS.md. Otherwise `causa: projeto`: the ticket goes to the project Run (`run_e7566c12893b`).
+   - **Class**:
    - **check**: mechanical error (fixed pattern, forbidden command, wrong place). It becomes a hook, test or guard in orq. A new `_retro_violations` pattern goes here.
    - **text**: judgment error. It becomes a line in AGENTS.md, in the worker's default spec or in a memory. Say which file and the exact line.
    - **calibration**: the model or effort missed by enough. It becomes a change to the `worker-routing` table, with the `por_modelo` table as proof.
+   - **trigger** (`gatilho`): the worker did not know something a skill already holds. Do not copy the text: the change is the skill's `description:` line (the condition of use). Name the skill and write the new line.
 5. Make the short list: at most 5 proposals, each with 2 or more cases, or 1 case that lost work or broke orq. Order by severity.
-6. Write the page in Lavish (`.lavish/retro-YYYY-MM-DD.html`, playbook `input`): per proposal, the evidence with pointer, the class, the concrete change and the collector metric that should drop the following week. Each proposal gets approve, reject or adjust.
-7. Save the summary to `<orq clone>/plan/relatorios/retro-YYYY-MM-DD.md` (ORQ_PLAN) and finish. The round only ends with the page open and the report written.
+6. Write the page in Lavish (`.lavish/retro-YYYY-MM-DD.html`, playbook `input`): per proposal, the evidence with pointer, the cause (`orq`/`projeto`), the class, the concrete change and the collector metric that should drop the following week. Each proposal gets approve, reject or adjust.
+7. In the report, also propose the matching edit to the prompt of the "Navegabilidade: retro das sessões de agente" automation (`orca automations edit`, so tickets with `causa: orq` stop going to the project Run). Write the command, do not run it; only with the user's ok.
+8. Save the summary to `<orq clone>/plan/relatorios/retro-YYYY-MM-DD.md` (ORQ_PLAN) and finish. The report lists the cause and class of each proposal and shows one example of each `causa` value, or says there was no case. The round only ends with the page open and the report written.
 
 ## After the ok
 
-Nothing is applied without the user's ok on the page. An approved **check** or **calibration** proposal becomes a ticket (`orq ticket new`); a **text** one, an edit to the document, in a worker.
+Nothing is applied without the user's ok on the page. An approved **check** or **calibration** proposal becomes a ticket (`orq ticket new`) in the Run of its `causa`; a **text** one, an edit to the document, in a worker; a **trigger** one, an edit to the skill's `description:`.
