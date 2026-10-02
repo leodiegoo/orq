@@ -12172,6 +12172,37 @@ def test_ticket105_gerente_absorver_toca_o_carimbo_e_grava_a_duracao_da_volta():
     assert json.load(open(os.path.join(a.home, "gerente.json")))["runs"] == ["run_a"], "o resto do gerente.json fica"
 
 
+def test_ticket120_o_painel_dorme_a_duracao_da_ultima_volta_entre_10_e_30_s():
+    f = orq_mod.painel_intervalo_s
+    assert f({}) == 10 and f({"voltas_s": []}) == 10, "sem volta gravada: 10 s"
+    assert f({"voltas_s": [6.6]}) == 10 and f({"voltas_s": [40, 8.0]}) == 10, "a volta rápida volta aos 10 s, mesmo depois de uma lenta"
+    assert f({"voltas_s": [8, 16.1]}) == 16 and f({"voltas_s": [8, 90]}) == 30, "volta lenta sobe o sleep até o teto de 30 s"
+
+
+def test_ticket120_orq_gerente_intervalo_le_o_gerente_json():
+    a = Amb(run="run_a")
+    _gerente105(a, voltas=[12.1, 20.4])
+    assert a.orq("gerente", "intervalo").stdout.strip() == "20"
+    _gerente105(a, voltas=[12.1, 5.0])
+    assert a.orq("gerente", "intervalo").stdout.strip() == "10"
+
+
+def test_ticket120_o_shell_do_painel_dorme_o_que_o_orq_manda_e_10_s_se_o_orq_quebrar():
+    for corpo_orq, esperado in (('[ "$2" = intervalo ] && echo 25', "25"), ("exit 1", "10")):
+        with tempfile.TemporaryDirectory() as t:
+            bin_ = os.path.join(t, "bin")
+            os.makedirs(bin_)
+            for nome, corpo in (("orq", corpo_orq), ("clear", ":"), ("sleep", f'echo "$1" > {t}/dormiu; kill $PPID')):
+                with open(os.path.join(bin_, nome), "w") as f:
+                    f.write("#!/bin/sh\n" + corpo + "\n")
+                os.chmod(os.path.join(bin_, nome), 0o755)
+            home = os.path.join(t, "orq")
+            os.makedirs(home)
+            subprocess.run(["sh", os.path.join(AQUI, "painel-agent-manager.sh")], env={**os.environ, "PATH": bin_ + os.pathsep + os.environ["PATH"], "ORQ_HOME": home},
+                           capture_output=True, timeout=20)
+            assert open(os.path.join(t, "dormiu")).read().strip() == esperado
+
+
 def test_ticket105_a_volta_toca_o_carimbo_depois_de_cada_run_e_nao_so_no_fim():
     a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
     _gerente(a)

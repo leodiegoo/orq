@@ -92,6 +92,8 @@ PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a ca
 PAINEL_PARADO_S = 60  # carimbo mais velho que isto já vale um aviso de "painel lento"; parado é o limite de painel_limite_s
 PAINEL_LIMITE_MIN_S = 90  # o carimbo só vale como painel parado depois de tanto tempo (ou de PAINEL_VOLTAS_X voltas médias, o que for maior)
 PAINEL_VOLTAS_X = 3
+PAINEL_INTERVALO_S = 10  # o `sleep` do painel com a volta rápida
+PAINEL_INTERVALO_MAX_S = 30  # teto do `sleep` quando a volta passa de PAINEL_INTERVALO_S
 VOLTAS_LEMBRADAS = 10  # durações de volta guardadas no gerente.json `voltas_s`
 INTEGRAR_FILA = "integrar-fila.json"  # {itens: [{branch, ticket, ts}]}: as branches que esperam o integrador; o worker do ticket fica "aguardando integração"
 PAINEL_CHECAGEM = "gerente-checagem.json"  # {ts, terminal, morto}: o que o último `orq gerente checar` (fora do hook) viu no Orca; o hook só o lê
@@ -731,6 +733,13 @@ def _media_voltas(g):
     """Duração média, em segundos, das últimas voltas do painel (gerente.json `voltas_s`); 0 sem nenhuma."""
     voltas = [v for v in g.get("voltas_s") or [] if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
     return sum(voltas) / len(voltas) if voltas else 0
+
+
+def painel_intervalo_s(g):
+    """Quanto o painel dorme antes da próxima volta: a duração da última volta (gerente.json `voltas_s`), entre PAINEL_INTERVALO_S e
+    PAINEL_INTERVALO_MAX_S. A volta lenta deixa o painel a no máximo metade do tempo trabalhando; a volta rápida volta aos 10 s."""
+    voltas = [v for v in (g or {}).get("voltas_s") or [] if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+    return min(PAINEL_INTERVALO_MAX_S, max(PAINEL_INTERVALO_S, round(voltas[-1]))) if voltas else PAINEL_INTERVALO_S
 
 
 def painel_limite_s(g):
@@ -9374,6 +9383,7 @@ def main(argv=None):
     ge.add_parser("checar", help="confere no Orca se o terminal do agent manager ainda existe (o prompt do coordenador chama, em segundo plano)")
     gs = ge.add_parser("subir", help="no coordenador: o terminal do agent manager sumiu; cria outro com o painel e religa todos os Runs do gerente.json")
     gs.add_argument("--forcar", action="store_true", help="sobe mesmo com o terminal antigo ainda no Orca")
+    ge.add_parser("intervalo", help="quantos segundos o painel dorme antes da próxima volta (o shell do painel chama)")
     ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
     rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
     rt.add_argument("--dry-run", action="store_true", help="só lista")
@@ -9638,6 +9648,8 @@ def main(argv=None):
                 print(json.dumps(gerente_checar(), ensure_ascii=False))
             elif a.op == "subir":
                 print(json.dumps(gerente_subir(a.forcar), ensure_ascii=False))
+            elif a.op == "intervalo":
+                print(painel_intervalo_s(_read_json(_path(GERENTE))))
             else:
                 print(gerente_absorver())
         elif a.cmd == "retomar" and a.pausados:
