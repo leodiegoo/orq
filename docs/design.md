@@ -301,6 +301,8 @@ Order: (1) refuse before touching anything: `--para` is the same harness, worktr
 
 When the worker hit its plan limit it has no turn left, so the package cannot depend on it. `orq passagem <dispatch> [--para codex|claude]` writes `PASSAGEM.md` from facts only and touches nothing else: no stop, no `worker-start`, no message to the worker. `orq passar` builds the same text (`_texto_passagem`), so both paths give one file. Nothing in it comes from the model.
 
+**Transcript reader.** `ler_transcrito` (`orqlib.py`) is the one neutral reader for both formats; `orq transcrito <dispatch> [--ultimos N] [--json]` prints it and `_registros_visiveis` (the package's history block) is a thin view over it. It reads the last `TRANSCRITO_FIM` bytes and yields `mensagem`, `chamada` and `resultado` events (messages capped at `PASSAGEM_MSG_MAX`, tool text at `TRANSCRITO_FERRAMENTA_MAX`). Reasoning (`thinking`, Codex `reasoning`), meta records (`isMeta`, `summary`, `session_meta`, `event_msg`), Codex `<environment_context>`, unreadable lines and truncated texts are counted in `cortes`, never silently dropped. Same cuts as ai-memory's `parse_claude`/`parse_codex`; unlike it, tool calls stay (name and arguments), since the package and the coordinator need what the worker ran.
+
 Sections, in the order of the analysis (2.3): Próximo passo, Perguntas abertas, Decisões já tomadas, Estado do git, Relatório parcial, Fim do transcrito, Onde está o resto, Como agir. What each one reads:
 
 - **Próximo passo**: always "Desconhecido" when the worker left no note. If the last transcript record is a tool call, a tool result or a prompt with no answer, it starts with "a sessão parou sem fechar o turno" (lesson 3): the tool may have run halfway, so check `git status` first.

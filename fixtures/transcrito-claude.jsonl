@@ -1,0 +1,6 @@
+{"type":"summary","summary":"resumo antigo"}
+{"type":"user","message":{"role":"user","content":"faça o ticket"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"caveat"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"segredo"},{"type":"text","text":"vou rodar a suíte"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"pytest -q"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"2 failed, 40 passed"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"faltam dois testes"}]}}

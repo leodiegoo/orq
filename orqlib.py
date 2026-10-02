@@ -4,6 +4,7 @@
 ORQ_PENDENCIAS troca o pendencias.json, ORQ_HOME troca o diretório de dados, ORQ_ORCA o binário do Orca, ORQ_LOG o log, ORQ_TRANSCRITOS a pasta dos transcritos do coordenador, ORQ_PROJETOS a pasta `projects` do Claude Code (transcritos dos workers), ORQ_NO_BG=1 desliga o refresh em segundo plano, ORQ_ISSUES a pasta dos tickets e ORQ_MAPA o mapa (desenho.md).
 """
 import argparse
+import collections
 import contextlib
 import difflib
 import fcntl
@@ -6543,43 +6544,134 @@ def _texto_da_msg(partes):
 _FERRAMENTA_CODEX = ("function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "local_shell_call")
 
 
-def _registros_visiveis(caminho):
-    """([(papel, texto)], aberto) do fim do transcrito do Claude ou do Codex: as mensagens visíveis de usuário e assistente em ordem e se o turno ficou aberto.
+TRANSCRITO_FERRAMENTA_MAX = 1_000  # letras de uma chamada ou resultado de ferramenta no leitor
 
-    Aberto é o último registro ser uma chamada ou um resultado de ferramenta, ou um prompt sem resposta: a sessão parou no meio e a ferramenta pode ter
-    rodado pela metade (lição 3). Raciocínio, registros meta e o contexto de ambiente do Codex saem; ([], False) sem arquivo legível.
-    ponytail: só mensagens; o leitor com chamadas de ferramenta e lista do que cortou é o `orq transcrito` (ticket 3)."""
+
+def _args_da_chamada(entrada):
+    """Uma linha com o que a chamada pediu: o comando de um Bash, senão o JSON compacto dos argumentos."""
+    if isinstance(entrada, str):
+        return entrada
+    e = _dict(entrada)
+    cmd = e.get("command") or e.get("cmd")
+    return " ".join(cmd) if isinstance(cmd, list) else cmd if isinstance(cmd, str) else json.dumps(entrada, ensure_ascii=False)
+
+
+def _resultado_texto(c):
+    return c if isinstance(c, str) else _texto_da_msg(c) if isinstance(c, list) else json.dumps(c, ensure_ascii=False)
+
+
+def _eventos_do_registro(m):
+    """([evento], [corte]) de um registro do transcrito, Claude (`type` user|assistant) ou Codex (`type` response_item).
+
+    Evento é `{papel, tipo: mensagem|chamada|resultado, texto, nome?}`; corte é o motivo de um pedaço que não entrou (raciocínio, registro meta, contexto de ambiente)."""
+    evs, cortes = [], []
+    if m.get("type") == "response_item":  # Codex
+        p = _dict(m.get("payload"))
+        t = p.get("type")
+        if t == "message" and p.get("role") in ("user", "assistant"):
+            texto = _texto_da_msg(p.get("content")).strip()
+            if texto.startswith("<environment_context>"):
+                cortes.append("contexto de ambiente")
+            elif texto:
+                evs.append({"papel": p["role"], "tipo": "mensagem", "texto": texto})
+        elif t == "reasoning":
+            cortes.append("raciocínio")
+        elif t in ("function_call", "custom_tool_call", "local_shell_call"):
+            args = p.get("arguments") or p.get("input") or p.get("action")
+            if isinstance(args, str):
+                with contextlib.suppress(ValueError):
+                    args = json.loads(args)
+            evs.append({"papel": "assistant", "tipo": "chamada", "nome": p.get("name") or "shell", "texto": _args_da_chamada(args)})
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            o = p.get("output")
+            if isinstance(o, str):
+                with contextlib.suppress(ValueError):
+                    o = _dict(json.loads(o)).get("output", o)
+            evs.append({"papel": "user", "tipo": "resultado", "texto": _resultado_texto(o)})
+        else:
+            cortes.append(f"registro meta ({t or '?'})")
+        return evs, cortes
+    papel = m.get("type")
+    if papel not in ("user", "assistant") or m.get("isMeta"):
+        return evs, [f"registro meta ({papel if papel not in ('user', 'assistant') else 'isMeta'})"]
+    conteudo = _dict(m.get("message")).get("content")
+    for b in [{"type": "text", "text": conteudo}] if isinstance(conteudo, str) else conteudo if isinstance(conteudo, list) else []:
+        b = _dict(b)
+        if b.get("type") == "text" and (b.get("text") or "").strip():
+            evs.append({"papel": papel, "tipo": "mensagem", "texto": b["text"].strip()})
+        elif b.get("type") == "tool_use":
+            evs.append({"papel": papel, "tipo": "chamada", "nome": b.get("name") or "?", "texto": _args_da_chamada(b.get("input"))})
+        elif b.get("type") == "tool_result":
+            evs.append({"papel": papel, "tipo": "resultado", "texto": _resultado_texto(b.get("content"))})
+        elif b.get("type") in ("thinking", "redacted_thinking"):
+            cortes.append("raciocínio")
+    return evs, cortes
+
+
+def ler_transcrito(caminho, ultimos=None):
+    """Leitor neutro do fim de um transcrito do Claude ou do Codex: `{eventos, cortes, aberto}`, sem arquivo legível `{eventos: [], cortes: {}, aberto: False}`.
+
+    Eventos em ordem: mensagens visíveis e chamadas e resultados de ferramenta (`{papel, tipo, texto, nome?}`), cada texto cortado em PASSAGEM_MSG_MAX
+    (mensagem) ou TRANSCRITO_FERRAMENTA_MAX (ferramenta). `cortes` conta o que ficou de fora por motivo: raciocínio, registros meta, contexto de ambiente
+    do Codex, linhas ilegíveis e textos truncados. `ultimos` fica com os N últimos eventos. `aberto` é o último evento ser uma ferramenta ou um prompt sem
+    resposta: a sessão parou no meio e a ferramenta pode ter rodado pela metade (lição 3).
+    ponytail: lê só os últimos TRANSCRITO_FIM bytes; o que veio antes está no `orca search`."""
+    vazio = {"eventos": [], "cortes": {}, "aberto": False}
     try:
         with open(caminho, "rb") as f:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - TRANSCRITO_FIM))
-            linhas = f.read().decode("utf-8", "replace").splitlines()
+            ini = max(0, f.tell() - TRANSCRITO_FIM)
+            f.seek(ini)
+            linhas = f.read().decode("utf-8", "replace").splitlines()[1 if ini else 0:]  # a primeira linha da janela pode vir pela metade
     except (OSError, TypeError):
-        return [], False
-    msgs, ultimo = [], None
+        return vazio
+    eventos, cortes = [], collections.Counter()
     for linha in linhas:
         try:
             m = json.loads(linha)
         except ValueError:
+            cortes["linha ilegível"] += bool(linha.strip())
             continue
-        if not isinstance(m, dict) or m.get("isMeta"):
+        if not isinstance(m, dict):
             continue
-        if m.get("type") == "response_item":  # Codex
-            p = _dict(m.get("payload"))
-            papel, partes = (p.get("role"), p.get("content")) if p.get("type") == "message" else (None, None)
-            tool = p.get("type") in _FERRAMENTA_CODEX
-        else:  # Claude
-            msg = _dict(m.get("message"))
-            papel, partes = (m["type"], msg.get("content")) if m.get("type") in ("user", "assistant") else (None, None)
-            blocos = [b.get("type") for b in partes if isinstance(b, dict)] if isinstance(partes, list) else []
-            tool = bool(blocos) and blocos[-1] in ("tool_use", "tool_result")
-        texto = _texto_da_msg(partes).strip()
-        if papel in ("user", "assistant") and texto and not texto.startswith("<environment_context>"):
-            msgs.append((papel, texto[:PASSAGEM_MSG_MAX]))
-            ultimo = "usuario" if papel == "user" else "fechado"
-        if tool:
-            ultimo = "ferramenta"
-    return msgs, ultimo in ("ferramenta", "usuario")
+        evs, cs = _eventos_do_registro(m)
+        cortes.update(cs)
+        for e in evs:
+            teto = PASSAGEM_MSG_MAX if e["tipo"] == "mensagem" else TRANSCRITO_FERRAMENTA_MAX
+            if len(e["texto"]) > teto:
+                e["texto"], cortes["texto truncado"] = e["texto"][:teto], cortes["texto truncado"] + 1
+        eventos += evs
+    ult = eventos[-1] if eventos else None
+    return {"eventos": eventos[-ultimos:] if ultimos else eventos, "cortes": dict(cortes),
+            "aberto": bool(ult) and (ult["tipo"] != "mensagem" or ult["papel"] == "user")}
+
+
+def _registros_visiveis(caminho):
+    """([(papel, texto)], aberto): só as mensagens visíveis de `ler_transcrito`, para o pacote de passagem."""
+    r = ler_transcrito(caminho)
+    return [(e["papel"], e["texto"]) for e in r["eventos"] if e["tipo"] == "mensagem"], r["aberto"]
+
+
+def transcrito(dispatch, ultimos=None):
+    """`ler_transcrito` do worker do dispatch, mais o arquivo e o agente. O arquivo vem do turnos.json (hook) ou, sem ele, do índice de sessões do Orca.
+
+    ValueError sem arquivo: dizer que o worker não disse nada seria mentira."""
+    t = _dict(_turnos_ro().get(dispatch))
+    arq, agente = t.get("transcrito"), t.get("harness")
+    if not arq:
+        agente = _checkpoint(dispatch)["agente"] or agente or "claude"
+        arq = sessao_do_dispatch(dispatch, agente).get("transcrito")
+    if not arq or not os.path.isfile(arq):
+        raise ValueError(f"o orq não achou o transcrito do dispatch {dispatch} ({arq or 'sem hook nem hit no orca search'})")
+    return {"dispatch": dispatch, "agente": agente, "arquivo": arq, **ler_transcrito(arq, ultimos)}
+
+
+def texto_transcrito(r):
+    """O transcrito em linhas `[papel] texto`, `[chamada Nome] args` e `[resultado] saída`, e no fim a lista do que o leitor cortou."""
+    linhas = [f"[{e['papel']}] {e['texto']}" if e["tipo"] == "mensagem" else f"[chamada {e['nome']}] {e['texto']}" if e["tipo"] == "chamada" else f"[resultado] {e['texto']}"
+              for e in r["eventos"]]
+    cortes = ", ".join(f"{k} ×{v}" for k, v in sorted(r["cortes"].items())) or "nada"
+    return "\n".join([*linhas, "", f"{'ABERTO: a sessão parou no meio de um turno. ' if r['aberto'] else ''}cortado: {cortes} ({r['arquivo']})"])
 
 
 def _fim_do_transcrito(caminho, limite=PASSAGEM_HISTORICO):
@@ -9838,6 +9930,10 @@ def main(argv=None):
     rl.add_argument("--modelo", help="troca o modelo (vai junto com --effort); sem ele, o do worker antigo")
     rl.add_argument("--effort")
     rl.add_argument("--run")
+    tc = sub.add_parser("transcrito", help="lê o fim do transcrito de um worker (Claude ou Codex): mensagens e chamadas de ferramenta, sem raciocínio nem registros meta, e a lista do que cortou")
+    tc.add_argument("dispatch")
+    tc.add_argument("--ultimos", type=int, default=20, help="só os N últimos eventos (padrão 20)")
+    tc.add_argument("--json", action="store_true")
     pg = sub.add_parser("passagem", help="escreve o PASSAGEM.md de um worker sem turno (limite do plano), só com fatos e em até 20 s; não para nem sobe worker")
     pg.add_argument("dispatch", help="o dispatch do worker, ou `coordenador` para gravar o snapshot desta sessão (o hook session do outro harness o injeta)")
     pg.add_argument("--para", choices=list(HARNESSES), help="o harness que vai ler (padrão: o outro)")
@@ -10090,6 +10186,9 @@ def main(argv=None):
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]
             print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([*filter(None, [aviso_hooks_codex()]), texto_agentes(ags), *linhas_hibernacao(), *parada]))
+        elif a.cmd == "transcrito":
+            r = transcrito(a.dispatch, a.ultimos)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_transcrito(r))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))

@@ -14108,6 +14108,55 @@ def test_ticket101_m4_resumo_e_cartao_leem_as_pendencias_do_backlog():
     assert a.orq("resumo").returncode == 0
 
 
+# ---------- ticket 89: orq transcrito, leitor neutro de Claude e Codex ----------
+
+def _transcrito_cli(a, nome, *args):
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ctx_w1": {"task": "task_w1", "inicio": now_iso(-600), "fim": None, "harness": "claude", "transcrito": os.path.join(FIX, nome)}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    return a.orq("transcrito", "ctx_w1", *args)
+
+
+def test_it_should_be_that_orq_transcrito_reads_a_claude_transcript_without_reasoning_or_meta():
+    r = json.loads(_transcrito_cli(Amb(run="run_a"), "transcrito-claude.jsonl", "--json").stdout)
+    assert [(e["tipo"], e["papel"]) for e in r["eventos"]] == [("mensagem", "user"), ("mensagem", "assistant"), ("chamada", "assistant"), ("resultado", "user"), ("mensagem", "assistant")], r
+    assert r["eventos"][2]["nome"] == "Bash" and r["eventos"][2]["texto"] == "pytest -q" and r["eventos"][3]["texto"] == "2 failed, 40 passed"
+    assert "segredo" not in json.dumps(r["eventos"]) and "caveat" not in json.dumps(r["eventos"])
+    assert r["cortes"] == {"raciocínio": 1, "registro meta (isMeta)": 1, "registro meta (summary)": 1} and r["aberto"] is False
+
+
+def test_it_should_be_that_orq_transcrito_reads_a_codex_rollout_with_tool_calls():
+    r = json.loads(_transcrito_cli(Amb(run="run_a"), "transcrito-codex.jsonl", "--json").stdout)
+    tipos = [e["tipo"] for e in r["eventos"]]
+    assert tipos == ["mensagem", "mensagem", "mensagem", "chamada", "resultado", "mensagem"], tipos
+    assert r["eventos"][3]["texto"] == "bash -lc pytest -q" and r["eventos"][4]["texto"] == "2 failed, 40 passed"
+    assert r["cortes"] == {"contexto de ambiente": 1, "raciocínio": 1, "registro meta (event_msg)": 1, "registro meta (session_meta)": 1}, r["cortes"]
+
+
+def test_it_should_be_that_orq_transcrito_keeps_the_last_n_events_and_lists_the_cuts_in_text():
+    p = _transcrito_cli(Amb(run="run_a"), "transcrito-claude.jsonl", "--ultimos", "2")
+    assert p.returncode == 0 and p.stdout.splitlines()[:2] == ["[resultado] 2 failed, 40 passed", "[assistant] faltam dois testes"], p.stdout
+    assert "cortado: raciocínio ×1, registro meta (isMeta) ×1, registro meta (summary) ×1" in p.stdout
+
+
+def test_it_should_be_that_the_reader_flags_an_open_turn_and_truncates_long_texts():
+    with tempfile.TemporaryDirectory() as t:
+        arq = os.path.join(t, "a.jsonl")
+        linhas = [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 7000}, {"type": "tool_use", "name": "Bash", "input": {"command": "pytest"}}]}}, "lixo{"]
+        open(arq, "w").write("\n".join(x if isinstance(x, str) else json.dumps(x) for x in linhas))
+        r = orq_mod.ler_transcrito(arq)
+    assert r["aberto"] is True and len(r["eventos"][0]["texto"]) == orq_mod.PASSAGEM_MSG_MAX
+    assert r["cortes"] == {"texto truncado": 1, "linha ilegível": 1}, r["cortes"]
+    assert orq_mod.ler_transcrito("/nao/existe.jsonl") == {"eventos": [], "cortes": {}, "aberto": False}
+
+
+def test_it_should_be_that_orq_transcrito_refuses_when_the_file_is_missing():
+    a = Amb(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ctx_w1": {"task": "task_w1", "transcrito": "/nao/existe.jsonl", "harness": "claude"}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    r = a.orq("transcrito", "ctx_w1")
+    assert r.returncode == 1 and "não achou o transcrito" in r.stderr, (r.stdout, r.stderr)
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
