@@ -1565,6 +1565,9 @@ VALORES_EN = {  # chave (em pt) -> os valores gravados que trocam; o resto (text
     "tipo": {**TIPOS_EN, **PEND_EN, **SUBIDA_EN},
     "pend_tipo": PEND_EN, "tipo_mate": SUBIDA_EN, "fila_tipo": {"despacho": "dispatch"},
     "efeito": {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "pend": "pending"},
+    "parada": {"orcamento": "budget", "decisao": "decision", "limite": "limit"},  # `end --stopped-by`
+    "motivo": {"entregue": "delivered", "falhou": "failed", "parou: orçamento": "stopped: budget", "parou: decisão pendente": "stopped: pending decision",  # o fim_motivo do release
+               "parou: limite de uso": "stopped: usage limit", "sem worker_done": "no worker_done", "motivo desconhecido": "unknown reason"},
     # agentes (ORDEM_AGENTES) e PRs (prs.json). `liberado` vira `freed`: o evento liberar grava em `estado` o `released` do Orca
     "estado": {"rodando": "running", "travado": "stuck", "perguntando": "asking", "entregue": "delivered", "liberado": "freed", "limite": "limit",
                "sem_terminal": "no_terminal", "nao_comecou": "not_started", "parado": "stopped", "aguardando_integracao": "awaiting_integration",
@@ -5857,8 +5860,9 @@ def guard_mate():
 
 def intake(e, efeito, ref=None, run=None, nota=None):
     """Grava o efeito de uma entrada. Levanta ValueError quando a referência não existe."""
+    efeito = VALORES_PT["efeito"].get(efeito, efeito)  # task|decision|conversation|discarded valem como os nomes em pt
     if efeito not in EFEITOS:
-        raise ValueError(f"invalid effect: {efeito} (use {'|'.join(EFEITOS)})")
+        raise ValueError(f"invalid effect: {efeito} (use {'|'.join(VALORES_EN['efeito'].get(x, x) for x in EFEITOS)})")
     eventos = read_events()
     alvo_e = next((x for x in eventos if x.get("id") == e and x.get("tipo") == "entrada"), None)
     if not alvo_e:
@@ -6630,8 +6634,8 @@ def le_ticket(caminho):
         raise ValueError(f"{caminho} does not start with the title (# NN: Title)")
     return {"num": os.path.basename(caminho).split("-")[0].zfill(2), "arquivo": caminho, "titulo": titulo.group(1).strip(),
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
-            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
-            "despacho": _campo(cab, "Despacho") or None, "espera": _campo(cab, "Espera") or None,
+            "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
+            "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
             "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
 
 
@@ -6709,9 +6713,9 @@ def espera_despacho(t, integracao, events, sem_push):
     """Por que o ticket não entra sozinho na fila de despacho, ou None. `Despacho: manual[, motivo]` nunca entra; `Espera: integrador vazio` só com a fila do
     integrador vazia e sem commits sem push na main (`sem_push`, lido sempre: o integrador não grava o `ciclo`)."""
     d = (t.get("despacho") or "").strip()
-    if d.lower().startswith("manual"):
-        return f"Despacho: {d}"
-    if (t.get("espera") or "").strip().lower() != "integrador vazio":
+    if d.lower().startswith("manual"):  # `Dispatch: manual` (ou o `Despacho:` antigo)
+        return f"Dispatch: {d}"
+    if (t.get("espera") or "").strip().lower() not in ("integrador vazio", "integrator empty"):
         return None
     if integracao:
         return f"waiting for the integrator to empty ({len(integracao)} in the queue)"
@@ -6950,7 +6954,7 @@ def _libera_dependentes(n, antes=None):
             except (OSError, ValueError) as e:
                 avisos.append(f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}")
         elif prio < 3:
-            avisos.append(f"ticket {t['num']} (P{prio}) released without a valid Modelo:/Effort: in the header: dispatch it with orq dispatch --ticket {t['num']}")
+            avisos.append(f"ticket {t['num']} (P{prio}) released without a valid Model:/Effort: in the header: dispatch it with orq dispatch --ticket {t['num']}")
         liberados.append(item)
     for t in livres:  # a task bloqueada por um blocker do Orca (worker-stop, deps) volta a ficar pronta
         if not (t["task"] and t["run"]):
@@ -7078,7 +7082,7 @@ def texto_doctor_antigos(r, liberar_=False):
     ls += [f"stays: {x['dispatch']} (ticket {x['ticket']}): {x['motivo']}" for x in r["ficam"]]
     ls += [f"warning: {x}" for x in r["avisos"]]
     if r["antigos"] and not liberar_:
-        ls.append("run `orq doctor antigos --liberar` to take them off the live list")
+        ls.append("run `orq doctor old --release` to take them off the live list")
     return "\n".join(ls) or "no old dispatch left unreleased"
 
 
@@ -9276,8 +9280,9 @@ def maquina_cfg():
 
 def maquina_definir(chave, valor):
     """`orq maquina set <chave> <valor>`: valor em JSON (4, true, ["claude-opus-*"]); recusa chave desconhecida ou de outro tipo. Devolve a config nova."""
+    chave = CHAVES_PT.get(chave, chave)  # a chave do machine.json em inglês vale como a em pt
     if chave not in MAQUINA_PADRAO:
-        raise ValueError(f"unknown key {chave!r}; the ones that exist: {', '.join(MAQUINA_PADRAO)}")
+        raise ValueError(f"unknown key {chave!r}; the ones that exist: {', '.join(CHAVES_EN.get(k, k) for k in MAQUINA_PADRAO)}")
     try:
         v = json.loads(valor)
     except ValueError:
@@ -11441,7 +11446,7 @@ FLAG_EN = {  # --pt -> --en (fase 1 da migração para inglês); o dest continua
     "ate-prioridade": "up-to-priority", "grupo": "group", "prazo": "deadline", "responde": "answers", "sem-gh": "no-gh",
     "sem-transcritos": "no-transcripts", "gravar": "save", "corpo": "body", "ambientes": "environments", "ultimos": "last", "fechados": "closed",
     "destino": "dest", "substituir-orca-yaml": "replace-orca-yaml", "despacho": "dispatch", "parar": "stop", "instalar": "install",
-    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state"}
+    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours"}
 FLAG_APELIDOS = {f"--{pt}": f"--{en}" for pt, en in FLAG_EN.items()}
 APELIDOS = {  # pt -> en. "" são os comandos; a chave de cada outra tabela é o comando em inglês (op) ou "<comando> <op>" (acao)
     "": {"feito": "fulfill", "adiar": "defer", "fila": "queue", "ausente": "away", "responder": "reply", "iniciar": "start", "ocupadas": "busy",
@@ -11467,6 +11472,7 @@ APELIDOS = {  # pt -> en. "" são os comandos; a chave de cada outra tabela é o
     "integrate queue": {"lista": "list"},
     "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
     "manager": {"ligar": "bind", "desligar": "unbind", "checar": "check", "subir": "spawn", "absorver": "absorb", "intervalo": "interval"},
+    "doctor": {"antigos": "old"},
     "dispatch-queue": {"lista": "list", "descartar": "discard"},
        "worktrees": {"limpar": "clean"},
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
@@ -11734,9 +11740,9 @@ def parser():
     dt = dc.add_parser("tasks", help="completes the blocked/pending task of a resolved ticket (supersededBy) and lists the one with no ticket")
     dt.add_argument("--dry-run", action="store_true", help="only lists")
     dt.add_argument("--json", action="store_true")
-    da = dc.add_parser("antigos", help="lists (and with --liberar takes off the live ones) the dispatch older than 24 h that is not released, has no terminal and has a resolved ticket")
-    da.add_argument("--liberar", action="store_true")
-    da.add_argument("--horas", type=float, default=24, help="minimum age of the dispatch (default 24)")
+    da = dc.add_parser("old", aliases=["antigos"], help="lists (and with --release takes off the live ones) the dispatch older than 24 h that is not released, has no terminal and has a resolved ticket")
+    _arg(da, "liberar", action="store_true")
+    _arg(da, "horas", type=float, default=24, help="minimum age of the dispatch (default 24)")
     da.add_argument("--ticket", action="append", default=[], help="only this ticket (repeatable)")
     da.add_argument("--json", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
@@ -12099,7 +12105,7 @@ def main(argv=None):
             r = doctor_backlog()
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_backlog(r))
             return 1 if r["problemas"] else 0
-        elif a.cmd == "doctor" and a.op == "antigos":
+        elif a.cmd == "doctor" and a.op == "old":
             r = doctor_antigos(a.liberar, a.horas, a.ticket)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_antigos(r, a.liberar))
         elif a.cmd == "doctor":

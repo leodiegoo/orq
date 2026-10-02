@@ -12235,7 +12235,7 @@ def test_ticket105_liberado_p1_ou_p2_com_modelo_entra_na_fila_de_despacho_e_p3_n
     assert (it["tipo"], it["ticket"], it["run"], it["modelo"], it["effort"], it["prioridade"]) == ("despacho", "88", "run_a", "claude-sonnet-5-5", "medium", 2), it
     por = {x["ticket"]: x for x in json.loads(r.stdout)["liberados"]}
     assert por["88"]["fila"] == it["id"] and not por["93"].get("fila"), "o P3 tem Modelo e nem assim entra na fila"
-    assert not por["91"].get("fila") and "91" in r.stderr and "Modelo:" in r.stderr, "P1 sem Modelo/Effort só avisa"
+    assert not por["91"].get("fila") and "91" in r.stderr and "Model:" in r.stderr, "P1 sem Modelo/Effort só avisa"
     assert not _log(a, "started.log"), "o ticket só entra na fila: quem sobe é o gerente"
 
 
@@ -14730,8 +14730,8 @@ def test_ticket142_despacho_manual_nunca_entra_na_fila_automatica_mesmo_com_mode
     r = a.orq("ticket", "fechar", "87", "--answer", "feito")
     assert r.returncode == 0, r.stderr
     assert _fila79(a) == [] and "manual" in r.stderr, r.stderr
-    assert "Despacho: manual, só depois da fase 3" in a.orq("ticket", "lista").stdout
-    assert "outside the dispatch queue: 88 (Despacho: manual" in a.orq("status").stdout
+    assert "Dispatch: manual, só depois da fase 3" in a.orq("ticket", "lista").stdout
+    assert "outside the dispatch queue: 88 (Dispatch: manual" in a.orq("status").stdout
 
 
 def test_ticket142_espera_integrador_vazio_so_entra_na_fila_com_o_integrador_vazio():
@@ -16433,6 +16433,7 @@ PARES129 = [  # (argv em pt, argv em inglês): um par de cada comando, subcomand
     ("uso --agente codex", "usage --agent codex"),
     ("revisar t", "review t"),
     ("maquina set k 1", "machine set k 1"),
+    ("doctor antigos --liberar --horas 2", "doctor old --release --hours 2"),
     ("fila-despacho lista", "dispatch-queue list"),
     ("fila-despacho descartar fd1 --motivo m", "dispatch-queue discard fd1 --reason m"),
     ("worktrees limpar --dry-run", "worktrees clean --dry-run"),
@@ -16752,6 +16753,59 @@ def test_orq_le_o_estado_pelo_nome_antigo_e_grava_em_ingles():
     d = json.load(open(os.path.join(a.home, "fila.json")))  # o nome pt vale até a migração; o conteúdo já sai em inglês
     assert r.returncode == 0 and "steps" in d and "passos" not in d, (r.stderr, d)
     assert [p["nome"] for p in orqlib.para_pt(d)["passos"]] == ["Login", "Depois"]
+
+
+def test_machine_set_accepts_the_english_key_of_machine_json():
+    a = Amb()
+    r = a.orq("machine", "set", "max_expensive", "3")
+    assert r.returncode == 0, r.stderr
+    assert json.load(open(os.path.join(a.home, "machine.json"))) == {"max_expensive": 3}
+    assert a.orq("machine", "set", "max_caros", "2").returncode == 0, "the pt key keeps working"
+    assert json.load(open(os.path.join(a.home, "machine.json"))) == {"max_expensive": 2}
+    r = a.orq("machine", "set", "no_such_key", "1")
+    assert r.returncode == 1 and "max_expensive" in r.stderr and "max_caros" not in r.stderr, r.stderr
+
+
+def test_intake_accepts_the_english_effects_and_records_the_pt_one():
+    a = Amb()
+    a.prompt("faz isso")
+    assert a.orq("intake", "e1", "conversation").returncode == 0
+    assert [e["efeito"] for e in a.events() if e["tipo"] == "intake"] == ["conversa"]
+    assert json.loads(open(os.path.join(a.home, "events.jsonl")).read().splitlines()[-1])["effect"] == "conversation"
+    r = a.orq("intake", "e1", "nonsense")
+    assert r.returncode == 1 and "task|steer|pending|decision|conversation|discarded|mate" in r.stderr, r.stderr
+
+
+def test_ticket_header_reads_the_english_and_the_pt_optional_lines():
+    a = Amb()
+    for num, extra in (("01", "Model: claude-sonnet-5-5\nEffort: low\nDispatch: manual, later\nWaiting: integrator empty\n"),
+                       ("02", "Modelo: claude-sonnet-5-5\nEffort: low\nDespacho: manual, later\nEspera: integrador vazio\n")):
+        _tk105(a, num, "T", extra=extra)
+        t = orq_mod.le_ticket(os.path.join(a.env["ORQ_ISSUES"], f"{num}-t.md"))
+        assert (t["modelo"], t["effort"], t["despacho"], t["espera"]) == ("claude-sonnet-5-5", "low", "manual, later", t["espera"]), t
+        assert t["espera"] in ("integrator empty", "integrador vazio")
+        assert orq_mod.espera_despacho({**t, "despacho": None}, {"50": {}}, [], 0).startswith("waiting for the integrator"), t
+
+
+def test_release_writes_the_end_reason_in_english_and_reads_both():
+    a = Amb(run="run_a")
+    _lib_env(a, worktree="/tmp/nao-existe")
+    a.set("inbox.json", {"ok": True, "result": {"messages": [{"id": "m1", "run_id": "run_a", "sequence": 1, "type": "worker_done", "subject": "s", "created_at": "2026-09-30T02:00:00Z",
+                                                            "payload": json.dumps({"dispatchId": "ctx_term_w1", "taskId": "task_w1", "outcome": "succeeded"})}]}})
+    assert a.orq("release", "ctx_term_w1").returncode == 0
+    linha = next(json.loads(x) for x in open(os.path.join(a.home, "events.jsonl")) if '"dispatch_end"' in x)
+    assert linha["reason"] == "delivered", linha
+    assert orqlib.para_pt({"type": "dispatch_end", "reason": "stopped: pending decision"})["motivo"] == "parou: decisão pendente"
+    assert orqlib.para_pt({"tipo": "fim_dispatch", "motivo": "sem worker_done"})["motivo"] == "sem worker_done", "the pt line from before is read as is"
+    assert orqlib.para_en({"tipo": "controle", "acao": "encerrar", "parada": "limite"})["stopped_by"] == "limit"
+
+
+def test_doctor_old_is_the_name_and_antigos_the_alias():
+    ap = orq_mod.parser()
+    novo = ap.parse_args(["doctor", "old", "--release", "--hours", "2"])
+    antigo = ap.parse_args(["doctor", "antigos", "--liberar", "--horas", "2"])
+    assert novo.liberar is True and novo.horas == 2 and (antigo.liberar, antigo.horas) == (True, 2)
+    assert orq_mod.normalizar(antigo, ["doctor", "antigos"]) and antigo.op == "old"
 
 
 if __name__ == "__main__":
