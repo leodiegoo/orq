@@ -7419,6 +7419,22 @@ def test_away_external_parks_each_denied_command_once():
     assert new[0] in _external(a, "gh pr merge 12 --base main")["permissionDecisionReason"]
 
 
+def test_away_external_night_budget_armed_by_away_does_not_free_a_merge_into_an_environment():
+    a = Env(run="run_a")
+    _away_project(a)  # no merge_allowed
+    _night(a, via="away", max_despachos=5)  # the budget `away on` arms (ticket 213)
+    _away_on(a.home)
+    for cmd, line in (("gh pr merge 12 --base development --squash", "merge-env"), ("gh pr merge 12 --base main", "merge-prod"), ("gh workflow run deploy.yaml", "workflow")):
+        out = _external(a, cmd)
+        assert out and out["permissionDecision"] == "deny" and f"line `{line}`" in out["permissionDecisionReason"], (cmd, out)
+    assert _external(a, "gh pr create --base development --fill") is None
+    a = Env(run="run_a")
+    _away_project(a, {"development": True})
+    _night(a, via="away", max_despachos=5)
+    _away_on(a.home)
+    assert _external(a, "gh pr merge 12 --base development --squash") is None, "the project flag frees it, the budget does not"
+
+
 def test_night_external_without_away_keeps_denying_everything_and_parks_nothing():
     a = Env(run="run_a")
     _night(a)
@@ -7553,11 +7569,15 @@ def test_ticket213_noite_ligar_with_away_on_replaces_the_state_without_duplicati
     assert "noite" not in _cursor(a)
 
 
-def test_ticket213_external_hook_stays_inert_with_only_away_on():
+def test_ticket213_away_on_alone_arms_the_budget_and_the_away_table_still_rules_the_external_actions():
     a = Env(run="run_a")
     a.orq("away", "on")
-    for cmd in EXTERNAL_COMMANDS:
-        assert _external(a, cmd) is None, cmd
+    assert _cursor(a)["noite"]["via"] == "away"
+    for cmd, line in (("gh workflow run deploy.yaml", "workflow"), ("git commit --no-verify -m x", "no-verify"), ("gh pr merge 12 --squash", "merge-unknown"),
+                      ("orca worktree rm --worktree x --force --run-hooks", "worktree-rm")):
+        out = _external(a, cmd)
+        assert out and "away mode" in out["permissionDecisionReason"] and f"line `{line}`" in out["permissionDecisionReason"], (cmd, out)
+    assert _external(a, "gh pr create --fill") is None
 
 
 def test_ticket213_away_dispatch_starts_the_worker_without_git_prompt():

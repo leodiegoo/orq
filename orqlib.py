@@ -5552,7 +5552,7 @@ AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:
 
 def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None):
     """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
-    marked `via: away` so `orq hook external` stays inert): the end time, the dispatch cap and the failure breaker. Already on, it keeps the original
+    marked `via: away`): the end time, the dispatch cap and the failure breaker. The budget releases no external action: `hook_external` applies AWAY_EXTERNAL whatever it holds. Already on, it keeps the original
     `ligada_em` and only re-arms the budget. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
     _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
     was = _dict(_cursor_ro().get("ausente"))
@@ -5866,7 +5866,7 @@ def night_lines(cur, events):
     has_stopped = next((e for e in reversed(_since_night(events, night, "noite_parou"))), None)
     cap = night.get("max_despachos")
     spent = f"{len(_since_night(events, night, 'despacho'))}/{cap if cap is not None else '∞'} dispatches, until {_hora_local(night['ate'])}"
-    if night.get("via") == "away":  # away keeps its own rules (ticket 126) and pushes after the audit: only the budget is added
+    if night.get("via") == "away":  # away keeps its own rules (ticket 126) and its external actions follow AWAY_EXTERNAL: only the budget is added
         return ["[orq away] Rules: park decisions with orq pend add (no AskUserQuestion), stop dispatching when the budget runs out.",
                 ("[orq away] Stopped dispatching: " + has_stopped["motivo"] + " (" + str(spent) + "); orq away on --until HH:MM re-arms it.") if has_stopped else ("[orq away] Budget: " + str(spent) + ", " + str(night.get("max_falhas") or NIGHT_FAILURES) + " consecutive failures close it.")]
     return ["[orq night] Rules: no AskUserQuestion (park the decision with orq pend add and carry on with what is independent), no push or merge, "
