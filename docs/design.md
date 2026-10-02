@@ -61,6 +61,7 @@ The model does the classifying. The code only checks that a classification was r
 | `dispatch_end` | `orq release`: `dispatch`, `reason` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
 | `processes` | `orq release`, `orq clean --closed`, `limpar-mergeados.py`: `op` (`encerrar` or `recusado`), `worktree`, `encerrados` (the worker's processes with `cwd` inside it that got TERM), `kill` (those that only fell to KILL), `lista` (`{pid, comando, cwd}` of what the sweep ended or, with `recusado`, would have), `nao_encerrados` and `restantes` (cwd inside but not below the worker's harness: left alone), `limite` (`ORQ_ENCERRA_MAX`, with `recusado`) |
 | `pr` (`op: ligar/desligar/sem_task/entrou/fechou/avisado`) | `orq pr`, the `prlink` hook, the poll, the manager loop |
+| `clean`, `clean_run` | `orq clean --apply` and the manager loop: one `clean` per removed item (`categoria`, `alvo`, `bytes`, `motivo`, plus `sha`, `branch`, `via` or `bundle` where they apply), one `clean_run` per pass with `quantos` (pairs `[category, n]`, not a dict: the read swaps dict keys between the pt and en names) and `bytes` |
 | `usage_notice`, `usage_stopped` | the manager loop warns the coordinator once per level and window; `orq dispatch` refuses on budget |
 | `priority` | `orq priority <task> <1-3>`: `task`, `valor` |
 | `dispatch_queued` (`op: entrou/subiu/saiu/removido/desistiu`), `machine_notice` | the dispatch queue of the machine budget; the manager loop warns the coordinator once per pressure episode |
@@ -1117,6 +1118,19 @@ The review stops at its approval gate, so after reading the output the orq runs 
 ## Tests after `__main__` never run (ticket 173)
 
 `test_orq.py` builds its test list when the `if __name__ == "__main__":` block starts, so a `def test_` below that block is never collected and its suite passes green without it (tickets 135 and 158 shipped that way). `_tests_after_main` scans the source for such definitions: the runner lists them as failures on every run, filtered or not, and `test_ticket173_guard_refuses_def_test_after_main` covers the scan and fails if the file has one.
+
+## Residue cleaning (ticket 326)
+
+`orq clean` exists because nothing owned what the orq leaves behind: on 02/10 there were 92 files in `avisos/`, 99 worktrees (606 MB), 111 local branches, a `backup-pt-*` folder, 7 bundles and 14 `settings.json.bak-*`. It is a dry run by default and `--apply` removes; `clean_plan()` only reads and `clean_apply()` does the removing, so the manager and the CLI share one rule set.
+
+- One rule per category, one place for what must never go. `_clean_protected()` refuses `plan/` (except the bundles in `plan/backups`), the live state (`events.jsonl`, `cursor.json`, `backlog.*`, `projects/`, `groups/`) and any file git tracks, and `clean_apply()` asks it again, so a bug in a lister cannot delete a protected path.
+- Worktrees reuse `clean_orq_worktrees()`; the only change there is that a ticket on the integrator queue counts as live, so a delivery still waiting for the integrator keeps its worktree. A branch at the exact tip of `main` is never listed: a worker's branch before its first commit is an ancestor of `main` too, and it is not integrated work.
+- A bundle holds the commits `main` lacks. For a branch already in `main` there is nothing to bundle (`git bundle` refuses an empty range), so the `clean` event keeps the tip sha and `git branch <name> <sha>` brings it back.
+- Flock files (`*.lock`) are not residue: the code recreates them on use, and deleting one while a process holds it lets two processes hold "the" lock. Only a lock or pid file with a numeric owner that is dead and a free flock goes.
+- `_short()` writes `avisos/<hash>.json` next to every long notice with its `valid_while`, the name of a function in `NOTICE_CONDITIONS` (`e2e_stuck`, `manager_down`, `machine_pressure`). `notify_e2e_queue` and the machine-pressure notice pass theirs; every other notice has `null` and only the 24 h age expires it. An unknown name counts as valid.
+- Tiers: `notices` and `state` every hour (cheap, reversible by the next notice), the size categories once a day. Away mode and machine pressure hold only the size tier, because that is the one that spends I/O. `clean-run.json` keeps the stamps; `ORQ_NO_CLEAN` turns the manager's call off (the test suite sets it).
+- The test lines in the real `events.jsonl` are the one category the manager never applies and a plain `--apply` skips: rewriting the live log is the user's decision (`--test-lines`), done under `cursor.lock` after a copy in `plan/backups`. The marker ids (`x`, `run_a`, `term_x`) are `CLEAN_TEST_IDS`.
+- Under `ORQ_TESTING`, `~/.claude` is not read unless `ORQ_CLAUDE_DIR` points at a fake: a test must not list or delete the real backups.
 
 ## Why the defaults are what they are (moved out of the README)
 

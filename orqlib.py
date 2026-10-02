@@ -586,6 +586,7 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         ev = read_events()
         lib = _released(ev) | {e.get("dispatch") for e in ev if e.get("tipo") == "liberar" and e.get("estado") in ("released", "already_released")}
         live = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}  # `retained` and `release_unknown` count as alive
+        live |= {str(i["ticket"]).zfill(2) for i in integration_queue().values()}  # a delivery still on the integrator queue is not residue (ticket 326)
     subjects = set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
     out, cwds, rewrites = {"removidas": [], "ficaram": [], "bundle": None}, None, []
     for item_name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
@@ -637,6 +638,382 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         out["removidas"].remove(x)
         out["ficaram"].append({"pasta": x["pasta"], "motivo": reason})
     return out
+
+
+# ---------- orq clean: residue with no owner (ticket 326) ----------
+
+CLEAN_DEFAULTS = {"notice_hours": 24,  # a notice in avisos/ older than this goes, whatever its condition
+                  "backups_keep": 3, "backups_days": 7,  # backup-pt-* and plan/backups/*.bundle: the 3 newest and the ones under 7 days stay
+                  "settings_keep": 3,  # ~/.claude/settings.json.bak-* and ~/.claude/backups/*: the 3 newest stay
+                  "integra_hours": 1,  # an integra-* worktree with no process and no commit for this long is an orphan
+                  "state_hours": 24}  # *.antes-* and dead-owner lock files older than this go
+CLEAN_FILE = "clean.json"  # same keys as CLEAN_DEFAULTS; machine.json takes the same keys, clean.json wins
+CLEAN_SAFE = ("notices", "state")  # the manager applies these every hour; CLEAN_SIZE once a day, outside away mode and without machine pressure
+CLEAN_SIZE = ("worktrees", "branches", "integra", "backups", "claude")
+CLEAN_CATEGORIES = (*CLEAN_SAFE, *CLEAN_SIZE, "test-lines")  # test-lines is only listed: `orq clean --test-lines --apply` is the user's approval
+CLEAN_STAMPS = "clean-run.json"  # {safe, size}: when the manager last ran each tier
+CLEAN_TEST_IDS = {"task": {"x"}, "run": {"x", "run_a"}, "terminal": {"term_x"}}  # what the suites that leaked into the real events.jsonl wrote (ticket 326, 02/10)
+NOTICE_CONDITIONS = {  # `valid_while` of a notice in avisos/: the notice is valid while the function answers True; unknown names count as valid (the age still expires it)
+    "e2e_stuck": lambda: bool((e2e_queue() or {}).get("presa")),
+    "manager_down": lambda: bool(panel_notice()),
+    "machine_pressure": lambda: machine_level()[0] == "alta"}
+STATE_NOTICES = {"e2e-notice.json": "e2e_stuck", fail_safe.MARKER: "hooks_broken"}  # state files that only mean something while their condition holds
+STATE_NOTICES_VALID = {"hooks_broken": lambda: bool(fail_safe.broken_line())}
+
+
+def clean_cfg():
+    """CLEAN_DEFAULTS on top of machine.json and clean.json; a key of the wrong type or an unknown one counts as absent."""
+    cfg = dict(CLEAN_DEFAULTS)
+    for name in (MACHINE_FILE, CLEAN_FILE):
+        stored = _dict(_read_json(_path(name)))
+        cfg.update({k: stored[k] for k in CLEAN_DEFAULTS if isinstance(stored.get(k), (int, float)) and not isinstance(stored[k], bool)})
+    return cfg
+
+
+def _claude_dir():
+    """The folder with settings.json.bak-* and backups/. Under the test suite (ORQ_TESTING) a missing ORQ_CLAUDE_DIR means no folder: a test must not list or remove the real ~/.claude."""
+    return os.environ.get("ORQ_CLAUDE_DIR") or (None if os.environ.get("ORQ_TESTING") else os.path.expanduser("~/.claude"))
+
+
+def _size_of(path):
+    """Bytes of a file, or of a folder through `du` (a worktree has thousands of files; du is the fast way)."""
+    try:
+        if not os.path.isdir(path) or os.path.islink(path):
+            return os.lstat(path).st_size
+        r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=30)
+        return int(r.stdout.split()[0]) * 1024 if r.returncode == 0 and r.stdout.split() else 0
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0
+
+
+def _clean_protected(path):
+    """Why orq clean never touches `path`, or None: plan/ (tickets, specs, reports), the live state (events, cursor, backlog.*, projects/, groups/) and any file git tracks."""
+    real = os.path.realpath(path)
+    plan, home = os.path.realpath(PLAN), os.path.realpath(HOME)
+    if real == plan or (real.startswith(plan + os.sep) and os.path.dirname(real) != os.path.join(plan, "backups")):
+        return "plan/ is never touched"
+    rel = os.path.relpath(real, home)
+    if not rel.startswith("..") and (rel in ("events.jsonl", "cursor.json") or rel.startswith(("backlog.", "projects" + os.sep, "groups" + os.sep)) or rel in ("projects", "groups")):
+        return "live state is never touched"
+    try:
+        tracked = subprocess.run(["git", "-C", os.path.dirname(real), "ls-files", "--error-unmatch", "--", os.path.basename(real)], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        tracked = True  # git did not answer: the safe reading is "versioned"
+    return "versioned file" if tracked else None
+
+
+def _newest_kept(entries, keep, days, now_at):
+    """`entries` = [(path, mtime)]: the ones to remove, i.e. outside the `keep` newest and older than `days` days."""
+    ordered = sorted(entries, key=lambda e: e[1], reverse=True)
+    return [(p, m) for p, m in ordered[keep:] if now_at - m >= days * 86400]
+
+
+def _clean_item(category, target, reason, now_at, age_at=None, size=None, **extra):
+    return {"categoria": category, "alvo": target, "bytes": _size_of(target) if size is None else size, "idade_s": int(now_at - age_at) if age_at is not None else None, "motivo": reason, **extra}
+
+
+def _clean_notices(now_at, cfg):
+    """avisos/: the long notices `_short` stores (`<hash>.txt` + `<hash>.json` with `valid_while`). A notice goes when its condition stopped holding, or after notice_hours."""
+    folder, out = os.path.join(HOME, "avisos"), []
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        path = os.path.join(folder, name)
+        if name.endswith(".json") and os.path.exists(path[:-5] + ".txt"):
+            continue  # the sidecar goes with its notice
+        mtime = os.path.getmtime(path)
+        side = _dict(_read_json(path[:-4] + ".json")) if name.endswith(".txt") else {}
+        cond = side.get("valid_while")
+        if cond in NOTICE_CONDITIONS and not NOTICE_CONDITIONS[cond]():
+            reason = f"the condition `{cond}` no longer holds"
+        elif now_at - mtime >= cfg["notice_hours"] * 3600:
+            reason = f"older than {cfg['notice_hours']:g} h"
+        else:
+            continue
+        if not _clean_protected(path):
+            out.append(_clean_item("notices", path, reason, now_at, mtime))
+    return out
+
+
+def _lock_free(path):
+    try:
+        with open(path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_dead(path):
+    try:
+        pid = int(open(path).read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _clean_state(now_at, cfg):
+    """Runtime files that became leftovers: `*.antes-*` (a state file kept before a change), a lock/pid file whose owner died and whose flock is free, and the
+    `*-notice.json` of a state that already resolved (e2e-notice.json with the E2E queue free, hook-failed.json with the hooks working)."""
+    out = []
+    for name in sorted(os.listdir(HOME)) if os.path.isdir(HOME) else []:
+        path = os.path.join(HOME, name)
+        if not os.path.isfile(path):
+            continue
+        mtime, old = os.path.getmtime(path), now_at - os.path.getmtime(path) >= cfg["state_hours"] * 3600
+        cond = STATE_NOTICES.get(name)
+        if ".antes-" in name and old:
+            reason = "state file kept before a change, older than %g h" % cfg["state_hours"]
+        elif name.endswith((".lock", ".pid")) and old and _pid_dead(path) and _lock_free(path):
+            reason = "lock whose owner process is gone"
+        elif cond and not (NOTICE_CONDITIONS.get(cond) or STATE_NOTICES_VALID[cond])():
+            reason = f"notice of a state that already resolved (`{cond}` no longer holds)"
+        else:
+            continue
+        if not _clean_protected(path):
+            out.append(_clean_item("state", path, reason, now_at, mtime))
+    return out
+
+
+def _clean_worktrees(now_at, repo, root, backups):
+    r = clean_orq_worktrees(repo, root, dry_run=True, now_at=now_at, backups=backups)
+    return [_clean_item("worktrees", x["pasta"], f"branch {x['branch']} already in origin/main ({x['via']})", now_at, _birth(x["pasta"]), branch=x["branch"], via=x["via"]) for x in r["removidas"]]
+
+
+def _clean_integra(now_at, cfg, repo, root):
+    """`<root>/integra-*` worktrees (the integrator's own): no process inside, clean, and the last commit older than integra_hours. Never one whose ticket is still in the integrator queue."""
+    queued = {i["branch"] for i in integration_queue().values()}
+    out, cwds = [], None
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        d = os.path.join(root, name)
+        if not name.startswith("integra-") or not os.path.exists(os.path.join(d, ".git")):
+            continue
+        branch = (_git(d, "branch", "--show-current") or "").strip()
+        last, status = (_git(d, "log", "-1", "--format=%ct") or "").strip(), _git(d, "status", "--porcelain")
+        cwds = _open_cwds() if cwds is None else cwds
+        real = os.path.realpath(d)
+        reason = ("detached HEAD" if not branch else "branch is on the integrator queue" if branch in queued else "uncommitted changes" if status is None or status.strip()
+                  else "a process is inside" if any(c == real or c.startswith(real + os.sep) for c in cwds) else "no commit time" if not last.isdigit()
+                  else "a commit is newer than the limit" if now_at - int(last) < cfg["integra_hours"] * 3600 else None)
+        if not reason:
+            out.append(_clean_item("integra", d, f"integration folder with no process and no new commit for over {cfg['integra_hours']:g} h", now_at, int(last), branch=branch))
+    return out
+
+
+def _local_branches(repo):
+    """[(branch, tip sha, checked-out path or '')] of the local branches."""
+    out = _git(repo, "for-each-ref", "--format=%(refname:short) %(objectname) %(worktreepath)", "refs/heads") or ""
+    return [(p[0], p[1], p[2] if len(p) > 2 else "") for p in (l.split(" ", 2) for l in out.splitlines() if l.strip())]
+
+
+def _clean_branches(now_at, repo, ref=None):
+    """Local branches whose tip is already in `ref`. Not: main/environment branches, one checked out in a worktree, one at the very tip of `ref` (a branch a worker just
+    created), one on the integrator queue."""
+    ref = ref or BRANCH_NO_REMOTE
+    if _git(repo, "rev-parse", "--verify", "-q", ref) is None:
+        return []
+    tip = (_git(repo, "rev-parse", ref) or "").strip()
+    queued = {i["branch"] for i in integration_queue().values()}
+    out = []
+    for b, sha, worktree in _local_branches(repo):
+        if b == ref or _environment_branch(b) or worktree or sha == tip or b in queued or _git(repo, "merge-base", "--is-ancestor", b, ref) is None:
+            continue
+        stamp = (_git(repo, "log", "-1", "--format=%ct", b) or "0").strip()
+        out.append(_clean_item("branches", b, f"already integrated into {ref}", now_at, int(stamp) if stamp.isdigit() else None, size=0, sha=sha))
+    return out
+
+
+def _clean_backups(now_at, cfg, backups):
+    """`backup-pt-*` folders in ORQ_HOME (the migration to English) and plan/backups/*.bundle: the newest `backups_keep` and the ones under `backups_days` days stay."""
+    entries = [(os.path.join(HOME, n), os.path.getmtime(os.path.join(HOME, n))) for n in os.listdir(HOME) if n.startswith("backup-pt-")] if os.path.isdir(HOME) else []
+    bundles = [(os.path.join(backups, n), os.path.getmtime(os.path.join(backups, n))) for n in os.listdir(backups) if n.endswith(".bundle")] if os.path.isdir(backups) else []
+    return [_clean_item("backups", p, f"not among the {cfg['backups_keep']:g} newest and older than {cfg['backups_days']:g} days", now_at, m)
+            for group in (entries, bundles) for p, m in _newest_kept(group, cfg["backups_keep"], cfg["backups_days"], now_at) if not _clean_protected(p)]
+
+
+def _clean_claude(now_at, cfg):
+    """~/.claude/settings.json.bak-* and ~/.claude/backups/*: the newest `settings_keep` of each stay."""
+    base = _claude_dir()
+    if not base:
+        return []
+    baks = [(os.path.join(base, n), os.path.getmtime(os.path.join(base, n))) for n in os.listdir(base) if n.startswith("settings.json.bak-")] if os.path.isdir(base) else []
+    folder = os.path.join(base, "backups")
+    saved = [(os.path.join(folder, n), os.path.getmtime(os.path.join(folder, n))) for n in os.listdir(folder)] if os.path.isdir(folder) else []
+    return [_clean_item("claude", p, f"not among the {cfg['settings_keep']:g} newest", now_at, m)
+            for group in (baks, saved) for p, m in _newest_kept(group, cfg["settings_keep"], 0, now_at)]
+
+
+def _is_test_event(line):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(e, dict) and any(e.get(k) in ids for k, ids in CLEAN_TEST_IDS.items())
+
+
+def clean_test_lines():
+    """The lines of events.jsonl that a test suite wrote into the real log (tasks and runs `x`, `run_a`, `term_x`): (line number, text). Lists only."""
+    try:
+        with open(_path("events.jsonl"), encoding="utf-8") as f:
+            return [(n, l.rstrip("\n")) for n, l in enumerate(f, 1) if _is_test_event(l)]
+    except OSError:
+        return []
+
+
+def _clean_test_lines(now_at):
+    lines = clean_test_lines()
+    return [_clean_item("test-lines", _path("events.jsonl"), f"{len(lines)} event line(s) from a test suite (task/run `x`, `run_a`, `term_x`); `orq clean --test-lines --apply` removes them after a backup", now_at,
+                        size=sum(len(l) + 1 for _, l in lines))] if lines else []
+
+
+def _clean_bundle(repo, branches, backups, now_at, ref):
+    """Bundle of the commits of `branches` that `ref` does not have (verified). Nothing to bundle when all of them are in `ref`: returns (None, True). (path, ok)."""
+    branches = [b for b in branches if (_git(repo, "log", "--format=%H", "-1", f"{ref}..{b}") or "").strip()]
+    if not branches:
+        return None, True
+    os.makedirs(backups, exist_ok=True)
+    bundle = os.path.join(backups, f"orq-clean-{time.strftime('%Y-%m-%d-%H%M%S', time.localtime(now_at))}.bundle")
+    ok = subprocess.run(["git", "-C", repo, "bundle", "create", bundle, *branches, f"^{ref}"], capture_output=True).returncode == 0 \
+        and subprocess.run(["git", "-C", repo, "bundle", "verify", bundle], capture_output=True).returncode == 0
+    return (bundle if ok else None), ok
+
+
+def clean_plan(now_at=None, only=None, repo=None, root=None, backups=None):
+    """What `orq clean` would remove, by category: {category: [item]}. Pure read: writes nothing, records nothing. `only`: the categories to look at (default all)."""
+    now_at = time.time() if now_at is None else now_at
+    repo, root, backups, cfg = repo or HOME, root or WT_ROOT, backups or os.path.join(PLAN, "backups"), clean_cfg()
+    looks = {"notices": lambda: _clean_notices(now_at, cfg), "state": lambda: _clean_state(now_at, cfg), "worktrees": lambda: _clean_worktrees(now_at, repo, root, backups),
+             "branches": lambda: _clean_branches(now_at, repo), "integra": lambda: _clean_integra(now_at, cfg, repo, root), "backups": lambda: _clean_backups(now_at, cfg, backups),
+             "claude": lambda: _clean_claude(now_at, cfg), "test-lines": lambda: _clean_test_lines(now_at)}
+    return {c: looks[c]() for c in CLEAN_CATEGORIES if only is None or c in only}
+
+
+def _remove_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def clean_apply(plan, now_at=None, repo=None, root=None, backups=None, approve_test_lines=False):
+    """Removes what `plan` lists, each category with its own rule, and records one `clean` event per item (`categoria`, `alvo`, `bytes`, `motivo`) and one `clean_run` with the totals.
+    A worktree or branch goes after a verified bundle of the commits `main` does not have (a branch already in main has nothing to bundle: the event keeps its tip sha).
+    Never a path `_clean_protected` refuses. The test lines of events.jsonl only with `approve_test_lines`, after a copy of the log in plan/backups. Returns {removed: [item], kept: [(item, why)]}."""
+    now_at = time.time() if now_at is None else now_at
+    repo, root, backups = repo or HOME, root or WT_ROOT, backups or os.path.join(PLAN, "backups")
+    removed, kept = [], []
+
+    def done(item):
+        removed.append(item)
+        append_event({"tipo": "clean", **item})
+
+    for item in plan.get("notices", []) + plan.get("state", []) + plan.get("backups", []) + plan.get("claude", []):
+        if why := _clean_protected(item["alvo"]):
+            kept.append((item, why))
+            continue
+        sidecar = item["alvo"][:-4] + ".json" if item["categoria"] == "notices" and item["alvo"].endswith(".txt") else None
+        for p in (item["alvo"], sidecar):
+            if p and os.path.lexists(p):
+                _remove_path(p)
+        done(item)
+    for item in plan.get("integra", []):
+        bundle, ok = _clean_bundle(repo, [item["branch"]], backups, now_at, BRANCH_NO_REMOTE)
+        if not ok or _git(repo, "worktree", "remove", item["alvo"]) is None:
+            kept.append((item, "backup bundle failed" if not ok else "git worktree remove refused"))
+        elif _git(repo, "branch", "-D", item["branch"]) is None:
+            kept.append((item, "folder removed, git branch refused"))
+        else:
+            done({**item, **({"bundle": bundle} if bundle else {})})
+    if plan.get("worktrees"):
+        r = clean_orq_worktrees(repo, root, now_at=now_at, backups=backups)
+        gone = {x["pasta"] for x in r["removidas"]}
+        for item in plan["worktrees"]:
+            (done({**item, **({"bundle": r["bundle"]} if r["bundle"] else {})}) if item["alvo"] in gone else kept.append((item, "no longer eligible")))
+    for item in plan.get("branches", []):
+        b = item["alvo"]
+        if (_git(repo, "rev-parse", b) or "").strip() != item["sha"] or _git(repo, "merge-base", "--is-ancestor", b, BRANCH_NO_REMOTE) is None:
+            kept.append((item, "branch moved since the listing"))
+        elif _git(repo, "branch", "-D", b) is None:  # -D: `-d` judges against HEAD; the ancestry in main was just checked
+            kept.append((item, "git branch refused"))
+        else:
+            done(item)
+    for item in plan.get("test-lines", []) if approve_test_lines else []:
+        with _lock("cursor.lock"):
+            os.makedirs(backups, exist_ok=True)
+            copy = os.path.join(backups, f"events-{time.strftime('%Y-%m-%d-%H%M%S', time.localtime(now_at))}.jsonl.bak")
+            shutil.copy2(item["alvo"], copy)
+            with open(item["alvo"], encoding="utf-8") as f:
+                rows = f.readlines()
+            drop = [i for i, l in enumerate(rows) if _is_test_event(l)]
+            with open(item["alvo"] + ".tmp", "w", encoding="utf-8") as f:
+                f.writelines(l for i, l in enumerate(rows) if i not in set(drop))
+            os.replace(item["alvo"] + ".tmp", item["alvo"])
+        done({**item, "motivo": f"{len(drop)} test line(s) removed; log backup at {copy}"})
+    totals = {}
+    for it in removed:
+        totals[it["categoria"]] = totals.get(it["categoria"], 0) + 1
+    if removed:
+        append_event({"tipo": "clean_run", "quantos": [[c, n] for c, n in totals.items()], "bytes": sum(it["bytes"] for it in removed)})
+    return {"removed": removed, "kept": kept}
+
+
+def clean_human(n):
+    return f"{n / 1048576:.0f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB" if n >= 1024 else f"{n} B"
+
+
+def _clean_block(plan, categories):
+    lines = []
+    for category in categories:
+        items = plan.get(category) or []
+        if items:
+            lines.append(f"{category} ({len(items)}, {clean_human(sum(i['bytes'] for i in items))}):")
+            lines += [f"  {i['alvo']}  {clean_human(i['bytes'])}" + (f", {i['idade_s'] // 3600} h old" if i["idade_s"] is not None else "") + f": {i['motivo']}" for i in items]
+    return lines
+
+
+def clean_text(plan, result=None):
+    """The report of `orq clean`: one block per category with size, age and reason, and the test lines apart (they need the user's approval). With nothing removable it says
+    `nothing to clean` (the second pass of `--apply`); `result` is what clean_apply did."""
+    removable = _clean_block(plan, [c for c in CLEAN_CATEGORIES if c != "test-lines"])
+    approval = _clean_block(plan, ["test-lines"])
+    head = ("dry run: nothing was removed (orq clean --apply removes it)" if result is None else f"removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}") if removable else "nothing to clean"
+    return "\n".join([head, *removable, *(f"kept {i['alvo']}: {why}" for i, why in (result or {}).get("kept", [])), *(["needs your approval:", *approval] if approval else [])])
+
+
+def clean_summary_line(events, since):
+    """One digest line for the cleaning since `since` ("cleaned 41 notices, 12 worktrees, 380 MB"), or None."""
+    runs = [e for e in events if e.get("tipo") == "clean_run" and (e.get("ts") or "") >= since]
+    if not runs:
+        return None
+    totals, size = {}, 0
+    for e in runs:
+        size += e.get("bytes") or 0
+        for c, n in e.get("quantos") or []:
+            totals[c] = totals.get(c, 0) + n
+    return {"ts": runs[-1]["ts"], "tipo": "info", "titulo": "Cleaned " + ", ".join(f"{n} {c}" for c, n in totals.items()) + f", {clean_human(size)}", "detalhe": "orq clean, by the manager"}
+
+
+def clean_round(now_at=None):
+    """Manager round: the safe categories (notices, state) every hour; the size ones (worktrees, branches, integra, backups, claude) once a day, only outside away mode and
+    with the machine under no pressure. The stamps in clean-run.json keep it from running every loop. Returns the panel lines."""
+    now_at = time.time() if now_at is None else now_at
+    stamps = _dict(_read_json(_path(CLEAN_STAMPS)))
+    lines = []
+    for tier, cats, every in (("safe", CLEAN_SAFE, 3600), ("size", CLEAN_SIZE, 86400)):
+        if now_at - (stamps.get(tier) or 0) < every:
+            continue
+        if tier == "size" and (_dict(_cursor_ro().get("ausente")) or machine_level()[0] == "alta"):
+            continue
+        stamps[tier] = now_at
+        _write_json(_path(CLEAN_STAMPS), stamps)
+        result = clean_apply(clean_plan(now_at, only=cats), now_at)
+        if result["removed"]:
+            lines.append(f"clean ({tier}): removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}")
+    return lines
 
 
 def integrate_conclude(hash_, branches, dispatch=None):
@@ -3583,7 +3960,7 @@ def notify_e2e_queue(f=None):
     file_path = _path("e2e-notice.json")
     if _dict(_read_json(file_path)).get("ticket") == f["ticket"]:
         return []
-    if notify_coordinator(g["coordenador"], f"orq: {e2e_line(f)}.") not in ("enviado", "adiado"):
+    if notify_coordinator(g["coordenador"], f"orq: {e2e_line(f)}.", valid_while="e2e_stuck") not in ("enviado", "adiado"):
         return []
     _write_json(file_path, {"ticket": f["ticket"]})
     return [f"E2E queue stuck ({f['ticket']}): notice typed in the coordinator"]
@@ -4345,6 +4722,8 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
     if e2e:  # the E2E queue is one extra line in `running`: `stuck_lock` when it does not move
         running.append({"titulo": e2e_line(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     line = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= since and (x := _log_line(e, title))]
+    if cleaned := clean_summary_line(events, since):  # one line for all the cleaning of the window (ticket 326)
+        line = sorted([*line, cleaned], key=lambda x: x["ts"])
     return {"versao": 1, "geradoEm": now_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(away_alias), "desde": _dict(away_alias).get("ligada_em")},
             "fila": declared or derived, "proximoPasso": next_step, "features": features, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
             "tickets_orq": panel_tickets(ts, open_state),
@@ -6754,9 +7133,10 @@ def free_terminal(handle):
 NOTICE_MAX = 150  # ceiling on what `type_text` and `type_text_busy` send (firstmate #6240: the ~290-character notice did not reach the panel on every re-tap)
 
 
-def _short(text_value):
-    """The text to type, with at most NOTICE_MAX characters. What goes past the cap goes whole into `HOME/notices/<hash>.txt` (same text, same
-    file) and what is typed carries the start of it and the full path: `<start>… full_text em <path>`."""
+def _short(text_value, valid_while=None):
+    """The text to type, with at most NOTICE_MAX characters. What goes past the cap goes whole into `HOME/avisos/<hash>.txt` (same text, same
+    file) and what is typed carries the start of it and the full path: `<start>… full_text em <path>`. Next to it, `<hash>.json` keeps `valid_while` (a NOTICE_CONDITIONS
+    name, or null: only the age expires it): `orq clean` removes the notice when the condition stops holding (ticket 326)."""
     if len(text_value) <= NOTICE_MAX:
         return text_value
     folder = os.path.join(HOME, "avisos")
@@ -6764,17 +7144,18 @@ def _short(text_value):
     os.makedirs(folder, exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(text_value + "\n")
+    _write_json(file_path[:-4] + ".json", {"valid_while": valid_while, "ts": now()})
     end = f"… full text at {file_path}"
     return text_value[: max(0, NOTICE_MAX - len(end))].rstrip() + end
 
 
-def type_text(handle, text_value):
+def type_text(handle, text_value, valid_while=None):
     """Types `text_value` + Enter into the terminal's agent, once. Returns `enviado` (sent), `ocupado`/`draft` (nothing was typed: repeat later) or
     `failed` (Orca refused: nothing was typed). The box is read twice, with NOTICE_GAP_S between them (ticket 82: a user who starts typing
     between the read and the send had the notice on top of their text). tui-idle alone misleads (satisfied at the start of the turn and for about 20 s of the turn, checked
     on the real Orca on 09/29): what really blocks is the send's `agent_prompt_blocked`, which Orca returns with the agent in the middle of a turn. If Orca observes the submission and did not see the turn start, it sends a lone Enter (on an empty box
     it does nothing); a send timeout counts as sent, because the text may have gone out and repeating would stack it."""
-    text_value = _short(text_value)
+    text_value = _short(text_value, valid_while)
     if reason := free_terminal(handle):
         return reason
     time.sleep(NOTICE_GAP_S)
@@ -6807,12 +7188,12 @@ def _turn_screen_without_draft(handle):
     return not ((t.get("draft") or "").strip() or any(screen_question(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])))
 
 
-def type_text_busy(handle, text_value):
+def type_text_busy(handle, text_value, valid_while=None):
     """Types `text_value` + Enter into an agent in the middle of a turn, for Claude Code to queue and inject into the next tool result (10/01).
 
     Only with the spinner on the screen, no draft in the box and no menu waiting for a human answer, in both reads (NOTICE_GAP_S between them, ticket 82):
     in all three cases it returns `ocupado` without typing. Returns `ocupado_digitado`, or `ocupado` if Orca blocked the send (agent_prompt_blocked) or it failed."""
-    text_value = _short(text_value)
+    text_value = _short(text_value, valid_while)
     if not _turn_screen_without_draft(handle):
         return "ocupado"
     time.sleep(NOTICE_GAP_S)
@@ -6844,7 +7225,7 @@ def _notify_mac(text_value):
                        capture_output=True, timeout=3, check=False)
 
 
-def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None):
+def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None, valid_while=None):
     """Delivers a notice to the coordinator without typing over someone who is writing (tickets 82, 107 and 182). With away mode on it types when the coordinator is idle
     (the old-prompt guard and the `type_text` draft guard apply). With away mode off the old-prompt guard is dropped (ticket 182: deliveries sat waiting for the user's next message):
     it types when the coordinator is stopped and the prompt box is empty; with a draft or a turn in progress it holds. Returns `enviado` (typed), `adiado`
@@ -6852,10 +7233,11 @@ def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None):
     shows, and `deliver_notices` types it if the coordinator goes idle) or, with away on, the `type_text` reason (nothing went out: retry later). `adiado` already counts as delivered."""
     away = bool(_dict(_cursor_ro().get("ausente")))
     if not away or not active_coordinator(minutes_elapsed=minutes_elapsed):
-        result = type_text(handle, text_value)
+        result = type_text(handle, text_value, *([valid_while] if valid_while else []))  # the condition only travels when there is one: callers and tests patch type_text with two arguments
         if away or result == "enviado":
             return result
-    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text_value, "ts": now(), "contexto": context, **({"minutos": minutes_elapsed} if minutes_elapsed is not None else {})}))
+    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text_value, "ts": now(), "contexto": context, **({"minutos": minutes_elapsed} if minutes_elapsed is not None else {}),
+                                                              **({"valid_while": valid_while} if valid_while else {})}))
     _notify_mac(text_value)
     return "adiado"
 
@@ -6868,7 +7250,7 @@ def deliver_notices():
         return []
     away = bool(_dict(_cursor_ro().get("ausente")))
     a = next((x for x in queue if not (away and active_coordinator(minutes_elapsed=x.get("minutos")))), None)  # the wake-up notice (2 min) does not wait behind a 10 one
-    if not a or type_text(g["coordenador"], a["texto"]) != "enviado":
+    if not a or type_text(g["coordenador"], a["texto"], *([a["valid_while"]] if a.get("valid_while") else [])) != "enviado":
         return []
     _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))
     return ["deferred notice typed into the coordinator, idle"]
@@ -10955,7 +11337,7 @@ def _machine_notify(reason, in_queue, cfg, cause=(None, None)):
     peso = f" Background processes: {', '.join(f'{t} {n}' for t, n in children.items())}." if children else ""
     text_value = (f"orq: machine under pressure ({reason}). The load comes from outside orq ({cause[1]}): pausing a worker does not help. The manager holds new dispatches ({in_queue} in the dispatch queue)."
              if outside else f"orq: machine under pressure ({reason}). The manager stopped starting workers ({in_queue} in the dispatch queue).{peso}{tip}")
-    if notify_coordinator(g["coordenador"], text_value) not in ("enviado", "adiado"):
+    if notify_coordinator(g["coordenador"], text_value, valid_while="machine_pressure") not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": reason}))
     append_event({"tipo": "maquina_aviso", "motivo": reason, "na_fila": in_queue, **({"causa": cause[0]} if cause[0] else {}), **({"sugerido": target["task"]} if target else {}),
@@ -12125,6 +12507,10 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
+        line_list += [] if os.environ.get("ORQ_NO_CLEAN") else clean_round()
+    except Exception as e:  # noqa: BLE001 - the cleaning doesn't take down the panel; the next loop tries
+        log(f"clean: {type(e).__name__}: {e}")
+    try:
         line_list += hooks_broken_round()
     except Exception as e:  # noqa: BLE001 - the warning about hooks doesn't take down the panel; the next loop tries
         log(f"hooks quebrados: {type(e).__name__}: {e}")
@@ -12914,6 +13300,7 @@ def _implicit(effect, ref=None, run=None):
 
 
 FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays the pt name, which the rest of the code reads
+    "aplicar": "apply", "somente": "only", "linhas-de-teste": "test-lines",
     "titulo": "title", "spec-arquivo": "spec-file", "detalhe": "detail", "frente": "stream", "comando": "command", "espera": "waiting", "ate": "until",
     "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "motivo": "reason",
     "tipo": "type", "forcar": "force", "abrir": "open", "passo": "step", "nome": "name", "por": "why", "agente": "agent", "objetivo": "objective",
@@ -12925,6 +13312,7 @@ FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays th
     "destino": "dest", "substituir-orca-yaml": "replace-orca-yaml", "despacho": "dispatch", "parar": "stop", "instalar": "install",
     "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours", "antes": "before", "depois": "after", "cenarios": "scenarios"}
 ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the dest)
+    "aplicar": "apply", "somente": "only", "linhas-de-teste": "test_lines",
     "titulo": "title", "spec-arquivo": "spec_file", "detalhe": "detail", "frente": "workstream", "comando": "command", "espera": "waiting", "ate":
     "until_at", "desde": "since", "todas": "all_listing", "todos": "include_all", "resposta": "answer_text", "entrada": "entry", "nota": "note",
     "prova": "proof", "motivo": "reason", "tipo": "type_name", "forcar": "force", "abrir": "open_page", "passo": "step", "nome": "item_name", "por":
@@ -12944,7 +13332,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "projetos": "projects", "projeto": "project", "fluxo": "flow", "ciclo": "cycle", "integrar": "integrate", "lavish-resposta": "lavish-answer",
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
-         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
+         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "limpar-residuos": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
          "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
@@ -13082,9 +13470,14 @@ def parser():
     pd2.add_argument("task")
     pd2.add_argument("url")
     _arg(pr.add_parser("poll", help="asks gh for the open PRs; a merge or a close becomes an entry, once"), "forcar", action="store_true", help="ignores the minimum interval")
-    lf = sub.add_parser("clean", aliases=["limpar"], help="orq clean --closed [--dry-run]: right away cleans the worktree and branches of the tasks whose PRs are all closed without merge")
-    _arg(lf, "fechados", action="store_true", required=True)
-    lf.add_argument("--dry-run", action="store_true", help="only shows what it would delete")
+    lf = sub.add_parser("clean", aliases=["limpar", "limpar-residuos"], help="orq clean [--apply] [--only CATEGORY,...] [--test-lines]: lists the residue with no owner (old notices, state leftovers, integrated worktrees and branches, "
+                        "backups); --apply removes it. --closed [--dry-run]: right away cleans the worktree and branches of the tasks whose PRs are all closed without merge")
+    _arg(lf, "fechados", action="store_true")
+    _arg(lf, "aplicar", action="store_true", help="removes what the list shows (without it, only lists)")
+    _arg(lf, "somente", help=f"comma-separated categories: {', '.join(CLEAN_CATEGORIES)}")
+    _arg(lf, "linhas-de-teste", action="store_true", help="with --apply: also removes the test lines from events.jsonl, after a backup of the log (the user's approval)")
+    lf.add_argument("--dry-run", action="store_true", help="only shows what it would delete (the default of the new mode)")
+    lf.add_argument("--json", action="store_true")
     dg = sub.add_parser("digest", help="writes digest/atual.json (the panel contract): merge queue, features, pending items, what happened and live workers")
     _arg(dg, "desde", help="ISO timestamp (YYYY-MM-DDTHH:MM:SSZ) instead of the moment away mode turned on or the user's last message")
     dg.add_argument("--html", action="store_true", help="also writes the page digest/<date>.html")
@@ -13481,8 +13874,15 @@ def main(argv=None):
             print(json.dumps(reply_to(a.msg_id, a.text_value), ensure_ascii=False))
         elif a.cmd == "alert":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
-        elif a.cmd == "clean":
+        elif a.cmd == "clean" and a.closed_items:
             print("\n".join(clean_closed(dry=a.dry_run)) or "no task with all PRs closed without merge")
+        elif a.cmd == "clean":
+            only = [c for c in (a.only or "").split(",") if c] or None
+            if bad := [c for c in only or [] if c not in CLEAN_CATEGORIES]:
+                raise ValueError(f"unknown category {bad[0]!r}; the ones that exist: {', '.join(CLEAN_CATEGORIES)}")
+            plan = clean_plan(only=only)
+            result = clean_apply(plan, approve_test_lines=a.test_lines) if a.apply and not a.dry_run else None
+            print(json.dumps({"plan": plan, **({"result": result} if result else {})}, ensure_ascii=False) if a.json else clean_text(clean_plan(only=only) if result else plan, result))
         elif a.cmd == "busy":
             print("\n".join(sorted(busy_worktrees())))
         elif a.cmd == "install":
