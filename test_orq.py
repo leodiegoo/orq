@@ -14084,7 +14084,7 @@ def _issues_101(a):
     os.makedirs(a.home, exist_ok=True)
     tks = [("01", "orq: Base", "resolved", "(nenhum)", "task_a1", "run_a", ""), ("02", "orq: Segundo", "ready-for-agent", "01", None, None, ""),
            ("03", "Terceiro sem prefixo", "ready-for-agent", "02", "task_c3", "run_a", "Modelo: claude-opus-5-5\nEffort: high\nissue: #2045\n"),
-           ("04", "Em curso", "claimed", "(nenhum)", "task_d4", "run_a", ""), ("05", "Paralelo", "ready-for-agent", "none (roda em paralelo numa worktree própria, 30/09)", None, None, "")]
+           ("04", "Em curso", "claimed", "(nenhum)", "task_d4", "run_a", ""), ("05", "Paralelo", "ready-for-agent", "none (roda em paralelo numa worktree própria, 30/09)", None, None, "Despacho: manual, só depois da fase 3\nEspera: integrador vazio\n")]
     for nn, titulo, status, bl, task, run, extra in tks:
         cab = f"# {nn}: {titulo}\n\nStatus: {status}\nBlocked by: {bl}\n" + (f"Run: {run}\n" if run else "") + (f"Task: {task}\n" if task else "") + extra
         open(os.path.join(a.env["ORQ_ISSUES"], f"{nn}-x.md"), "w").write(cab + "\n## What to build\n\ncorpo\n")
@@ -14113,6 +14113,8 @@ def test_ticket101_m2_converte_emite_o_backlog_confere_as_contagens_e_so_escreve
     assert sorted(i["id"] for i in backlog_mod.prontos(backlog_mod.ler(saida)) if i["kind"] == "ticket") == ["t02", "t05"]
     meta, _ = backlog_mod.meta_corpo(it["t03"]["corpo"], backlog_mod.META_TICKET)
     assert meta == {"spec": "issues/03-x.md", "orca": "task_c3 run_a", "modelo": "claude-opus-5-5", "effort": "high", "issue": "2045"}, meta
+    meta5, _ = backlog_mod.meta_corpo(it["t05"]["corpo"], backlog_mod.META_TICKET)
+    assert meta5["despacho"] == "manual, só depois da fase 3" and meta5["espera"] == "integrador vazio", meta5
     assert it["esp-x"]["hold"] == {"motivo": "esperando time de ops Alice", "kind": "external", "until": "2999-01-01"} and it["esp-x"]["repo"] == "pend"
     assert open(os.path.join(a.tmp.name, "data", ".tasks.toml")).read().count("done_keep = 100000") == 1
     r2 = _converte(a, saida)
@@ -14139,6 +14141,7 @@ def test_ticket101_m2_tickets_do_backlog_sao_os_dos_arquivos_exceto_o_bloqueador
         assert {k: v for k, v in arq[n].items() if k != "blocked_by"} == {k: v for k, v in bl[n].items() if k not in ("blocked_by", "fechado_em")}, (n, arq[n], bl[n])
     assert arq["02"]["blocked_by"] == ["01"] and bl["02"]["blocked_by"] == [], "o bloqueador resolvido não bloqueia mais"
     assert arq["05"]["blocked_by"] == ["30", "09"] and bl["05"]["blocked_by"] == [], "o achado do ticket 72: o leitor antigo lia 30 e 09 do comentário"
+    assert (bl["05"]["despacho"], bl["05"]["espera"]) == ("manual, só depois da fase 3", "integrador vazio") == (arq["05"]["despacho"], arq["05"]["espera"])
     assert bl["03"]["blocked_by"] == ["02"] and bl["03"]["modelo"] == "claude-opus-5-5" and bl["03"]["issue"] == 2045 and bl["03"]["task"] == "task_c3" and bl["03"]["run"] == "run_a"
 
 
@@ -14285,6 +14288,21 @@ def test_ticket101_m3_orq_backlog_diz_o_estado_e_sem_a_variavel_diz_que_esta_des
     assert out["tasks-axi"] == "0.2.6 ok" and out["queued"] == 2 and out["pendencias vivas"] == 2 and out["tickets lidos do backlog"] is False, out
     off = a.orq("backlog", ORQ_BACKLOG="")
     assert "desligado" in off.stdout and off.returncode == 0
+
+
+def test_ticket167_backlog_path_em_orq_home_liga_o_backlog_sem_a_variavel_e_a_variavel_vazia_desliga():
+    a = _amb_bl()
+    caminho = a.env.pop("ORQ_BACKLOG")
+    open(os.path.join(a.home, "backlog.path"), "w").write(caminho + "\n")
+    ligado = json.loads(a.orq("backlog", "--json").stdout)
+    assert ligado["itens"] == 2 and ligado["pendencias vivas"] == 2, ligado
+    r = a.orq("pend", "add", "--id", "via-arquivo", "--tipo", "acao", "--titulo", "veio pelo backlog.path")
+    assert r.returncode == 0, r.stderr
+    assert "via-arquivo" in _bl_itens_de(caminho), "a escrita foi para o backlog do arquivo"
+    off = a.orq("backlog", ORQ_BACKLOG="")
+    assert "desligado" in off.stdout, "a variável vazia vence o arquivo"
+    os.remove(os.path.join(a.home, "backlog.path"))
+    assert "desligado" in a.orq("backlog").stdout, "sem variável e sem arquivo o backlog fica desligado"
 
 
 def test_ticket101_m3_lavish_resposta_fecha_a_decisao_no_backlog():

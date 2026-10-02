@@ -165,7 +165,7 @@ Closed PRs without a merge (ticket 104). When every PR linked to a task is close
 | `~/.claude/orquestrador-plan/issues/` | tickets, `NN-<slug>.md` | `ORQ_ISSUES` |
 | `~/.claude/orquestrador-plan/desenho.md` | your own design notes; orq only prints this path at session start and in the handoff | `ORQ_MAPA`, `ORQ_DESENHO` (precompact) |
 | `~/.claude/dashboard/data/pendencias.json` | the user's pending list (with `ORQ_BACKLOG`, a mirror the dashboard reads) | `ORQ_PENDENCIAS` |
-| `backlog.md` (you pick the path, outside this repo) | the tasks-axi backlog: pending items, and a snapshot of the tickets until stage 2 | `ORQ_BACKLOG` (`ORQ_BACKLOG_TICKETS=1` reads tickets from it too, `ORQ_TASKS_AXI` the binary) |
+| `backlog.md` (you pick the path, outside this repo) | the tasks-axi backlog: pending items, and a snapshot of the tickets until stage 2 | `ORQ_BACKLOG`, or the path in `~/.claude/orq/backlog.path` (`ORQ_BACKLOG_TICKETS=1` reads tickets from it too, `ORQ_TASKS_AXI` the binary) |
 | `~/.claude/logs/orq.log` | errors from hooks that failed open | `ORQ_LOG` |
 | `~/.claude/projects/` | Claude Code transcripts, read by `orq liberar` and `orq retro` | `ORQ_PROJETOS` |
 | `~/.claude/orq/avisos/` | the full text of any notice longer than 150 characters (ticket 98); what orq types cites the file path | `ORQ_HOME` |
@@ -347,8 +347,11 @@ Optional, stage 1 of moving the register to [tasks-axi](https://github.com/kunch
 
 - The pending list lives in the backlog (`repo: pend`, one item per pending entry, the user's hold as a tasks-axi hold). `orq pend add|lista|done|edit`, the AskUserQuestion hook, `orq lavish-resposta`, `orq perguntar`, the status line, the digest and the compaction handoff all read and write it, and `pendencias.json` is regenerated after every change for the dashboard.
 - Reads are done in Python (`backlog.py`, about 7 ms for the whole backlog); the hooks never start `tasks-axi`. Writes call the `tasks-axi` CLI and are refused unless `tasks-axi --version` is exactly `0.2.6`. A symlinked `backlog.md` is refused too.
+- Where it is switched on (ticket 167): `ORQ_BACKLOG` wins when it is set (an empty value turns the backlog off for that process); without it the orq reads the first line of `~/.claude/orq/backlog.path` (`ORQ_HOME`). The file is the switch the machine uses, because every process reads it, sessions that were already open included; an environment variable would only reach the sessions started after it was set. The backlog on this machine is `~/.claude/orquestrador-plan/backlog.md`, so the `spec: issues/NN-….md` lines resolve next to the ticket files.
 - `orq backlog [--json]` shows the path, whether the CLI version is the right one, and the counts.
 - `ORQ_BACKLOG_TICKETS=1` also makes `tickets()` read the backlog (so the digest's `tickets_orq` and the session summary come from it). Use it only after stage 2: `orq ticket novo|fechar` and `orq despachar` still write the ticket files, so until then the tickets in the backlog are a snapshot.
+
+Turning it off (the way back): delete `~/.claude/orq/backlog.path` (or run a command with `ORQ_BACKLOG=`). `pendencias.json` is rewritten from the backlog after every `pend` change, so it is already current when you switch off and `orq pend` goes back to it; nothing to regenerate. To rebuild the mirror by hand, run any `orq pend` write (`add` then `done` on a throwaway id) with the backlog on. The original `issues/` and the dated copies in `~/.claude/orquestrador-plan/backups/<date>/` stay until stage 2 (ticket 102) ends.
 
 Migrate with a rehearsal on a fresh file, then point `ORQ_BACKLOG` at it:
 
@@ -357,7 +360,7 @@ python3 ~/.claude/orq/scripts/converte-backlog.py --saida /tmp/ensaio/backlog.md
 ORQ_BACKLOG=/tmp/ensaio/backlog.md orq backlog
 ```
 
-The script writes only to a new file, runs `tasks-axi render`, and exits 1 if Done, blocking edges or ready counts differ from the sources. It also writes a `.tasks.toml` with a high `done_keep` next to the backlog, so the archive never takes tickets orq still reads. Do not install the tasks-axi SessionStart hook (`tasks-axi setup hooks`): it runs in every session and injects the whole panel; `orq hook session` already injects the lines that matter.
+The script carries each ticket's title, state, `Blocked by`, Run, Task, `Modelo`, `Effort`, `issue:`, `Despacho:` and `Espera:`, and points `spec:` at the ticket file for the body. It writes only to a new file, runs `tasks-axi render`, and exits 1 if Done, blocking edges or ready counts differ from the sources. It also writes a `.tasks.toml` with a high `done_keep` next to the backlog, so the archive never takes tickets orq still reads. Do not install the tasks-axi SessionStart hook (`tasks-axi setup hooks`): it runs in every session and injects the whole panel; `orq hook session` already injects the lines that matter.
 
 Publication audit: `githooks/pre-push` runs `orq auditar-publicacao <base>..<head>` on every ref pushed, and the integrator runs the same command before fast-forwarding `main`, so a bad commit shows up in the cycle and not at the push. It refuses a commit whose author or committer is not the configured noreply (`ORQ_AUTOR`, default `git config user.email`), with a `Co-Authored-By` trailer or generator footer, with a forbidden term (same list as the audience check; no list means a warning and a pass) in the added lines or the message, and a range that changes `orqlib.py`/`orq.py` without touching `README.md`. The refusal names the commit, the reason and the fix (`git commit --amend --reset-author`, or `git rebase --exec`).
 

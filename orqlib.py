@@ -45,7 +45,20 @@ LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
 LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
-BACKLOG = os.environ.get("ORQ_BACKLOG")  # backlog.md do tasks-axi (ticket 101): com ele as pendências moram lá e o pendencias.json vira só o espelho que o painel lê
+
+
+def _backlog_configurado():
+    """O backlog.md ligado: o `ORQ_BACKLOG` do ambiente (vazio desliga) ou, sem a variável, a primeira linha de ORQ_HOME/backlog.path (ticket 167: vale para todo processo, sessão já aberta inclusive)."""
+    if "ORQ_BACKLOG" in os.environ:
+        return os.environ["ORQ_BACKLOG"] or None
+    try:
+        with open(os.path.join(HOME, "backlog.path"), encoding="utf-8") as f:
+            return f.readline().strip() or None
+    except OSError:
+        return None
+
+
+BACKLOG = _backlog_configurado()  # backlog.md do tasks-axi (ticket 101): com ele as pendências moram lá e o pendencias.json vira só o espelho que o painel lê
 BACKLOG_TICKETS = os.environ.get("ORQ_BACKLOG_TICKETS")  # tickets() também lê do backlog; só até os comandos de ticket escreverem nele (M5)
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
 HOOK_TIMEOUT = 3

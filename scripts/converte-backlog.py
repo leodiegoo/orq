@@ -4,7 +4,7 @@
     converte-backlog.py [--saida ORQ_BACKLOG] [--issues D] [--pendencias F] [--eventos F] [--forcar]
 
 Escreve só em arquivo novo (recusa um que exista, a não ser com --forcar), então rodar de novo na cópia é seguro. Um ticket vira `tNN`
-(kind `ticket`, `repo` do prefixo do título antes de `:`), com `spec:` para o arquivo, `orca: <task> <run>` e `modelo:`/`effort:`/`issue:`
+(kind `ticket`, `repo` do prefixo do título antes de `:`), com `spec:` para o arquivo, `orca: <task> <run>` e `modelo:`/`effort:`/`issue:`/`despacho:`/`espera:`
 quando o cabeçalho os tem; uma pendência vira o item `repo: pend` que `orq pend add` cria. As datas vêm do events.jsonl (`ticket novo|fechar`),
 com o mtime do arquivo na falta. O `Blocked by` lê só os números do começo do campo ("none (… 30/09)" não bloqueia ninguém).
 Depois de escrever, roda o `tasks-axi render` (confere que a gramática foi aceita e que nada de fundo mudou) e compara as contagens
@@ -45,7 +45,8 @@ def le_ticket(caminho):
     issue = re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)
     return {"num": nome.split("-")[0], "nome": nome, "titulo": titulo.group(1).strip(), "status": _campo(cab, "Status") or "?",
             "bloqueios": bloqueios_de(_campo(cab, "Blocked by")), "run": _campo(cab, "Run"), "task": _campo(cab, "Task"),
-            "modelo": _campo(cab, "Modelo"), "effort": _campo(cab, "Effort"), "issue": issue.group(1) if issue else None}
+            "modelo": _campo(cab, "Modelo"), "effort": _campo(cab, "Effort"), "issue": issue.group(1) if issue else None,
+            "despacho": _campo(cab, "Despacho"), "espera": _campo(cab, "Espera")}
 
 
 def datas_dos_eventos(caminho):
@@ -80,7 +81,7 @@ def converte(issues, pendencias, eventos):
         arestas += len(bl)
         prefixo = re.match(r"^([a-z][a-z0-9-]{1,15}):\s", t["titulo"])
         meta = {"spec": f"issues/{t['nome']}", "orca": f"{t['task']} {t['run']}" if t["task"] and t["run"] else None,
-                "modelo": t["modelo"], "effort": t["effort"], "issue": t["issue"]}
+                "modelo": t["modelo"], "effort": t["effort"], "issue": t["issue"], "despacho": t["despacho"], "espera": t["espera"]}
         itens.append({"id": f"t{n}", "titulo": t["titulo"], "estado": estado, "kind": "ticket", "repo": prefixo.group(1) if prefixo else None, "bloqueios": bl,
                       "since": novo.get(n) or mtime, "closed": fechou.get(n) or mtime, "corpo": backlog.corpo_com_meta(meta, None, backlog.META_TICKET)})
     try:
