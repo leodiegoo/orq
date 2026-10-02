@@ -15846,7 +15846,7 @@ def _env225():
 
 
 def _intent225(a):
-    return _log(a, "nm.log")[-2]["args"].copy() and (lambda args: args[args.index("--intent") + 1])(_log(a, "nm.log")[-2]["args"])
+    return _log(a, "nm.log")[-2]["stdin"]  # the intent goes through stdin since 224 (`--intent -`)
 
 
 def test_ticket225_review_intent_is_pure_and_unchanged_without_decisions_or_commits():
