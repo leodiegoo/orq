@@ -20,6 +20,8 @@ sys.path.insert(0, AQUI)
 import orq as orq_mod  # noqa: E402
 if "ORQ_BACKLOG" not in os.environ:
     orq_mod.BACKLOG = None  # o backlog.path da máquina (ticket 167) não liga o backlog nos testes em processo
+if "ORQ_BACKLOG_TICKETS" not in os.environ:
+    orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # a segunda leitura da caixa não espera nos testes
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
@@ -15592,6 +15594,329 @@ def test_ticket157_orq_intake_posterior_corrige_o_implicito():
     assert [(i["entrada"], i["efeito"]) for i in _intakes(a)] == [("e1", "tarefa"), ("e1", "conversa")]
     assert {i["entrada"]: i["efeito"] for i in _intakes(a)} == {"e1": "conversa"}  # os leitores indexam por entrada: o último vale
     assert _stop_gate(a, sessao="abcdef123456") == {}
+# ---------- ticket 102: tasks-axi etapa 2 (M5 tickets no backlog, M6 doctor backlog, M7 backlog por grupo) ----------
+
+def _amb_tk(**env):
+    """Ambiente com ORQ_BACKLOG e ORQ_BACKLOG_TICKETS: os tickets moram no backlog, as pendências também."""
+    a = _amb_bl(**env)
+    a.env["ORQ_BACKLOG_TICKETS"] = "1"
+    return a
+
+
+def _meta_tk(item):
+    return backlog_mod.meta_corpo(item["corpo"], backlog_mod.META_TICKET)[0]
+
+
+def _tasks_fake(a, run="run_a"):
+    return json.load(open(os.path.join(a.fake, f"tasks_{run}.json")))
+
+
+def _lista_tk(a, *extra):
+    return a.orq("ticket", "lista", *extra).stdout
+
+
+def _tasks_axi_que_recusa(*verbos):
+    """Um tasks-axi que recusa os `verbos` (no `add`, só o do t01) e repassa o resto para o de verdade."""
+    exe = os.path.join(tempfile.mkdtemp(), "tasks-axi")
+    teste = " || ".join(f'[ "$1" = "{v}" ]' for v in verbos)
+    open(exe, "w").write(f'#!/bin/sh\nif {teste}; then echo recusei >&2; exit 1; fi\nexec "{backlog_mod.binario()}" "$@"\n')
+    os.chmod(exe, 0o755)
+    return exe
+
+
+def test_ticket102_m5_ciclo_novo_despachar_fechar_deixa_backlog_e_task_coerentes():
+    a = _amb_tk()
+    r = _novo(a, "orq: Base")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["ticket"] == "01"
+    it = _bl_itens(a)["t01"]
+    assert (it["kind"], it["estado"], it["repo"], it["titulo"]) == ("ticket", "queued", "orq", "orq: Base")
+    assert _meta_tk(it) == {"spec": "issues/01-orq-base.md", "orca": "task_tk1 run_a"}, it["corpo"]
+    txt = _lido(a, "01")
+    assert txt.startswith("# 01: orq: Base\n") and not re.search(r"^(Status|Blocked by|Run|Task):", txt, re.M), "o arquivo guarda só o texto"
+    assert "\n## What to build\n" in txt and "\n## Acceptance criteria\n" in txt
+    assert json.loads(_novo(a, "Depende", "--blocked-by", "01").stdout)["ticket"] == "02"
+    assert _bl_itens(a)["t02"]["bloqueios"] == ["t01"]
+    lista = _lista_tk(a)
+    assert lista.splitlines() == ["01 orq: Base (ready-for-agent)", "02 Depende (ready-for-agent; Blocked by: 01)"], lista
+    base = ["despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium"]
+    r = a.orq(*base, "--ticket", "02")
+    assert r.returncode == 1 and "bloqueado por 01" in r.stderr, r.stderr
+    assert not _log(a, "started.log"), "o gate recusa antes do worker-start"
+    r = a.orq(*base, "--ticket", "01")
+    assert r.returncode == 0, r.stderr
+    assert _bl_itens(a)["t01"]["estado"] == "in_flight" and "01 orq: Base (claimed)" in _lista_tk(a)
+    r = a.orq("ticket", "fechar", "01", "--answer", "feito")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert [x["ticket"] for x in out["liberados"]] == ["02"] and out["task_fechada"] is True, out
+    it = _bl_itens(a)
+    assert it["t01"]["estado"] == "done" and it["t02"]["estado"] == "queued"
+    assert [t["status"] for t in _tasks_fake(a)] == ["completed", "pending"], "o orq completa a task do fechado; o Orca reavalia a dependência"
+    assert _lista_tk(a).splitlines() == ["02 Depende (ready-for-agent)"], "o dependente deixou de ter bloqueio e o fechado saiu da lista"
+    assert _lido(a, "01").rstrip().endswith("## Answer\n\nfeito")
+    assert a.orq(*base, "--ticket", "02").returncode == 0, "fechado o bloqueador, o dependente passa no gate"
+    assert [i["id"] for i in _pend(a)["itens"]] == ["freio-prod", "avisar-x"] and "freio prod" in a.orq("pend", "lista").stdout, "pend lista segue igual ao espelho"
+
+
+def test_ticket102_m5_dependente_so_e_liberado_quando_o_ultimo_bloqueador_fecha():
+    a = _amb_tk()
+    for t in ("Um", "Dois"):
+        _novo(a, t)
+    _novo(a, "Tres", "--blocked-by", "01,02")
+    assert _bl_itens(a)["t03"]["bloqueios"] == ["t01", "t02"]
+    assert json.loads(a.orq("ticket", "fechar", "01", "--answer", "ok").stdout)["liberados"] == []
+    assert "03 Tres (ready-for-agent; Blocked by: 02)" in _lista_tk(a)
+    assert [x["ticket"] for x in json.loads(a.orq("ticket", "fechar", "02", "--answer", "ok").stdout)["liberados"]] == ["03"]
+
+
+def test_ticket102_m5_numero_conta_arquivos_backlog_e_backlogs_de_grupo():
+    a = _amb_tk()
+    os.makedirs(a.env["ORQ_ISSUES"])
+    open(os.path.join(a.env["ORQ_ISSUES"], "12-legado.md"), "w").write("# 12: legado\n")
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "add", "t20", "so no backlog", "--kind", "ticket")
+    assert json.loads(_novo(a, "A").stdout)["ticket"] == "21"
+    grupo = os.path.join(a.tmp.name, "data", "grupos", "orq", "backlog.md")
+    backlog_mod.cli(grupo, "add", "t30", "no grupo", "--kind", "ticket")
+    os.makedirs(os.path.join(a.home, "groups"))
+    json.dump({"projetos": [], "prefixos": ["orq:"]}, open(os.path.join(a.home, "groups", "orq.json"), "w"))
+    assert json.loads(_novo(a, "B").stdout)["ticket"] == "31", "o número é único na máquina: o ticket que saiu para o grupo continua ocupando o dele"
+
+
+def test_ticket102_m5_backlog_que_recusa_o_add_desfaz_o_arquivo_e_completa_a_task():
+    a = _amb_tk()
+    n_eventos = len([e for e in a.events() if e["tipo"] == "ticket"])
+    r = _novo(a, "Vai falhar", ORQ_TASKS_AXI=_tasks_axi_que_recusa("add"))
+    assert r.returncode == 1 and "recusei" in r.stderr, (r.stdout, r.stderr)
+    assert not [f for f in os.listdir(a.env["ORQ_ISSUES"]) if f.endswith(".md")] and "t01" not in _bl_itens(a)
+    (tk,) = _tasks_fake(a)
+    assert tk["status"] == "completed" and "desfeito" in tk["result"], tk
+    assert len([e for e in a.events() if e["tipo"] == "ticket"]) == n_eventos, "sem evento de ticket novo"
+    assert json.loads(_novo(a, "Agora vai").stdout)["ticket"] == "01", "o número não ficou queimado"
+
+
+def test_ticket102_m5_titulo_que_a_gramatica_leria_como_tag_e_recusado_antes_de_criar_a_task():
+    a = _amb_tk()
+    for titulo in ("termina assim (repo: x)", "-começa como opção"):
+        r = _novo(a, titulo)
+        assert r.returncode == 1 and ("tag do backlog" in r.stderr or "começar com '-'" in r.stderr), r.stderr
+    assert not _log(a, "created.log") and not os.path.exists(a.env["ORQ_ISSUES"])
+
+
+def test_ticket102_m5_modelo_effort_despacho_e_espera_vao_para_a_meta_e_editar_troca_sem_perder_o_resto():
+    a = _amb_tk()
+    r = _novo(a, "Com modelo", "--modelo", "claude-opus-5-5", "--effort", "high", "--despacho", "manual, depois", "--espera", "integrador vazio")
+    assert r.returncode == 0, r.stderr
+    assert _meta_tk(_bl_itens(a)["t01"]) == {"spec": "issues/01-com-modelo.md", "orca": "task_tk1 run_a", "modelo": "claude-opus-5-5", "effort": "high", "despacho": "manual, depois", "espera": "integrador vazio"}
+    (t,) = json.loads(_lista_tk(a, "--json"))
+    assert (t["modelo"], t["effort"], t["despacho"], t["espera"]) == ("claude-opus-5-5", "high", "manual, depois", "integrador vazio")
+    r = a.orq("ticket", "editar", "01", "--effort", "medium", "--despacho", "")
+    assert r.returncode == 0, r.stderr
+    assert _meta_tk(_bl_itens(a)["t01"]) == {"spec": "issues/01-com-modelo.md", "orca": "task_tk1 run_a", "modelo": "claude-opus-5-5", "effort": "medium", "espera": "integrador vazio"}
+    assert a.orq("ticket", "editar", "01").returncode == 1 and a.orq("ticket", "editar", "09", "--effort", "low").returncode == 1
+
+
+def test_ticket102_m5_editar_sem_backlog_troca_a_linha_do_cabecalho_do_arquivo():
+    a = Amb(run="run_a")
+    _novo(a, "No arquivo", "--modelo", "claude-opus-5-5", "--effort", "high")
+    cab = _lido(a, "01").split("\n## ")[0]
+    assert "Modelo: claude-opus-5-5" in cab and "Effort: high" in cab and "Task: task_tk1" in cab, cab
+    assert a.orq("ticket", "editar", "01", "--effort", "low", "--modelo", "").returncode == 0
+    cab = _lido(a, "01").split("\n## ")[0]
+    assert "Effort: low" in cab and "Modelo:" not in cab and "Task: task_tk1" in cab, cab
+
+
+def test_ticket102_m5_despachar_recusa_ticket_em_hold_e_aceita_depois_do_unhold():
+    a = _amb_tk()
+    _novo(a, "Segurado")
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "hold", "t01", "--reason", "esperando decisão", "--kind", "captain")
+    base = ["despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "01"]
+    r = a.orq(*base)
+    assert r.returncode == 1 and "hold (esperando decisão)" in r.stderr, r.stderr
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "unhold", "t01")
+    assert a.orq(*base).returncode == 0
+
+
+def test_ticket102_m5_despachar_com_o_start_recusado_avisa_e_o_worker_fica():
+    a = _amb_tk()
+    _novo(a, "Start falha")
+    r = a.orq("despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "01", ORQ_TASKS_AXI=_tasks_axi_que_recusa("start"))
+    assert r.returncode == 0, r.stderr
+    assert "tasks-axi start t01" in json.loads(r.stdout)["aviso"] and _bl_itens(a)["t01"]["estado"] == "queued"
+
+
+def test_ticket102_m5_fechar_com_a_cli_recusando_nao_muda_nada():
+    a = _amb_tk()
+    _novo(a, "Nao fecha")
+    r = a.orq("ticket", "fechar", "01", "--answer", "x", ORQ_TASKS_AXI=_tasks_axi_que_recusa("done"))
+    assert r.returncode == 1 and "recusei" in r.stderr
+    assert "## Answer" not in _lido(a, "01") and _tasks_fake(a)[0]["status"] == "ready" and _bl_itens(a)["t01"]["estado"] == "queued"
+
+
+def test_ticket102_m5_sessao_lista_os_tickets_abertos_do_backlog():
+    a = _amb_tk()
+    _novo(a, "Aberto um")
+    _novo(a, "Aberto dois", "--blocked-by", "01")
+    r = a.orq("hook", "session", stdin=json.dumps({"session_id": "s1", "source": "startup", "hook_event_name": "SessionStart"}))
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Tickets abertos (2):" in ctx and "01 Aberto um (ready-for-agent)" in ctx and "02 Aberto dois (ready-for-agent; Blocked by: 01)" in ctx, ctx
+    assert ctx.count("\n") + 1 <= orq_mod.LINHAS_SESSAO
+
+
+def test_ticket102_backlog_tickets_e_o_arquivo_da_maquina_e_a_variavel_vazia_desliga():
+    a = _amb_bl()
+    assert json.loads(a.orq("backlog", "--json").stdout)["tickets lidos do backlog"] is False
+    os.makedirs(a.home, exist_ok=True)
+    open(os.path.join(a.home, "backlog.tickets"), "w").write("")
+    assert json.loads(a.orq("backlog", "--json").stdout)["tickets lidos do backlog"] is True, "o arquivo liga para todo processo"
+    assert json.loads(a.orq("backlog", "--json", ORQ_BACKLOG_TICKETS="").stdout)["tickets lidos do backlog"] is False, "a variável vazia desliga"
+
+
+# ---- M6: orq doctor backlog ----
+
+def test_ticket102_m6_doctor_backlog_sem_diferenca_diz_o_que_conferiu_e_com_diferenca_imprime_o_conserto():
+    a = _amb_tk()
+    for t in ("Um", "Dois", "Tres", "Quatro"):
+        _novo(a, t)
+    r = a.orq("doctor", "backlog")
+    assert r.returncode == 0 and "coerentes (4 tickets, 4 tasks conferidas)" in r.stdout, (r.stdout, r.stderr)
+    bl = a.env["ORQ_BACKLOG"]
+    backlog_mod.cli(bl, "done", "t01", "--no-prune")  # Done com a task aberta
+    backlog_mod.cli(bl, "start", "t02")  # In flight sem worker despachado
+    ts = _tasks_fake(a)
+    ts[2]["status"] = "completed"  # Queued com a task acabada
+    ts[3]["status"] = "dispatched"  # Queued com a task despachada
+    a.set("tasks_run_a.json", ts)
+    open(os.path.join(a.env["ORQ_ISSUES"], "09-solto.md"), "w").write("# 09: solto\n")  # arquivo sem item
+    r = a.orq("doctor", "backlog")
+    assert r.returncode == 1, r.stdout
+    linhas = r.stdout.splitlines()
+    assert len(linhas) == 5, r.stdout
+    por = {l.split(":")[0]: l for l in linhas}
+    assert "Done, mas a task task_tk1 está ready" in por["01"] and "task-update --id task_tk1 --status completed --run run_a" in por["01"]
+    assert "In flight, mas a task task_tk2 está ready, sem worker despachado" in por["02"] and "orq despachar --run run_a --ticket 02" in por["02"]
+    assert "Queued, mas a task task_tk3 já está completed" in por["03"] and "orq ticket fechar 03" in por["03"]
+    assert "Queued, mas a task task_tk4 está dispatched" in por["04"] and f"TASKS_AXI_FILE={bl} tasks-axi start t04" in por["04"]
+    assert "09-solto.md não tem item" in por["09"] and "converte-backlog.py --completa" in por["09"]
+    assert len(json.loads(a.orq("doctor", "backlog", "--json").stdout)["problemas"]) == 5
+
+
+def test_ticket102_m6_doctor_backlog_aponta_a_task_que_o_orca_nao_lista_e_nao_escreve_nada():
+    a = _amb_tk()
+    _novo(a, "Um")
+    antes = open(a.env["ORQ_BACKLOG"]).read()
+    a.set("tasks_run_a.json", [])
+    r = a.orq("doctor", "backlog")
+    assert r.returncode == 1 and "a task task_tk1 não está no Run run_a" in r.stdout, r.stdout
+    assert open(a.env["ORQ_BACKLOG"]).read() == antes and not _log(a, "updated.log"), "o doctor só imprime o conserto"
+
+
+# ---- M7: backlog por grupo ----
+
+def _grupo_orq(a, **cfg):
+    os.makedirs(os.path.join(a.home, "groups"), exist_ok=True)
+    json.dump({"projetos": [], "prefixos": ["orq:"], **cfg}, open(os.path.join(a.home, "groups", "orq.json"), "w"))
+    return os.path.join(a.tmp.name, "data", "grupos", "orq", "backlog.md")
+
+
+def test_ticket102_m7_mover_leva_o_conjunto_ligado_ao_backlog_do_grupo_e_preserva_os_bloqueios():
+    a = _amb_tk()
+    destino = _grupo_orq(a)
+    _novo(a, "Base")
+    _novo(a, "orq: B", "--blocked-by", "01")
+    _novo(a, "orq: C", "--blocked-by", "02")
+    _novo(a, "Solto")
+    a.orq("ticket", "fechar", "01", "--answer", "ok")
+    r = a.orq("backlog", "mover", "02", "03", "--grupo", "orq")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == {"grupo": "orq", "destino": destino, "tickets": ["t02", "t03"]}
+    assert sorted(_bl_itens(a)) == ["avisar-x", "freio-prod", "t01", "t04"]
+    lado = {i["id"]: i for i in backlog_mod.ler(destino)}
+    assert sorted(lado) == ["t02", "t03"] and lado["t03"]["bloqueios"] == ["t02"] and lado["t02"]["bloqueios"] == [], "a aresta entre os dois ficou; a do bloqueador já Done saiu"
+    assert _meta_tk(lado["t02"])["orca"] == "task_tk2 run_a" and _meta_tk(lado["t02"])["spec"] == "issues/02-orq-b.md", "o elo com o Orca e com o arquivo foi junto"
+    assert _lista_tk(a).splitlines() == ["04 Solto (ready-for-agent)"]
+    assert open(os.path.join(os.path.dirname(destino), ".tasks.toml")).read().count("done_keep = 100000") == 1
+    (ev,) = [e for e in a.events() if e["tipo"] == "backlog"]
+    assert (ev["op"], ev["grupo"], ev["tickets"]) == ("mover", "orq", ["t02", "t03"])
+
+
+def test_ticket102_m7_mover_recusa_dependencia_pendurada_ticket_fora_da_fila_e_grupo_sem_cadastro():
+    a = _amb_tk()
+    destino = _grupo_orq(a)
+    _novo(a, "orq: A")
+    _novo(a, "orq: B", "--blocked-by", "01")
+    antes = open(a.env["ORQ_BACKLOG"]).read()
+    r = a.orq("backlog", "mover", "01", "--grupo", "orq")
+    assert r.returncode == 1 and "blocking" in r.stderr, r.stderr
+    assert open(a.env["ORQ_BACKLOG"]).read() == antes and backlog_mod.ler(destino) == [], "nada se moveu"
+    a.orq("ticket", "fechar", "01", "--answer", "ok")
+    r = a.orq("backlog", "mover", "01", "--grupo", "orq")
+    assert r.returncode == 1 and "só sai o que ainda está na fila" in r.stderr, r.stderr
+    assert a.orq("despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "02").returncode == 0
+    r = a.orq("backlog", "mover", "02", "--grupo", "orq")
+    assert r.returncode == 1 and "só sai o que ainda está na fila" in r.stderr
+    assert a.orq("backlog", "mover", "02", "--grupo", "nao-existe").returncode == 1 and a.orq("backlog", "mover", "--grupo", "orq").returncode == 2
+
+
+def test_ticket102_m7_aresta_do_bloqueador_done_volta_quando_o_mv_falha():
+    a = _amb_tk()
+    _grupo_orq(a)
+    _novo(a, "Base")
+    _novo(a, "orq: Filho", "--blocked-by", "01")
+    _novo(a, "Neto", "--blocked-by", "02")
+    a.orq("ticket", "fechar", "01", "--answer", "ok")
+    r = a.orq("backlog", "mover", "02", "--grupo", "orq")  # o 03 (fica) depende do 02 (sai): a CLI recusa
+    assert r.returncode == 1 and "blocking" in r.stderr, r.stderr
+    assert _bl_itens(a)["t02"]["bloqueios"] == ["t01"], "a aresta que o orq tirou antes do mv voltou"
+
+
+def test_ticket102_m7_mate_abre_com_o_backlog_do_grupo_quando_ele_existe():
+    a = _amb_tk()
+    destino = _grupo_orq(a)
+    cfg = {"projetos": [], "prefixos": ["orq:"], "backlog": destino}
+    antes, _ = orq_mod._comando_mate("orq", cfg, None)
+    assert "ORQ_BACKLOG" not in antes, "sem o arquivo do grupo, o mate segue com o backlog da máquina"
+    backlog_mod.cli(destino, "add", "t50", "x", "--kind", "ticket")
+    depois, _ = orq_mod._comando_mate("orq", cfg, None)
+    assert depois.startswith(f"ORQ_MATE=orq ORQ_BACKLOG={destino} "), depois
+
+
+# ---- a conversão completa o backlog que existe ----
+
+def test_ticket102_completa_acrescenta_so_o_que_falta_e_confere_a_contagem_antes_e_depois():
+    a = Amb()
+    _issues_101(a)
+    a.set("../pendencias.json", {"itens": []})
+    saida = os.path.join(a.tmp.name, "data", "backlog.md")
+    assert _converte(a, saida).returncode == 0
+    antes = {i["id"]: i for i in backlog_mod.ler(saida)}
+    for nn, titulo, status, bl, task in (("06", "orq: Novo livre", "ready-for-agent", "05", "task_n6"), ("07", "Novo andando", "claimed", "06", "task_n7"), ("08", "Novo feito", "resolved", "(nenhum)", "task_n8")):
+        open(os.path.join(a.env["ORQ_ISSUES"], f"{nn}-x.md"), "w").write(f"# {nn}: {titulo}\n\nStatus: {status}\nBlocked by: {bl}\nRun: run_a\nTask: {task}\n\n## What to build\n\ncorpo\n")
+    r = _converte(a, saida, "--completa")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "antes 5, depois 8 (+3: t06, t07, t08)" in r.stdout, r.stdout
+    it = {i["id"]: i for i in backlog_mod.ler(saida)}
+    assert {k: v for k, v in it.items() if k in antes} == antes, "o que já estava não foi tocado"
+    assert (it["t06"]["estado"], it["t06"]["repo"], it["t06"]["bloqueios"]) == ("queued", "orq", ["t05"])
+    assert (it["t07"]["estado"], it["t07"]["bloqueios"]) == ("in_flight", ["t06"]) and it["t08"]["estado"] == "done"
+    assert _meta_tk(it["t06"]) == {"spec": "issues/06-x.md", "orca": "task_n6 run_a"}
+    r = _converte(a, saida, "--completa")
+    assert r.returncode == 0 and "antes 8, depois 8 (+0: nenhum)" in r.stdout, "rodar de novo não acrescenta nada"
+    assert _converte(a, os.path.join(a.tmp.name, "nao-existe.md"), "--completa").returncode == 1
+
+
+def test_ticket102_completa_nao_repete_o_ticket_que_ja_saiu_para_um_grupo():
+    a = Amb()
+    _issues_101(a)
+    a.set("../pendencias.json", {"itens": []})
+    saida = os.path.join(a.tmp.name, "data", "backlog.md")
+    assert _converte(a, saida).returncode == 0
+    grupo = os.path.join(a.tmp.name, "data", "grupos", "orq", "backlog.md")
+    backlog_mod.cli(grupo, "add", "t09", "no grupo", "--kind", "ticket")
+    open(os.path.join(a.env["ORQ_ISSUES"], "09-x.md"), "w").write("# 09: no grupo\n\nStatus: ready-for-agent\nBlocked by: (nenhum)\n\n## What to build\n\nx\n")
+    r = _converte(a, saida, "--completa")
+    assert r.returncode == 0 and "antes 5, depois 5 (+0: nenhum)" in r.stdout, (r.stdout, r.stderr)
+    assert "t09" not in {i["id"] for i in backlog_mod.ler(saida)}
 
 
 if __name__ == "__main__":

@@ -47,10 +47,8 @@ LOG = os.environ.get("ORQ_LOG") or os.path.expanduser("~/.claude/logs/orq.log")
 PEND = os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json")
 
 
-def _backlog_configurado():
-    """O backlog.md ligado: o `ORQ_BACKLOG` do ambiente (vazio desliga) ou, sem a variável, a primeira linha de ORQ_HOME/backlog.path (ticket 167: vale para todo processo, sessão já aberta inclusive)."""
-    if "ORQ_BACKLOG" in os.environ:
-        return os.environ["ORQ_BACKLOG"] or None
+def _backlog_da_maquina():
+    """A primeira linha de ORQ_HOME/backlog.path: o backlog que a máquina liga para todo processo (ticket 167), sessão já aberta inclusive."""
     try:
         with open(os.path.join(HOME, "backlog.path"), encoding="utf-8") as f:
             return f.readline().strip() or None
@@ -58,8 +56,15 @@ def _backlog_configurado():
         return None
 
 
+def _backlog_configurado():
+    """O backlog.md ligado: o `ORQ_BACKLOG` do ambiente (vazio desliga) ou, sem a variável, o da máquina."""
+    if "ORQ_BACKLOG" in os.environ:
+        return os.environ["ORQ_BACKLOG"] or None
+    return _backlog_da_maquina()
+
+
 BACKLOG = _backlog_configurado()  # backlog.md do tasks-axi (ticket 101): com ele as pendências moram lá e o pendencias.json vira só o espelho que o painel lê
-BACKLOG_TICKETS = os.environ.get("ORQ_BACKLOG_TICKETS")  # tickets() também lê do backlog; só até os comandos de ticket escreverem nele (M5)
+BACKLOG_TICKETS = os.environ["ORQ_BACKLOG_TICKETS"] if "ORQ_BACKLOG_TICKETS" in os.environ else (os.path.exists(os.path.join(HOME, "backlog.tickets")) or None)  # os tickets moram no backlog (M5); o arquivo é o interruptor da máquina, como o backlog.path, e a variável vazia desliga
 EFEITOS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
 HOOK_TIMEOUT = 3
 TIPOS_PEND = ("acao", "decisao", "avisar")
@@ -2219,12 +2224,12 @@ def _pend_ro():
 def _pend_para_backlog(item):
     """(título, corpo, (motivo, kind, until)) com que uma pendência entra no backlog. Recusa título que a gramática leria como tag e id que o tasks-axi não aceita."""
     i = backlog.pend_a_item(item)
-    if backlog._tags(i["titulo"])[0] != i["titulo"]:
-        raise ValueError(f"o título termina numa tag do backlog (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): reescreva {i['titulo']!r}")
+    if (p := backlog.problema_titulo(i["titulo"])) and not i["titulo"].startswith("-"):
+        raise ValueError(p)
     if not backlog.ID_RE.match(i["id"]):
         raise ValueError(f"id de pendência no backlog: letras, dígitos, . _ - ({i['id']!r})")
-    if i["titulo"].startswith("-"):
-        raise ValueError(f"o título não pode começar com '-' (a CLI o leria como opção): reescreva {i['titulo']!r}")
+    if p:
+        raise ValueError(p)
     return i["titulo"], i["corpo"], (i["hold"]["motivo"], i["hold"]["kind"], i["hold"]["until"])
 
 
@@ -2463,6 +2468,46 @@ def backlog_estado():
     cont = {e: sum(1 for i in itens if i["estado"] == e) for e in ("queued", "in_flight", "done")}
     return {"backlog": BACKLOG, "tasks-axi": cli, "itens": len(itens), **cont, "pendencias vivas": len(_pend_do_backlog()),
             "prontos": len([i for i in backlog.prontos(itens) if i["repo"] != "pend"]), "tickets lidos do backlog": bool(BACKLOG_TICKETS)}
+
+
+def backlog_mover(numeros, grupo):
+    """`orq backlog mover NN... --grupo G` (M7): leva um conjunto ligado de tickets para o backlog do grupo pelo `tasks-axi mv`, que move tudo ou nada e recusa deixar
+    uma dependência pendurada (inclua o conjunto inteiro). Só sai ticket ainda na fila (Queued); In flight e Done ficam. O bloqueador já Done de quem sai perde a aresta
+    antes do `mv` (a CLI a trataria como dependência pendurada) e a aresta volta se o `mv` falha. Devolve {grupo, destino, tickets}."""
+    cfg = grupos().get(grupo)
+    if cfg is None:
+        raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/")
+    if not (BACKLOG and _tickets_no_backlog()):
+        raise ValueError("o backlog por grupo pede os tickets no backlog (ORQ_BACKLOG e ORQ_BACKLOG_TICKETS)")
+    destino = grupo_backlog(grupo, cfg)
+    if os.path.abspath(destino) == os.path.abspath(BACKLOG):
+        raise ValueError(f"o backlog do grupo {grupo} é este mesmo: {BACKLOG}")
+    itens = {i["id"]: i for i in backlog.ler(BACKLOG)}
+    ids = []
+    for n in dict.fromkeys(str(x).strip().zfill(2) for x in numeros):
+        i = _item_do_ticket(n)
+        if not i:
+            raise ValueError(f"ticket {n} não está neste backlog ({BACKLOG})")
+        if i["estado"] != "queued":
+            raise ValueError(f"ticket {n} está {STATUS_ANDAMENTO if i['estado'] == 'in_flight' else STATUS_FECHADO}: só sai o que ainda está na fila; In flight e Done ficam")
+        ids.append(i["id"])
+    resolvidas = [(i, b) for i in ids for b in itens[i]["bloqueios"] if b not in ids and itens.get(b, {}).get("estado") == "done"]
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    toml = os.path.join(os.path.dirname(destino), ".tasks.toml")
+    if not os.path.exists(toml):
+        with open(toml, "w", encoding="utf-8") as f:
+            f.write(backlog.TOML)
+    for i, b in resolvidas:
+        backlog.cli(BACKLOG, "unblock", i, "--by", b)
+    try:
+        backlog.cli(BACKLOG, "mv", *ids, "--to", destino)
+    except backlog.BacklogErro:
+        for i, b in resolvidas:
+            with contextlib.suppress(backlog.BacklogErro):
+                backlog.cli(BACKLOG, "block", i, "--by", b)
+        raise
+    append_event({"tipo": "backlog", "op": "mover", "grupo": grupo, "tickets": ids, "destino": destino})
+    return {"grupo": grupo, "destino": destino, "tickets": ids}
 
 
 def pend_edit(id_, **campos):
@@ -5303,7 +5348,9 @@ def _comando_mate(grupo, cfg, sessao, cwd=None, dormia=False):
     cmd = HARNESS[agente]["resume"](sessao, modelo, cfg.get("effort"), msg) if sessao else HARNESS[agente]["abrir"](modelo, cfg.get("effort"), msg)
     # `ORQ_MATE=x claude` e não `env ORQ_MATE=x claude`: num terminal do Orca (fish) o claude lançado pelo `env` roda não interativo (sdk-cli, ou o erro de --print
     # sem prompt), com ou sem prompt na linha. A atribuição direta vale no fish, no zsh e no bash e deixa o claude interativo (ticket 106)
-    comando = f"ORQ_MATE={shlex.quote(grupo)} " + shlex.join([x for x in cmd if x is not None])
+    meu = grupo_backlog(grupo, cfg)  # o grupo que já recebeu tickets (`orq backlog mover`) lê e escreve o backlog dele, não o da máquina
+    ambiente = f"ORQ_MATE={shlex.quote(grupo)} " + (f"ORQ_BACKLOG={shlex.quote(meu)} " if meu and os.path.exists(meu) else "")
+    comando = ambiente + shlex.join([x for x in cmd if x is not None])
     # o Orca só cria terminal numa worktree que conhece, e a pasta do grupo (o ~/.claude/orq) não é uma: o terminal abre no checkout atual e entra nela.
     # `cd x; y` vale no fish, no zsh e no bash; o resume do claude só acha a sessão no cwd onde ela nasceu
     return (f"cd {shlex.quote(cwd)}; {comando}" if cwd else comando), (" ".join(texto.split()) if digitado else None)  # a quebra de linha submeteria no meio
@@ -6301,6 +6348,42 @@ def le_ticket(caminho):
             "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
 
 
+def _tickets_no_backlog():
+    """Os tickets moram no backlog (ORQ_BACKLOG e ORQ_BACKLOG_TICKETS): estado, bloqueios e o elo com a task do Orca ficam lá, e o arquivo `issues/NN-slug.md` guarda só o texto."""
+    return bool(BACKLOG and BACKLOG_TICKETS)
+
+
+def grupo_backlog(nome, cfg):
+    """O backlog.md de um grupo (M7): o `backlog` do JSON do grupo ou, sem ele, `grupos/<nome>/backlog.md` ao lado do backlog da máquina; None sem nenhum backlog ligado."""
+    if cfg.get("backlog"):
+        return _path(os.path.expanduser(cfg["backlog"]))
+    base = _backlog_da_maquina() or BACKLOG
+    return os.path.join(os.path.dirname(base), "grupos", nome, "backlog.md") if base else None
+
+
+def _backlogs_de_tickets():
+    """Os backlog.md onde um número de ticket pode estar: o do processo, o da máquina e os dos grupos que já existem. O número é único na máquina inteira."""
+    achados = [BACKLOG, _backlog_da_maquina(), *(grupo_backlog(n, c) for n, c in grupos().items())]
+    return [b for b in dict.fromkeys(achados) if b and (b == BACKLOG or os.path.exists(b))]
+
+
+def _maior_ticket():
+    """O maior número de ticket já usado: nos arquivos de ISSUES e, com os tickets no backlog, em todos os backlogs (um ticket que já saiu para o grupo continua ocupando o número)."""
+    try:
+        nums = [int(n.split("-")[0]) for n in os.listdir(ISSUES) if _NUM_ARQ.match(n)]
+    except FileNotFoundError:
+        nums = []
+    if _tickets_no_backlog():
+        for b in _backlogs_de_tickets():
+            nums += [int(i["id"][1:]) for i in backlog.ler(b) if re.fullmatch(r"t\d+", i["id"])]
+    return max(nums, default=0)
+
+
+def _item_do_ticket(num):
+    """O item do backlog do ticket `num` (o id pode ser `t5` ou `t05`), ou None."""
+    return next((i for i in backlog.ler(BACKLOG) if (m := re.fullmatch(r"t(\d+)", i["id"])) and int(m.group(1)) == int(num)), None)
+
+
 def _tickets_do_backlog():
     """Os tickets do backlog no formato de `tickets()` (ver `backlog.ticket_de_item`); `arquivo` é o `spec:` relativo à pasta que guarda ISSUES."""
     try:
@@ -6315,7 +6398,7 @@ def _tickets_do_backlog():
 
 def tickets():
     """Todos os tickets de ISSUES, por número (ou do backlog, com ORQ_BACKLOG e ORQ_BACKLOG_TICKETS). Ticket ilegível vai para o log e fica de fora: o resumo da sessão não cai por causa dele."""
-    if BACKLOG and BACKLOG_TICKETS:
+    if _tickets_no_backlog():
         return _tickets_do_backlog()
     try:
         nomes = sorted((n for n in os.listdir(ISSUES) if _NUM_ARQ.match(n)), key=lambda n: int(n.split("-")[0]))
@@ -6359,16 +6442,38 @@ def _linha_ticket_espera(t, integracao, events, sem_push):
     return linha_ticket(t, espera_despacho(t, integracao, events, sem_push) if t["status"] == STATUS_NOVO and not t["blocked_by"] else None)
 
 
-def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
+def _meta_ticket(modelo=None, effort=None, despacho=None, espera=None):
+    """Os campos opcionais que dizem como o ticket sobe: Modelo, Effort, Despacho e Espera (ticket 142), na ordem em que o cabeçalho e o backlog os guardam."""
+    return {k: " ".join(v.split()) for k, v in (("modelo", modelo), ("effort", effort), ("despacho", despacho), ("espera", espera)) if v}
+
+
+def _backlog_ticket_add(num, titulo, bloqueios, caminho, task, run, meta):
+    """`add` do ticket `tNN` no backlog: kind `ticket`, `repo` do prefixo do título, um `blocked-by` por bloqueador e o corpo com o `spec:` (relativo à pasta de ISSUES),
+    o `orca: <task> <run>` e a meta. A CLI exige que o bloqueador exista neste mesmo backlog."""
+    corpo = backlog.corpo_com_meta({"spec": os.path.relpath(caminho, os.path.dirname(ISSUES)), "orca": f"{task} {run}", **meta}, None, backlog.META_TICKET)
+    repo = backlog.repo_do_titulo(titulo)
+    backlog.cli(BACKLOG, "add", f"t{num}", titulo, "--kind", "ticket", *(["--repo", repo] if repo else []),
+                *(x for b in bloqueios for x in ("--blocked-by", f"t{b}")), "--body", corpo)
+
+
+def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None, modelo=None, effort=None, despacho=None, espera=None):
     """Cria `ISSUES/NN-<slug>.md` a partir do título e do arquivo de spec, e a task do Orca (`--task-title` igual ao título, `--spec` curto que
     aponta para o arquivo, `--deps` com as tasks dos Blocked by ainda abertos). A `task_id` fica no ticket, que é a única fonte do conteúdo.
 
     O spec traz "## What to build" (senão o texto todo vira essa seção) e "## Acceptance criteria" (obrigatório). Sem a task o ticket não fica:
     se o `task-create` falha, o arquivo é desfeito.
+
+    Com os tickets no backlog (M5) o arquivo é só o texto (`# NN: título` e as seções, sem Status, Blocked by, Run nem Task) e o estado vai para o item `tNN` do backlog,
+    escrito depois da task: se o `add` falha, o arquivo some e a task é completada com `desfeito`. `modelo`, `effort`, `despacho` e `espera` são os campos
+    opcionais do cabeçalho (ou da meta do item).
     """
     titulo = " ".join((titulo or "").split())
     if not titulo:
         raise ValueError("ticket sem título")
+    no_backlog = _tickets_no_backlog()
+    if no_backlog and (p := backlog.problema_titulo(titulo)):
+        raise ValueError(p)
+    meta = _meta_ticket(modelo, effort, despacho, espera)
     try:
         with open(os.path.expanduser(spec_arquivo), encoding="utf-8") as f:
             corpo = f.read().strip()
@@ -6401,13 +6506,10 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
             raise ValueError(f"o ticket é para o Run {alvo}, que o coordenador não comanda: o Orca recusa task-create em outro Run (consumer_fenced); {dica_ligar(alvo)}")
         os.makedirs(ISSUES, exist_ok=True)
         with _trava("ticket.lock"):  # B25: dois `ticket novo` ao mesmo tempo não escolhem o mesmo número
-            try:
-                maior = max(int(n.split("-")[0]) for n in os.listdir(ISSUES) if _NUM_ARQ.match(n))
-            except ValueError:
-                maior = 0
-            num = f"{maior + 1:02d}"
+            num = f"{_maior_ticket() + 1:02d}"
             caminho = os.path.join(ISSUES, f"{num}-{_slug(titulo)}.md")
-            txt = f"# {num}: {titulo}\n\nStatus: {STATUS_NOVO}\nBlocked by: {', '.join(bloqueios) or '(nenhum)'}\nRun: {alvo}\n\n{corpo}\n"
+            cab = "" if no_backlog else f"\nStatus: {STATUS_NOVO}\nBlocked by: {', '.join(bloqueios) or '(nenhum)'}\nRun: {alvo}\n" + "".join(f"{k.capitalize()}: {v}\n" for k, v in meta.items())
+            txt = f"# {num}: {titulo}\n{cab}\n{corpo}\n"
             with open(caminho, "x", encoding="utf-8") as f:
                 f.write(txt)
         try:
@@ -6420,16 +6522,30 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
             with contextlib.suppress(OSError):
                 os.remove(caminho)
             raise
-        _escrever(caminho, _trocar_campo(txt, "Task", task))
+        if no_backlog:
+            try:
+                _backlog_ticket_add(num, titulo, bloqueios, caminho, task, alvo, meta)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.remove(caminho)
+                with contextlib.suppress(Exception):
+                    orca("task-update", "--id", task, "--status", "completed", "--run", alvo, "--result", json.dumps({"desfeito": f"ticket {num}: o backlog recusou"}), timeout=20)
+                raise
+        else:
+            _escrever(caminho, _trocar_campo(txt, "Task", task))
         append_event({"tipo": "ticket", "op": "novo", "ticket": num, "task": task, "run": alvo, "titulo": titulo, **({"deps": deps} if deps else {})})
     return {"ticket": num, "arquivo": caminho, "task": task, "run": alvo, **({"aviso": "; ".join(avisos)} if avisos else {})}
 
 
 def ticket_fechar(numero, answer):
     """Grava `## Answer` (o texto, ou o conteúdo do arquivo se `answer` é um caminho), põe `Status: resolved` e completa a task no Orca se ela
-    ainda estiver aberta. O arquivo é a verdade: falha do Orca vira aviso e o ticket fica resolvido. Devolve {ticket, status, task, task_fechada, aviso}."""
+    ainda estiver aberta. O arquivo é a verdade: falha do Orca vira aviso e o ticket fica resolvido. Devolve {ticket, status, task, task_fechada, aviso}.
+
+    Com os tickets no backlog (M5) a verdade é o item: o `done` vem primeiro (se a CLI recusa nada mudou), o `## Answer` entra no arquivo depois e o cabeçalho do
+    arquivo não é tocado. Os dependentes saem do bloqueio sozinhos, porque o bloqueador passou a Done."""
     n = str(numero).strip().zfill(2)
-    t = next((t for t in tickets() if t["num"] == n), None)
+    antes = tickets()
+    t = next((t for t in antes if t["num"] == n), None)
     if not t:
         raise ValueError(f"ticket {n} não existe em {ISSUES}")
     if t["status"] == STATUS_FECHADO:
@@ -6438,10 +6554,19 @@ def ticket_fechar(numero, answer):
     resposta = (open(caminho, encoding="utf-8").read() if answer and os.path.isfile(caminho) else answer or "").strip()
     if not resposta:
         raise ValueError("--answer vazio: diga o que resolveu o ticket (texto ou arquivo)")
-    with open(t["arquivo"], encoding="utf-8") as f:
-        txt = f.read()
-    _escrever(t["arquivo"], _trocar_campo(txt, "Status", STATUS_FECHADO).rstrip("\n") + f"\n\n## Answer\n\n{resposta}\n")
     fechada, aviso = False, ""
+    if _tickets_no_backlog():
+        backlog.cli(BACKLOG, "done", _item_do_ticket(n)["id"], "--no-prune")
+        try:
+            with open(t["arquivo"], encoding="utf-8") as f:
+                txt = f.read()
+            _escrever(t["arquivo"], txt.rstrip("\n") + f"\n\n## Answer\n\n{resposta}\n")
+        except (OSError, TypeError) as e:  # o item já está Done: a resposta fica no log e no aviso
+            aviso = f"o ## Answer não entrou no arquivo do ticket ({getattr(e, 'strerror', None) or 'ticket sem spec'}): {_cita(resposta, 80)}"
+    else:
+        with open(t["arquivo"], encoding="utf-8") as f:
+            txt = f.read()
+        _escrever(t["arquivo"], _trocar_campo(txt, "Status", STATUS_FECHADO).rstrip("\n") + f"\n\n## Answer\n\n{resposta}\n")
     if t["task"] and t["run"]:
         try:
             with _no_run(t["run"]):
@@ -6450,16 +6575,41 @@ def ticket_fechar(numero, answer):
                     orca("task-update", "--id", t["task"], "--status", "completed", "--run", t["run"], "--result", json.dumps({"ticket": n}), timeout=20)
                     fechada = True
                     if tk.get("status") == "dispatched":
-                        aviso = f"a task {t['task']} estava dispatched: confira se o worker ainda roda (orq agentes)"
+                        aviso = "; ".join(x for x in (aviso, f"a task {t['task']} estava dispatched: confira se o worker ainda roda (orq agentes)") if x)
         except Exception as e:  # noqa: BLE001 - o ticket já está resolvido: a task fecha à mão
-            aviso = f"task {t['task']} não fechada ({e}): {dica_ligar(t['run'])} e orca orchestration task-update --id {t['task']} --status completed"
-    liberados, avisos = _libera_dependentes(n)
+            aviso = "; ".join(x for x in (aviso, f"task {t['task']} não fechada ({e}): {dica_ligar(t['run'])} e orca orchestration task-update --id {t['task']} --status completed") if x)
+    liberados, avisos = _libera_dependentes(n, antes)
     aviso = "; ".join(x for x in (aviso, *avisos) if x)
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": fechada, **({"aviso": aviso} if aviso else {}),
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in liberados]})
     for o in [o for o in obrigacoes_abertas(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
         _fechar_obrigacao(o, "feito", prova=f"ticket {n} {STATUS_FECHADO}")  # o orq cumpre sozinho e só registra
     return {"ticket": n, "status": STATUS_FECHADO, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": fechada, "aviso": aviso, "liberados": liberados}
+
+
+def ticket_editar(numero, **campos):
+    """Troca `modelo`, `effort`, `despacho` ou `espera` de um ticket (valor vazio tira o campo): com os tickets no backlog, a meta do corpo do item (`tasks-axi update --body`);
+    sem ele, a linha do cabeçalho do arquivo. Devolve {ticket, campos}."""
+    n = str(numero).strip().zfill(2)
+    t = next((t for t in tickets() if t["num"] == n), None)
+    if not t:
+        raise ValueError(f"ticket {n} não existe")
+    novos = {k: " ".join(v.split()) for k, v in campos.items() if v is not None}
+    if not novos:
+        raise ValueError("diga o que mudar: --modelo, --effort, --despacho ou --espera")
+    if _tickets_no_backlog():
+        item = _item_do_ticket(n)
+        meta, resto = backlog.meta_corpo(item["corpo"], backlog.META_TICKET)
+        meta = {k: v for k, v in {**meta, **novos}.items() if v}
+        backlog.cli(BACKLOG, "update", item["id"], "--body", backlog.corpo_com_meta(meta, resto, backlog.META_TICKET))
+    else:
+        with open(t["arquivo"], encoding="utf-8") as f:
+            txt = f.read()
+        for k, v in novos.items():
+            nome = k.capitalize()
+            txt = _trocar_campo(txt, nome, v) if v else re.sub(rf"^{nome}:.*\n", "", txt, count=1, flags=re.M)
+        _escrever(t["arquivo"], txt)
+    return {"ticket": n, "campos": sorted(novos)}
 
 
 def _worktree_do_liberado(t):
@@ -6471,8 +6621,9 @@ def _worktree_do_liberado(t):
     return "new-top-level", _slug(t["titulo"])[:40].strip("-")
 
 
-def _libera_dependentes(n):
+def _libera_dependentes(n, antes=None):
     """O ticket `n` acabou de ser resolvido: tira o número do `Blocked by:` de quem dependia dele (e os outros bloqueios já resolvidos).
+    Com os tickets no backlog não há linha para reescrever: `antes` (os tickets de antes do `done`) diz quem dependia de `n`, e o resto da conta é a mesma.
 
     O que ficou sem nenhum bloqueio e ainda é ready-for-agent é "liberado": com prioridade 1 ou 2 e `Modelo:` e `Effort:` no cabeçalho entra na fila de
     despacho (o gerente sobe por vaga e prioridade); sem eles só avisa; P3 nunca sobe sozinho. A task do Orca em `blocked` de quem ficou livre vira `ready`.
@@ -6482,16 +6633,19 @@ def _libera_dependentes(n):
     liberados, avisos, livres = [], [], []
     events, integracao = read_events(), integracao_fila()
     sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+    no_backlog = _tickets_no_backlog()
+    dependiam = {x["num"] for x in (antes or ts) if n in x["blocked_by"]}
     for t in ts:
-        if n not in t["blocked_by"] or t["status"] == STATUS_FECHADO:
+        if (t["num"] not in dependiam if no_backlog else n not in t["blocked_by"]) or t["status"] == STATUS_FECHADO:
             continue
         restam = [b for b in t["blocked_by"] if b != n and status.get(b) != STATUS_FECHADO]
-        try:
-            with open(t["arquivo"], encoding="utf-8") as f:
-                _escrever(t["arquivo"], _trocar_campo(f.read(), "Blocked by", ", ".join(restam) or "(nenhum)"))
-        except OSError as e:
-            avisos.append(f"ticket {t['num']}: Blocked by não atualizado ({e.strerror}): tire o {n} à mão")
-            continue
+        if not no_backlog:
+            try:
+                with open(t["arquivo"], encoding="utf-8") as f:
+                    _escrever(t["arquivo"], _trocar_campo(f.read(), "Blocked by", ", ".join(restam) or "(nenhum)"))
+            except OSError as e:
+                avisos.append(f"ticket {t['num']}: Blocked by não atualizado ({e.strerror}): tire o {n} à mão")
+                continue
         if restam:
             continue
         livres.append(t)
@@ -6581,6 +6735,66 @@ def texto_doctor_tasks(r, dry_run=False):
     ls += [f"sem ticket: {x['task']} ({x['status']}, {x['run']}) {_cita(x.get('titulo') or '', 50)}: decida se completa (task-update --status completed) ou se vira ticket" for x in r["sem_ticket"]]
     ls += [f"aviso: {x}" for x in r["avisos"]]
     return "\n".join(ls) or "nenhuma task presa"
+
+
+def doctor_backlog():
+    """`orq doctor backlog` (M6): cruza os tickets dos backlogs (o do processo, o da máquina e os dos grupos) com as tasks do Orca e diz o conserto de cada diferença, sem escrever nada.
+
+    Procura: In flight sem task despachada, Done com task aberta, Queued cuja task já acabou ou está despachada, task que o Orca não lista, spec ausente e arquivo de
+    `issues/` sem item em nenhum backlog. Devolve {tickets, tasks, problemas: [{ticket, problema, conserto}], avisos}."""
+    backlogs = _backlogs_de_tickets()
+    raiz = os.path.dirname(ISSUES)
+    tks, ids = [], set()
+    for b in backlogs:
+        itens = backlog.ler(b)
+        por_id = {i["id"]: i for i in itens}
+        ids |= {i["id"] for i in itens}
+        tks += [(b, t) for i in itens if (t := backlog.ticket_de_item(i, por_id, raiz))]
+    por_run, avisos, problemas = {}, [], []
+    for run in sorted({t["run"] for _, t in tks if t["run"] and t["task"]}):
+        try:
+            por_run[run] = {x["id"]: x for x in orca("task-list", "--run", run, timeout=20)["tasks"]}
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            avisos.append(f"Run {run}: task-list falhou ({e}): as tasks dele ficaram sem conferência")
+
+    def acha(t, problema, conserto):
+        problemas.append({"ticket": t["num"], "problema": problema, "conserto": conserto})
+
+    for b, t in tks:
+        n, arq = t["num"], f"TASKS_AXI_FILE={shlex.quote(b)} tasks-axi"
+        if t["arquivo"] and not os.path.exists(t["arquivo"]):
+            acha(t, f"o spec {t['arquivo']} não existe", f"restaure o arquivo ou aponte outro com {arq} update t{n} --body")
+        if not (t["task"] and t["run"]) or t["run"] not in por_run:
+            continue
+        tk = por_run[t["run"]].get(t["task"])
+        if not tk:
+            acha(t, f"a task {t['task']} não está no Run {t['run']}", "se o trabalho acabou, orq ticket fechar; senão recrie o ticket (orq ticket novo)")
+            continue
+        st, aberta = tk.get("status"), tk.get("status") not in ("completed", "failed")
+        if t["status"] == STATUS_FECHADO and aberta:
+            acha(t, f"Done, mas a task {t['task']} está {st}", f"orca orchestration task-update --id {t['task']} --status completed --run {t['run']}")
+        elif t["status"] == STATUS_ANDAMENTO and not aberta:
+            acha(t, f"In flight, mas a task {t['task']} já está {st}", f"orq ticket fechar {n} --answer <o que resolveu>")
+        elif t["status"] == STATUS_ANDAMENTO and st != "dispatched":
+            acha(t, f"In flight, mas a task {t['task']} está {st}, sem worker despachado", f"orq despachar --run {t['run']} --ticket {n} --modelo <m> --effort <e>")
+        elif t["status"] == STATUS_NOVO and not aberta:
+            acha(t, f"Queued, mas a task {t['task']} já está {st}", f"orq ticket fechar {n} --answer <o que resolveu>")
+        elif t["status"] == STATUS_NOVO and st == "dispatched":
+            acha(t, f"Queued, mas a task {t['task']} está dispatched", f"{arq} start t{n}")
+    try:
+        for nome in sorted(os.listdir(ISSUES)):
+            if _NUM_ARQ.match(nome) and f"t{nome.split('-')[0]}" not in ids and f"t{int(nome.split('-')[0])}" not in ids:
+                problemas.append({"ticket": nome.split("-")[0].zfill(2), "problema": f"o arquivo {nome} não tem item em nenhum backlog",
+                                  "conserto": "python3 ~/.claude/orq/scripts/converte-backlog.py --completa"})
+    except FileNotFoundError:
+        pass
+    return {"tickets": len(tks), "tasks": sum(len(v) for v in por_run.values()), "problemas": problemas, "avisos": avisos}
+
+
+def texto_doctor_backlog(r):
+    """Uma linha por diferença, com o conserto; sem nenhuma, a contagem do que foi conferido."""
+    ls = [f"{x['ticket']}: {x['problema']}. Conserto: {x['conserto']}" for x in r["problemas"]] + [f"aviso: {x}" for x in r["avisos"]]
+    return "\n".join(ls) or f"backlog e Orca coerentes ({r['tickets']} tickets, {r['tasks']} tasks conferidas)"
 
 
 def contexto_sessao():
@@ -8216,6 +8430,18 @@ def _com_bloco_orq(txt, num=None):
     return txt if ORQ_WT_TITULO in txt else txt.rstrip("\n") + "\n\n" + bloco_worktree_orq(num)
 
 
+def _gate_backlog(tk):
+    """O gate do despacho com os tickets no backlog (o do firstmate): o item tem de existir e estar `ready`, sem hold ativo e sem bloqueador aberto. Recusa antes de criar qualquer coisa."""
+    item = _item_do_ticket(tk["num"])
+    if not item:
+        raise ValueError(f"o ticket {tk['num']} não está no backlog {BACKLOG}: migre com scripts/converte-backlog.py --completa")
+    if backlog.hold_ativo(item):
+        h = item["hold"]
+        raise ValueError(f"o ticket {tk['num']} está em hold ({h['motivo']}{', até ' + h['until'] if h.get('until') else ''}): tasks-axi unhold t{tk['num']}")
+    if tk["blocked_by"]:
+        raise ValueError(f"o ticket {tk['num']} está bloqueado por {', '.join(tk['blocked_by'])}: feche os bloqueadores primeiro")
+
+
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False, servico=False):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
 
@@ -8268,6 +8494,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             raise ValueError(f"ticket {n} não tem task: crie-o com orq ticket novo")
         if tk["run"] and tk["run"] != run:
             raise ValueError(f"o ticket {n} é do Run {tk['run']} e o despacho é para {run}: a task só despacha no Run onde nasceu")
+        if _tickets_no_backlog():
+            _gate_backlog(tk)
         titulo, spec = tk["titulo"], None
     elif not (titulo and spec_arquivo):
         raise ValueError("passe --ticket <NN>, ou --titulo e --spec-arquivo")
@@ -8292,7 +8520,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
         if ticket_do_orq(titulo, projeto):
             if spec is not None:
                 spec = _com_bloco_orq(spec)
-            else:  # o conteúdo do ticket é o arquivo: o bloco entra nele, uma vez
+            elif tk["arquivo"]:  # o conteúdo do ticket é o arquivo: o bloco entra nele, uma vez
                 with open(tk["arquivo"], encoding="utf-8") as f:
                     txt = f.read()
                 if ORQ_WT_TITULO not in txt:
@@ -8338,7 +8566,12 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             confiadas += confiar_codex(_checkpoint(dispatch)["caminho"])  # a worktree que o Orca criou
         if confiadas:
             out["confiadas"] = confiadas
-    if tk:  # B24: o ticket despachado deixa de ser "pronto para agente", senão uma sessão nova o despacharia de novo
+    if tk and _tickets_no_backlog():  # o `start` do tasks-axi é o que antes era o Status do cabeçalho: o item passa a In flight depois do worker-start
+        try:
+            backlog.cli(BACKLOG, "start", _item_do_ticket(tk["num"])["id"])
+        except (backlog.BacklogErro, TypeError) as e:
+            out["aviso"] = f"o worker subiu mas o ticket {tk['num']} não foi para In flight ({e}): rode tasks-axi start t{tk['num']} no backlog"
+    elif tk:  # B24: o ticket despachado deixa de ser "pronto para agente", senão uma sessão nova o despacharia de novo
         try:
             with open(tk["arquivo"], encoding="utf-8") as f:
                 _escrever(tk["arquivo"], _trocar_campo(f.read(), "Status", STATUS_ANDAMENTO))
@@ -10876,7 +11109,10 @@ def main(argv=None):
     pe.add_argument("id")
     for k in ("titulo", "detalhe", "frente", "link", "comando", "espera", "ate"):
         pe.add_argument(f"--{k}")
-    bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens")
+    bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens; `mover NN... --grupo G` leva tickets ao backlog de um grupo")
+    bl.add_argument("op", nargs="?", choices=["mover"])
+    bl.add_argument("numeros", nargs="*", help="os tickets que saem (mover)")
+    bl.add_argument("--grupo", help="o grupo que recebe os tickets (mover)")
     bl.add_argument("--json", action="store_true")
     dv = sub.add_parser("devolver", help="orq devolver <task|dispatch> \"<motivo>\": manda a correção ao worker de uma entrega já concluída e tira a entrega do Stop até o worker_done novo")
     dv.add_argument("alvo")
@@ -11054,6 +11290,8 @@ def main(argv=None):
     tn.add_argument("--spec-arquivo", required=True)
     tn.add_argument("--blocked-by", help="números dos tickets que bloqueiam este, separados por vírgula")
     tn.add_argument("--run", help="Run da task (o ligado ao coordenador, por padrão)")
+    for k, h in (("modelo", "o modelo com que o ticket liberado sobe sozinho"), ("effort", "o effort dele"), ("despacho", "`manual[, motivo]`: nunca sobe sozinho"), ("espera", "`integrador vazio`")):
+        tn.add_argument(f"--{k}", help=h)
     tf = tk.add_parser("fechar", help="grava o Answer, põe resolved e completa a task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="texto ou caminho de um arquivo")
@@ -11061,6 +11299,12 @@ def main(argv=None):
     dt = dc.add_parser("tasks", help="completa a task blocked/pending de ticket resolvido (supersededBy) e lista a que não tem ticket")
     dt.add_argument("--dry-run", action="store_true", help="só lista")
     dt.add_argument("--json", action="store_true")
+    dbk = dc.add_parser("backlog", help="cruza os tickets dos backlogs com as tasks do Orca e imprime o conserto de cada diferença (não escreve nada)")
+    dbk.add_argument("--json", action="store_true")
+    te = tk.add_parser("editar", help="troca o modelo, o effort, o despacho ou a espera de um ticket (valor vazio tira o campo)")
+    te.add_argument("numero")
+    for k in ("modelo", "effort", "despacho", "espera"):
+        te.add_argument(f"--{k}")
     tl = tk.add_parser("lista", help="os tickets abertos (--todos inclui os resolvidos)")
     tl.add_argument("--todos", action="store_true")
     tl.add_argument("--json", action="store_true")
@@ -11200,6 +11444,11 @@ def main(argv=None):
                 print(json.dumps(feito, ensure_ascii=False))
                 if feito.get("aviso"):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
+        elif a.cmd == "backlog" and a.op == "mover":
+            if not (a.numeros and a.grupo):
+                print("backlog mover: passe os números dos tickets e --grupo", file=sys.stderr)
+                return 2
+            print(json.dumps(backlog_mover(a.numeros, a.grupo), ensure_ascii=False))
         elif a.cmd == "backlog":
             r = backlog_estado()
             print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"{k}: {v}" for k, v in r.items()))
@@ -11370,14 +11619,20 @@ def main(argv=None):
             motivos = auditar_publicacao(a.revs)
             print("\n".join(f"auditar-publicacao: {m}" for m in motivos), file=sys.stderr)
             return 1 if motivos else 0
+        elif a.cmd == "doctor" and a.op == "backlog":
+            r = doctor_backlog()
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_backlog(r))
+            return 1 if r["problemas"] else 0
         elif a.cmd == "doctor":
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))
         elif a.cmd == "ticket":
             if a.op == "novo":
-                r = ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run)
+                r = ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run, a.modelo, a.effort, a.despacho, a.espera)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicito("tarefa", r["task"], r["run"])
+            elif a.op == "editar":
+                print(json.dumps(ticket_editar(a.numero, modelo=a.modelo, effort=a.effort, despacho=a.despacho, espera=a.espera), ensure_ascii=False))
             elif a.op == "fechar":
                 r = ticket_fechar(a.numero, a.answer)
                 print(json.dumps(r, ensure_ascii=False))
