@@ -574,8 +574,8 @@ def limpar_worktrees_orq(repo=None, raiz=None, ref="origin/main", dry_run=False,
         resolvidos = {t["num"] for t in tickets() if t["status"] == STATUS_FECHADO}
     if vivos is None:
         ev = read_events()
-        lib = _liberados(ev)
-        vivos = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}
+        lib = _liberados(ev) | {e.get("dispatch") for e in ev if e.get("tipo") == "liberar" and e.get("estado") in ("released", "already_released")}
+        vivos = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}  # `retained` e `release_unknown` contam como vivos
     assuntos = set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
     out, cwds, reescritas = {"removidas": [], "ficaram": [], "bundle": None}, None, []
     for nome in sorted(os.listdir(raiz)) if os.path.isdir(raiz) else []:
