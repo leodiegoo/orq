@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
+import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +19,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORQ = os.path.join(HERE, "orq.py")
 CLEAN_SCRIPT = os.path.join(HERE, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, HERE)
+SUITE_TMP = []  # every temporary folder this run creates: the real-log check looks for their names (ticket 216)
+_mkdtemp = tempfile.mkdtemp
+tempfile.mkdtemp = lambda *a, **k: SUITE_TMP.append(_mkdtemp(*a, **k)) or SUITE_TMP[-1]  # TemporaryDirectory goes through it too
+os.environ["ORQ_HOME"] = tempfile.mkdtemp()  # orqlib reads ORQ_HOME once, at import: an in-process call never lands in the real state (ticket 216)
 import orq as orq_mod  # noqa: E402
 import orqlib  # noqa: E402
 if "ORQ_BACKLOG" not in os.environ:
@@ -15064,14 +15070,15 @@ def test_ticket147_end_spares_orq_itself_and_its_caller():
     file_path = os.path.join(a.tmp.name, "p.json")
     json.dump([{"pid": 400, "ppid": 1, "args": "node", "cwd": wt}, {"pid": parent, "ppid": 1, "args": "coordenador", "cwd": wt},
                {"pid": eu, "ppid": parent, "args": "orq", "cwd": wt}], open(file_path, "w"))
-    before = {k: os.environ.get(k) for k in ("ORQ_PROCESSOS", "ORQ_HOME")}
-    os.environ.update(ORQ_PROCESSOS=file_path, ORQ_HOME=a.home)
+    before, home = os.environ.get("ORQ_PROCESSOS"), orqlib.HOME
+    os.environ["ORQ_PROCESSOS"], orqlib.HOME = file_path, a.home  # orqlib.HOME, not the variable: it is read at import (ticket 216, the leak into the real log)
     try:
         res = orqlib.terminate_worktree_processes(wt, wait_s=0.2)
     finally:
-        for k, v in before.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        os.environ.pop("ORQ_PROCESSOS", None) if before is None else os.environ.__setitem__("ORQ_PROCESSOS", before)
+        orqlib.HOME = home
     assert res["encerrados"] == 1 and {p["pid"] for p in json.load(open(file_path))} == {parent, eu}, res
+    assert [e["tipo"] for e in orq_mod_events(a.home)] == ["processos"], "the event goes to the test's ORQ_HOME"
 
 
 def test_hotfix147_main_checkout_never_has_process_ended():
@@ -17409,10 +17416,140 @@ def test_ticket124_project_add_without_origin_head_guesses_no_environments():
     assert "ambientes" not in _read_state(os.path.join(a.home, "projects", "app.json")), "without origin/HEAD the production is unknown"
 
 
+# ---------- ticket 216: the producer→consumer contract and the suite's isolation from the real log ----------
+
+# event type -> who reads it: the Stop (`hook_stop`) or the manager's wake-up (`wake_stopped`), with everything they call. The test rebuilds this table from the
+# code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
+# integrator never writes, with tests that wrote it by hand.
+EVENTOS_LIDOS = {
+    "alerta": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
+    "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped", "entrada": "hook_stop wake_stopped",
+    "gate_falha": "wake_stopped", "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
+    "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
+    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta_coordenador": "hook_stop",
+    "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped", "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped",
+    "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
+}
+NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
+
+
+def _type_strings(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    return [s for x in node.elts for s in _type_strings(x)] if isinstance(node, (ast.Tuple, ast.List, ast.Set)) else []
+
+
+def _reads_type(node):
+    """`x.get("tipo")` or `x["tipo"]`."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args and _type_strings(node.args[0]) == ["tipo"]) or (
+        isinstance(node, ast.Subscript) and _type_strings(node.slice) == ["tipo"])
+
+
+def _reachable(defs, roots):
+    """The module-level functions and names reachable from `roots` through any name they load (calls, references, the hooks table)."""
+    seen, queue = set(), list(roots)
+    while queue:
+        n = queue.pop()
+        if n in seen or n not in defs:
+            continue
+        seen.add(n)
+        queue += [x.id for x in ast.walk(defs[n]) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)]
+    return seen
+
+
+def event_contract(source):
+    """({type: readers} of what hook_stop and wake_stopped compare `tipo` with, {types written by a `{"tipo": ...}` literal reachable from main}) of orqlib's source.
+    # ponytail: static, by name; a type built at runtime (`{"tipo": kind}`) is not seen, nor is a command the real flow never calls (the replay covers that)."""
+    tree = ast.parse(source)
+    defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    defs.update({t.id: n for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name) and t.id not in defs})
+    reads = {}
+    for root in ("hook_stop", "wake_stopped"):
+        for name in _reachable(defs, [root]):
+            for x in ast.walk(defs[name]):
+                if isinstance(x, ast.Compare) and _reads_type(x.left):
+                    for kind in (s for c in x.comparators for s in _type_strings(c)):
+                        reads.setdefault(kind, set()).add(root)
+    written = {s for name in _reachable(defs, ["main"]) for x in ast.walk(defs[name]) if isinstance(x, ast.Dict)
+               for k, v in zip(x.keys, x.values) if k is not None and _type_strings(k) == ["tipo"] for s in _type_strings(v)}
+    return reads, written
+
+
+def contract_gaps(source):
+    """What breaks the contract: a type read with nobody writing it, a read missing from EVENTOS_LIDOS, an entry nobody reads any more."""
+    reads, written = event_contract(source)
+    reads = {k: v for k, v in reads.items() if k not in NOT_EVENTS}
+    return ([f"{k}: read by {' '.join(sorted(v))} and no command writes it" for k, v in sorted(reads.items()) if k not in written]
+            + [f"{k}: read by {' '.join(sorted(v))}, missing from EVENTOS_LIDOS" for k, v in sorted(reads.items()) if k not in EVENTOS_LIDOS]
+            + [f"{k}: in EVENTOS_LIDOS and nobody reads it" for k in sorted(set(EVENTOS_LIDOS) - set(reads))]
+            + [f"{k}: EVENTOS_LIDOS says {EVENTOS_LIDOS[k]!r}, the code {' '.join(sorted(reads[k]))!r}" for k in sorted(set(EVENTOS_LIDOS) & set(reads))
+               if set(EVENTOS_LIDOS[k].split()) != reads[k]])
+
+
+def test_ticket216_every_event_the_stop_and_the_manager_read_has_a_real_producer():
+    assert contract_gaps(open(os.path.join(HERE, "orqlib.py")).read()) == []
+
+
+def test_ticket216_a_new_stop_read_of_an_event_nobody_writes_fails_the_contract():
+    source = open(os.path.join(HERE, "orqlib.py")).read().replace(
+        "def hook_stop(ev, run):\n", 'def hook_stop(ev, run):\n    [e for e in read_events() if e.get("tipo") == "evento_fantasma"]\n', 1)
+    assert contract_gaps(source) == ["evento_fantasma: read by hook_stop and no command writes it", "evento_fantasma: read by hook_stop, missing from EVENTOS_LIDOS"]
+
+
+def _real_logs():
+    """The live events.jsonl files a test must never touch: the clone's (the default ORQ_HOME since ticket 124) and the old install's."""
+    return [os.path.join(orqlib.orqpaths.main_checkout(HERE), "events.jsonl"), os.path.join(orqlib.orqpaths.LEGACY_LINK, "events.jsonl")]
+
+
+def log_snapshot(paths):
+    """{path: (size, sha256)} of each log that exists."""
+    out = {}
+    for p in paths:
+        with contextlib.suppress(OSError):
+            data = open(p, "rb").read()
+            out[p] = (len(data), hashlib.sha256(data).hexdigest())
+    return out
+
+
+
+
+def log_leaks(before):
+    """What the suite did to the real logs since `before`: rewritten (the old bytes changed) or a line from this run appended. The live coordinator, and the suites of
+    other worktrees, keep appending while it runs, so a new line alone is not a leak: only one carrying the name of a temporary folder this run created.
+    # ponytail: a leaked event with no path in it passes; a per-run marker in every event if that ever bites."""
+    out = []
+    for p, (size, digest) in before.items():
+        try:
+            data = open(p, "rb").read()
+        except OSError:
+            out.append(f"{p}: gone")
+            continue
+        if len(data) < size or hashlib.sha256(data[:size]).hexdigest() != digest:
+            out.append(f"{p}: rewritten during the suite")
+            continue
+        names = {os.path.basename(d) for d in SUITE_TMP}
+        out += [f"{p}: test line appended: {x[:160]}" for x in data[size:].decode("utf-8", "replace").splitlines()
+                if any(n in names for n in re.findall(r"tmp[\w-]{8}", x))]
+    return out
+
+
+def test_ticket216_the_leak_check_catches_a_test_line_and_ignores_the_coordinator():
+    p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+    open(p, "w").write('{"ts": "2026-10-02T09:00:00Z", "type": "entry"}\n')
+    before = log_snapshot([p])
+    open(p, "a").write('{"ts": "2026-10-02T09:01:00Z", "type": "coordinator_answer"}\n')
+    assert log_leaks(before) == [], "the live coordinator's own line is not a leak"
+    open(p, "a").write(json.dumps({"type": "processes", "worktree": os.path.join(tempfile.mkdtemp(), "wt147")}) + "\n")
+    assert len(log_leaks(before)) == 1 and "wt147" in log_leaks(before)[0]
+    open(p, "w").write("")
+    assert log_leaks(before) == [f"{p}: rewritten during the suite"]
+
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
     failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
+    real_logs = log_snapshot(_real_logs())
     for item_name, fn in tests:
         try:
             fn()
@@ -17420,5 +17557,8 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001 - the report shows all failures at once
             failures.append(item_name)
             print(f"FALHOU  {item_name}: {type(e).__name__}: {str(e)[-400:]!r}")
+    for leak in log_leaks(real_logs):  # ticket 216: the suite leaves the real events.jsonl as it found it
+        failures.append(leak)
+        print(f"FALHOU  isolation: {leak}")
     print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram")
     sys.exit(1 if failures else 0)
