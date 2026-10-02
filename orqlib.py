@@ -564,7 +564,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
                 estado = "nao_comecou"
             if (limites or {}).get(d) and estado != "perguntando":
                 estado = "limite"
-            if _perdeu_terminal(w, vivos, pausados, hibernados):  # sem terminal nenhum steer chega: o que falta é o `orq retomar`
+            if _perdeu_terminal(w, vivos, pausados, hibernados) and not (limites or {}).get(d):  # sem terminal nenhum steer chega: o que falta é o `orq retomar`; tela do limite lida = terminal vivo
                 estado, espera, motivo = "sem_terminal", None, None
         else:
             espera = motivo = None
