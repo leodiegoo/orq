@@ -1,0 +1,70 @@
+2026-10-01 18:51 t76 bce0482  713/713 (test_orq) + test_precompact ok
+2026-10-01 18:51 t75 3990ccf  713/713 (test_orq) + test_precompact ok
+2026-10-01 18:51 t77 dad1d33  713/713 (test_orq) + test_precompact ok
+2026-10-01 19:03 t97 2db947c  736/736 (test_orq, pilha t97+t87+t88+t91) + test_precompact ok
+2026-10-01 19:03 t87 fc7cdad  736/736 (test_orq, pilha t97+t87+t88+t91) + test_precompact ok
+2026-10-01 19:03 t88 0c0d67b  736/736 (test_orq, pilha t97+t87+t88+t91) + test_precompact ok
+2026-10-01 19:03 t91 945216d  736/736 (test_orq, pilha t97+t87+t88+t91) + test_precompact ok
+2026-10-01 19:26 t105 4d840ef 759/759 (test_orq) + test_precompact ok; c7dc37d chore ignore estado/ vai junto
+2026-10-01 19:37 t114 a55f220 770/770 (test_orq, pilha t114+t113) + test_precompact ok
+2026-10-01 19:37 t113 765b645 770/770 (test_orq, pilha t114+t113) + test_precompact ok
+2026-10-01 19:47 t92 bddf614 782/782 (test_orq, pilha t92+t103+t111+t80) + test_precompact ok
+2026-10-01 19:47 t103 5889972 782/782 (test_orq, pilha t92+t103+t111+t80) + test_precompact ok
+2026-10-01 19:47 t111 d5ffed4 782/782 (test_orq, pilha t92+t103+t111+t80) + test_precompact ok
+2026-10-01 19:47 t80 consertos 4257996..02ff529 782/782 (test_orq, pilha t92+t103+t111+t80) + test_precompact ok
+2026-10-01 20:05 t106 7621fa4 800/800 (test_orq, pilha t106+t107+t112+t115) + test_precompact ok + limpar self-test ok
+2026-10-01 20:05 t107 df54b95 800/800 (test_orq, pilha t106+t107+t112+t115) + test_precompact ok + limpar self-test ok
+2026-10-01 20:05 t112 4bc71e3 800/800 (test_orq, pilha t106+t107+t112+t115) + test_precompact ok + limpar self-test ok
+2026-10-01 20:05 t115 (+junções 114/113/111/103) a642ccf 800/800 (test_orq, pilha t106+t107+t112+t115) + test_precompact ok + limpar self-test ok
+2026-10-01 21:24 t126 0229cab 809/809 (test_orq; a rodada inteira deu 808/809 e o 1 teste do guard foi corrigido e passa) + test_precompact ok
+2026-10-01 21:24 t126 docs+teste 1b8a9ea a2f57f9 809/809 (test_orq; a rodada inteira deu 808/809 e o 1 teste do guard foi corrigido e passa) + test_precompact ok
+2026-10-01 21:39 t125 ee63728 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t104 0008a16 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t125 fix helper d1f7d3e 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t118 a1ba4b5 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t119 806bca6 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t127 013d417 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t120 446d633 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 21:39 t128 b787e84 841/841 (test_orq, pilha t125..t128) + test_precompact ok + limpar self-test ok + bun test 2/2 
+2026-10-01 22:01 t135 26b1386 843/843 (test_orq, pilha t125..t128+t135+t27) + test_precompact ok + limpar self-test ok + bun test 2/2
+2026-10-01 22:01 chore ignore integrar-fila.json 6930812 843/843 (test_orq, pilha t125..t128+t135+t27) + test_precompact ok + limpar self-test ok + bun test 2/2
+2026-10-01 22:01 t27 8d1eac3 843/843 (test_orq, pilha t125..t128+t135+t27) + test_precompact ok + limpar self-test ok + bun test 2/2
+2026-10-01 22:01 FF main a2f57f9..8d1eac3 main = 8d1eac3, 11 commits à frente da origin; empurrar até 8d1eac3
+2026-10-01 22:28 t96 407b529 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t93 0f2b0b3 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t90 9727148 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t101 f012c49 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t117 1699246 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t99 757085b 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t100 8c076cb 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t134 24179c5 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t89 7ecaaf8 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t98 1f07999 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 chore ignore overflow cc39f86 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t136 021ce66 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t137 33b9b37 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 teste: avisos curtos e módulos da raiz c725995 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 t139 c40a901 911/911 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0 sem apontamentos; autores 15/15 corretos
+2026-10-01 22:28 FF main 9065106..c40a901 main = c40a901 (a base 9065106 já estava na origin; empurrar até c40a901)
+2026-10-01 22:55 t143 9937203 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 t142 be3c57a 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 t140 f0f7567 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 t144 9667c56 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 t141 59a9905 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 fix t140 dica duplicada f33048d 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 test t140 dica nos testes antigos 4910a66 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 fix backlog chaves Despacho/Espera 62c1119 934/934 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 8/8 corretos
+2026-10-01 22:55 FF main c40a901..62c1119 main = 62c1119; empurrar até 62c1119
+2026-10-01 23:08 chore ignore run-parado.json 3e89f97 943/943 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 4/4 corretos
+2026-10-01 23:08 t147 476fec4 943/943 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 4/4 corretos
+2026-10-01 23:08 t146 f006894 943/943 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 4/4 corretos
+2026-10-01 23:08 t153 4e69cc6 943/943 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; autores 4/4 corretos
+2026-10-01 23:08 FF main 62c1119..4e69cc6 main = 4e69cc6; empurrar até 4e69cc6
+2026-10-01 23:52 FF main 479e310..86adf6f main = 86adf6f; t145 177f143, t158 87a2053, t165 a15a9ae, t155 26ed560, t150 412180f+7995dcd, t166 476c8c6+a999a3c, t168 99096cb, t169 eb08415, fix limite-vs-sem_terminal 86adf6f: 967/967 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao origin/main..HEAD: exit 0; empurrar até 86adf6f
+2026-10-02 00:08 FF main 86adf6f..b16660a main = b16660a; t171 4cdf45e, t154 a09804f, t170 32364db, chore deploy-check b16660a: 979/979 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao exit 0; empurrar até b16660a
+2026-10-02 00:08 [BLOQUEADO] t167 (feat/backlog-ligado) NÃO integrada, fica em integracao-167 (rebaseada, conflito só em .gitignore resolvido): com ORQ_BACKLOG + ORQ_BACKLOG_TICKETS=1, 'orq ticket novo' grava em issues/ (06-...md criado) mas 'orq ticket lista' não mostra o ticket novo (lista 02..05 antes e depois). Gate (2) falhou; (1) pend lista == pendencias.json passou. Precisa da 102 (ticket novo/fechar escrevendo no backlog) antes de ligar ORQ_BACKLOG_TICKETS.
+2026-10-02 00:46 FF main b16660a..3c07344 main = 3c07344; t156 6604c5d, t172 99b2aaa, t157 53a10e8 + fix(entrega) ambientes lidos dos projetos: 993/993 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao exit 0; empurrar até 3c07344
+2026-10-02 00:58 FF main 3c07344..0a8aba1 main = 0a8aba1; t102 (com a 167: b54c676..d144267) + t173 (7f132e0, f4cb495 runner único: 30 testes que nunca rodavam agora rodam) + chore ignore backlog.tickets: 1023/1023 (test_orq) + test_precompact ok + limpar self-test ok + bun test 2/2; auditar-publicacao exit 0. Gates 102 numa cópia dos dados vivos: converte --completa +1 (t173), pend lista --todas == pendencias.json (19/19), ticket novo apareceu no ticket lista e fechou. Vivo: backup backlog.md.antes-102-*, converte --completa (+t173), backlog.tickets criado, pend 19/19. empurrar até 0a8aba1
+2026-10-02 05:42 FF main 0a8aba1..7b3b093 main = 7b3b093; t174 19ce362, t175 7b3b093: 1031/1031 (1 instável test_it_should_warn_when_the_tree_is_dirty falhou na rodada e passou ao repetir) + precompact ok + limpar self-test ok + bun 2/2; auditar exit 0; empurrar até 7b3b093
+2026-10-02 06:08 FF main 7b3b093..3f078a3 main = 3f078a3; t176 (3 commits), t177, t178 + fix(worktrees) 01a601d-equivalente (limpar do ciclo sujava a main viva com __pycache__ e lia o orq-wt real; 'main' fixo quebrava o teste 115): 1044/1044 na soma das rodadas (instáveis, cada um passou ao repetir: test_it_should_only_preview..., test_it_should_check_the_pr_commits_with_gh...) + precompact ok + limpar self-test ok + bun 2/2; auditar exit 0; empurrar até 3f078a3
+2026-10-02 06:22 FF main 3f078a3..e7aeffa main = e7aeffa; t129 (nomes em inglês fase 1; conflito com 175/176/178 resolvido: dispatch-queue discard e worktrees clean ganharam par em inglês): 1053/1053 + precompact ok + limpar self-test ok + bun 2/2; auditar exit 0; empurrar até e7aeffa. Nota: 'doctor antigos' (178) e suas flags ainda sem nome em inglês

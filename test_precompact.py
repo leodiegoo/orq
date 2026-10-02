@@ -8,6 +8,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "precompact.py")
+for _k in [k for k in os.environ if k.startswith(("ORQ_", "ORCA_", "CLAUDE", "CODEX_"))]:
+    del os.environ[_k]  # hermetic: the caller's orq, Orca and harness environment never reaches a test (ticket 328)
 
 T = tempfile.mkdtemp()
 def w(item_name, txt, exe=False):
