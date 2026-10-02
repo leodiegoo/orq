@@ -7445,6 +7445,10 @@ try:
     data = json.load(open(os.path.join(d, "gh.json")))
 except OSError:
     data = {}
+if sys.argv[1] == "api":
+    if "api:" + sys.argv[2] not in data:
+        sys.stderr.write("HTTP 404"); sys.exit(1)
+    print(json.dumps(data["api:" + sys.argv[2]])); sys.exit(0)
 if sys.argv[2] == "list":
     repo = sys.argv[sys.argv.index("--repo") + 1]
     so_abertos = "--state" in sys.argv and sys.argv[sys.argv.index("--state") + 1] == "open"
@@ -18797,6 +18801,102 @@ def test_ticket219_evidence_verdict_never_turns_untested_or_not_live_into_pass()
     assert v([{"after": "pass", "live": False}]) == "inconclusive"
     assert v([{"after": "untested", "live": True}]) == "inconclusive"
     assert v([{"after": "pass", "live": True}, {"after": "fail", "live": True}]) == "no-go"
+def _base_runs(a, base, **by_name):
+    """The check runs on the tip of `base` as `gh api repos/acme/app/commits/<base>/check-runs` returns them: {name: (conclusion, completed_at)}."""
+    data = _log_json(a, "gh.json", {})
+    data[f"api:repos/acme/app/commits/{base}/check-runs?per_page=100"] = {"check_runs": [{"name": n, "conclusion": c, "completed_at": t} for n, (c, t) in by_name.items()]}
+    a.set("gh.json", data)
+
+
+def _prs_by_number(a):
+    return {i["numero"]: i for i in _read_state(os.path.join(a.home, "prs.json"))["itens"]}
+
+
+def test_ticket220_failure_also_red_on_the_base_tip_blocks_the_pr_by_the_base_not_the_pr():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("lint"), _ck("deploy-oci-tests", "FAILURE")])
+    _pr(a, PR2, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint", "FAILURE"), _ck("deploy-oci-tests", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-09-21T10:00:00Z"), "lint": ("success", "2026-09-21T10:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    prs = _prs_by_number(a)
+    assert prs[1216]["ci"]["falhas_na_base"] == ["deploy-oci-tests"] and prs[1216]["ci"]["base_vermelha_desde"] == "2026-09-21T10:00:00Z", prs[1216]["ci"]
+    assert orq_mod._blocked_by_base(prs[1216]["ci"]) and not orq_mod._blocked_by_base(prs[1220]["ci"]), "lint is red only in the PR"
+    r1, r2 = orq_mod._pr_reading(prs[1216]), orq_mod._pr_reading(prs[1220])
+    assert r1["marcas"] == [("⛔", "blocked by base: red on development: deploy-oci-tests")] and not r1["pronto"] and r1["bloqueada_pela_base"], r1
+    assert r2["marcas"] == [("✗", "lint"), ("✗", "already red on development: deploy-oci-tests")] and not r2["bloqueada_pela_base"], r2
+    assert len([c for c in _gh_calls(a) if c[0] == "api"]) == 1, "one call per repository and base, not per PR"
+
+
+def test_ticket220_failure_only_in_the_pr_stays_a_failure_and_a_green_or_unreadable_base_adds_nothing():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("lint", "FAILURE")])
+    _pr(a, PR2, "OPEN", "staging", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint", "FAILURE")])
+    _base_runs(a, "development", lint=("success", "2026-09-21T10:00:00Z"))  # staging: gh api answers 404
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    for i in _prs_by_number(a).values():
+        assert i["ci"]["falhas"] == ["lint"] and "falhas_na_base" not in i["ci"], i["ci"]
+        assert orq_mod._pr_reading(i)["marcas"] == [("✗", "lint")]
+
+
+def test_ticket220_cancelled_run_on_the_base_is_not_red_and_a_green_pr_never_reads_its_base():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("e2e", "FAILURE")])
+    _pr(a, PR2, "OPEN", "staging", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint")])
+    _base_runs(a, "development", e2e=("cancelled", "2026-09-21T10:00:00Z"))
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert "falhas_na_base" not in _prs_by_number(a)[1216]["ci"]
+    assert [c[1] for c in _gh_calls(a) if c[0] == "api"] == ["repos/acme/app/commits/development/check-runs?per_page=100"], "the green PR's base is not read"
+
+
+def test_ticket220_coordinator_is_told_once_with_since_when_the_base_is_red_and_again_only_after_it_cleared():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("deploy-oci-tests", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-09-21T10:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    before, dig = orq_mod.HOME, orq_mod.type_text
+    sent = []
+    orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t: sent.append(t) or "enviado"
+    try:
+        _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
+        _away_on(a.home)
+        assert len(orq_mod.pr_notify()) == 1 and len(sent) == 1, sent
+        assert "PR #1216 blocked by development: deploy-oci-tests red there since 2026-09-21;" in sent[0], sent
+        assert orq_mod.pr_notify() == [] and len(sent) == 1, "once"
+        assert a.orq("pr", "poll", "--forcar").returncode == 0 and orq_mod.pr_notify() == [] and len(sent) == 1, "still red, same checks: no new notice"
+        _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("deploy-oci-tests")])
+        assert a.orq("pr", "poll", "--forcar").returncode == 0 and "base_avisada" not in _prs_by_number(a)[1216], "cleared: the flag resets"
+    finally:
+        orq_mod.HOME, orq_mod.type_text = before, dig
+
+
+def test_ticket220_pr_1285_shape_pr_green_except_the_check_that_the_base_has_failed_for_weeks():
+    """PR #1285: its own jobs pass; deploy-oci-tests fails on the PR and on the base (71 of 91 runs since 21/08). The poll calls the base red and the PR blocked."""
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="leodiegoo/ci-pr-1285-merge",
+        statusCheckRollup=[_ckw("web-pr-checks", "Web PR Checks"), _ckw("deploy-oci-tests", "Web Deploy Pipeline", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-08-21T09:00:00Z"), "web-pr-checks": ("success", "2026-10-01T09:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    i = _prs_by_number(a)[1216]
+    assert i["ci"]["falhas"] == ["deploy-oci-tests"] and i["ci"]["falhas_na_base"] == ["deploy-oci-tests"] and i["ci"]["base_vermelha_desde"] == "2026-08-21T09:00:00Z"
+    assert orq_mod._pr_contract(i)["bloqueadaPelaBase"] is True
 
 
 if __name__ == "__main__":
