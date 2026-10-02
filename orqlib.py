@@ -8989,6 +8989,17 @@ def _repo_in_orca(folder):
     return root if root and any(r.get("path") and os.path.realpath(r["path"]) == root for r in repos) else None
 
 
+def _remote_environments(root):
+    """The `ambientes` block a new project gets from its remote's branches (ticket 124): the remote's default branch is production, and every other remote
+    branch without a `/` (a working branch carries a type prefix, `feat/x`) is an environment before it. With only the default branch, or a remote without
+    `origin/HEAD`: None, the direct flow.
+    ponytail: a loose branch without a slash is taken for an environment and the others come in name order; the file is plain JSON to fix by hand."""
+    base = default_branch(root)
+    names = (_git(root, "for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin") or "").split()
+    others = sorted(b for b in names if b not in ("HEAD", base) and "/" not in b)
+    return [*({"branch": b} for b in others), {"branch": base, "producao": True}] if others and base in names else None  # no origin/HEAD: no guess
+
+
 def add_project(target, item_name=None, harness=None, group_name=None, proposal_file=None, destination=None, replace_text=False, dry_run=False):
     """`orq project add <path|url>`: writes ORQ_HOME/projects/<name>.json, registers the repository in Orca if missing (`repo add`, and the base of new
     worktrees, `origin/<project production>`) and writes the orca.yaml at its root. Everything is validated before touching anything. An orca.yaml that already exists
@@ -9010,6 +9021,8 @@ def add_project(target, item_name=None, harness=None, group_name=None, proposal_
     data = _dict(_read_json(file_path)) if does_exist else {"repo": f"path:{root}", **({"harness": harness} if harness and harness != "claude" else {}), **({"grupo": group_name} if group_name else {})}
     if data.get("repo") != f"path:{root}":
         raise ValueError(f"project {item_name} already exists in {file_path} and points to {data.get('repo')}, not to {root}: pass --name")
+    if not does_exist and (envs := _remote_environments(root)):
+        data["ambientes"] = envs
     harness = data.get("harness") or "claude"
     if harness not in HARNESS_TRUST:
         raise ValueError(f"harness {harness!r} of project {item_name}: orq only trusts the folder for {', '.join(HARNESS_TRUST)}")

@@ -17327,6 +17327,42 @@ def test_ticket124_no_fixed_install_plan_or_worktree_path_in_the_versioned_files
     assert not hits, "\n".join(hits)
 
 
+def _remote124(a, branches):
+    """A clone of a bare origin with `branches` (the first one is the remote's default) plus a working branch `feat/x`."""
+    origin, seed, clone = (os.path.join(a.tmp.name, n) for n in ("origin.git", "seed", "app"))
+    g = lambda *x: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True)  # noqa: E731
+    g("init", "-q", "--bare", "-b", branches[0], origin)
+    g("init", "-q", "-b", branches[0], seed)
+    g("-C", seed, "commit", "-q", "--allow-empty", "-m", "base")
+    for b in [*branches[1:], "feat/x"]:
+        g("-C", seed, "branch", b)
+    g("-C", seed, "push", "-q", origin, "--all")
+    g("clone", "-q", origin, clone)
+    return os.path.realpath(clone)
+
+
+def test_ticket124_project_add_on_a_repository_with_only_main_declares_no_environments():
+    a = Env()
+    repo = _remote124(a, ["main"])
+    r = a.orq("project", "add", repo)
+    assert r.returncode == 0, r.stderr
+    assert "ambientes" not in _read_state(os.path.join(a.home, "projects", "app.json")), "only the default branch: the direct flow, no block"
+    assert ["set-base-ref", "--repo", f"path:{repo}", "--ref", "origin/main"] in _repo_calls(a), _repo_calls(a)
+
+
+def test_ticket124_project_add_on_a_repository_with_dev_and_main_declares_both_environments():
+    a = Env()
+    repo = _remote124(a, ["main", "dev"])
+    r = a.orq("project", "add", repo)
+    assert r.returncode == 0, r.stderr
+    p = _read_state(os.path.join(a.home, "projects", "app.json"))
+    assert p["ambientes"] == [{"branch": "dev"}, {"branch": "main", "producao": True}], p
+    assert ["set-base-ref", "--repo", f"path:{repo}", "--ref", "origin/main"] in _repo_calls(a), "new worktrees start from production"
+    flow = json.loads(a.orq("flow", "--repo", repo, "--json").stdout)
+    assert flow["producao"] == "main" and flow["fluxo"] == "promocao", flow
+
+
+
 def test_ticket124_install_takes_a_hook_written_differently_as_the_same_hook_and_keeps_a_symlinked_settings_a_link():
     t = os.path.realpath(tempfile.mkdtemp())
     clone = _clone124(t)
@@ -17361,6 +17397,14 @@ def test_ticket124_an_edit_in_a_ticket_worktree_inside_the_clone_is_not_the_chec
         assert not orq_mod._in_live_checkout(os.path.join(live, ".worktrees", "124", "orqlib.py"))
     finally:
         orq_mod.WT_ROOT = wt
+
+
+def test_ticket124_project_add_without_origin_head_guesses_no_environments():
+    a = Env()
+    repo = _remote124(a, ["master", "develop"])
+    subprocess.run(["git", "-C", repo, "remote", "set-head", "origin", "-d"], check=True, capture_output=True)
+    assert a.orq("project", "add", repo).returncode == 0
+    assert "ambientes" not in _read_state(os.path.join(a.home, "projects", "app.json")), "without origin/HEAD the production is unknown"
 
 
 if __name__ == "__main__":

@@ -552,6 +552,8 @@ Read compatibility: while the install path from before this ticket is still a li
 
 The hooks stay global, not in a `.claude/settings.json` inside the clone. Workers run in the projects' worktrees, where a project-level file of the orq clone does not load, and the same hooks in both places would fire twice in a coordinator opened in the clone.
 
+`orq project add` proposes the `ambientes` block of a new project from its remote: the default branch is production, and every other remote branch without a `/` is an environment before it. A remote with only the default branch gets no block, which means the direct flow.
+
 ## Secondmates by group (ticket 80)
 
 Why. The user talks to one coordinator, and the coordinator piles up the detail of every domain and compacts often. A secondmate holds one domain (a group of projects) and its workers; the coordinator keeps the decisions. The full design, with the alternatives, is `secondmate-por-grupo.md` in the plan notes.
