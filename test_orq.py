@@ -14795,6 +14795,107 @@ def test_ticket147_encerrar_poupa_o_proprio_orq_e_quem_o_chamou():
     assert res["encerrados"] == 1 and {p["pid"] for p in json.load(open(arq))} == {pai, eu}, res
 
 
+# ---------- ticket 146: orq revisar (só o review do no-mistakes) ----------
+
+FAKE_NM146 = """#!/usr/bin/env python3
+import json, os, sqlite3, sys, time
+d = os.environ["FAKE_DIR"]
+open(os.path.join(d, "nm.log"), "a").write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "nm_home": os.environ.get("NM_HOME")}) + "\\n")
+if sys.argv[1:3] == ["axi", "run"]:
+    con = sqlite3.connect(os.path.join(os.environ["NM_HOME"], "state.sqlite"))
+    con.execute("create table if not exists agent_invocations (started_at integer, input_tokens integer, output_tokens integer, cache_read_tokens integer, cache_creation_tokens integer, finding_count integer)")
+    con.execute("insert into agent_invocations values (?, 8, 200, 1500000, 165000, 1)", (int(time.time()),))
+    con.commit()
+    print("review: 1 finding (warning) awaiting_approval")
+    sys.exit(int(os.environ.get("FAKE_NM_RC", "0")))
+"""
+
+
+def _amb146(**env):
+    a = Amb(run="run_a", **env)
+    nm = os.path.join(a.tmp.name, "no-mistakes")
+    with open(nm, "w") as f:
+        f.write(FAKE_NM146)
+    os.chmod(nm, 0o755)
+    a.env.update({"ORQ_NM": nm, "ORQ_NM_HOME": os.path.join(a.tmp.name, "nm-orq")})
+    wt = os.path.join(a.tmp.name, "wt146")
+    os.makedirs(wt)
+    a.wt = wt
+    _tk105(a, "146", "Revisar so o review", status="claimed", task="task_term_r1")
+    a.set("workers.json", [{"handle": "term_r1", "run": "run_a", "status": "completed", "worktree": wt, "agente": "claude"}])
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_term_r1", "dispatch": "ctx_term_r1", "titulo": "Revisar so o review", "ticket": "146"}) + "\n")
+    return a
+
+
+def test_ticket146_revisar_recusa_em_pausa_e_em_segura_sem_rodar_o_no_mistakes():
+    a = _amb146()
+    _uso51(a, semana=93, cinco_h=10)
+    r = a.orq("revisar", "task_term_r1")
+    assert r.returncode == 1 and "uso do plano" in r.stderr and not _log(a, "nm.log"), r
+    _uso51(a, semana=50, cinco_h=91)
+    r = a.orq("revisar", "146")
+    assert r.returncode == 1 and "janela de 5 h" in r.stderr and not _log(a, "nm.log"), "a prioridade 1 também recusa: a revisão é gasto opcional"
+    assert not [e for e in a.events() if e["tipo"] == "revisao_nm"]
+
+
+def test_ticket146_revisar_roda_so_o_review_na_worktree_da_task_com_o_nm_home_do_orq():
+    a = _amb146()
+    _uso51(a, semana=50, cinco_h=10)
+    r = a.orq("revisar", "task_term_r1", "--json")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    init, run, abort = _log(a, "nm.log")
+    assert init["args"] == ["init"] and init["cwd"] == os.path.realpath(a.wt), init
+    assert run["args"][:2] == ["axi", "run"] and run["cwd"] == os.path.realpath(a.wt), run
+    assert run["args"][run["args"].index("--skip") + 1] == "test,document,lint,push,pr,ci"
+    assert "Revisar so o review" in run["args"][run["args"].index("--intent") + 1] and "Acceptance criteria" in run["args"][run["args"].index("--intent") + 1]
+    assert abort["args"] == ["axi", "abort"] and abort["cwd"] == os.path.realpath(a.wt), "a run parada no gate é abortada: a branch volta a ser do worker"
+    assert run["nm_home"] == a.env["ORQ_NM_HOME"] != os.path.expanduser("~/.no-mistakes"), "o NM_HOME é o do orq"
+    assert "claude-sonnet-5-5" in open(os.path.join(a.env["ORQ_NM_HOME"], "config.yaml")).read()
+    assert (out["modelo"], out["effort"], out["achados"]) == ("claude-sonnet-5-5", "low", 1) and "awaiting_approval" in out["saida"], out
+    assert "modelo claude-sonnet-5-5" in a.orq("revisar", "146").stdout, "o orq revisar mostra o modelo usado"
+
+
+def test_ticket146_revisar_grava_revisao_nm_com_duracao_achados_e_tokens():
+    a = _amb146()
+    _uso51(a, semana=50, cinco_h=10)
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert e["task"] == "task_term_r1" and e["modelo"] == "claude-sonnet-5-5" and e["achados"] == 1 and e["duracao_s"] >= 0, e
+    assert e["tokens"] == {"entrada": 8, "saida": 200, "cache_lido": 1500000, "cache_criado": 165000} and "erro" not in e, e
+    assert not os.path.exists(os.path.join(a.home, "revisao-nm.json")) or json.load(open(os.path.join(a.home, "revisao-nm.json"))) == [], "o slot foi solto"
+
+
+def test_ticket146_revisar_falha_do_no_mistakes_grava_o_erro_e_sai_com_1():
+    a = _amb146(FAKE_NM_RC="3")
+    _uso51(a, semana=50, cinco_h=10)
+    r = a.orq("revisar", "task_term_r1")
+    assert r.returncode == 1 and "saiu com 3" in r.stderr, r
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert "saiu com 3" in e["erro"], e
+
+
+def test_ticket146_revisar_conta_um_slot_caro_e_recusa_sem_vaga():
+    a = _amb146()
+    _uso51(a, semana=50, cinco_h=10)
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"max_caros": 1}, open(os.path.join(a.home, "maquina.json"), "w"))
+    json.dump([{"pid": os.getpid(), "task": "task_outra", "ts": "x"}], open(os.path.join(a.home, "revisao-nm.json"), "w"))  # outra revisão viva
+    r = a.orq("revisar", "task_term_r1")
+    assert r.returncode == 1 and "slots caros" in r.stderr and not _log(a, "nm.log"), r
+    json.dump([{"pid": 2 ** 22 + 12345, "task": "task_morta", "ts": "x"}], open(os.path.join(a.home, "revisao-nm.json"), "w"))  # pid morto não ocupa
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+
+
+def test_ticket146_revisar_task_sem_despacho_recusa():
+    a = _amb146()
+    r = a.orq("revisar", "task_nao_existe")
+    assert r.returncode == 1 and "sem despacho" in r.stderr and not _log(a, "nm.log"), r
+
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

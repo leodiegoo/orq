@@ -10266,6 +10266,133 @@ def cmd_retro(a):
     return json.dumps(r, ensure_ascii=False) if a.json else retro_texto(r, anterior)
 
 
+# ---------- orq revisar: só o review do no-mistakes (ticket 146) ----------
+
+NM_BIN = os.environ.get("ORQ_NM") or "no-mistakes"
+NM_HOME = os.environ.get("ORQ_NM_HOME") or os.path.expanduser("~/.no-mistakes-orq")  # o NM_HOME do orq: nunca o ~/.no-mistakes pessoal
+NM_MODELO, NM_EFFORT = "claude-sonnet-5-5", "low"  # o review barato; o config.yaml do NM_HOME do orq só é escrito se não existe, então editá-lo vale
+NM_CONFIG = f"agent: claude\nagent_config:\n  claude:\n    model: {NM_MODELO}\n    effort: {NM_EFFORT}\nauto_fix:\n  review: 0\nintent:\n  enabled: false\n"
+NM_SKIP = "test,document,lint,push,pr,ci"  # sobra o rebase e o review; test sobe stack fora da fila do E2E, push e pr são do coordenador
+NM_ESPERA_S = 720  # o `axi run` espera até o primeiro gate (--wait); o processo ganha folga por cima
+NM_INTENT_MAX = 6000
+REVISAO = "revisao-nm.json"  # [{pid, task, ts}]: as revisões em curso, que contam como slot caro
+
+
+def _nm_modelo():
+    """(modelo, effort) do config.yaml do NM_HOME do orq (o que o no-mistakes vai usar), ou os padrões do orq se o arquivo não diz."""
+    try:
+        with open(os.path.join(NM_HOME, "config.yaml"), encoding="utf-8") as f:
+            m = re.search(r"^[ \t]+claude:[ \t]*\n(?:[ \t]+\w+:[^\n]*\n)*?[ \t]+model:[ \t]*(\S+)", f.read() + "\n", re.M)
+    except OSError:
+        m = None
+    return (m.group(1) if m else NM_MODELO), NM_EFFORT
+
+
+def _revisoes_em_curso():
+    """As revisões vivas do REVISAO (pid que ainda existe); a que morreu sem limpar não ocupa slot."""
+    vivas = []
+    for r in _read_json(_path(REVISAO)) or []:
+        try:
+            os.kill(r["pid"], 0)
+            vivas.append(r)
+        except (OSError, KeyError, TypeError):
+            pass
+    return vivas
+
+
+def _revisao_slot(task):
+    """Reserva um slot caro para a revisão ou levanta ValueError: pressão alta da máquina, ou workers caros mais revisões em curso no `max_caros`.
+    ponytail: o `orq despachar` só vê os workers; um despacho durante a revisão pode passar do teto por um. Contar a revisão no maquina_ocupacao se virar problema."""
+    with _trava("revisao.lock"):
+        cfg = maquina_cfg()
+        nivel, motivo = maquina_nivel(None, cfg)
+        if nivel == "alta":
+            raise ValueError(f"máquina sob pressão: {motivo}; a revisão não rodou")
+        caros = sum(modelo_caro(m, cfg) for m in maquina_ocupacao()["vivos"].values()) + len(_revisoes_em_curso())
+        if caros >= cfg["max_caros"]:
+            raise ValueError(f"{caros}/{cfg['max_caros']:g} slots caros ocupados (workers e revisões); a revisão conta como um")
+        _write_json(_path(REVISAO), [*_revisoes_em_curso(), {"pid": os.getpid(), "task": task, "ts": now()}])
+
+
+def _revisao_solta():
+    with _trava("revisao.lock"):
+        _write_json(_path(REVISAO), [r for r in _revisoes_em_curso() if r["pid"] != os.getpid()])
+
+
+def _nm_uso(desde):
+    """{achados, tokens: {entrada, saida, cache_lido, cache_criado}} das chamadas de agente do state.sqlite do NM_HOME do orq desde `desde` (epoch s); vazio sem banco."""
+    import sqlite3  # só aqui: fora do topo para não pesar nos hooks
+    vazio = {"achados": None, "tokens": None}
+    try:
+        con = sqlite3.connect(f"file:{os.path.join(NM_HOME, 'state.sqlite')}?mode=ro", uri=True, timeout=5)
+        try:
+            ach, ent, sai, cl, cc = con.execute("select sum(finding_count), sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), sum(cache_creation_tokens) "
+                                                "from agent_invocations where started_at >= ?", (int(desde),)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return vazio
+    return {"achados": ach or 0, "tokens": {"entrada": ent or 0, "saida": sai or 0, "cache_lido": cl or 0, "cache_criado": cc or 0}}
+
+
+def revisar(task):
+    """`orq revisar <task>`: só o review do no-mistakes na worktree da task, com o modelo barato do NM_HOME do orq.
+
+    `task` é o id da task ou o número do ticket. Recusa em `pausa` ou `segura` do `orq uso` (qualquer prioridade: a revisão é gasto opcional), sob pressão da
+    máquina e sem slot caro. O `--intent` é o texto do ticket (ou o título do despacho). Devolve {task, worktree, modelo, effort, duracao_s, achados, tokens, saida}
+    e grava `revisao_nm` no events.jsonl. `saida` é o que o `axi run` imprimiu: os achados e o gate em que parou."""
+    tk = next((t for t in tickets() if task in (t["num"], t["task"]) or task.zfill(2) == t["num"]), None)
+    task = tk["task"] if tk and tk["task"] else task
+    ev = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == task), None)
+    if not ev:
+        raise ValueError(f"task {task} sem despacho no events.jsonl: nada para revisar")
+    wt = _caminho_do_worker(orca("worker-show", "--dispatch", ev["dispatch"], timeout=10))
+    if not wt or not os.path.isdir(wt):
+        raise ValueError(f"o Orca não diz a worktree do despacho {ev['dispatch']} ({wt or 'sem caminho'}): a pasta já foi limpa?")
+    uso_checar(2)
+    if tk:
+        corpo = open(tk["arquivo"], encoding="utf-8").read().split("\n## ", 1)
+        intent = f"{tk['titulo']}\n\n## {corpo[1]}"[:NM_INTENT_MAX] if len(corpo) > 1 else tk["titulo"]
+    else:
+        intent = ev.get("titulo") or task
+    modelo, effort = _nm_modelo()
+    os.makedirs(NM_HOME, exist_ok=True)
+    if not os.path.exists(os.path.join(NM_HOME, "config.yaml")):
+        with open(os.path.join(NM_HOME, "config.yaml"), "w", encoding="utf-8") as f:
+            f.write(NM_CONFIG)
+    env = {**os.environ, "NM_HOME": NM_HOME}
+    _revisao_slot(task)
+    t0, inicio, erro, saida = int(time.time()), time.monotonic(), None, ""
+    try:
+        init = subprocess.run([NM_BIN, "init"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)  # por repositório; repetir é inofensivo
+        if init.returncode and "already" not in (init.stdout + init.stderr).lower():
+            raise RuntimeError(f"no-mistakes init falhou: {(init.stderr or init.stdout).strip()[-300:]}")
+        r = subprocess.run([NM_BIN, "axi", "run", "--intent", intent, "--skip", NM_SKIP, "--wait", f"{NM_ESPERA_S}s"], cwd=wt, env=env,
+                           capture_output=True, text=True, timeout=NM_ESPERA_S + 60)
+        saida = r.stdout.strip()
+        if r.returncode:
+            raise RuntimeError(f"no-mistakes axi run saiu com {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+        erro = f"{type(e).__name__}: {e}"
+    finally:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):  # o review para no gate: sem abortar a branch fica `pipeline_owned` e o worker não commita nela
+            subprocess.run([NM_BIN, "axi", "abort"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)
+        _revisao_solta()
+    uso = _nm_uso(t0)
+    res = {"task": task, "worktree": wt, "modelo": modelo, "effort": effort, "duracao_s": round(time.monotonic() - inicio, 1), **uso, "saida": saida}
+    append_event({"tipo": "revisao_nm", **{k: v for k, v in res.items() if k != "saida"}, **({"erro": erro} if erro else {})})
+    if erro:
+        raise RuntimeError(erro)
+    return res
+
+
+def revisao_texto(r):
+    """O cabeçalho (modelo, achados, duração, tokens) e, abaixo, a saída do no-mistakes como veio."""
+    t = r["tokens"]
+    toks = f", tokens: {t['entrada']} entrada, {t['saida']} saída, {t['cache_lido']} cache lido" if t else ""
+    return f"revisão no-mistakes de {r['task']}: modelo {r['modelo']} (effort {r['effort']}), {r['achados'] if r['achados'] is not None else '?'} achado(s), {r['duracao_s']:g} s{toks}\n\n{r['saida']}"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="orq")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -10543,6 +10670,9 @@ def main(argv=None):
     uz = sub.add_parser("uso", help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
     uz.add_argument("--json", action="store_true")
     uz.add_argument("--agente", default="claude", choices=HARNESSES, help="de que plano (as cotas do Claude e do Codex são separadas)")
+    rv = sub.add_parser("revisar", help="só o review do no-mistakes na worktree da task (ticket 146), com o modelo barato do NM_HOME do orq; recusa em pausa/segura do uso e sem slot caro")
+    rv.add_argument("task", help="o id da task ou o número do ticket")
+    rv.add_argument("--json", action="store_true")
     mq = sub.add_parser("maquina", help="o orçamento da máquina (ticket 79): o que ela tem agora, o que o orq decide e as vagas. `orq maquina set <chave> <valor>` ajusta o maquina.json")
     mq.add_argument("op", nargs="?", choices=["set"])
     mq.add_argument("chave", nargs="?")
@@ -10869,6 +10999,9 @@ def main(argv=None):
         elif a.cmd == "mate":
             ps = [p for p in mate_pendentes(read_events(), _mates(), datetime.now(timezone.utc)) if not a.grupo or p["grupo"] == a.grupo]
             print("\n".join(f"{p['corr']} {p['grupo']} {p['estado']}: {_cita(p['texto'])}" for p in ps) or "nenhum pedido sem resposta")
+        elif a.cmd == "revisar":
+            r = revisar(a.task)
+            print(json.dumps(r, ensure_ascii=False) if a.json else revisao_texto(r))
         elif a.cmd == "maquina" and a.op == "set":
             if not a.chave or a.valor is None:
                 raise ValueError("orq maquina set <chave> <valor>")

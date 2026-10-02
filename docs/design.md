@@ -904,3 +904,14 @@ The merge cleanup (`limpar-mergeados.py`) and the orphan cleanup (ticket 45) lea
 
 Why a preview first: deleting a remote branch is the one irreversible-looking step, so the automatic run only prints `limparia …` (task marked `previa`) until a real `orq limpar --fechados` writes `limpar-fechados.json`. The `limpou_fechado` event carries the remote tip and a note that GitHub restores the branch from the closed PR.
 
+
+
+## `orq revisar`: only the no-mistakes review (ticket 146)
+
+Source: `no-mistakes-licoes.md` (ticket 69, sections 5 and 6, candidates 1, 2 and 7). no-mistakes is a fixed nine-step pipeline that assumes one PR per branch, so it clashes with the three-PR git flow, the E2E queue and the `/pr` body. Only the review is worth borrowing, as an optional coordinator step.
+
+`revisar(task)` accepts a task id or a ticket number, finds the last `despacho` of the task, asks Orca (`worker-show`) for its worktree, and runs `no-mistakes init` (repeatable) and `no-mistakes axi run --intent <ticket text> --skip test,document,lint,push,pr,ci` there. `rebase` still runs: with a branch already based on `main` it is a no-op. Guards, in order: `uso_checar(2)` (the P1 pass of `segura` is deliberately not used), machine pressure (`maquina_nivel`), and one expensive slot (`_revisao_slot`: expensive workers plus the live pids in `revisao-nm.json` against `max_caros`). Limit: `orq despachar` does not count a review in progress, so a dispatch during a review can exceed `max_caros` by one; count it in `maquina_ocupacao` if that bites.
+
+`NM_HOME` is `~/.no-mistakes-orq` (`ORQ_NM_HOME`); the personal one is untouched. `config.yaml` is written only when absent (model `claude-sonnet-5-5`, effort `low`, `auto_fix.review: 0`, intent inference off since `--intent` is given). `--model` and `--effort` of `axi run` are Pi-only, so for Claude the model goes through `agent_config.claude`. Measured on 2026-10-01 with no-mistakes v1.84.0 on a three-line diff: 24 s and about 160 k cache-read tokens, against 161 s and 1.5 M on Opus for the ticket 69 pilot (a bigger diff, so not a like-for-like number).
+
+The review stops at its approval gate, so after reading the output the orq runs `no-mistakes axi abort`: without it the worker's branch stays `pipeline_owned` ("do not make local follow-up commits"). The abort happens in a `finally`, and the `revisao_nm` event is written on failure too (field `erro`). Tokens and findings come from `agent_invocations` rows started since the run began; the orq NM_HOME only holds orq runs, so no per-run filter. A `NM_HOME` path past about 100 characters makes the daemon fail to start (socket path length). An `ask-user` finding is reported as it came, through the existing worker, orchestrator, user chain; there is no `--yes`.
