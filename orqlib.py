@@ -5370,10 +5370,16 @@ def _orca_avisou(msg_id):
         return False
 
 
+def _turno_acabou_ha_menos_que_a_tolerancia(ag, s, agora):
+    """True se o turno do worker terminou depois do steer (ou da última redigitação) e há menos de STEER_LEITURA_S: ainda não é falta de leitura."""
+    fim = _ts(ag.get("turno_fim"))
+    return bool(fim and fim > s["ultima"] and (agora - fim).total_seconds() < STEER_LEITURA_S)
+
+
 def reentrega_steers(agora=None):
     """Uma volta do gerente sobre os steers abertos: as linhas do painel.
 
-    Só toca o Orca com um steer vencido (STEER_LEITURA_S depois do envio ou da última redigitação). Mensagem com `read` no inbox ou citada no
+    Só toca o Orca com um steer vencido (STEER_LEITURA_S depois do envio ou da última redigitação, e depois do fim do turno do worker se ele terminou depois disso). Mensagem com `read` no inbox ou citada no
     transcrito do worker (lido_no_transcrito): `steer_fim` (lido).
     Dispatch que já entregou: `steer_fim` (encerrado). Worker `parado` (turno encerrado, pelos hooks): redigita o aviso com `digita`, que não digita
     por cima de um turno em andamento nem de rascunho e por isso não gasta a tentativa. Depois de STEER_TENTATIVAS redigitações sem leitura grava o
@@ -5399,6 +5405,8 @@ def reentrega_steers(agora=None):
             append_event({"tipo": "steer_fim", **base, "motivo": "encerrado"})
         elif ag["estado"] == "perguntando":
             continue  # o worker espera a resposta do coordenador: redigitar ou alertar só empilha ruído, o steer segue aberto até o worker voltar
+        elif _turno_acabou_ha_menos_que_a_tolerancia(ag, s, agora):
+            continue  # o worker leu (ou está lendo) ao encerrar o turno: os STEER_LEITURA_S correm do fim dele, não do envio (lição #6126)
         elif s["tentativas"] >= STEER_TENTATIVAS:
             append_event({"tipo": "alerta", "alerta": "steer_nao_lido", **base})
             linhas.append(f"{st.get('task')}: steer não lido depois de {s['tentativas']} avisos (alerta gravado)")

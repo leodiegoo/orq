@@ -5869,6 +5869,25 @@ def test_ticket26_painel_do_gerente_reentrega_a_cada_volta():
     assert r.returncode == 0 and len(_digitados_26(a)) == 1 and "task_rodando" in r.stdout and "redigitado" in r.stdout, (r.stdout, r.stderr)
 
 
+def test_ticket99_tolerancia_corre_do_fim_do_turno_que_passou_da_tolerancia():
+    def amb(fim_s):
+        a = Amb()
+        _steer_26(a)
+        a.set("busy.json", [])
+        json.dump({"ctx_1": {"task": "task_rodando", "inicio": now_iso(-600), "fim": now_iso(-fim_s)}}, open(os.path.join(a.home, "turnos.json"), "w"))
+        _linha_26(a)
+        _envelhece_26(a, 500)  # o steer saiu há 500 s, o turno longo acabou só agora
+        return a
+    a = amb(70)  # parado (>= PARADO_S) mas dentro dos 90 s do fim do turno
+    assert a.orq("steers").returncode == 0 and _digitados_26(a) == [], "turno acabou há 70 s: ainda dentro da tolerância"
+    b = amb(100)
+    assert b.orq("steers").returncode == 0 and len(_digitados_26(b)) == 1, "turno acabou há 100 s sem leitura: redigita"
+    c = amb(70)
+    env = _transcrito_26(c, "msg_9 lida")
+    json.dump({"ctx_1": {"task": "task_rodando", "sessao": "sess26", "inicio": now_iso(-600), "fim": now_iso(-70)}}, open(os.path.join(c.home, "turnos.json"), "w"))
+    assert c.orq("steers", **env).returncode == 0 and _digitados_26(c) == [] and [e["motivo"] for e in c.events() if e["tipo"] == "steer_fim"] == ["lido"]
+
+
 def test_ticket26_constantes_com_nome():
     assert (orq_mod.STEER_LEITURA_S, orq_mod.STEER_TENTATIVAS) == (90, 3)
 
