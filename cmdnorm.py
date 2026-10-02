@@ -8,10 +8,10 @@ import re
 
 _HEREDOC = re.compile(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
-_REDIR_AMP = re.compile(r"&>|>&")  # `2>&1` becomes `2>1`, `&>log` and `>&log` become `>log`: still a redirection, no longer a separator
+_REDIR_AMP = re.compile(r"(?<!&)&>|>&")  # `2>&1` becomes `2>1`, `&>log` and `>&log` become `>log`: still a redirection, no longer a separator
 _SEPARATOR = re.compile(r"[;&|(){}\n]+")
 _KEYWORD = re.compile(r"(?:!|do|then|else|elif|if|while|until)\s+")  # a loop or an `if` runs the command that follows
-_PREFIX = re.compile(r"^(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+(?:-[CPSu]\s*\S+|--chdir[=\s]\S+|-\S+))*|command|time(?:\s+-p)?|sudo|nohup|exec|nice(?:\s+-n\s*\S+|\s+-\S+)*|stdbuf(?:\s+-\S+)*|timeout(?:\s+(?:-[sk]\s*\S+|-\S+))*\s+\d\S*)\s+)+")
+_PREFIX = re.compile(r"^(?:(?:\d*(?:>>?|<)\s*\S+|\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+(?:-[CPSu]\s*\S+|--chdir[=\s]\S+|-\S+))*|command|time(?:\s+-p)?|sudo|nohup|exec|nice(?:\s+-n\s*\S+|\s+-\S+)*|stdbuf(?:\s+-\S+)*|timeout(?:\s+(?:-[sk]\s*\S+|-\S+))*\s+\d\S*)\s+)+")
 _ENV_CHDIR = re.compile(r"\benv\b.*?\s(?:-C\s*|--chdir[=\s])(\S+)")  # `env -C dir cmd` runs cmd in dir: it becomes a `cd dir` segment
 
 
