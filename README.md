@@ -174,7 +174,8 @@ The easy way is `orq project add <path|url>`, which writes it. By hand:
   ],
   "flow": "promocao",
   "e2e_queue": "~/.cache/my-app-e2e/queue",
-  "deploy_check": "my-deploy-status --env {base} --commit {sha}"
+  "deploy_check": "my-deploy-status --env {base} --commit {sha}",
+  "tests": ["**/*.unit-test.js"]
 }
 ```
 
@@ -188,6 +189,7 @@ Step by step:
 6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered) and `{sha}` (its merge commit) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
+9. `tests` is optional: the globs of the unit-test files `orq prove-red` looks for in a branch (`["**/*.unit-test.js"]`), or `{"globs": [...], "command": "cd web && npx jest ../{file}"}` to also set the command (`{file}` is the test file). Without it: `test_*.py` for orq's own tickets, `**/*.unit-test.js` for a product's.
 
 Check it with `orq projects` (an invalid file shows `invalid: <why>` and is never picked on its own) and `orq flow --repo <path>`.
 
@@ -393,6 +395,7 @@ Also available: `orq ingest [--refresh]`, `orq alert seen <task>`, `orq lavish-a
 - `orq agents` shows every dispatch across all Runs as `running`, `stuck` (no heartbeat for 15 min), `asking`, `delivered`, `released`, `limit` (the plan limit is on the screen), `no_terminal` (lost its terminal without a `worker_done`), `hibernated`, `sent_back`, and two "not stuck, on purpose" states: `awaiting_integration` (the ticket is on the integrator queue, `orq integrate queue add <branch> <ticket>`) and `service` (a dispatch started with `--service`, such as an integrator or a secondmate, that stays alive after its first `worker_done`; it reports each cycle with `orq cycle done --dispatch <id> --hash <commit> [--note ...]`, which does not call Orca; `orq service mark <dispatch>` marks one by hand).
 - Worker control. `orq interrupt <dispatch>` sends Orca's interrupt to a running worker. `orq end <dispatch> --reason <why>` stops and releases it. `orq relaunch <dispatch> --note <what changed>` stops it and starts another in the same worktree and task, keeping the model and effort unless `--model` and `--effort` say otherwise. Each step is an event, and `orq agents` prints the control history under the dispatch.
 - `orq send-back <task|dispatch> "<reason>" [--run]` sends the worker a correction on a delivery whose task is already `completed`, where `orq steer` refuses. It types the notice into the worker's terminal, resumes the session when the terminal is gone, or wakes a hibernated worker, and sets the task back to `dispatched`.
+- `orq prove-red <ticket|task> [--command CMD] [--worktree PATH] [--base BRANCH] [--timeout S]` proves that the new tests fail without the change. It finds the test files the branch created or changed (the `tests` globs of the project file), makes a throwaway worktree at the merge-base with the base (the project's first environment; the local branch first, because the integrator advances it before the push), copies only those files from the branch's head, links the worker worktree's `node_modules` and runs the command on each file (default `python3 {file}`, `npx --no-install jest {file}` for JavaScript; a command with `{test}` runs once per test function the branch added, and orq's own tickets default to `python3 {file} {test}`). Red is expected. A file that was red is then run in a throwaway worktree at the head. Each file prints `red on base / green on head`, `green on base (proves nothing)`, `red on head` or `not verifiable` (exit 126/127, timeout, or JavaScript with no `node_modules`: never read as a failure of the base). One deadline (`--timeout`, 600 s) covers every run. It records the `red_proof` event (`task`, `ticket`, `head`, `files`, `result`). Limit: fast unit tests only (Jest, pytest/unittest); a test whose subject lives in the same test file is green on base by construction; a Playwright spec or a Meteor integration test is out, and for those the proof is the before/after of the evidence. The ingest of the `worker_done` of a ticket whose `## Acceptance criteria` cites red→green (`red→green`, `red->green`, `red-green`) runs it in the background once, when the delivery enters the integrator queue. A file green on base adds a delivery notice that suggests `orq send-back <task> "..."` with the list; orq never sends it back by itself.
 - `orq steer` sends a correction to a running worker and, if Orca did not notify it, types the notice into its terminal (also in the middle of a turn, when the screen shows no menu and the input box is empty). The manager loop checks that the worker read it, retypes up to 3 times, then records a "steer not read" alert.
 - Switching harness. `orq switch <dispatch> --to codex|claude` continues a worker on the other harness, in the same worktree and task. It refuses before stopping anything (same harness, worktree gone, no equivalent model, the other harness over its quota, no machine slot), then stops the old worker, writes `HANDOFF.md` in the worktree root, starts the new one with the equivalent model and effort, and steers it to read the file. `orq handoff <dispatch> [--to codex|claude]` writes the same file for a worker that has no turn left (it hit its plan limit), from facts only and without stopping or starting anything. `orq handoff coordinator [--to codex|claude]` hands the coordinator itself to the other harness through `precompact.py`'s snapshot; the other harness's `hook session` injects it once, fenced as the old session's state.
 - `orq transcript <dispatch> [--last N] [--json]` reads the tail of a worker's transcript (Claude `.jsonl` or Codex rollout): visible messages plus tool calls and results, reasoning left out.
@@ -498,6 +501,8 @@ Publication audit: `githooks/pre-push` runs `orq audit-publication <base>..<head
 
 **Waiting without turns.** Every spec `orq dispatch` builds, and the task `orq ticket new` creates, ends with a block that tells the worker: end the turn after an `ask` or an escalation; run an external wait (CI, PR, merge) as one blocking command with the tool's maximum timeout; if it returns unchanged, repeat the same command with no check in between; never background a command to poll it. A worker that sleeps in a loop burns a full context per turn and never looks idle to `orq hibernate`.
 
+**Rule of the tests.** The same block (`SPEC_BLOCKS`) ends with a `## Tests` section: do not write a test whose only proof is reading or grepping the source text of the code, run the interface and check the observable behavior; a new test must fail without the change, and `orq prove-red` runs it against the base when the worker delivers.
+
 The coordinator can be a Claude Code or a Codex session, and each worker can be either: `orq dispatch --agent codex --model <model-id> --effort low ...` (the default is `claude`, or the harness of the project). What changes per agent sits in one table, `HARNESS` in `orqlib.py`: the resume command, the screen patterns and the accepted efforts. Orca builds the launch command from `worker-start --agent`. The rest goes through Orca for both: `orq resume` finds a session the hooks never recorded through `orca search <dispatch id>`; `orq usage` reads each plan from `orca account list`; `orq switch` moves a worker to the other harness.
 
 The `worker-routing` skill maps the Claude roles to Codex models and sets the model and effort to use per kind of task; read it before dispatching.
@@ -576,6 +581,7 @@ The Portuguese command names still work as aliases until the aliases are removed
 | `ciclo feito`, `servico marcar` | `cycle done`, `service mark` |
 | `integrar fila add`, `rm`, `lista`; `integrar concluir` | `integrate queue add`, `rm`, `list`; `integrate conclude` |
 | `limpar`, `worktrees limpar`, `devolver`, `revisar`, `caixa` | `clean`, `worktrees clean`, `send-back`, `review`, `inbox` |
+| `provar-red` | `prove-red` |
 | `ticket novo`, `fechar`, `editar`, `lista` | `ticket new`, `close`, `edit`, `list` |
 | `lavish-resposta`, `perguntar`, `auditar-respostas`, `auditar-publicacao` | `lavish-answer`, `ask`, `audit-answers`, `audit-publication` |
 | `gerente ligar`, `desligar`, `checar`, `subir`, `absorver`, `intervalo` | `manager bind`, `unbind`, `check`, `spawn`, `absorb`, `interval` |

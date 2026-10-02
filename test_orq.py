@@ -3715,7 +3715,7 @@ def test_dispatch_runs_worker_start_with_model_and_effort_and_returns_the_ids():
     (arg,) = _log(a, "started.log")
     assert arg[:1] == ["worker-start"] and arg[arg.index("--run") + 1] == "run_a" and arg[arg.index("--agent") + 1] == "claude"
     assert arg[arg.index("--model") + 1] == "claude-sonnet-5-5" and arg[arg.index("--effort") + 1] == "medium"
-    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.WAITING_BLOCK + "\n"
+    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.SPEC_BLOCKS + "\n"
     assert "--worktree" not in arg
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
     assert (ev["run"], ev["task"], ev["dispatch"], ev["titulo"], ev["modelo"], ev["effort"], ev["terminal"]) == \
@@ -3746,14 +3746,14 @@ def test_dispatch_with_entry_puts_the_literal_request_at_the_top_of_the_spec():
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
     assert spec == ('# Ticket 05\n\n## User request\ncria o ticket 05, com "aspas" e acento\n\n'
-                    'What the coordinator wrote below does not replace it: done is checked against this request.\n\nFaça X.\n\n' + orq_mod.WAITING_BLOCK + "\n"), spec
+                    'What the coordinator wrote below does not replace it: done is checked against this request.\n\nFaça X.\n\n' + orq_mod.SPEC_BLOCKS + "\n"), spec
 
 
 def test_dispatch_without_entry_only_appends_the_waiting_block_to_the_spec():
     a = Env(run="run_a")
     _dispatch(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
-    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.WAITING_BLOCK + "\n"
+    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.SPEC_BLOCKS + "\n"
 
 
 def test_dispatch_entry_with_untitled_spec_puts_the_request_after_the_title_orq_adds():
@@ -3769,7 +3769,7 @@ def test_dispatch_puts_the_waiting_block_at_the_end_of_the_spec_once():
     _dispatch(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
-    assert spec.count("## Waiting") == 1 and spec.rstrip().endswith("already waits inside the command."), spec
+    assert spec.count("## Waiting") == 1 and spec.rstrip().endswith(orq_mod.TEST_BLOCK) and spec.index("## Waiting") < spec.index("## Tests"), spec
     for rule in ("end the turn", "600000 ms", "repeat the same command", "Never background"):
         assert rule in spec, rule
 
@@ -16468,6 +16468,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("hook lugar", "hook place"),
     ("hook externas", "hook external"),
     ("hook prligar", "hook prlink"),
+    ("provar-red 05", "prove-red 05"),
 ]
 
 
@@ -17497,6 +17498,149 @@ def test_ticket181_group_with_mate_auto_should_have_its_mate_opened_by_the_manag
         assert orq_mod.mate_proposals(orq_mod.tickets(), group_map, {"orq": {"terminal": "t"}}, [], orq_mod.machine_cfg()) == [], "a group with a mate is not proposed"
     assert opened == ["orq"]
 
+
+
+# ---- ticket 221: orq proves the red of the new tests against the base ----
+
+def _red_repo(tmp, base_files, branch_files):
+    """A repository with `main` (base_files) and a branch `feat/x` (branch_files) on top of it."""
+    repo = os.path.join(tmp, "repo")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+
+    def commit(files, message):
+        for name, content in files.items():
+            os.makedirs(os.path.dirname(os.path.join(repo, name)), exist_ok=True)
+            with open(os.path.join(repo, name), "w") as f:
+                f.write(content)
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message], check=True)
+
+    commit(base_files, "base")
+    subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "feat/x"], check=True)
+    commit(branch_files, "feature")
+    return repo
+
+
+RED_BASE = {"mod.py": "def f():\n    return 1\n", "test_base.py": "import mod\nassert mod.f() == 1\n"}
+RED_BRANCH = {"mod.py": "def f():\n    return 2\n", "test_new.py": "import mod\nassert mod.f() == 2\n", "test_old.py": "import mod\nassert mod.f() in (1, 2)\n",
+              "test_bad.py": "assert False\n", "notes.txt": "x"}
+
+
+def test_ticket221_prove_red_tells_red_on_base_green_on_base_and_red_on_head():
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, RED_BRANCH)
+    r = orq_mod.prove_red(repo, "main", ["test_*.py"])
+    assert {f["arquivo"]: f["resultado"] for f in r["files"]} == {"test_new.py": "ok", "test_old.py": "green_on_base", "test_bad.py": "red_on_head"}, r
+    assert r["resultado"] == "green_on_base", "a file that proves nothing decides the overall result"
+    assert r["head"] == subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.count("\n") == 1, "the throwaway worktrees are gone"
+    assert open(os.path.join(repo, "mod.py")).read().endswith("return 2\n"), "the worker worktree is not touched"
+    assert orq_mod.prove_red(repo, "main", ["test_new.py"])["resultado"] == "ok"
+    assert orq_mod.prove_red(repo, "main", ["*.md"]) == {"head": r["head"], "files": [], "resultado": "no_tests"}
+
+
+def test_ticket221_prove_red_command_that_does_not_exist_or_times_out_is_unverifiable_not_a_base_failure():
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, RED_BRANCH)
+    r = orq_mod.prove_red(repo, "main", ["test_new.py"], "orq-no-such-command-221 {file}")
+    assert r["files"] == [{"arquivo": "test_new.py", "resultado": "unverifiable", "motivo": "exit 127"}] and r["resultado"] == "unverifiable", r
+    slow = orq_mod.prove_red(repo, "main", ["test_new.py"], "sleep 30 # {file}", timeout=1)
+    assert slow["files"][0]["resultado"] == "unverifiable" and slow["files"][0]["motivo"] == "timeout", slow
+    js = orq_mod.prove_red(_red_repo(tempfile.mkdtemp(), {"a.js": "x"}, {"a.unit-test.js": "x"}), "main", ["**/*.unit-test.js"])
+    assert js["files"][0]["resultado"] == "unverifiable" and "node_modules" in js["files"][0]["motivo"], js
+
+
+def test_ticket221_prove_red_links_node_modules_of_the_worker_worktree():
+    repo = _red_repo(tempfile.mkdtemp(), {"web/a.js": "x"}, {"web/a.unit-test.js": "x"})
+    os.makedirs(os.path.join(repo, "web", "node_modules"))
+    open(os.path.join(repo, "web", "node_modules", "seen"), "w").close()
+    r = orq_mod.prove_red(repo, "main", ["**/*.unit-test.js"], 'test -e web/node_modules/seen && test "$(basename "$PWD")" = head')
+    assert r["files"][0]["resultado"] == "ok", "linked in the base tree (red only because of the name) and in the head tree: " + str(r)
+
+
+def test_ticket221_glob_and_acceptance_citation():
+    assert orq_mod._glob_hit("a/b/test_x.py", "test_*.py") and orq_mod._glob_hit("web/x.unit-test.js", "**/*.unit-test.js") and orq_mod._glob_hit("x.unit-test.js", "**/*.unit-test.js")
+    assert not orq_mod._glob_hit("web/x.test.js", "**/*.unit-test.js") and not orq_mod._glob_hit("a/notest_x.py", "test_*.py")
+    tmp = tempfile.mkdtemp()
+    for name, body, expected in (("a.md", "# 1: x\n\n## Acceptance criteria\n- tests red→green\n", True), ("b.md", "# 1: x\n\n## Acceptance criteria\n- Red-Green tests\n", True),
+                                 ("c.md", "# 1: x\n\n## What to build\nred→green\n## Acceptance criteria\n- done\n", False),
+                                 ("d.md", "# 1: x\n\n## Acceptance criteria\n- done\n\n## Notes\nred to green\n", False)):
+        with open(os.path.join(tmp, name), "w") as f:
+            f.write(body)
+        assert orq_mod.cites_red_green(os.path.join(tmp, name)) is expected, name
+    assert orq_mod.cites_red_green(os.path.join(tmp, "missing.md")) is False
+
+
+def test_ticket221_project_file_tests_key_takes_a_list_or_globs_and_command():
+    a = Env()
+    os.makedirs(os.path.join(a.home, "projects"))
+    for name, tests in (("lista", ["**/*.unit-test.js"]), ("obj", {"globs": ["t_*.py"], "command": "python3 -m unittest {file}"}), ("ruim", "x"), ("vazia", [])):
+        with open(os.path.join(a.home, "projects", f"{name}.json"), "w") as f:
+            json.dump({"repo": "path:/x", "tests": tests}, f)
+    with open(os.path.join(a.home, "projects", "sem.json"), "w") as f:
+        json.dump({"repo": "path:/x"}, f)
+    with InProcess(a):
+        ps = orq_mod.projects()
+    assert ps["lista"]["tests"] == {"globs": ["**/*.unit-test.js"], "command": None}, ps["lista"]
+    assert ps["obj"]["tests"] == {"globs": ["t_*.py"], "command": "python3 -m unittest {file}"}, ps["obj"]
+    assert ps["ruim"]["tests"] is None and ps["vazia"]["tests"] is None and ps["sem"]["tests"] is None
+
+
+def test_ticket221_prove_red_with_test_placeholder_runs_each_added_test_on_its_own():
+    runner = "import sys, mod\n\n\ndef test_a():\n    assert mod.f() == 2\n\n\ndef test_b():\n    assert mod.f() in (1, 2)\n\n\nglobals()[sys.argv[1]]()\n"
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, {"mod.py": "def f():\n    return 2\n", "test_multi.py": runner})
+    r = orq_mod.prove_red(repo, "main", ["test_*.py"], "python3 {file} {test}")
+    assert {f["arquivo"]: f["resultado"] for f in r["files"]} == {"test_multi.py::test_a": "ok", "test_multi.py::test_b": "green_on_base"}, r
+    assert orq_mod.prove_red(repo, "main", ["test_*.py"], "python3 {file} test_a")["files"][0]["arquivo"] == "test_multi.py", "no {test}: one row per file"
+
+
+def _ticket221(a, num="05", task="task_t221"):
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], f"{num}-orq-teste.md"), "w") as f:
+        f.write(f"# {num}: orq: teste\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: {task}\n\n## What to build\n\nx\n\n## Acceptance criteria\n- testes red→green\n")
+
+
+def test_ticket221_prove_red_ticket_records_the_event_with_the_head_and_suggests_send_back_without_sending():
+    tmp = tempfile.mkdtemp()
+    repo = _red_repo(tmp, RED_BASE, RED_BRANCH)
+    a = Env()
+    _ticket221(a)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t221", "dispatch": "ctx_w", "titulo": "orq: teste"})
+    with InProcess(a):
+        r = orq_mod.prove_red_ticket("05", worktree=repo)
+        orq_mod.prove_red_ticket("task_t221", worktree=repo, command="python3 {file}")
+        try:
+            orq_mod.prove_red_ticket("99", worktree=repo)
+            raise AssertionError("ticket that does not exist")
+        except ValueError as e:
+            assert "99" in str(e)
+    proofs = [e for e in a.events() if e["tipo"] == "red_proof"]
+    assert len(proofs) == 2 and proofs[0]["head"] == r["head"] and proofs[0]["task"] == "task_t221" and proofs[0]["resultado"] == "green_on_base", proofs
+    assert {f["arquivo"]: f["resultado"] for f in proofs[0]["files"]}["test_new.py"] == "ok"
+    (notice, _) = [e for e in a.events() if e["tipo"] == "entrega" and e.get("avisos")]
+    assert "test_old.py" in notice["avisos"][0] and "orq send-back task_t221" in notice["avisos"][0] and notice["dispatch"] == "ctx_w", notice
+    assert not [e for e in a.events() if e["tipo"] == "devolver"], "suggests, does not send back by itself"
+    out = a.orq("provar-red", "05", "--worktree", repo, "--comando", "python3 {file}")
+    assert out.returncode == 0 and "test_new.py: red on base / green on head" in out.stdout and "test_old.py: green on base (proves nothing)" in out.stdout, (out.stdout, out.stderr)
+
+
+def test_ticket221_delivery_of_ticket_citing_red_green_starts_the_proof_once():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery141(a)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"), "a") as f:
+        f.write("\n## Acceptance criteria\n- red→green with a temporary repository\n")
+    started, real, env = [], orq_mod.red_proof_bg, dict(os.environ)
+    orq_mod.red_proof_bg = started.append
+    os.environ["ORQ_REPOS"] = a.env["ORQ_REPOS"]
+    try:
+        with InProcess(a):
+            orq_mod.ingest()
+            orq_mod.ingest()
+    finally:
+        orq_mod.red_proof_bg = real
+        os.environ.clear()
+        os.environ.update(env)
+    assert started == ["141"], "one proof per delivery, with the ticket number"
+    assert "grepping the source text" in orq_mod.SPEC_BLOCKS and "fail without the change" in orq_mod.SPEC_BLOCKS
 
 
 if __name__ == "__main__":

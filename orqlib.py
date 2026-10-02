@@ -8,6 +8,7 @@ import collections
 import contextlib
 import difflib
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -21,6 +22,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -2254,15 +2256,21 @@ def _payload_branch(b):
     return b if b and not _environment_branch(b) else None
 
 
-def _orq_wt_branch(number):
-    """The branch of the `<ORQ_WT>/<ticket>` convention worktree (or `t<ticket>`), or None. An orq ticket is dispatched with `--worktree
+def _orq_wt(number):
+    """(folder, branch) of the `<ORQ_WT>/<ticket>` convention worktree (or `t<ticket>`), or None. An orq ticket is dispatched with `--worktree
     current`: the dispatch's worktree is the product's, and the one holding the delivery branch is this one."""
     root = WT_ROOT
     for item_name in dict.fromkeys((number, number.lstrip("0"), f"t{number}", f"t{number.lstrip('0')}")):
         d = os.path.join(root, item_name)
         if os.path.isdir(d) and (b := _orq_branch((_git(d, "branch", "--show-current") or "").strip())):
-            return b
+            return d, b
     return None
+
+
+def _orq_wt_branch(number):
+    """The branch of the `<ORQ_WT>/<ticket>` convention worktree, or None."""
+    found = _orq_wt(number)
+    return found and found[1]
 
 
 def _integrator_dispatch(events):
@@ -2308,6 +2316,169 @@ def _orq_delivery(m, p):
     return ev["ticket"]
 
 
+# ---------- red proof of the new tests (ticket 221) ----------
+RED_TIMEOUT_S = 600  # one deadline for the whole proof, shared by every run (what a file leaves is what the next one has)
+RED_STATE = {"ok": "red on base / green on head", "green_on_base": "green on base (proves nothing)", "red_on_head": "red on head", "unverifiable": "not verifiable"}
+RED_ORDER = ("green_on_base", "red_on_head", "unverifiable", "ok")  # the overall result is the first one any file has
+_RED_CITES = re.compile(r"red\s*(?:→|->|-->|-|to)\s*green", re.I)
+
+
+def _glob_hit(path, pattern):
+    """Does `pattern` pick `path`? Without a `/` it is read against the file name (`test_*.py`); `**/x` also picks `x` at the root."""
+    if "/" not in pattern:
+        return fnmatch.fnmatch(os.path.basename(path), pattern)
+    return fnmatch.fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:]))
+
+
+def cites_red_green(path):
+    """Does the `## Acceptance criteria` of the ticket file cite red→green (the ticket asks for tests that fail before the change)?"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return False
+    m = _ACCEPTANCE.search(txt)
+    return bool(m and _RED_CITES.search(re.split(r"^##\s", txt[m.end():], maxsplit=1, flags=re.M)[0]))
+
+
+def _red_merge_base(worktree, base):
+    """The merge-base of HEAD with the local `base` branch (the integrator advances it before the push), otherwise with `origin/<base>`."""
+    for ref in (f"refs/heads/{base}", f"refs/remotes/origin/{base}"):
+        if _git(worktree, "rev-parse", "--verify", "--quiet", ref) is not None:
+            if mb := (_git(worktree, "merge-base", ref, "HEAD") or "").strip():
+                return mb
+    raise ValueError(f"no merge-base between HEAD and {base} in {worktree}: pass --base")
+
+
+def _red_names(worktree, mb, head, file):
+    """The `def test_*` names the branch added to `file` (from the diff against the merge-base), in order."""
+    diff = _git(worktree, "diff", "-U0", mb, head, "--", file) or ""
+    return list(dict.fromkeys(re.findall(r"^\+\s*(?:async\s+)?def (test\w*)\(", diff, re.M)))
+
+
+def _red_run(command, file, test, folder, left):
+    """Exit code of `command` ({file} swapped for the test file, {test} for the test name) in `folder`; None on timeout (the whole process group is killed)."""
+    p = subprocess.Popen(["sh", "-c", command.replace("{file}", shlex.quote(file)).replace("{test}", shlex.quote(test))], cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return p.wait(timeout=max(left, 0.1))
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        return None
+
+
+def _red_link_deps(src, dst):
+    """Links the `node_modules` of `src` (its root and each folder one level down) into the same place of `dst`; True if there was any."""
+    linked = False
+    for sub in ("", *sorted(d for d in os.listdir(src) if not d.startswith(".") and d != "node_modules" and os.path.isdir(os.path.join(src, d)))):
+        nm = os.path.join(src, sub, "node_modules")
+        if os.path.isdir(nm) and os.path.isdir(os.path.join(dst, sub)) and not os.path.lexists(os.path.join(dst, sub, "node_modules")):
+            os.symlink(nm, os.path.join(dst, sub, "node_modules"))
+            linked = True
+    return linked
+
+
+def _red_file(f, test, command, trees, deps, deadline):
+    """{resultado, motivo?} of one test file (or of one test of it): red on base, then green on head."""
+    js = f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs"))
+    if js and not deps and not command:
+        return {"resultado": "unverifiable", "motivo": "no node_modules in the worker worktree"}
+    cmd = command or ("npx --no-install jest {file}" if js else "python3 {file}")
+    for name in ("base", "head"):
+        rc = _red_run(cmd, f, test, trees[name], deadline - time.monotonic())
+        if rc in (None, 126, 127):
+            return {"resultado": "unverifiable", "motivo": "timeout" if rc is None else f"exit {rc}"}
+        if name == "base" and rc == 0:
+            return {"resultado": "green_on_base"}
+    return {"resultado": "ok" if rc == 0 else "red_on_head"}
+
+
+def prove_red(worktree, base, globs, command=None, timeout=RED_TIMEOUT_S):
+    """Does each test file the branch of `worktree` created or changed fail without the change? -> {head, files: [{arquivo, resultado, motivo?}], resultado}.
+
+    A throwaway worktree at the merge-base with `base` gets only the test files of HEAD and runs `command` ({file} is the file; default by extension) there: red is expected.
+    A command with `{test}` runs once per test function the branch added to the file (a monolith such as orq's `test_orq.py` takes minutes as a whole), and each one is a row `file::test`.
+    Then, if it was red, it runs the same in a throwaway worktree at HEAD. A file is `ok` (red on base, green on head), `green_on_base` (proves nothing), `red_on_head` or
+    `unverifiable` (exit 126/127, timeout or a JavaScript file with no `node_modules` to link: never read as a failure of the base). The deadline is one for all the runs.
+    Unit tests only (Jest, pytest/unittest): a Playwright spec or a Meteor integration test is out. # ponytail: the unit is the file, not the test; names inside it need a runner per framework."""
+    head = (_git(worktree, "rev-parse", "HEAD") or "").strip()
+    if not head:
+        raise ValueError(f"{worktree} is not a git worktree")
+    mb = _red_merge_base(worktree, base)
+    changed = (_git(worktree, "diff", "--name-only", "--diff-filter=ACMR", mb, head) or "").splitlines()
+    files = [f for f in changed if any(_glob_hit(f, g) for g in globs)]
+    out = {"head": head, "files": [], "resultado": "no_tests"}
+    if not files:
+        return out
+    deadline, tmp, trees = time.monotonic() + timeout, tempfile.mkdtemp(prefix="orq-red-"), {}
+    try:
+        for name, rev in (("base", mb), ("head", head)):
+            trees[name] = os.path.join(tmp, name)
+            if _git(worktree, "worktree", "add", "--detach", trees[name], rev, timeout=180) is None:
+                raise ValueError(f"could not create the throwaway worktree at {rev[:8]}")
+        for f in files:
+            data = subprocess.run(["git", "-C", worktree, "show", f"{head}:{f}"], capture_output=True, timeout=30).stdout
+            os.makedirs(os.path.dirname(os.path.join(trees["base"], f)), exist_ok=True)
+            with open(os.path.join(trees["base"], f), "wb") as fh:
+                fh.write(data)
+        deps = _red_link_deps(worktree, trees["base"]) & _red_link_deps(worktree, trees["head"])
+        for f in files:
+            for test in (_red_names(worktree, mb, head, f) if "{test}" in (command or "") else []) or [""]:
+                out["files"].append({"arquivo": f"{f}::{test}" if test else f, **_red_file(f, test, command, trees, deps, deadline)})
+    finally:
+        for path in trees.values():
+            _git(worktree, "worktree", "remove", "--force", path, timeout=60)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _git(worktree, "worktree", "prune")
+    got = {r["resultado"] for r in out["files"]}
+    out["resultado"] = next(k for k in RED_ORDER if k in got)
+    return out
+
+
+def _red_worktree(t):
+    """The worktree that holds the ticket's delivery: the `<ORQ_WT>/<ticket>` one, otherwise the dispatch's (worker-list), or None."""
+    if found := _orq_wt(t["num"]):
+        return found[0]
+    d = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == t.get("task")), None)
+    return d and _dispatch_worktree(d.get("run"), d.get("dispatch"))
+
+
+def prove_red_ticket(target, command=None, worktree=None, base=None, timeout=RED_TIMEOUT_S):
+    """`prove_red` for ticket `target` (number or task): the globs and the command come from the `tests` of its project file (default: `test_*.py` for orq's own ticket,
+    `**/*.unit-test.js` for a product's), the base is the project's first environment. Records the `red_proof` event with the head; a file green on base also records a
+    delivery notice that suggests `orq send-back` (it does not send it back by itself). Returns what `prove_red` returned."""
+    t = next((t for t in tickets() if target in (t["num"], t["num"].lstrip("0"), t.get("task"))), None)
+    if not t:
+        raise ValueError(f"{target} is neither a ticket nor the task of one")
+    wt = worktree or _red_worktree(t)
+    if not wt or not os.path.isdir(wt):
+        raise ValueError(f"no worktree for ticket {t['num']}: pass --worktree")
+    ps = projects()
+    name = project_by_folder(ps, os.path.realpath(wt)) or project_by_folder(ps, _repo_root(wt) or wt)
+    cfg = _dict((ps.get(name) or {}).get("tests"))
+    mine = orq_ticket(t["titulo"], name)
+    globs = cfg.get("globs") or (["test_*.py"] if mine else ["**/*.unit-test.js"])
+    r = prove_red(wt, base or repo_flow(wt)["ambientes"][0], globs, command or cfg.get("command") or ("python3 {file} {test}" if mine else None), timeout)  # orq's runner takes the name as a filter
+    d = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == t.get("task")), {})
+    append_event({"tipo": "red_proof", "task": t.get("task"), "ticket": t["num"], "dispatch": d.get("dispatch"), "head": r["head"], "files": r["files"], "resultado": r["resultado"]})
+    green = [f["arquivo"] for f in r["files"] if f["resultado"] == "green_on_base"]
+    if green:
+        append_event({"tipo": "entrega", "dispatch": d.get("dispatch"), "task": t.get("task"), "run": d.get("run"),
+                      "avisos": [f"ticket {t['num']}: the new tests pass on the base, so they prove nothing ({', '.join(green)}): "
+                                 f"suggested `orq send-back {t.get('task') or t['num']} \"write tests that fail without the change: {', '.join(green)}\"`"]})
+    return r
+
+
+def red_proof_bg(ticket):
+    """The ingest of the worker_done of a ticket whose acceptance cites red→green: runs `orq prove-red` in the background (a unit run takes minutes)."""
+    if os.environ.get("ORQ_NO_BG"):
+        return
+    subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py"), "prove-red", ticket], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def _ingest_msg(m, since, already, titles):
     """One inbox message -> 1 if it became an entry. Raises whatever is wrong with the message; the caller isolates it.
 
@@ -2318,7 +2489,8 @@ def _ingest_msg(m, since, already, titles):
     p = _payload(m)
     _delivery_proof(m, p)
     try:
-        _orq_delivery(m, p)
+        if (queued := _orq_delivery(m, p)) and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
+            red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
     if p.get("reportPath"):
@@ -6703,6 +6875,13 @@ WAITING_BLOCK = """## Waiting
 - If the command returns with no change, repeat the same command, with no check between runs.
 - Never background it to poll. Do not wrap `npm run test-app-e2e` or `scripts/e2e-infra.sh` in a loop of your own: the E2E queue already waits inside the command."""
 
+# Ticket 221: the rule of the tests, after the waiting block in every spec and every ticket task (`orq prove-red` checks the red from the delivery).
+TEST_BLOCK = """## Tests
+
+- Do not write a test whose only proof is reading or grepping the source text of the code: run the interface and check the observable behavior.
+- A new test must fail without the change: see it red before it goes green. `orq prove-red` runs it against the base when you deliver."""
+SPEC_BLOCKS = f"{WAITING_BLOCK}\n\n{TEST_BLOCK}"
+
 ORQ_WT_TITLE = "## orq worktree"  # the block that the dispatch of one of orq's own tickets appends to the spec (ticket 136)
 
 
@@ -7045,7 +7224,7 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
             with open(path, "x", encoding="utf-8") as f:
                 f.write(txt)
         try:
-            res = orca("task-create", "--spec", f"Leia e execute o ticket {path}\n\n{WAITING_BLOCK}", "--task-title", title, "--run", target,
+            res = orca("task-create", "--spec", f"Leia e execute o ticket {path}\n\n{SPEC_BLOCKS}", "--task-title", title, "--run", target,
                        *(["--deps", json.dumps(deps)] if deps else []), timeout=20)
             task = (res.get("task") or res).get("id")
             if not task:
@@ -8820,6 +8999,14 @@ def _file_environments(d):
     return branches, (marked or branches[-1:])[0], flow or ("promocao" if len(branches) > 1 else "direto"), None
 
 
+def _file_tests(v):
+    """The `tests` of a project file as {globs, command?} (`orq prove-red`): a list of globs or `{"globs": [...], "command": "..."}`; anything else is None (the default applies)."""
+    v = {"globs": v} if isinstance(v, list) else v
+    c = v.get("command") or v.get("comando") if isinstance(v, dict) else None  # to_pt reads the file's `command` as `comando`
+    ok = isinstance(v, dict) and isinstance(v.get("globs"), list) and v["globs"] and all(isinstance(g, str) and g for g in v["globs"])
+    return {"globs": v["globs"], "command": c if isinstance(c, str) and c.strip() else None} if ok else None
+
+
 def projects():
     """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "erro"}}.
 
@@ -8848,7 +9035,7 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
-                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None}
+                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None, "tests": _file_tests(d.get("tests"))}
     return findings
 
 
@@ -9273,7 +9460,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             spec = (f"{head}\n\n{REQUEST_TITLE}\n{request}\n\nWhat the coordinator wrote below does not replace it: done is checked against this request.\n\n"
                     f"{rest.lstrip(chr(10))}")
         if spec is not None:
-            spec = f"{spec.rstrip()}\n\n{WAITING_BLOCK}\n"
+            spec = f"{spec.rstrip()}\n\n{SPEC_BLOCKS}\n"
         environment = night_environment() if night_active(_cursor_ro()) else None  # at night the worker comes up with no git prompt (credential, pinentry)
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
         trusted = trust_codex(_repo_root(folder) or folder) if agent == "codex" else []  # before worker-start: Codex asks about trust when it comes up
@@ -11983,7 +12170,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "projetos": "projects", "projeto": "project", "fluxo": "flow", "ciclo": "cycle", "integrar": "integrate", "lavish-resposta": "lavish-answer",
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
-         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
+         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "provar-red": "prove-red", "revisar": "review", "caixa": "inbox",
          "transcrito": "transcript", "servico": "service"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
@@ -12087,6 +12274,12 @@ def parser():
     dv.add_argument("target")
     dv.add_argument("reason")
     dv.add_argument("--run")
+    pr_ = sub.add_parser("prove-red", aliases=["provar-red"], help="orq prove-red <ticket|task> [--command CMD]: runs the test files the branch created or changed against the merge-base with the base (red expected) and then on the head, and records the `red_proof` event")
+    pr_.add_argument("target")
+    _arg(pr_, "comando", help="the test command, {file} is the file (default: python3 {file} for .py, npx --no-install jest {file} for JavaScript; the project's `tests.command` otherwise)")
+    pr_.add_argument("--worktree", help="the worktree with the delivery (default: <ORQ_WT>/<ticket> or the dispatch's)")
+    pr_.add_argument("--base", help="the base branch (default: the project's first environment)")
+    pr_.add_argument("--timeout", type=int, default=RED_TIMEOUT_S, help="seconds for the whole proof")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("text_value")
@@ -12481,6 +12674,10 @@ def main(argv=None):
                 print("\n".join(pr_poll(force=a.force)) or "no changes in the PRs")
         elif a.cmd == "send-back":
             print(json.dumps(send_back(a.target, a.reason, a.run), ensure_ascii=False))
+        elif a.cmd == "prove-red":
+            r = prove_red_ticket(a.target, a.command, a.worktree, a.base, a.timeout)
+            print("\n".join([f"{f['arquivo']}: {RED_STATE[f['resultado']]}" + (f" ({f['motivo']})" if f.get("motivo") else "") for f in r["files"]]
+                             or ["no test file created or changed by the branch"]) + f"\nhead {r['head'][:8]}: {r['resultado']}")
         elif a.cmd == "steer":
             ev = steer(a.task, a.text_value, a.run, a.entry)
             print(json.dumps(ev, ensure_ascii=False))
