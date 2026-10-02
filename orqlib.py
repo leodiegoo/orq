@@ -12041,6 +12041,23 @@ LAUNCH_AGENTS = os.environ.get("ORQ_LAUNCH_AGENTS") or os.path.expanduser("~/Lib
 LAUNCHCTL = os.environ.get("ORQ_LAUNCHCTL") or "launchctl"
 
 
+def _launchd_event(op, **extra):
+    """Ticket 316: every launchctl call and every SIGTERM on the serve leaves a `launchd` event with who asked (pid, parent, cwd, command), so the next time the
+    job vanishes from launchd the log names the author. Logging never blocks the call itself."""
+    with contextlib.suppress(Exception):
+        parent = subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True, timeout=5).stdout.strip()
+        append_event({"tipo": "launchd", "op": op, "pid": os.getpid(), "ppid": os.getppid(), "parent": parent, "cwd": os.getcwd(), "argv": " ".join(sys.argv), **extra})
+
+
+def _launchctl(op, *args):
+    """The only point that touches the real launchctl (as `orca()` is for Orca). Under the test suite (ORQ_TESTING) a missing ORQ_LAUNCHCTL fails loud: a test
+    that reaches the real launchd would unload the live manager job (ticket 316: `serve --stop` in a test bootout'd com.orq.gerente)."""
+    if os.environ.get("ORQ_TESTING") and not os.environ.get("ORQ_LAUNCHCTL"):
+        raise RuntimeError(f"launchctl {op}: ORQ_TESTING is set and ORQ_LAUNCHCTL points at no fake; a test must not reach the real launchd")
+    _launchd_event(op, args=list(args))
+    return subprocess.run([LAUNCHCTL, op, *args], capture_output=True, text=True, timeout=30)
+
+
 def serve_owner():
     """The pid of the live `orq manager serve`, or None: whoever holds the SERVE_PID flock. The lock, not the written pid, says whether a serve exists (a reused pid does not fool it)."""
     try:
@@ -12146,9 +12163,10 @@ def manager_serve(loops=None):
 def serve_stop(wait_s=15):
     """For the serve: through launchd when installed (KeepAlive would start it again; it returns at the next login), otherwise SIGTERM on the pid. Waits for the lock to release."""
     if os.path.exists(_plist_serve()):
-        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+        _launchctl("bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}")
     pid = serve_owner()
     if pid and pid > 0:
+        _launchd_event("stop", target=pid)
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
     end = time.time() + wait_s
@@ -12171,8 +12189,8 @@ def serve_install():
     with open(_plist_serve(), "wb") as f:
         plistlib.dump(pl, f)
     target = f"gui/{os.getuid()}"
-    subprocess.run([LAUNCHCTL, "bootout", f"{target}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)  # already loaded: reload with the new plist
-    r = subprocess.run([LAUNCHCTL, "bootstrap", target, _plist_serve()], capture_output=True, text=True, timeout=30)
+    _launchctl("bootout", f"{target}/{LAUNCHD_LABEL}")  # already loaded: reload with the new plist
+    r = _launchctl("bootstrap", target, _plist_serve())
     if r.returncode:
         raise ValueError(f"launchctl bootstrap failed: {(r.stderr or r.stdout).strip()}")
     return serve_status()
@@ -12180,7 +12198,7 @@ def serve_install():
 
 def serve_uninstall():
     if os.path.exists(_plist_serve()):
-        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+        _launchctl("bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}")
         os.remove(_plist_serve())
     return serve_status()
 

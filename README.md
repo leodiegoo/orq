@@ -311,6 +311,8 @@ orq manager serve --stop
 orq manager serve --uninstall
 ```
 
+Every `launchctl bootout`/`bootstrap` and every `--stop` SIGTERM appends a `launchd` event to `events.jsonl` with the caller's `pid`, `ppid`, `parent`, `cwd` and `argv`, so a job that vanishes from launchd has an author. The test suite sets `ORQ_TESTING=1`: without an `ORQ_LAUNCHCTL` fake it raises instead of calling the real launchctl.
+
 `serve` still needs the manager terminal from `orq start` or `orq manager bind`: Orca only accepts a handle that belongs to a terminal it has seen. Two `serve` processes at once is an error.
 
 `orq manager tui` opens a read-only terminal UI ([OpenTUI](https://github.com/sst/opentui), needs Bun) with the manager, live workers, the integrator, the queues, pending items, machine load and the latest events. Without Bun it prints the install steps and exits 1.

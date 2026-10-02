@@ -27,6 +27,8 @@ if "ORQ_BACKLOG_TICKETS" not in os.environ:
 os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
 os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
 os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
+os.environ["ORQ_TESTING"] = "1"  # orqlib._launchctl fails loud without an ORQ_LAUNCHCTL fake: no test unloads the live com.orq.gerente (ticket 316)
+os.environ["ORQ_LAUNCH_AGENTS"] = os.path.join(tempfile.mkdtemp(), "LaunchAgents")  # nor does it see the real plist, so `serve --stop` in a test finds nothing to bootout
 os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
@@ -14013,6 +14015,47 @@ def test_ticket128_serve_install_writes_launchd_and_uninstall_removes_it():
     assert not os.path.exists(os.path.join(agents_dir, orq_mod.LAUNCHD_LABEL + ".plist"))
     call_list = open(os.path.join(t, "launchctl.log")).read()
     assert "bootstrap" in call_list and "bootout" in call_list, call_list
+
+
+def _fake_launchctl316(t):
+    lctl = os.path.join(t, "launchctl")
+    with open(lctl, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {t}/launchctl.log\n")
+    os.chmod(lctl, 0o755)
+    return lctl
+
+
+def test_ticket316_serve_stop_without_a_launchctl_fake_never_reaches_the_real_one():
+    a = Env(run="run_a")
+    t = os.path.dirname(a.home)
+    agents_dir = os.path.join(t, "LaunchAgents")
+    os.makedirs(agents_dir)
+    open(os.path.join(agents_dir, orq_mod.LAUNCHD_LABEL + ".plist"), "w").close()  # the plist exists, as the real one does on the machine
+    _fake_launchctl316(t)  # a launchctl on PATH: what `serve --stop` would have called
+    r = a.orq("gerente", "serve", "--parar", ORQ_LAUNCH_AGENTS=agents_dir, PATH=t + os.pathsep + os.environ["PATH"], ORQ_LAUNCHCTL="")
+    assert r.returncode != 0 and "ORQ_LAUNCHCTL" in r.stderr, (r.returncode, r.stderr)
+    assert not os.path.exists(os.path.join(t, "launchctl.log")), "o launchctl real (do PATH) foi chamado por um teste"
+
+
+def test_ticket316_every_launchctl_call_and_stop_records_its_caller():
+    a = Env(run="run_a")
+    t = os.path.dirname(a.home)
+    env = {"ORQ_LAUNCH_AGENTS": os.path.join(t, "LaunchAgents"), "ORQ_LAUNCHCTL": _fake_launchctl316(t)}
+    _manager(a)
+    p = _serve128(a)
+    try:
+        assert a.orq("gerente", "serve", "--instalar", cwd=t, **env).returncode == 0
+        assert a.orq("gerente", "serve", "--parar", cwd=t, **env).returncode == 0
+        p.wait(timeout=15)
+    finally:
+        p.kill()
+    assert a.orq("gerente", "serve", "--desinstalar", cwd=t, **env).returncode == 0
+    evs = [e for e in a.events() if e.get("tipo") == "launchd"]
+    assert [e["op"] for e in evs] == ["bootout", "bootstrap", "bootout", "stop", "bootout"], evs
+    for e in evs:
+        assert e["pid"] and e["ppid"] and e["parent"] and os.path.realpath(e["cwd"]) == os.path.realpath(t), e
+        assert e["argv"].endswith("orq.py gerente serve --instalar") or "--parar" in e["argv"] or "--desinstalar" in e["argv"], e
+    assert evs[3]["target"] == p.pid, "the stop names the pid it sent SIGTERM to"
 
 
 # ---- ticket 96: E2E queue and transcripts come from the project file ----
