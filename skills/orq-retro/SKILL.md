@@ -1,25 +1,25 @@
 ---
 name: orq-retro
-description: Analisa a rodada do `orq retro` e propõe mudanças no ambiente do orq (checagem, texto, calibragem do worker-routing). Use na retro semanal do orq ou quando o usuário pedir para aprender com as falhas dos workers.
+description: Analyzes an `orq retro` round and proposes changes to the orq environment (checks, text, worker-routing calibration). Use in the weekly orq retro or when the user asks to learn from worker failures.
 ---
 
-# Retro do orq
+# orq retro
 
-O coletor (`orq retro`) conta os sinais de falha sem LLM. Esta skill lê a rodada e propõe mudanças no **ambiente**, nunca no código do produto. A fonte da análise é o coletor; os passos de classificar e apresentar são os da skill `retro` (leia-a antes).
+The collector (`orq retro`) counts failure signals without an LLM. This skill reads the round and proposes changes to the **environment**, never to the product code. The analysis source is the collector; the steps for classifying and presenting are those of the `retro` skill (read it first).
 
-## Passos
+## Steps
 
-1. Rode `orq retro --json` (o gatilho semanal soma `--gravar`; sob demanda não grava). A janela padrão é de 7 dias; `--desde AAAA-MM-DD` troca.
-2. Para cada sinal com `n > 0`, abra o ponteiro de pelo menos um caso antes de afirmar algo: `sed -n <linha>p ~/.claude/orq/events.jsonl`, a linha do transcrito, o PR. Um sinal só vira proposta com a causa lida no ponteiro.
-3. Separe sinal de **ruído**: árvore suja com a mesma contagem em todo `liberado_sujo` do checkout principal é a sujeira que já existia, não do worker; `entrada_sem_tratamento` alto mede o hábito do coordenador, não um bug; steer anterior ao primeiro `steer_fim` do log é de antes da prova de leitura existir. Casos de ruído entram numa linha só.
-4. Classifique cada proposta em exatamente uma classe:
-   - **checagem**: erro mecânico (padrão fixo, comando proibido, lugar errado). Vira hook, teste ou guarda no orq. Padrão novo de `_retro_viola` entra aqui.
-   - **texto**: erro de julgamento. Vira linha no AGENTS.md, no spec padrão do worker ou numa memória. Diga qual arquivo e a linha exata.
-   - **calibragem**: o modelo ou o effort errou o bastante. Vira mudança na tabela do `worker-routing`, com o quadro `por_modelo` como prova.
-5. Faça a lista curta: no máximo 5 propostas, cada uma com 2 casos ou mais, ou 1 caso que perdeu trabalho ou quebrou o orq. Ordene por gravidade.
-6. Escreva a página no Lavish (`.lavish/retro-AAAA-MM-DD.html`, playbook `input`): por proposta, a evidência com ponteiro, a classe, a mudança concreta e a métrica do coletor que deve cair na semana seguinte. Cada proposta leva aprovar, rejeitar ou ajustar.
-7. Grave o resumo em `~/.claude/orquestrador-plan/relatorios/retro-AAAA-MM-DD.md` e termine. A rodada só acaba com a página aberta e o relatório escrito.
+1. Run `orq retro --json` (the weekly trigger adds `--save`; on demand it does not save). The default window is 7 days; `--since YYYY-MM-DD` changes it.
+2. For each signal with `n > 0`, open the pointer of at least one case before claiming anything: `sed -n <line>p ~/.claude/orq/events.jsonl`, the transcript line, the PR. A signal only becomes a proposal once the cause is read in the pointer.
+3. Separate signal from **noise**: a dirty tree with the same count on every `liberado_sujo` of the main checkout is dirt that was already there, not the worker's; a high `entrada_sem_tratamento` measures the coordinator's habit, not a bug; a steer from before the first `steer_end` in the log predates the read proof. Noise cases go in a single line.
+4. Classify each proposal into exactly one class:
+   - **check**: mechanical error (fixed pattern, forbidden command, wrong place). It becomes a hook, test or guard in orq. A new `_retro_viola` pattern goes here.
+   - **text**: judgment error. It becomes a line in AGENTS.md, in the worker's default spec or in a memory. Say which file and the exact line.
+   - **calibration**: the model or effort missed by enough. It becomes a change to the `worker-routing` table, with the `por_modelo` table as proof.
+5. Make the short list: at most 5 proposals, each with 2 or more cases, or 1 case that lost work or broke orq. Order by severity.
+6. Write the page in Lavish (`.lavish/retro-YYYY-MM-DD.html`, playbook `input`): per proposal, the evidence with pointer, the class, the concrete change and the collector metric that should drop the following week. Each proposal gets approve, reject or adjust.
+7. Save the summary to `~/.claude/orquestrador-plan/relatorios/retro-YYYY-MM-DD.md` and finish. The round only ends with the page open and the report written.
 
-## Depois do ok
+## After the ok
 
-Nada é aplicado sem o ok do usuário na página. Proposta aprovada de **checagem** ou **calibragem** vira ticket (`orq ticket novo`); de **texto**, uma edição no documento, em worker.
+Nothing is applied without the user's ok on the page. An approved **check** or **calibration** proposal becomes a ticket (`orq ticket new`); a **text** one, an edit to the document, in a worker.

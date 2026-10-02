@@ -30,11 +30,11 @@ ARTEFATOS_ORQ = ("PAUSE.md", "HANDOFF.md", "final-report*.md", ".scratch/*/final
 
 
 def fluxo_do_repo(repo):
-    """{producao, ambientes} do projeto desse repositório, lido do orq (`orq fluxo --repo`): em um fluxo de promoção a mesma branch vai por PR a cada ambiente e só
+    """{producao, ambientes} do projeto desse repositório, lido do orq (`orq flow --repo`): em um fluxo de promoção a mesma branch vai por PR a cada ambiente e só
     o merge na produção a encerra. ORQ_FINAL_BASE e ORQ_PROTECTED_BRANCHES (lista separada por vírgula) forçam um dos dois. Sem o orq, a branch padrão do remoto."""
     fx = None
     try:
-        r = run([sys.executable, ORQ, "fluxo", "--repo", repo, "--json"])
+        r = run([sys.executable, ORQ, "flow", "--repo", repo, "--json"])
         fx = json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
@@ -104,46 +104,46 @@ def guardar(where, artefatos, dest=None):
 def decide(f):
     """f: fatos de um item. Devolve (remove|skip, motivo). 'remote' exige autor e existência no remoto."""
     if f["branch"] in PROTECTED or f.get("is_main_current"):
-        return "skip", "branch protegida"
+        return "skip", "protected branch"
     if f["kept"]:
-        return "skip", "listada em limpar-mergeados.keep"
+        return "skip", "listed in limpar-mergeados.keep"
     if not f["merged"]:
-        return "skip", "sem PR mergeado"
+        return "skip", "no merged PR"
     if f["open_head"]:
-        return "skip", "PR aberto usa o branch como head"
+        return "skip", "an open PR uses the branch as head"
     if f["kind"] == "remote":
         if not f["mine"]:
-            return "skip", "PR mergeado não é do usuário"
+            return "skip", "merged PR is not the user's"
         if not f["on_remote"]:
-            return "skip", "já não existe no remoto"
+            return "skip", "no longer on the remote"
         if f["open_base"]:
-            return "skip", "PR aberto usa o branch como base"
+            return "skip", "an open PR uses the branch as base"
         if not f["tip_matches"]:
-            return "skip", "remoto tem commit depois do merge"
-        return "remove", "PR mergeado do usuário"
+            return "skip", "remote has a commit after the merge"
+        return "remove", "merged PR by the user"
     if f["kind"] == "worktree" and f["dirty"]:
-        return "skip", "worktree com alterações ou arquivos não rastreados"
+        return "skip", "worktree has changes or untracked files"
     if f["ahead"]:
-        return "skip", "commit fora da base do PR"
-    return "remove", "PR mergeado e sem trabalho pendente"
+        return "skip", "commit outside the PR base"
+    return "remove", "merged PR and no pending work"
 
 
 def decide_orfa(f):
     """Worktree sem PR mergeado. Só sai se nada nela se perde: todo commit já está na main (cherry sem "+", p.ex. cherry-pick), árvore limpa,
     nenhum worker vivo do orq (`busy` None, sem resposta do orq, conta como vivo) e sem atividade recente (worktree que acabou de nascer também não tem commit)."""
     if f["branch"] in PROTECTED or f["branch"].startswith("prototype/") or f["kept"]:
-        return "skip", "branch protegida ou listada em limpar-mergeados.keep"
+        return "skip", "protected branch or listed in limpar-mergeados.keep"
     if f["open_head"]:
-        return "skip", "PR aberto usa o branch como head"
+        return "skip", "an open PR uses the branch as head"
     if f["dirty"]:
-        return "skip", "worktree com alterações ou arquivos não rastreados"
+        return "skip", "worktree has changes or untracked files"
     if f["ahead"]:
-        return "skip", "commit fora da main"
+        return "skip", "commit outside main"
     if f["busy"] is not False:
-        return "skip", "worker vivo do orq usa a worktree"
+        return "skip", "a live orq worker uses the worktree"
     if f["recente"]:
-        return "skip", f"atividade nas últimas {ORFA_OCIOSA_H} h"
-    return "remove", "sem commit fora da main, árvore limpa e sem worker"
+        return "skip", f"activity in the last {ORFA_OCIOSA_H} h"
+    return "remove", "no commit outside main, clean tree and no worker"
 
 
 def is_ahead(base, head, cwd, pr_head_oid=None):
@@ -254,8 +254,8 @@ def self_test():
 
 
 def worktrees_ocupadas():
-    """Caminhos das worktrees com worker vivo, pelo `orq ocupadas`; None se o orq não responder."""
-    p = run(["python3", ORQ, "ocupadas"])
+    """Caminhos das worktrees com worker vivo, pelo `orq busy`; None se o orq não responder."""
+    p = run(["python3", ORQ, "busy"])
     return None if p.returncode else set(p.stdout.split("\n"))
 
 
@@ -281,7 +281,7 @@ def main():
     cwd = a.repo or os.getcwd()
     top = run(["git", "rev-parse", "--show-toplevel"], cwd)
     if top.returncode:
-        sys.exit(f"não é repositório git: {cwd}")
+        sys.exit(f"not a git repository: {cwd}")
     cwd = top.stdout.strip()
     # o cwd pode ser uma worktree; o checkout principal é o primeiro de `git worktree list`
     main_path = run(["git", "worktree", "list", "--porcelain"], cwd).stdout.split("\n")[0].removeprefix("worktree ")
@@ -379,14 +379,14 @@ def main():
                     try:
                         guardados = guardar(w["path"], fa["artefatos"])
                     except OSError as e:  # sem a cópia, remover perderia o relatório
-                        v, r = "skip", f"não consegui guardar {', '.join(fa['artefatos'])}: {e}"
+                        v, r = "skip", f"could not save {', '.join(fa['artefatos'])}: {e}"
             if v == "remove" and not a.dry_run:
                 try:
                     sys.path.insert(0, ORQ_DIR)
                     from orqlib import encerrar_processos_da_worktree
                     encerrar_processos_da_worktree(w["path"])
                 except Exception as e:  # sem o orq a limpeza segue; o Orca remove a worktree do mesmo jeito
-                    print(f"limpar-mergeados: processos da worktree não encerrados: {e}", file=sys.stderr)
+                    print(f"limpar-mergeados: worktree processes not terminated: {e}", file=sys.stderr)
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
             if guardados:
                 items[-1]["guardados"] = guardados
@@ -403,7 +403,7 @@ def main():
             continue
         if b in in_wt or b in PROTECTED:
             if b in in_wt and b not in PROTECTED:
-                add("local", b, "skip", "branch em uso por uma worktree")
+                add("local", b, "skip", "branch in use by a worktree")
             continue
         try:
             v, r = decide(facts("local", b, b))
@@ -443,7 +443,7 @@ def evento_orq(task, branch, items):
         append_event(ev)
         limpou_fecha(ev)
     except Exception as e:  # noqa: BLE001 - o evento é registro, não pode derrubar a limpeza
-        print(f"evento não gravado: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"event not recorded: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def finish(items, a):
@@ -459,7 +459,7 @@ def finish(items, a):
         for i in items:
             print(f"{i['action']:<12} {i['kind']:<9} {i['name']}  ({i['reason']})")
         if not items:
-            print("nada a fazer")
+            print("nothing to do")
 
 
 if __name__ == "__main__":

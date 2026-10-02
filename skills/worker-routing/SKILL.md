@@ -1,104 +1,104 @@
 ---
 name: worker-routing
-description: Escolhe o Run, o modelo e o effort antes de despachar um worker. Use ao chamar `orca orchestration worker-start`, ao lançar um subagente pelo Agent tool, ou ao montar os agentes de um Workflow.
+description: Picks the Run, the model and the effort before dispatching a worker. Use when calling `orca orchestration worker-start`, when launching a subagent through the Agent tool, or when assembling the agents of a Workflow.
 ---
 
-# Modelo e effort do worker
+# Worker model and effort
 
-Vale quando você despacha um worker (Orca `worker-start --model <id> --effort <nível>`, Agent tool, workflow) e precisa escolher modelo e effort. As duas escolhas são independentes:
+Applies when you dispatch a worker (Orca `worker-start --model <id> --effort <level>`, Agent tool, workflow) and must choose model and effort. The two choices are independent:
 
-- **modelo** segue a **ambiguidade**: quanta dúvida existe sobre *qual* solução seguir;
-- **effort** segue a quantidade de raciocínio que *esta* execução merece.
+- **model** follows **ambiguity**: how much doubt there is about *which* solution to follow;
+- **effort** follows how much reasoning *this* execution deserves.
 
-Tamanho do diff e número de arquivos são sinais secundários. Trocar uma API em 40 arquivos pode ser Sonnet medium; uma função de 30 linhas que às vezes duplica pagamento pode pedir Opus high.
+Diff size and file count are secondary signals. Swapping an API across 40 files can be Sonnet medium; a 30-line function that sometimes duplicates a payment can call for Opus high.
 
-## Papéis
+## Roles
 
-- **Haiku, scout**: o caminho já está determinado. Busca, localizar símbolo ou uso, resumo de módulo, rename, imports, lint, config simples. Não tem controle de effort.
-- **Sonnet, executor padrão** (cerca de 70% das tarefas):
-  - **low**: fix óbvio, DTO, validação, campo novo, testes de uma função;
-  - **medium**: feature normal, endpoint, refactor seguindo padrões, teste falhando;
-  - **high**: debug multi-arquivo, feature que cruza banco, API e front, refactor preservando comportamento.
-- **Opus, especialista e escalation**: dúvida real sobre a solução.
-  - **high**: arquitetura, boundaries e data model; bug obscuro de causa desconhecida; review de segurança, concorrência ou invariantes; auth, pagamento, migration destrutiva; plano de feature que cruza o sistema;
-  - **xhigh**: um worker anterior já falhou, ou há várias hipóteses em aberto;
-  - **max**: último recurso, só depois de Opus xhigh falhar.
+- **Haiku, scout**: the path is already determined. Search, locating a symbol or usage, module summary, rename, imports, lint, simple config. It has no effort control.
+- **Sonnet, default executor** (about 70% of tasks):
+  - **low**: obvious fix, DTO, validation, new field, tests for one function;
+  - **medium**: normal feature, endpoint, refactor following patterns, failing test;
+  - **high**: multi-file debugging, feature that crosses database, API and front end, behavior-preserving refactor.
+- **Opus, specialist and escalation**: real doubt about the solution.
+  - **high**: architecture, boundaries and data model; obscure bug of unknown cause; review of security, concurrency or invariants; auth, payment, destructive migration; plan for a feature that crosses the system;
+  - **xhigh**: a previous worker already failed, or several hypotheses are still open;
+  - **max**: last resort, only after Opus xhigh failed.
 
-Planejamento trivial ("campo `phone` com migration, endpoint e formulário") é Sonnet medium, não Opus.
+Trivial planning ("`phone` field with migration, endpoint and form") is Sonnet medium, not Opus.
 
-## Overrides fixos
+## Fixed overrides
 
-- Busca pura ou mudança mecânica: Haiku.
-- Segurança, pagamento ou decisão de arquitetura: Opus high.
-- Worker falhou duas vezes na mesma tarefa: Opus xhigh.
+- Pure search or mechanical change: Haiku.
+- Security, payment or architecture decision: Opus high.
+- Worker failed twice on the same task: Opus xhigh.
 
-## Worker no Codex
+## Worker on Codex
 
-`orq despachar --agente codex --modelo <slug> --effort <nível>` sobe o worker no Codex (o Orca lança com `worker-start --agent codex`). Sem `--agente`, o worker é Claude. O papel continua vindo da ambiguidade. Para chegar ao modelo do Codex, parta do papel que você daria no Claude:
+`orq dispatch --agent codex --model <slug> --effort <level>` starts the worker on Codex (Orca launches it with `worker-start --agent codex`). Without `--agent`, the worker is Claude. The role still comes from ambiguity. To reach the Codex model, start from the role you would give on Claude:
 
-| No Claude | No Codex |
+| On Claude | On Codex |
 |---|---|
-| Haiku | sem equivalente: busca simples e mudança mecânica seguem no Claude Haiku |
+| Haiku | no equivalent: simple search and mechanical change stay on Claude Haiku |
 | Sonnet low | `gpt-6-luna` low |
-| Sonnet medium | `gpt-6-luna` medium ou high |
-| Sonnet high | `gpt-6-luna` xhigh ou max, ou `gpt-6-sol` low, que sai barato para o que entrega |
-| Opus high | `gpt-6-sol` medium ou high |
+| Sonnet medium | `gpt-6-luna` medium or high |
+| Sonnet high | `gpt-6-luna` xhigh or max, or `gpt-6-sol` low, which is cheap for what it delivers |
+| Opus high | `gpt-6-sol` medium or high |
 | Opus xhigh | `gpt-6-astra` low |
-| Opus max | `gpt-6-astra` medium; se falhar, suba para o Claude Opus max |
+| Opus max | `gpt-6-astra` medium; if it fails, move up to Claude Opus max |
 
-- O `max` do Luna fica acima do high e abaixo do Sol.
-- Para escalar no Codex, suba um degrau por vez: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Astra low → Astra medium → Claude Opus max.
-- Astra só em low e medium, no lugar do Opus xhigh e max (decisão do usuário, 01/10). Não use `gpt-5.6-terra`.
-- Não use `ultra` em worker: ele delega para subagentes por conta própria.
+- Luna's `max` sits above high and below Sol.
+- To escalate on Codex, go up one step at a time: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Astra low → Astra medium → Claude Opus max.
+- Astra only at low and medium, in place of Opus xhigh and max (user decision, 01/10). Do not use `gpt-5.6-terra`.
+- Do not use `ultra` on a worker: it delegates to subagents on its own.
 
-De onde vem a tabela:
-- A OpenAI não publica uma equivalência com o Claude. Ela avisa que os efforts não se correspondem nem entre gerações dos próprios modelos ("Reasoning efforts don't map exactly between model generations", https://learn.chatgpt.com/docs/models).
-- A divisão Luna e Sol segue os papéis que a mesma página dá:
-  - Luna para tarefas claras e repetíveis, em que se sabe como é um bom resultado;
-  - Sol para tarefas ambíguas, difíceis ou de alto valor.
-- O Sol fica no degrau do Opus, mas abaixo dele, por dois resultados:
-  - no Intelligence Index da Artificial Analysis, o GPT-6 Sol em max marca 47,5, contra 51,2 do Opus 5.5 em medium e 57,6 em max (https://kingy.ai/blog/gpt-6-sol-vs-claude-opus-5-5/);
-  - a Anthropic mostra o Sonnet 5.5 em high empatando com o melhor GPT-6 Sol no FrontierCode (https://www.anthropic.com/claude-sonnet-5-5).
+Where the table comes from:
+- OpenAI does not publish an equivalence with Claude. It warns that efforts do not correspond even between generations of its own models ("Reasoning efforts don't map exactly between model generations", https://learn.chatgpt.com/docs/models).
+- The Luna and Sol split follows the roles that same page gives:
+  - Luna for clear, repeatable tasks where you know what a good result looks like;
+  - Sol for ambiguous, hard or high-value tasks.
+- Sol sits at Opus's step, but below it, because of two results:
+  - on the Artificial Analysis Intelligence Index, GPT-6 Sol at max scores 47.5, against 51.2 for Opus 5.5 at medium and 57.6 at max (https://kingy.ai/blog/gpt-6-sol-vs-claude-opus-5-5/);
+  - Anthropic shows Sonnet 5.5 at high tying the best GPT-6 Sol on FrontierCode (https://www.anthropic.com/claude-sonnet-5-5).
 
-## Onde despachar
+## Where to dispatch
 
-Toda tarefa do usuário vira task no Run do Orca da sua **frente** (o assunto). O objetivo do Run é o título do card no painel do tablet, que só lê o Orca.
+Every user task becomes a task in the Orca Run of its **stream** (the subject). The Run's objective is the card title on the tablet panel, which only reads Orca.
 
-- **Frente nova:** `orca orchestration run-create --objective "<assunto>" --json` antes do primeiro despacho; com o agent manager ligado, rode em seguida `orq gerente ligar --terminal <gerente>`.
-- **Frente existente:** despache com `--run <id da frente>`.
-- **Tarefa nova nasce como ticket:** `orq ticket novo --titulo "..." --spec-arquivo <f> [--blocked-by NN,NN]` grava `~/.claude/orquestrador-plan/issues/NN-<slug>.md` (o ticket é a única fonte do conteúdo; o spec traz `## Acceptance criteria`) e cria a task no Orca. `orq despachar --ticket <NN> --modelo <m> --effort <e>` sobe o worker nessa task, e `orq ticket fechar <NN> --answer <arquivo|texto>` grava o Answer e completa a task (`docs/design.md`).
-- **Despachar:** `orq despachar --run <frente> --titulo "..." --spec-arquivo <f> --modelo <m> --effort <e> [--worktree current|new-top-level --name ... --base-branch ...] [--entrada <e>]`. Ele roda o `worker-start` com modelo e effort, grava o evento `despacho`, liga a entrada (`--entrada`) e devolve `dispatchId`, `taskId` e o comando do waiter pronto (`orca-wait-runs.py`, `espera` no JSON). O título vira a primeira linha do spec e o nome da aba. O coordenador precisa estar ligado ao Run (`run-use --id`).
-- **Agent tool:** o subagente não cria task. Antes de lançar, rode `task-create --run <frente> --task-title ... --spec ...` e depois `task-update --status dispatched`. Quando ele voltar, marque `completed` ou `failed`.
-- **Agent manager:** os avisos do Orca ("You have N orchestration message", heartbeat incluído) vão só para o terminal ligado ao Run, e terminal sem agente não recebe aviso. Por isso os Runs ficam ligados ao terminal do agent manager, um shell rodando `~/.claude/orq/painel-agent-manager.sh`, e o coordenador só acorda com o que importa (`docs/design.md`).
-  - **Ligar:** `orq gerente ligar --terminal <gerente> [--run r]...` no coordenador; soma aos Runs que o gerente já tem, e sem `--run` entra o Run do último `run-create`/`run-use`. O `orq despachar` num Run novo o liga sozinho. `orq gerente desligar [--run r]` devolve um Run ou todos ao coordenador (que segura um só).
-  - **Um Run por terminal:** o Orca liga o gerente a um Run por vez; o painel os reveza, e cada comando do `orq` com `--run` (`despachar`, `liberar`, `steer`, `ticket`, o waiter, o hook) religa o gerente ao Run antes, sob a trava. Heartbeat de Run desligado do coordenador não avisa ninguém.
-  - **Comando cru do Orca no Run:** prefixe com `env ORCA_TERMINAL_HANDLE=<gerente>` (`check`, `worker-start`, `worker-stop`, `task-update`…; para `reply` use `orq responder`). O Orca responde `consumer_fenced` se o gerente estiver noutro Run: rode `orq gerente ligar --terminal <gerente> --run <r>` de novo ou espere a volta do painel, que fica no Run do aviso.
-  - **O que chega ao coordenador:** o painel confirma os heartbeats a cada 10 s e digita no coordenador `You have N orchestration message. Run orca orchestration check --run <r> --terminal <gerente>.` uma vez por lote com `worker_done`, `question` ou `escalation`, de qualquer Run do gerente. Rode esse `check` como está, processe e confirme com `--ack`. O waiter também acorda com o `worker_done`.
-- **Ligação do coordenador:** ele consome o mailbox de um Run só, o último do `run-create` ou do `run-use --id`. Em outro Run, `check` devolve `consumer_fenced`, e `worker-start`, `task-create` e `task-update` falham ou não gravam. Antes de mexer num Run, faça `run-use --id` nele e confira o `ok` do resultado. Com o agent manager ligado, os comandos do `orq` com `--run` escolhem sozinhos o dono do Run: o gerente, religado, ou o próprio coordenador se ele segura o Run fora do gerente. Sem `--run` e com o gerente em mais de um Run, o `orq` pede `--run`; Run que ninguém segura pede `orq gerente ligar --terminal <gerente> --run <r>`. `orq pend add --task <t> --run <r>` cria o gate no Run da task.
-- **Run é do coordenador:** o spec do worker manda usar só o Run que recebeu no despacho; o worker não roda `run-create` nem `run-use`. Teste que precise de Run usa `ORQ_HOME` e `ORQ_ORCA` falsos. O `orq` decide o papel de worker pelo preâmbulo de despacho (o primeiro prompt do worker), antes de qualquer Run ligado, então um Run criado por engano não muda o papel, mas suja o painel. Não dá para usar o `worker-list` como sinal: sem `--run` ele só lista o Run ligado ao terminal.
-- **Várias frentes ativas:** espere com `~/.claude/scripts/orca-wait-runs.py <run>...`. Ele acompanha o `task-list` de todos os Runs e o mailbox do Run ligado (com o agent manager, o de cada Run dele); nos demais Runs da lista acorda com question, escalation e worker_done lidos no inbox, sem consumir. Para ler e dar ack numa mensagem de outro Run, faça `run-use --id <run>` e volte depois.
-- **Heartbeat não acorda o coordenador:** o hook `orq hook prompt` absorve o aviso do Orca quando a caixa do Run ligado só tem heartbeat (`docs/design.md`), e o waiter faz o mesmo. A última fase e a hora de cada despacho rodando aparecem em `Vivos:` no resumo do `orq` e em "Rodando" no painel. Aviso de heartbeat de outro Run é bloqueado do mesmo jeito, lendo o `inbox` e sem confirmar nada: as mensagens ficam na caixa daquele Run até o `run-use --id`. Qualquer outro tipo de mensagem, de qualquer Run, acorda.
-- **Ajuste em task rodando:** `orq steer <task> "<texto>" [--run r] [--entrada e]`. Ele acha o dispatch, manda o `send` e registra; precisa que o coordenador comande o Run do worker (gerente ligado a ele, ou `run-use --id`). Se o Orca não avisou o worker (a linha do inbox sem `delivered_at`) e ele está livre, o `orq` digita o aviso; se o Orca já avisou, não repete. O painel do gerente confere a cada volta (ou `orq steers`): sem leitura 90 s depois e com o worker parado no prompt, redigita o aviso, até 3 vezes; depois grava o alerta "steer não lido" no resumo e no `orq agentes` (`orq alerta visto <task>` o trata). Leitura é o `read` do inbox ou o id da mensagem no transcrito do worker: o `read` só vira 1 com `check --ack`. O spec do worker manda confirmar com `check --terminal <ele> --ack <deliveryId>` depois de ler, porque sem o ack o `check` repete a mesma entrega e esconde as mensagens novas. Worker ocupado não recebe nada.
-- **Responder pergunta de worker:** `orq responder <msg_id> "<texto>"` acha o Run da mensagem no inbox, liga o gerente a ele e responde pelo handle do gerente. O `orca orchestration reply` cru dá `consumer_fenced` quando o gerente está em outro Run.
-- **Pergunta ou permissão presa no terminal do worker:** nada que peça resposta humana fica na tela do worker. O hook do `orq` recusa o AskUserQuestion em sessão de worker e manda escalar (`orca orchestration ask` ou `send --type escalation`). O que o Claude Code pergunta por conta própria (prompt de permissão como "Dangerous rm operation… Do you want to proceed?", o "trust this folder") o painel reconhece na tela: o worker vira `perguntando` no `orq agentes`, o gerente digita uma vez no coordenador a pergunta e as opções, e `orq responder-tela <task> <opção>` (número ou começo do rótulo) digita a resposta no terminal dele, com quem respondeu no log. O spec do worker pede comandos que não disparam o guard: `rm -rf "${S:?}"/*.exit`, nunca `rm -rf $S/*.exit`, e o mesmo para qualquer `rm`, `mv` ou `cp` com variável no caminho. Sessão retomada pelo `orq retomar` recebe na mensagem de continuação o handle do coordenador e o comando de escalação, porque o preâmbulo de despacho se perdeu.
-- **Decisão do usuário com worker ativo:** vai por uma página do Lavish no browser do Orca, e o `orq lavish-resposta <arquivo>` grava a resposta (`docs/design.md`). Passe ao comando a saída crua do `lavish-axi poll`, sem extrair o JSON. A página manda `disposicao: "escolha"` (ou `manter`/`trocar`) com a resposta escrita para fechar a decisão; `livre`, `adiar` e `conversar` a deixam aberta. O AskUserQuestion vale só sem despacho ativo: um hook do `orq` recusa a caixa enquanto houver algum, em qualquer Run. Dúvida de worker vai por `orca orchestration ask` ao coordenador (o preâmbulo do Orca já manda), nunca pela caixa.
-- **Worker concluído:** `orq liberar <dispatch> [--run r]` confirma o `worker_done` pendente do dispatch, roda o `worker-release` e, se o estado voltar `retained` sem motivo de retenção, roda `orca terminal close` no terminal dele. Terminal que o Orca reteve por motivo (`user_takeover`, `user_requested`, `external_terminal`…) e o do coordenador ficam abertos, com o aviso na saída. Leia a saída depois com `worker-read` (https://www.onorca.dev/docs/cli/orchestration). Se o release voltar `release_pending`, repita depois; `terminal close` à mão não substitui.
-- **Controle do worker:** `orq interromper <dispatch>` manda o interrupt ao terminal (o worker segue vivo). `orq encerrar <dispatch> --motivo "…"` roda o `worker-stop` e o `orq liberar`, com o motivo no log. `orq relancar <dispatch> --nota "o que mudou" [--modelo m --effort e]` para o worker e sobe outro na mesma worktree e task (`--retry-of`), com o modelo e o effort do antigo se você não trocar; a nota chega como o primeiro ajuste. Se o perfil pedido não sobe, sobe o antigo; se nada sobe, a worktree fica e a mensagem traz o comando para repetir. O histórico aparece em `orq agentes`. `orq passar <dispatch> --para codex|claude [--modelo m --effort e]` continua o worker no outro harness (limite do plano) na mesma worktree e task: escreve o `PASSAGEM.md` (git, decisões da task, fim do transcrito), sobe `worker-start --retry-of --agent <outro>` com o modelo equivalente da tabela acima e avisa o novo para ler o arquivo; recusa antes de parar se o outro harness também está acima do limiar.
-- **Quem está vivo:** `orq agentes [--json] [--run r] [--todos]` dá o estado de cada dispatch de todos os Runs: rodando, travado (sem heartbeat há mais de 15 min, com o `orq steer` sugerido), perguntando e entregue (terminal aberto, pronto para o `orq liberar`). O resumo injetado e o painel mostram o mesmo (`docs/design.md`).
-- **Espera declarada:** antes de um comando longo que bloqueia (fila de E2E, CI, deploy), o spec manda o worker enviar um heartbeat com `--phase "esperando: <motivo> até HH:MM"` (hora local; sem o `até`, vale 60 min). Até o prazo o dispatch conta como rodando, não travado; vencido, vira travado com "espera vencida". Sem o heartbeat, o worker parado no comando aparece travado aos 15 min.
-- **Checkpoint:** o spec do worker manda gravar `orca worktree set --comment` nas transições de fase, no formato de https://www.onorca.dev/docs/cli/worktree-checkpoints (primeira linha é a ação; ler antes com `orca worktree current --json`).
-- **Relatório do worker:** o spec manda escrever o relatório (o `reportPath` e o corpo do `worker_done`) com a skill `writing-for-agents`: veredito primeiro, uma fonte por fato, critério de pronto conferível, o resto atrás de ponteiro. Relatório de pesquisa segue a skill `research`.
-- **Spec de worker que edita o `orq`:** manda criar uma worktree própria (`git worktree add ../orq-<ticket>` a partir de `~/.claude/orq`), rodar os testes lá e commitar lá; o `~/.claude/orq` ao vivo só anda com `git pull` depois do commit verde, porque os hooks e o painel executam o `orq.py` dele. O painel grava `gerente-vivo` a cada volta e o `orq status`, o `orq resumo` e o hook de prompt avisam "painel do agent manager parado" depois de 60 s.
-- **Spec de worker na noite:** com `orq noite` ligado o spec manda não fazer push, merge de PR, deploy nem `git commit --no-verify` (o hook `orq hook externas` nega), estacionar a decisão com `orq pend add` e, se o commit falhar no pre-commit, reparar o que o hook apontou em vez de contorná-lo. O `orq despachar` já sobe o worker com `GIT_TERMINAL_PROMPT=0` e `commit.gpgsign=false`.
-- **Pedido do usuário no spec:** `orq despachar --entrada eNNN` põe o texto literal da entrada numa seção `## Pedido do usuário` no topo do spec, separada do que o coordenador escreveu, e `orq steer <task> "<texto>" --entrada eNNN` anexa o pedido novo a ela (`## Pedido do usuário (acréscimo)`). O spec manda o review do worker conferir o pronto contra essa seção, não contra o resumo do coordenador. Sem `--entrada`, o spec sai como estava; com `--ticket` o spec é o arquivo do ticket e não recebe a seção.
-- **Spec de worker que abre PR:** manda citar só arquivo versionado (`docs/research`, `docs/adr`, `docs/features`) no corpo do PR e subir a pesquisa no mesmo PR quando ele depende dela; `.scratch/` fica de fora.
+- **New stream:** `orca orchestration run-create --objective "<subject>" --json` before the first dispatch; with the agent manager on, follow with `orq manager bind --terminal <manager>`.
+- **Existing stream:** dispatch with `--run <stream's id>`.
+- **A new task is born as a ticket:** `orq ticket new --title "..." --spec-file <f> [--blocked-by NN,NN]` writes `~/.claude/orquestrador-plan/issues/NN-<slug>.md` (the ticket is the only source of the content; the spec carries `## Acceptance criteria`) and creates the task in Orca. `orq dispatch --ticket <NN> --model <m> --effort <e>` starts the worker on that task, and `orq ticket close <NN> --answer <file|text>` writes the Answer and completes the task (`docs/design.md`).
+- **Dispatch:** `orq dispatch --run <stream> --title "..." --spec-file <f> --model <m> --effort <e> [--worktree current|new-top-level --name ... --base-branch ...] [--entry <e>]`. It runs `worker-start` with model and effort, writes the `dispatch` event, links the entry (`--entry`) and returns `dispatchId`, `taskId` and the ready-made waiter command (`orca-wait-runs.py`, `waiting` in the JSON). The title becomes the first line of the spec and the tab name. The coordinator must be bound to the Run (`run-use --id`).
+- **Agent tool:** the subagent does not create a task. Before launching, run `task-create --run <stream> --task-title ... --spec ...` and then `task-update --status dispatched`. When it returns, mark `completed` or `failed`.
+- **Agent manager:** Orca notices ("You have N orchestration message", heartbeat included) go only to the terminal bound to the Run, and a terminal with no agent receives no notice. That is why the Runs are bound to the agent manager's terminal, a shell running `~/.claude/orq/painel-agent-manager.sh`, and the coordinator only wakes for what matters (`docs/design.md`).
+  - **Bind:** `orq manager bind --terminal <manager> [--run r]...` in the coordinator; it adds to the Runs the manager already has, and without `--run` the Run of the last `run-create`/`run-use` is added. `orq dispatch` on a new Run binds it on its own. `orq manager unbind [--run r]` gives one Run or all of them back to the coordinator (which holds only one).
+  - **One Run per terminal:** Orca binds the manager to one Run at a time; the panel rotates them, and every `orq` command with `--run` (`dispatch`, `release`, `steer`, `ticket`, the waiter, the hook) rebinds the manager to the Run first, under the lock. A heartbeat from a Run unbound from the coordinator notifies nobody.
+  - **Raw Orca command on the Run:** prefix it with `env ORCA_TERMINAL_HANDLE=<manager>` (`check`, `worker-start`, `worker-stop`, `task-update`…; for `reply` use `orq reply`). Orca answers `consumer_fenced` if the manager is on another Run: run `orq manager bind --terminal <manager> --run <r>` again or wait for the panel to come back, which stays on the Run of the notice.
+  - **What reaches the coordinator:** the panel acknowledges heartbeats every 10 s and types into the coordinator `You have N orchestration message. Run orca orchestration check --run <r> --terminal <manager>.` once per batch with `worker_done`, `question` or `escalation`, from any Run of the manager. Run that `check` as is, process it and confirm with `--ack`. The waiter also wakes with the `worker_done`.
+- **Coordinator binding:** it consumes the mailbox of one Run only, the last from `run-create` or `run-use --id`. On another Run, `check` returns `consumer_fenced`, and `worker-start`, `task-create` and `task-update` fail or do not save. Before touching a Run, do `run-use --id` on it and check the `ok` in the result. With the agent manager on, `orq` commands with `--run` pick the Run's owner on their own: the rebound manager, or the coordinator itself if it holds the Run outside the manager. Without `--run` and with the manager on more than one Run, `orq` asks for `--run`; a Run nobody holds asks for `orq manager bind --terminal <manager> --run <r>`. `orq pend add --task <t> --run <r>` creates the gate in the task's Run.
+- **The Run belongs to the coordinator:** the worker spec tells the worker to use only the Run it received at dispatch; the worker does not run `run-create` or `run-use`. A test that needs a Run uses fake `ORQ_HOME` and `ORQ_ORCA`. `orq` decides the worker role from the dispatch preamble (the worker's first prompt), before any bound Run, so a Run created by mistake does not change the role but dirties the panel. `worker-list` cannot be used as a signal: without `--run` it only lists the Run bound to the terminal.
+- **Several active streams:** wait with `~/.claude/scripts/orca-wait-runs.py <run>...`. It follows the `task-list` of every Run and the mailbox of the bound Run (with the agent manager, that of each of its Runs); on the other Runs in the list it wakes on question, escalation and worker_done read from the inbox, without consuming. To read and ack a message from another Run, do `run-use --id <run>` and switch back afterwards.
+- **Heartbeat does not wake the coordinator:** the `orq hook prompt` hook absorbs the Orca notice when the bound Run's mailbox only has heartbeats (`docs/design.md`), and the waiter does the same. The last phase and the time of each running dispatch show under `Alive:` in the `orq` summary and under "Running" in the panel. A heartbeat notice from another Run is blocked the same way, reading the `inbox` and confirming nothing: the messages stay in that Run's mailbox until `run-use --id`. Any other message type, from any Run, wakes it.
+- **Adjusting a running task:** `orq steer <task> "<text>" [--run r] [--entry e]`. It finds the dispatch, sends the `send` and records it; the coordinator must command the worker's Run (manager bound to it, or `run-use --id`). If Orca did not notify the worker (the inbox line has no `delivered_at`) and it is free, `orq` types the notice; if Orca already notified it, it does not repeat. The manager panel checks on every round (or `orq steers`): no read 90 s later and with the worker idle at the prompt, it retypes the notice, up to 3 times; after that it records the "unread steer" alert in the summary and in `orq agents` (`orq alert seen <task>` handles it). A read is the inbox `read` or the message id in the worker's transcript: the `read` only becomes 1 with `check --ack`. The worker spec tells the worker to confirm with `check --terminal <it> --ack <deliveryId>` after reading, because without the ack `check` repeats the same delivery and hides new messages. A busy worker receives nothing.
+- **Answering a worker's question:** `orq reply <msg_id> "<text>"` finds the message's Run in the inbox, binds the manager to it and answers through the manager's handle. The raw `orca orchestration reply` gives `consumer_fenced` when the manager is on another Run.
+- **Question or permission stuck in the worker's terminal:** nothing that asks for a human answer stays on the worker's screen. The `orq` hook refuses AskUserQuestion in a worker session and tells it to escalate (`orca orchestration ask` or `send --type escalation`). What Claude Code asks on its own (a permission prompt such as "Dangerous rm operation… Do you want to proceed?", the "trust this folder") the panel recognizes on screen: the worker becomes `asking` in `orq agents`, the manager types the question and the options once into the coordinator, and `orq answer-screen <task> <option>` (number or start of the label) types the answer into its terminal, with who answered in the log. The worker spec asks for commands that do not trigger the guard: `rm -rf "${S:?}"/*.exit`, never `rm -rf $S/*.exit`, and the same for any `rm`, `mv` or `cp` with a variable in the path. A session resumed by `orq resume` gets, in the continuation message, the coordinator's handle and the escalation command, because the dispatch preamble was lost.
+- **User decision with an active worker:** goes through a Lavish page in the Orca browser, and `orq lavish-answer <file>` records the answer (`docs/design.md`). Pass the command the raw output of `lavish-axi poll`, without extracting the JSON. The page sends `disposicao: "escolha"` (or `manter`/`trocar`) with the written answer to close the decision; `livre`, `adiar` and `conversar` leave it open. AskUserQuestion is valid only with no active dispatch: an `orq` hook refuses the box while there is any, in any Run. A worker's doubt goes through `orca orchestration ask` to the coordinator (the Orca preamble already says so), never through the box.
+- **Finished worker:** `orq release <dispatch> [--run r]` confirms the dispatch's pending `worker_done`, runs `worker-release` and, if the state comes back `retained` with no retention reason, runs `orca terminal close` on its terminal. A terminal Orca retained for a reason (`user_takeover`, `user_requested`, `external_terminal`…) and the coordinator's stay open, with the notice in the output. Read the output afterwards with `worker-read` (https://www.onorca.dev/docs/cli/orchestration). If the release comes back `release_pending`, repeat it later; `terminal close` by hand is no substitute.
+- **Worker control:** `orq interrupt <dispatch>` sends the interrupt to the terminal (the worker stays alive). `orq end <dispatch> --reason "…"` runs `worker-stop` and `orq release`, with the reason in the log. `orq relaunch <dispatch> --note "what changed" [--model m --effort e]` stops the worker and starts another in the same worktree and task (`--retry-of`), with the old one's model and effort if you do not change them; the note arrives as the first adjustment. If the requested profile does not start, the old one starts; if nothing starts, the worktree stays and the message carries the command to repeat. The history shows in `orq agents`. `orq switch <dispatch> --to codex|claude [--model m --effort e]` continues the worker on the other harness (plan limit) in the same worktree and task: it writes `HANDOFF.md` (git, the task's decisions, the end of the transcript), starts `worker-start --retry-of --agent <other>` with the equivalent model from the table above and tells the new one to read the file; it refuses before stopping if the other harness is also above the threshold.
+- **Who is alive:** `orq agents [--json] [--run r] [--all]` gives the state of each dispatch of all Runs: running, stuck (no heartbeat for more than 15 min, with the suggested `orq steer`), asking, and delivered (terminal open, ready for `orq release`). The injected summary and the panel show the same (`docs/design.md`).
+- **Declared wait:** before a long blocking command (E2E queue, CI, deploy), the spec tells the worker to send a heartbeat with `--phase "waiting: <reason> until HH:MM"` (local time; without the `until`, it counts for 60 min). Until the deadline the dispatch counts as running, not stuck; once past, it becomes stuck with "wait expired". Without the heartbeat, a worker parked on the command shows as stuck at 15 min.
+- **Checkpoint:** the worker spec tells it to write `orca worktree set --comment` on phase transitions, in the format of https://www.onorca.dev/docs/cli/worktree-checkpoints (the first line is the action; read first with `orca worktree current --json`).
+- **Worker report:** the spec tells the worker to write the report (the `reportPath` and the body of `worker_done`) with the `writing-for-agents` skill: verdict first, one source per fact, a checkable done criterion, the rest behind a pointer. A research report follows the `research` skill.
+- **Worker spec that edits `orq`:** tells it to create a worktree of its own (`git worktree add ../orq-<ticket>` from `~/.claude/orq`), run the tests there and commit there; the live `~/.claude/orq` only moves with `git pull` after the green commit, because the hooks and the panel run its `orq.py`. The panel writes `manager-alive` on every round and `orq status`, `orq summary` and the prompt hook warn "agent manager panel stopped" after 60 s.
+- **Worker spec at night:** with `orq night` on, the spec tells the worker not to push, merge a PR, deploy or `git commit --no-verify` (the `orq hook external` hook denies it), to park the decision with `orq pend add` and, if the commit fails in pre-commit, to repair what the hook pointed at instead of bypassing it. `orq dispatch` already starts the worker with `GIT_TERMINAL_PROMPT=0` and `commit.gpgsign=false`.
+- **User request in the spec:** `orq dispatch --entry eNNN` puts the entry's literal text in a `## User request` section at the top of the spec, separate from what the coordinator wrote, and `orq steer <task> "<text>" --entry eNNN` appends the new request to it (`## User request (addition)`). The spec tells the worker's review to check done against that section, not against the coordinator's summary. Without `--entry`, the spec comes out as it was; with `--ticket` the spec is the ticket file and does not get the section.
+- **Worker spec that opens a PR:** tells it to cite only versioned files (`docs/research`, `docs/adr`, `docs/features`) in the PR body and to push the research in the same PR when the PR depends on it; `.scratch/` stays out.
 
 ## Escalation
 
-Suba um degrau por vez quando o worker falhar ou reportar incerteza: Haiku → Sonnet low → medium → high → Opus high → xhigh → max. Peça no spec que o worker devolva `needs_escalation`, com o motivo e o degrau sugerido, em vez de insistir. Assim o Opus não é gasto por precaução.
+Go up one step at a time when the worker fails or reports uncertainty: Haiku → Sonnet low → medium → high → Opus high → xhigh → max. Ask in the spec for the worker to return `needs_escalation`, with the reason and the suggested step, instead of insisting. That way Opus is not spent as a precaution.
 
-O spec do retry cita o id da tarefa antiga. Quando o retry termina bem, feche a antiga: `orca orchestration task-update --id <antiga> --status completed --result '{"supersededBy":"<nova>"}'`. Sem isso, ela continua como falha no painel e no `task-list`.
+The retry spec cites the old task's id. When the retry finishes well, close the old one: `orca orchestration task-update --id <old> --status completed --result '{"supersededBy":"<new>"}'`. Without it, it stays as a failure in the panel and in `task-list`.
 
-## Calibrar
+## Calibrate
 
-A meta aproximada é 15% Haiku, 70% Sonnet e 15% Opus, sem virar regra. Quem calibra são os traces: tarefa concluída sem retry, escalations, testes quebrando depois do "pronto" e correções no review. `orq retro` conta isso por modelo e effort (o quadro `por_modelo`), e a skill `orq-retro` propõe a mudança nesta tabela, que só vale com o ok do usuário.
+The rough target is 15% Haiku, 70% Sonnet and 15% Opus, without becoming a rule. The traces do the calibrating: tasks finished without retry, escalations, tests breaking after "done" and fixes in review. `orq retro` counts this per model and effort (the `por_modelo` table), and the `orq-retro` skill proposes the change to this table, which only applies with the user's ok.

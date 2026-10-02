@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/orq/orq.py hook externas",
+            "command": "python3 ~/.claude/orq/orq.py hook external",
             "timeout": 3
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/orq/orq.py hook lugar",
+            "command": "python3 ~/.claude/orq/orq.py hook place",
             "timeout": 3
           }
         ]
@@ -101,7 +101,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/orq/orq.py hook prligar",
+            "command": "python3 ~/.claude/orq/orq.py hook prlink",
             "timeout": 3
           }
         ]

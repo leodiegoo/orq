@@ -1,8 +1,8 @@
 ---
-description: Liga, desliga ou mostra o away mode do orq (modo ausente)
+description: Turns the orq away mode on or off, or shows it
 argument-hint: [on|off|status]
 allowed-tools: Bash(orq away:*)
 ---
 !`orq away $ARGUMENTS`
 
-Repita a saída acima ao usuário, inteira (ao desligar ela traz o relatório da ausência e o caminho do arquivo), sem mais nada.
+Repeat the output above to the user, in full (when turning it off it carries the away report and the file path), with nothing else.
