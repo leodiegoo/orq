@@ -17199,6 +17199,303 @@ def test_ticket228_the_pin_should_leave_the_other_hooks_and_the_file_formatting_
     assert after.replace(sys.executable, "python3") == before, "same file, only the interpreter changed"
 
 
+
+# ---------- ticket 184: quave-one deploy_check and the production PR opened by itself ----------
+
+QUAVE184 = os.path.join(HERE, "scripts", "quave-deploy-check.py")
+
+
+def _git184(repo, *args):
+    return subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _repo184():
+    """A repository with three commits in a row: (folder, [c0, c1, c2])."""
+    repo = os.path.join(tempfile.mkdtemp(), "repo")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    for n in range(3):
+        _git184(repo, "commit", "-q", "--allow-empty", "-m", f"c{n}")
+    return repo, _git184(repo, "log", "--format=%H", "--reverse").splitlines()
+
+
+class _Quave184:
+    """The fake quave-one: an MCP server over HTTP that answers `get-app-env-status` in SSE with what `states` holds per appEnvId
+    (a `latestDeployment` dict, None for an environment with no deploy, or an int to answer that HTTP status)."""
+
+    def __init__(self):
+        import http.server
+        import threading
+        self.states, self.requests = {}, []
+        owner = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                env_id = body["params"]["arguments"]["appEnvId"]
+                owner.requests.append((self.headers.get("Authorization"), body["params"]["name"], env_id))
+                state = owner.states.get(env_id)
+                if isinstance(state, int):
+                    self.send_response(state)
+                    self.end_headers()
+                    return
+                texto = json.dumps({"appEnvId": env_id, "latestDeployment": state})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(("event: message\ndata: " + json.dumps({"result": {"content": [{"type": "text", "text": texto}]}, "jsonrpc": "2.0", "id": 1}) + "\n\n").encode())
+
+            def log_message(self, *args):
+                pass
+
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_port}/"
+
+    def deploy(self, env_id, sha, status="DEPLOYED", version=7):
+        self.states[env_id] = {"version": version, "status": status, "statusLabel": status.title(), "gitCommitId": sha, "isSuccess": status == "DEPLOYED",
+                             "isFailed": status == "FAILED", "isInProgress": status in ("BUILDING", "DEPLOYING")}
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _quave_check184(q, repo, env, sha, ids, url=None):
+    return subprocess.run([sys.executable, QUAVE184, "--env", env, "--sha", sha, "--ids", ids], capture_output=True, text=True, cwd=repo, timeout=60,
+                          env={**os.environ, "QUAVE_MCP_URL": url or q.url, "QUAVE_MCP_TOKEN": "tok-184"})
+
+
+def test_ticket184_quave_deploy_check_with_the_deployed_commit_exits_0_with_version_and_commit():
+    q, (repo, (c0, c1, c2)) = _Quave184(), _repo184()
+    try:
+        q.deploy("ID_DEV", c1, version=1020)
+        r = _quave_check184(q, repo, "development", c1, "development=ID_DEV,main=ID_PROD")
+        assert r.returncode == 0 and r.stdout.strip() == f"v1020 {c1[:7]}", (r.stdout, r.stderr)
+        assert q.requests == [("Bearer tok-184", "get-app-env-status", "ID_DEV")], q.requests
+        q.deploy("ID_DEV", c2, version=1021)
+        assert _quave_check184(q, repo, "development", c1, "development=ID_DEV").returncode == 0, "a newer commit that descends from the merged one covers it too"
+    finally:
+        q.close()
+
+
+def test_ticket184_quave_deploy_check_building_or_still_on_the_old_commit_exits_2():
+    q, (repo, (c0, c1, c2)) = _Quave184(), _repo184()
+    try:
+        q.deploy("ID_DEV", c1, "BUILDING")
+        assert _quave_check184(q, repo, "development", c1, "development=ID_DEV").returncode == 2
+        q.deploy("ID_DEV", c0)
+        r = _quave_check184(q, repo, "development", c1, "development=ID_DEV")
+        assert r.returncode == 2 and r.stdout == "" and "does not cover" in r.stderr, "the deploy of the previous commit is not the PR's yet"
+        q.states["ID_DEV"] = None
+        assert _quave_check184(q, repo, "development", c1, "development=ID_DEV").returncode == 2, "an environment with no deploy at all waits"
+    finally:
+        q.close()
+
+
+def test_ticket184_quave_deploy_check_that_failed_on_the_commit_exits_1_and_a_failure_of_another_commit_waits():
+    q, (repo, (c0, c1, c2)) = _Quave184(), _repo184()
+    try:
+        q.deploy("ID_DEV", c1, "FAILED")
+        r = _quave_check184(q, repo, "development", c1, "development=ID_DEV")
+        assert r.returncode == 1 and "failed" in r.stderr, (r.returncode, r.stderr)
+        q.deploy("ID_DEV", c0, "FAILED")
+        assert _quave_check184(q, repo, "development", c1, "development=ID_DEV").returncode == 2, "the deploy that failed predates the PR"
+    finally:
+        q.close()
+
+
+def test_ticket184_quave_deploy_check_of_production_only_closes_with_both_ids():
+    q, (repo, (c0, c1, c2)) = _Quave184(), _repo184()
+    try:
+        q.deploy("WEB", c1)
+        q.deploy("JOBS", c1, "BUILDING")
+        assert _quave_check184(q, repo, "main", c1, "main=WEB+JOBS").returncode == 2
+        q.deploy("JOBS", c1, version=9)
+        r = _quave_check184(q, repo, "main", c1, "main=WEB+JOBS")
+        assert r.returncode == 0 and r.stdout.strip() == f"v7 {c1[:7]} + v9 {c1[:7]}", r.stdout
+        q.deploy("JOBS", c1, "FAILED")
+        assert _quave_check184(q, repo, "main", c1, "main=WEB+JOBS").returncode == 1, "one that failed beats the one still building"
+    finally:
+        q.close()
+
+
+def test_ticket184_quave_deploy_check_without_an_answer_waits_and_an_access_error_warns():
+    q, (repo, (c0, c1, c2)) = _Quave184(), _repo184()
+    try:
+        assert _quave_check184(q, repo, "development", c1, "development=ID_DEV", url="http://127.0.0.1:1/").returncode == 2, "network down: try again later"
+        q.states["ID_DEV"] = 401
+        r = _quave_check184(q, repo, "development", c1, "development=ID_DEV")
+        assert r.returncode == 3 and "401" in r.stderr, "a bad token does not wait forever"
+        assert _quave_check184(q, repo, "staging", c1, "development=ID_DEV").returncode == 3, "environment with no id"
+        assert _quave_check184(q, repo, "development", " ", "development=ID_DEV").returncode == 3, "with no commit there is nothing to check"
+    finally:
+        q.close()
+
+
+def _notices184(a):
+    """What went to the coordinator: the calls the fake Orca saw plus the full text of the long notices, which orq leaves in ORQ_HOME/avisos."""
+    folder = os.path.join(a.home, "avisos")
+    full = "".join(open(os.path.join(folder, n)).read() for n in sorted(os.listdir(folder))) if os.path.isdir(folder) else ""
+    return json.dumps(_log(a, "calls.log")) + full
+
+
+def _merge184(a, sha):
+    """Links the main PR, gh sees it merged with that merge commit and the poll creates the entry and the obligations."""
+    _pr(a, PR_MAIN, "OPEN", "main")
+    assert a.orq("pr", "ligar", "task_feat1", PR_MAIN, "--issue", "2045").returncode == 0
+    _pr(a, PR_MAIN, "MERGED", "main", mergeCommit={"oid": sha})
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    return next(e["id"] for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr")
+
+
+def _with_quave184(a, q):
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    a.env.update({"QUAVE_MCP_URL": q.url, "QUAVE_MCP_TOKEN": "tok-184"})
+    _deploy155(a, f"{sys.executable} {QUAVE184} --env {{base}} --sha {{sha}} --ids main=WEB")
+    return sha
+
+
+def test_ticket184_deploy_building_waits_and_the_deployed_commit_closes_the_obligation_with_the_version():
+    q, a = _Quave184(), _prs_env()
+    try:
+        sha = _with_quave184(a, q)
+        e = _merge184(a, sha)
+        q.deploy("WEB", sha, "BUILDING")
+        assert _round155(a) == "" and "deploy" in _find_obligation(a, e), "building: stays open, no notice"
+        assert not [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "falhou"]
+        q.deploy("WEB", sha, version=778)
+        assert f"main deploy checked (v778 {sha[:7]})" in _round155(a)
+        assert "deploy" not in _find_obligation(a, e)
+        (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito" and x["chave"] == "deploy"]
+        assert f["prova"] == f"v778 {sha[:7]}" and f["auto"], f
+    finally:
+        q.close()
+
+
+def test_ticket184_deploy_check_resolves_orq_to_the_clone_of_orq():
+    a = _prs_env()
+    _deploy155(a, "echo {orq}/scripts/quave-deploy-check.py")
+    e = _merge_main(a)
+    assert "main deploy checked" in _round155(a)
+    (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito" and x["chave"] == "deploy"]
+    assert f["prova"] == os.path.join(HERE, "scripts", "quave-deploy-check.py") and os.path.isfile(f["prova"]), f
+
+
+def test_ticket184_deploy_that_failed_warns_the_coordinator_once_and_stays_open():
+    q, a = _Quave184(), _prs_env()
+    try:
+        sha = _with_quave184(a, q)
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+        e = _merge184(a, sha)
+        q.deploy("WEB", sha, "FAILED")
+        _round155(a)
+        _round155(a)
+        assert "deploy" in _find_obligation(a, e)
+        assert len([x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "falhou"]) == 1, "once only"
+        assert "deploy_check for main exited 1" in _notices184(a)
+    finally:
+        q.close()
+
+
+FAKE_GH184 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+open(os.path.join(d, "gh.log"), "a").write(json.dumps(sys.argv[1:]) + "\\n")
+arq = os.path.join(d, "gh.json")
+dados = json.load(open(arq)) if os.path.exists(arq) else {}
+if sys.argv[2] == "create":
+    url = "https://github.com/acme/app/pull/%d" % (300 + len(dados))
+    dados[url] = {"state": "OPEN", "mergedAt": None, "baseRefName": sys.argv[sys.argv.index("--base") + 1], "title": sys.argv[sys.argv.index("--title") + 1],
+                  "body": open(sys.argv[sys.argv.index("--body-file") + 1]).read(), "headRefName": sys.argv[sys.argv.index("--head") + 1]}
+    json.dump(dados, open(arq, "w")); print(url)
+elif sys.argv[2] == "view" and sys.argv[3] in dados:
+    print(json.dumps(dados[sys.argv[3]]))
+else:
+    sys.exit(1)
+"""
+DEV184, STG184 = "https://github.com/acme/app/pull/1216", "https://github.com/acme/app/pull/1217"
+CORPO184 = "## Summary\nx\n\n## Evidence\ny\n\n## Merge Danger\nz\n"
+
+
+def _production184(conflict=None, flow="promocao", states=("mergeado", "mergeado")):
+    """What orq sees with the feature entered in development and staging: the project repository with the branch worktree, fake gh and git, the PRs in prs.json."""
+    tmp = tempfile.mkdtemp()
+    repo = _repo_with_branch(tmp)
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat/algo", os.path.join(tmp, "wt")], check=True)
+    a = Env(run="run_a", **({"FAKE_CONFLITO": conflict} if conflict else {}))
+    with open(os.path.join(tmp, "git184"), "w") as f:
+        f.write(FAKE_GIT143)
+    with open(os.path.join(tmp, "gh184"), "w") as f:
+        f.write(FAKE_GH184)
+    for item_name, var in (("git184", "ORQ_GIT"), ("gh184", "ORQ_GH")):
+        os.chmod(os.path.join(tmp, item_name), 0o755)
+        a.env[var] = os.path.join(tmp, item_name)
+    os.makedirs(os.path.join(a.home, "projects"))
+    with open(os.path.join(a.home, "projects", "neo.json"), "w") as f:
+        json.dump({"repo": f"path:{repo}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": flow}, f)
+    a.set("gh.json", {url: {"state": "MERGED", "mergedAt": "2026-10-02T10:00:00Z", "baseRefName": base, "title": "feat: add algo", "body": CORPO184, "headRefName": "feat/algo"}
+                      for url, base in ((DEV184, "development"), (STG184, "staging"))})
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_feat1", "dispatch": "ctx_term_w", "nome": "algo"}) + "\n")
+    item_list = [{"task": "task_feat1", "url": u, "numero": int(u.rsplit("/", 1)[1]), "base": b, "estado": s, "head": "feat/algo", "ligado_em": "2026-10-02T09:00:00Z", "avisado": True}
+             for u, b, s in ((DEV184, "development", states[0]), (STG184, "staging", states[1]))]
+    json.dump({"itens": item_list}, open(os.path.join(a.home, "prs.json"), "w"))
+    a.repo = repo
+    return a
+
+
+def _lap184(a):
+    r = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {HERE!r}); import orqlib as o; print(chr(10).join(o.pr_production_open()))"],
+                       capture_output=True, text=True, env=a.env, cwd=a.repo, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _created184(a):
+    return [c for c in _log143(a, "gh.log") if c[:2] == ["pr", "create"]]
+
+
+def test_ticket184_development_and_staging_merged_open_the_main_pr_with_inherited_title_and_body():
+    a = _production184()
+    assert "main PR opened by itself" in _lap184(a)
+    (c,) = _created184(a)
+    assert c[c.index("--base") + 1] == "main" and c[c.index("--head") + 1] == "feat/algo" and c[c.index("--title") + 1] == "feat: add algo", c
+    body = json.load(open(os.path.join(a.fake, "gh.json")))["https://github.com/acme/app/pull/302"]["body"]
+    assert body.startswith("development and staging already entered (#1216, #1217)\n\n## Summary\nx"), body
+    assert "## Merge Danger\nz" in body, "the rest of the development body comes whole"
+    items = orqlib.to_pt(json.load(open(os.path.join(a.home, "prs.json"))))["itens"]
+    assert ("task_feat1", "main", "aberto") in [(i["task"], i["base"], i["estado"]) for i in items], "the main PR stays linked to the task"
+    (ev,) = [e for e in a.events() if e["tipo"] == "pr" and e["op"] == "production_opened"]
+    assert ev["task"] == "task_feat1" and ev["url"].endswith("/302") and ev["inherited_from"] == DEV184, ev
+    assert _lap184(a) == "" and len(_created184(a)) == 1, "the second lap does not open another"
+
+
+def test_ticket184_main_pr_only_opens_with_every_environment_entered_and_nothing_open():
+    for states in (("mergeado", "aberto"), ("mergeado", "fechado"), ("aberto", "mergeado")):
+        a = _production184(states=states)
+        assert _lap184(a) == "" and not _created184(a), states
+    a = _production184(flow="direto")
+    assert _lap184(a) == "" and not _created184(a), "a direct flow has nothing to promote"
+    a = _production184()
+    prs = orqlib.to_pt(json.load(open(os.path.join(a.home, "prs.json"))))
+    prs["itens"].append({"task": "task_feat1", "url": "https://github.com/acme/app/pull/1230", "numero": 1230, "base": "main", "estado": "fechado", "ligado_em": "2026-10-02T09:00:00Z"})
+    json.dump(prs, open(os.path.join(a.home, "prs.json"), "w"))
+    assert _lap184(a) == "" and not _created184(a), "a main PR closed without merge is a human call: it does not reopen"
+
+
+def test_ticket184_conflict_with_main_does_not_open_warns_the_coordinator_and_does_not_retry():
+    a = _production184(conflict="origin/main")
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    panel_line = _lap184(a)
+    assert "main PR not opened" in panel_line and "conflict with main" in panel_line, panel_line
+    git = _log143(a, "git.log")
+    assert not [c for c in git if c[0] == "push"] and not _created184(a), "nothing goes up with a conflict"
+    (ev,) = [e for e in a.events() if e["tipo"] == "pr" and e["op"] == "production_failed"]
+    assert "conflict with main" in ev["motivo"] and "src/a.js" in ev["motivo"], ev
+    assert "did not open the main PR of task_feat1: conflict with main" in _notices184(a)
+    assert _lap184(a) == "" and len([c for c in _log143(a, "git.log") if c[0] == "merge-tree"]) == 1, "warned once, does not repeat"
+
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
