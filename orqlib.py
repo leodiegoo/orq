@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 import backlog
 import cmdnorm
+import fail_safe
 
 
 def ThreadPoolExecutor(n):  # late import: concurrent.futures costs ~11 ms and only the panel and the ingest use it (ticket 49)
@@ -67,7 +68,9 @@ def _configured_backlog():
 BACKLOG = _configured_backlog()  # tasks-axi's backlog.md (ticket 101): with it the pending items live there and pendencias.json becomes just the mirror the panel reads
 BACKLOG_TICKETS = os.environ["ORQ_BACKLOG_TICKETS"] if "ORQ_BACKLOG_TICKETS" in os.environ else (os.path.exists(os.path.join(HOME, "backlog.tickets")) or None)  # tickets live in the backlog (M5); the file is the machine's switch, like backlog.path, and an empty variable turns it off
 EFFECTS = ("tarefa", "steer", "pend", "decisao", "conversa", "descartado", "mate")
-HOOK_TIMEOUT = 3
+HOOK_TIMEOUT = int(os.environ.get("ORQ_HOOK_TIMEOUT") or 3)  # seconds of alarm per hook; the tests shorten it
+WARN_KINDS = ("session", "prompt", "stop")  # the coordinator hooks whose failure warns the user (ticket 228); the per-tool ones fail in silence, as the log
+MSG_NO_CONTEXT = "[orq] orq context did not load: run `orq status`"
 PENDING_TYPES = ("acao", "decisao", "avisar")
 PENDING_AGE_DAYS = 14  # a pending item untouched for more than 14 days leaves the view and goes to "Depois" (Later)
 ID_HEADER = 12  # the AskUserQuestion header accepts up to 12 characters
@@ -205,13 +208,14 @@ CODEX_HOOKS = os.environ.get("ORQ_CODEX_HOOKS") or os.path.join(os.path.dirname(
 CLAUDE_SETTINGS = os.environ.get("ORQ_CLAUDE_SETTINGS") or os.path.expanduser("~/.claude/settings.json")
 HOOKS_FILES = {"claude": CLAUDE_SETTINGS, "codex": CODEX_HOOKS}  # where each harness reads the hooks; each one's example sits next to orq.py
 HOOKS_EXAMPLE = {"claude": "settings.hooks.example.json", "codex": "codex.hooks.example.json"}
+ORQ_LINK = os.environ.get("ORQ_LINK") or os.path.expanduser("~/.local/bin/orq")  # what the manager loop calls (`orq`): a wrapper that pins the interpreter
 HOOK_ORQ = re.compile(r"orq\.py hook \w+|precompact\.py(?: retomar)?")  # the call of an orq hook, without the path or the harness argument
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)  # the path of each file that Codex's apply_patch touches
 
 
 # ---------- puras ----------
 
-ORQ_NOTICES = ("orq: PR ", "orq: E2E queue", "orq: plan usage", "orq: worker ", "orq: coordinator stopped ", "orq ▸ request ", "orq ▸ mate ",
+ORQ_NOTICES = ("orq hooks broken ", "orq: PR ", "orq: E2E queue", "orq: plan usage", "orq: worker ", "orq: coordinator stopped ", "orq ▸ request ", "orq ▸ mate ",
               "orq: Fila do E2E", "orq: uso do plano", "orq: coordenador parado ", "orq ▸ pedido ")  # what the panel types into the coordinator (notify_coordinator)
 
 
@@ -3367,6 +3371,19 @@ def notify_e2e_queue(f=None):
     return [f"E2E queue stuck ({f['ticket']}): notice typed in the coordinator"]
 
 
+def hooks_broken_round():
+    """The manager round's line when a hook is failing (the marker fail_safe.py leaves), and a notice typed in the coordinator once per marker: its own hooks are the ones that went quiet.
+    The line goes away when the hook that failed imports or runs again."""
+    line = fail_safe.broken_line()
+    if not line:
+        return []
+    g, marker = _manager_cfg(), fail_safe.read_marker()
+    if g and g.get("coordenador") and marker.get("told") != marker.get("first") and notify_coordinator(g["coordenador"], line) in ("enviado", "adiado"):
+        fail_safe.write_marker({**fail_safe.read_marker(), "told": marker.get("first")})
+        return [line, "broken hooks: notice typed in the coordinator"]
+    return [line]
+
+
 def _clean_post_merge(i, branch):
     """PR merged into the final base: fires that branch's limpar-mergeados.py in the background, with the delay of the "merged" hook (GitHub takes a few
     seconds to mark the PR). The repository comes from the task's dispatch project, otherwise from cwd. Without the branch there is nothing to clean. A failure to
@@ -4709,7 +4726,13 @@ def coordinator(ev):
         log(f"preâmbulo de despacho numa sessão que já coordena ({sid[:8]}): segue como coordenador")
     if _roles().get(sid) == "worker":
         return None
-    run = orca("run-current")["run"]
+    try:
+        run = orca("run-current")["run"]
+    except Exception as e:  # noqa: BLE001 - Orca slow or down (12 failures and 3 timeouts in 3 days): the session that already coordinated keeps its Run, as the guard does
+        log(f"hook {HOOK_STATE.get('kind')}: {type(e).__name__}: {e} (run-current)")
+        hook_failed(e)
+        remembered = _dict(_cursor_ro().get("runs")).get(sid)
+        return {"id": remembered} if remembered else None
     if run is None:
         return None
     remember_run(sid, run["id"], ev.get("cwd"), ev.get("_harness_orq") or "claude")
@@ -5393,10 +5416,35 @@ def guard_worker():
 
 
 HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_place, "externas": hook_external, "prligar": hook_pr_link}
+HOOK_STATE = {}  # the hook running in this process: kind, failed (it raised or lost Orca), notice (the systemMessage to print), printed
+
+
+def hook_failed(exc):
+    """A coordinator hook (session, prompt, stop) failed or lost Orca: marks it, leaves the marker and keeps the warning to print with the hook's answer. The other kinds only log."""
+    if HOOK_STATE.get("kind") not in WARN_KINDS:
+        return
+    HOOK_STATE["failed"] = True
+    if not HOOK_STATE.get("notice"):
+        HOOK_STATE["notice"] = fail_safe.warn(f"run:{HOOK_STATE['kind']}", exc)
+
+
+def emit_hook(out=None):
+    """Prints the hook's answer once, with the failure warning (systemMessage) and, in SessionStart, the short note that the context did not load."""
+    out = dict(out or {})
+    if HOOK_STATE.get("failed") and HOOK_STATE["kind"] == "session" and "hookSpecificOutput" not in out:
+        out["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": MSG_NO_CONTEXT}
+    if HOOK_STATE.get("notice"):
+        out["systemMessage"] = "\n".join(filter(None, [HOOK_STATE["notice"], out.get("systemMessage")]))  # the hook's own systemMessage (the stop's block notice) stays
+    if out:
+        print(json.dumps(out, ensure_ascii=False))
+        HOOK_STATE["printed"] = True
 
 
 def run_hook(kind, harness="claude"):
-    """Coordinator only (Run linked and terminal that is not a worker's). Fail-open: any exception becomes exit 0 and a line in the log."""
+    """Coordinator only (Run linked and terminal that is not a worker's). Fail-open: any exception becomes exit 0, a line in the log and, in session, prompt and stop, a warning to the user."""
+    HOOK_STATE.clear()
+    HOOK_STATE["kind"] = kind
+
     def overflow(*_):
         raise TimeoutError(f"hook {kind} passou de {HOOK_TIMEOUT}s")
     try:
@@ -5446,13 +5494,17 @@ def run_hook(kind, harness="claude"):
                 if last_item and kind == "prompt" and origin_name(ev.get("prompt")) == "usuario":
                     print(json.dumps(lost_binding(ev, last_item), ensure_ascii=False))
                 return 0
-        out = HOOKS[kind](ev, run)
-        if out:
-            print(json.dumps(out, ensure_ascii=False))
+        emit_hook(HOOKS[kind](ev, run))
     except Exception as e:
+        signal.alarm(0)  # the warning (macOS notification) may take a second: the alarm has already done its job
         log(f"hook {kind}: {type(e).__name__}: {e}")
+        hook_failed(e)
     finally:
         signal.alarm(0)
+        if HOOK_STATE.get("failed") and not HOOK_STATE.get("printed"):
+            emit_hook()  # the hook died or lost Orca before answering: the warning still reaches the user
+        elif kind in WARN_KINDS and not HOOK_STATE.get("failed"):
+            fail_safe.recovered(f"run:{kind}")  # it ran clean: a marker left by this hook goes away
     return 0
 
 
@@ -7174,6 +7226,23 @@ def doctor_old_text(r, release_=False):
     return "\n".join(ls) or "no old dispatch left unreleased"
 
 
+def doctor_hooks(pin=False):
+    """`orq doctor hooks`: per harness hooks file that exists, the problems with the interpreter of orq's hooks; with `pin`, writes the absolute Python first. Exit 1 while there is a problem."""
+    broken = 0
+    for agent in HOOKS_FILES:
+        if not _hook_commands(HOOKS_FILES[agent]):
+            continue
+        if pin:
+            python, changed = pin_hooks_python(agent)
+            print(f"{agent}: " + (f"{changed} hook command(s) now run {python}" if python else "no Python 3.12+ found") + ("; Codex asks to trust them again in /hooks" if changed and agent == "codex" else ""))
+        problems = hooks_python_problems(agent)
+        broken += len(problems)
+        print("\n".join(f"{agent}: {x}" for x in problems) or f"{agent}: hooks ok")
+    if pin:
+        print("orq link: " + ("wrapper written" if pin_orq_link() else "unchanged"))
+    return 1 if broken else 0
+
+
 def doctor_backlog():
     """`orq doctor backlog` (M6): crosses the tickets of the backlogs (the process's, the machine's and the groups') with Orca's tasks and states the fix for each difference, writing nothing.
 
@@ -8422,19 +8491,25 @@ def _check_start(dispatch, terminal, title, out):
     return _wait_prompt(dispatch, terminal, title)
 
 
+def _command_key(command):
+    """The command without the interpreter of an orq hook: `python3 x/orq.py hook stop` and `/opt/homebrew/bin/python3 x/orq.py hook stop` are the same hook (ticket 247)."""
+    first = hook_interpreter(command)
+    return command[len(first):].lstrip() if first else command
+
+
 def merge_codex_hooks(current, example):
     """Appends to the end of each `current` event the `example` groups whose command is not there yet. Never reorders or removes: Codex's trust
     is positional (`hooks.json:<event>:<group>:<hook>`) and inserting in the middle makes the following groups untrusted. Returns (new hooks, [(event, group)] appended)."""
     new, add = json.loads(json.dumps(current)), []
-    already = {h.get("command") for group_map in _dict(new.get("hooks")).values() for g in group_map for h in g.get("hooks", [])}
+    already = {_command_key(h.get("command")) for group_map in _dict(new.get("hooks")).values() for g in group_map for h in g.get("hooks", [])}
     for ev, groups in _dict(example.get("hooks")).items():
         for g in groups:
-            if all(h.get("command") in already for h in g.get("hooks", [])):
+            if all(_command_key(h.get("command")) in already for h in g.get("hooks", [])):
                 continue
             listing = new.setdefault("hooks", {}).setdefault(ev, [])
             listing.append(g)
             add.append((ev, len(listing) - 1))
-            already |= {h.get("command") for h in g.get("hooks", [])}
+            already |= {_command_key(h.get("command")) for h in g.get("hooks", [])}
     return new, add
 
 
@@ -8444,7 +8519,14 @@ def install_codex_hooks(example):
         current = json.load(open(CODEX_HOOKS, encoding="utf-8"))
     except FileNotFoundError:
         current = {}
-    new, add = merge_codex_hooks(current, json.load(open(example, encoding="utf-8")))
+    example_hooks = json.load(open(example, encoding="utf-8"))
+    if python := resolve_python():  # what is appended runs the 3.12+ interpreter, not whatever `python3` the PATH has
+        for group_map in _dict(example_hooks.get("hooks")).values():
+            for g in group_map:
+                for h in g.get("hooks", []):
+                    if first := hook_interpreter(h.get("command")):
+                        h["command"] = python + h["command"][len(first):]
+    new, add = merge_codex_hooks(current, example_hooks)
     if add:
         tmp = f"{CODEX_HOOKS}.{os.getpid()}.tmp"
         os.makedirs(os.path.dirname(CODEX_HOOKS) or ".", exist_ok=True)
@@ -9234,7 +9316,7 @@ def handoff_lines(events, turns, now_at=None):
 
 def status_text():
     """What `orq status` prints: the state, the open handoffs, the PRs, the worktrees, the E2E queue and the machine."""
-    return "\n".join([state(include_old=True), *handoff_lines(read_events(), _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line()])])
+    return "\n".join([*filter(None, [fail_safe.broken_line()]), state(include_old=True), *handoff_lines(read_events(), _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line()])])
 
 
 # ---------- orq iniciar: the coordinator that is already open, in any harness ----------
@@ -9266,6 +9348,110 @@ def missing_hooks(agent):
     return [f"{ev}: {call}" for ev, call in sorted(example - _orq_hooks(HOOKS_FILES[agent]))]
 
 
+def _python_ok(exe):
+    """Is `exe` a Python at least fail_safe.MIN_PYTHON?"""
+    try:
+        return subprocess.run([exe, "-c", "import sys; sys.exit(sys.version_info < %r)" % (fail_safe.MIN_PYTHON,)], capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def resolve_python():
+    """Absolute path of a Python 3.12+ (ticket 247): ORQ_PYTHON, then the PATH's `python3` (a name that survives Homebrew upgrades), the versioned ones, mise, uv and this process's own. None if none qualifies."""
+    candidates = [os.environ.get("ORQ_PYTHON"), *(shutil.which(n) for n in ("python3", "python3.14", "python3.13", "python3.12")),
+                  *sorted(glob.glob(os.path.expanduser("~/.local/share/mise/installs/python/*/bin/python3")), reverse=True)]
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        candidates.append(subprocess.run(["uv", "python", "find", ">=%d.%d" % fail_safe.MIN_PYTHON], capture_output=True, text=True, timeout=5).stdout.strip())
+    candidates.append(sys.executable)
+    return next((c for c in candidates if c and os.path.isabs(c) and _python_ok(c)), None)
+
+
+def hook_interpreter(command):
+    """The interpreter (first word) of an orq hook command, or None when the command is not an orq hook or has none."""
+    first = (command or "").split(None, 1)[0] if HOOK_ORQ.search(command or "") else ""
+    return first if first and not first.endswith(".py") else None
+
+
+def _hook_commands(file_name):
+    """[(event, call, command)] of orq's hooks in a settings.json or hooks.json; empty if it does not exist or cannot be read."""
+    try:
+        event_list = _dict(json.load(open(file_name, encoding="utf-8")).get("hooks"))
+    except (OSError, ValueError):
+        return []
+    return [(ev, m.group(0), c) for ev, group_map in event_list.items() for g in group_map for h in _dict(g).get("hooks", [])
+            if (c := _dict(h).get("command") or "") and (m := HOOK_ORQ.search(c))]
+
+
+def hooks_python_problems(agent):
+    """What keeps the harness's hooks from running orq (tickets 228 and 247), one line each: the interpreter of an orq hook command that cannot import orqlib
+    (too old, missing), and the `python3` written loose, which depends on the PATH of whoever fires the hook."""
+    by_python = {}
+    for ev, call, command in _hook_commands(HOOKS_FILES[agent]):
+        by_python.setdefault(hook_interpreter(command) or "python3", []).append(f"{ev}: {call}")
+    problems = []
+    for python, hooks in sorted(by_python.items()):
+        exe = os.path.expanduser(python) if "/" in python else shutil.which(python)
+        listing = ", ".join(hooks[:2]) + (f" +{len(hooks) - 2}" if len(hooks) > 2 else "")
+        if not exe:
+            problems.append(f"{listing}: `{python}` not found")
+            continue
+        code = f"import sys; print(sys.version.split()[0]); sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r}); import orqlib"
+        try:
+            p = subprocess.run([exe, "-c", code], capture_output=True, text=True, timeout=15)
+            version, error = (p.stdout.split() or ["?"])[0], (p.stderr.strip().splitlines() or [""])[-1] if p.returncode else ""
+        except (OSError, subprocess.SubprocessError) as e:
+            version, error = "?", f"{type(e).__name__}: {e}"
+        if error:
+            problems.append(f"{listing}: `{python}` (Python {version}) cannot import orqlib: {error}")
+        elif "/" not in python:
+            problems.append(f"{listing}: `{python}` is loose (this shell's PATH finds Python {version}, the harness may not): `orq doctor hooks --pin`")
+    return problems
+
+
+def pin_hooks_python(agent, python=None):
+    """Writes the absolute interpreter into the orq hook commands of the harness's hooks file (text edit: the rest of the file keeps its formatting). Returns (python, changed commands);
+    (None, 0) when there is no Python 3.12+ to write. Codex trusts a hook by what it says, so the pinned ones need `/hooks` again (codex_hooks_notice)."""
+    python = python or resolve_python()
+    file_name = HOOKS_FILES[agent]
+    if not python or not os.path.exists(file_name):
+        return python, 0
+    changed = 0
+
+    def pin(m):
+        nonlocal changed
+        first = hook_interpreter(m.group(2))
+        if first is None or first == python:
+            return m.group(0)
+        changed += 1
+        return m.group(1) + python + m.group(2)[len(first):] + m.group(3)
+
+    text = open(file_name, encoding="utf-8").read()
+    new = re.sub(r'("command"\s*:\s*")([^"]*)(")', pin, text)
+    if changed:
+        json.loads(new)  # never leave a hooks file that does not parse
+        tmp = f"{file_name}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new)
+        os.replace(tmp, file_name)
+    return python, changed
+
+
+def pin_orq_link(python=None):
+    """The `orq` the manager loop calls becomes a two-line wrapper that runs orq.py with the resolved interpreter (a symlink would take whatever `python3` the PATH has). True if it wrote."""
+    python = python or resolve_python()
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py")
+    wrapper = f"#!/bin/sh\nexec {shlex.quote(python or '')} {shlex.quote(script)} \"$@\"\n"
+    if not python or (os.path.isfile(ORQ_LINK) and not os.path.islink(ORQ_LINK) and open(ORQ_LINK, encoding="utf-8").read() == wrapper):
+        return False
+    os.makedirs(os.path.dirname(ORQ_LINK), exist_ok=True)
+    tmp = f"{ORQ_LINK}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(wrapper)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, ORQ_LINK)
+    return True
+
+
 def start(agent=None, run=None, objective=None, take_over=False):
     """Links the coordinator that is already open (never opens another): checks the harness hooks, links the Run (`run`, otherwise a new one with `objective`, otherwise the
     one the coordinator already commands), starts or reuses the agent manager and returns the text with the state. A missing hook refuses before touching Orca;
@@ -9279,6 +9465,9 @@ def start(agent=None, run=None, objective=None, take_over=False):
     if still_missing := missing_hooks(agent):
         acting_as = "orq hooks-codex" if agent == "codex" else f"merge {HOOKS_EXAMPLE[agent]} into {CLAUDE_SETTINGS}"
         raise ValueError(f"orq hooks missing in {HOOKS_FILES[agent]}: {'; '.join(still_missing)}. Install with: {acting_as}")
+    found = hooks_python_problems(agent)
+    python, pinned = pin_hooks_python(agent)
+    pinned_link = pin_orq_link(python)
     g, live = _manager_cfg(), _alive_terminals()
     dead = lambda h: live is not None and h not in live  # noqa: E731 - without a reliable list nothing proves it died
     if g and g.get("coordenador") != mine and not take_over and not dead(g["coordenador"]):
@@ -9293,7 +9482,9 @@ def start(agent=None, run=None, objective=None, take_over=False):
     new = not g or dead(g["gerente"])
     terminal = _new_terminal("agent manager", f"sh {shlex.quote(_path('painel-agent-manager.sh'))}") if new else g["gerente"]
     manager_bind(terminal, [current], take_over=take_over)
-    return "\n".join([f"harness: {agent}", "hooks: ok", *filter(None, [codex_hooks_notice() if agent == "codex" else ""]),
+    problems = hooks_python_problems(agent) if python else [f"no Python {fail_safe.MIN_PYTHON[0]}.{fail_safe.MIN_PYTHON[1]}+ found (Homebrew, mise, uv, python3.12): install one or set ORQ_PYTHON"]
+    pin_notice = [f"hooks: Python pinned to {python} in {pinned} hook command(s)" + (" and in the `orq` link" if pinned_link else "")] if pinned or pinned_link else []
+    return "\n".join([f"harness: {agent}", *(f"hooks: found: {x}" for x in found), *pin_notice, *([f"hooks: BROKEN {x}" for x in problems] or ["hooks: ok"]), *filter(None, [codex_hooks_notice() if agent == "codex" else ""]),
                       f"Run: {current}", f"manager: {terminal} ({'new' if new else 'already existed'})", status_text()])
 
 
@@ -10896,6 +11087,10 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
+        line_list += hooks_broken_round()
+    except Exception as e:  # noqa: BLE001 - the warning about hooks doesn't take down the panel; the next loop tries
+        log(f"hooks quebrados: {type(e).__name__}: {e}")
+    try:
         line_list += mate_lap()
     except Exception as e:  # noqa: BLE001 - the mates channel doesn't take down the panel; the next loop tries
         log(f"mates: {type(e).__name__}: {e}")
@@ -11845,6 +12040,8 @@ def parser():
     _arg(da, "horas", type=float, default=24, help="minimum age of the dispatch (default 24)")
     da.add_argument("--ticket", action="append", default=[], help="only this ticket (repeatable)")
     da.add_argument("--json", action="store_true")
+    dh = dc.add_parser("hooks", help="checks the interpreter of each orq hook (it must import orqlib: Python 3.12+); --pin writes the absolute path into the hook commands and the `orq` link")
+    dh.add_argument("--pin", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
     dbk.add_argument("--json", action="store_true")
     te = tk.add_parser("edit", aliases=["editar"], help="changes the model, effort, dispatch or wait of a ticket (an empty value removes the field)")
@@ -12205,6 +12402,8 @@ def main(argv=None):
             r = doctor_backlog()
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_backlog_text(r))
             return 1 if r["problemas"] else 0
+        elif a.cmd == "doctor" and a.op == "hooks":
+            return doctor_hooks(a.pin)
         elif a.cmd == "doctor" and a.op == "old":
             r = doctor_old(a.release, a.max_age_hours, a.ticket)
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_old_text(r, a.release))

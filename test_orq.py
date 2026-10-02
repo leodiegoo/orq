@@ -23,6 +23,9 @@ if "ORQ_BACKLOG" not in os.environ:
     orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
 if "ORQ_BACKLOG_TICKETS" not in os.environ:
     orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
+os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
+os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
+os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
 os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
@@ -574,10 +577,10 @@ def test_lost_binding_notifies_instead_of_staying_silent():
 def test_exception_becomes_exit_0_and_log():
     a = Env()
     r = a.orq("hook", "prompt", stdin="isto não é json")
-    assert (r.returncode, r.stdout) == (0, "") and "hook prompt" in a.log()
+    assert r.returncode == 0 and "hooks broken" in json.loads(r.stdout)["systemMessage"] and "hook prompt" in a.log()  # the first failure warns the user (ticket 228)
     a = Env(FAKE_CRASH="1")
     r = a.prompt("oi")
-    assert (r.returncode, r.stdout) == (0, "") and "hook prompt" in a.log()
+    assert r.returncode == 0 and "hooks broken" in json.loads(r.stdout)["systemMessage"] and "hook prompt" in a.log()
     r = a.orq("hook", "stop", stdin="{}")
     assert r.returncode == 0 and a.log().count("hook") == 2
     assert a.events() == []
@@ -587,7 +590,7 @@ def test_slow_orca_fails_open_on_the_call_timeout():
     a = Env(FAKE_SLEEP="6", ORQ_ORCA_TIMEOUT="2.5")
     t = time.time()
     r = a.prompt("oi")
-    assert r.returncode == 0 and r.stdout == "" and time.time() - t < 4.5
+    assert r.returncode == 0 and "hooks broken (TimeoutExpired" in json.loads(r.stdout)["systemMessage"] and time.time() - t < 4.5
     assert "hook prompt: TimeoutExpired" in a.log()  # the 3 s alarm has the finding 8 tests
 
 
@@ -1756,7 +1759,7 @@ def test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm():
     finally:
         p.stdin.close()
     dt = time.time() - t
-    assert 2.7 < dt < 3.6 and p.stdout.read() == "", dt
+    assert 2.7 < dt < 3.6 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
     assert "TimeoutError: hook stop passou de 3s" in a.log()
 
 
@@ -1768,7 +1771,7 @@ def test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm():
         t = time.time()
         r = a.prompt("oi")
         dt = time.time() - t
-    assert (r.returncode, r.stdout) == (0, "") and 2.7 < dt < 3.6, (dt, r)
+    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 3.6, (dt, r)
     assert "TimeoutError: hook prompt passou de 3s" in a.log()
     assert a.events() == []
 
@@ -4245,10 +4248,10 @@ def test_hook_session_only_in_the_coordinator_worker_stays_mute():
 def test_hook_session_e_fail_open():
     a = Env(run="run_a")
     r = a.orq("hook", "session", stdin="isto não é json")
-    assert (r.returncode, r.stdout) == (0, "") and "hook session" in a.log()
+    assert r.returncode == 0 and "orq status" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] and "hook session" in a.log()
     b = Env(run="run_a")
     r = _session(b, FAKE_CRASH="1")  # o Orca responde lixo
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert r.returncode == 0 and "hooks broken" in json.loads(r.stdout)["systemMessage"], r
     c = Env(run="run_a")
     os.makedirs(c.env["ORQ_ISSUES"])
     open(os.path.join(c.env["ORQ_ISSUES"], "01-quebrado.md"), "wb").write(b"\xff\xfe nao e utf-8 \x00")
@@ -9390,7 +9393,7 @@ def test_ticket73_hook_with_unknown_harness_exits_0_and_codex_example_installs_e
     cfg = json.load(open(os.path.join(HERE, "codex.hooks.example.json")))["hooks"]
     cmds = {h["command"] for g in cfg.values() for x in g for h in x["hooks"]}
     for k in ("prompt", "stop", "session", "place", "external", "prlink"):
-        assert f"python3 ~/.claude/orq/orq.py hook {k} codex" in cmds, k
+        assert f"/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook {k} codex" in cmds, k  # the example shows the interpreter path (ticket 228)
     assert "apply_patch" in next(x["matcher"] for x in cfg["PreToolUse"] if "hook place" in json.dumps(x))
     assert not [c for c in cmds if "hook guard" in c or "hook ask" in c], "o Codex não tem AskUserQuestion"
 
@@ -10759,10 +10762,13 @@ def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_
         shutil.copy(os.path.join(HERE, f), t)
     open(os.path.join(t, "orqlib.py"), "w").write("<<<<<<< HEAD\nx = 1\n=======\nx = 2\n>>>>>>> outro\n")
     log = os.path.join(t, "orq.log")
-    env = {**os.environ, "ORQ_LOG": log, "ORCA_TERMINAL_HANDLE": "term_x"}
+    env = {**os.environ, "ORQ_LOG": log, "ORCA_TERMINAL_HANDLE": "term_x", "ORQ_HOME": os.path.join(t, "home")}
+    outs = []
     for cmd in (["orq.py", "hook", "session"], ["orq.py", "hook", "prligar"], ["precompact.py"], ["precompact.py", "retomar"]):
         r = subprocess.run([sys.executable, os.path.join(t, cmd[0]), *cmd[1:]], input="{}", env=env, capture_output=True, text=True)
-        assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), (cmd, r.returncode, r.stdout, r.stderr)
+        assert (r.returncode, r.stderr) == (0, ""), (cmd, r.returncode, r.stdout, r.stderr)
+        outs.append(r.stdout)
+    assert [bool(x) for x in outs] == [True, False, False, False], "only the first failure warns (ticket 228); the rest stay silent for 10 min"
     assert open(log).read().count("import failed") == 4, open(log).read()
     # the cleanup hook imports the orq of the installation (HOME/.claude/orq)
     home_dir = os.path.join(t, "casa")
@@ -17018,6 +17024,179 @@ def test_ticket182_read_failure_keeps_the_command_hint():
     a.inbox(("question", {"taskId": "task_1"}))
     ctx = _ctx182(a.prompt(NOTICE_A))
     assert "orq inbox run_a --ack" in ctx, ctx
+
+
+# ---------- ticket 228: a hook that fails or does not import warns the user and the coordinator, and the hooks' Python is checked ----------
+
+def _broken_install228(source='x = f"{"a"}" +\n'):
+    """Temporary install with an orqlib that does not compile; returns (folder, env with ORQ_HOME/ORQ_LOG inside it, the notifier's record file)."""
+    t = tempfile.mkdtemp()
+    for f in ("orq.py", "precompact.py", "fail_safe.py"):
+        shutil.copy(os.path.join(HERE, f), t)
+    open(os.path.join(t, "orqlib.py"), "w").write(source)
+    record = os.path.join(t, "notified.log")
+    notifier = os.path.join(t, "osascript-fake")
+    open(notifier, "w").write(f'#!/bin/sh\nfor a; do last="$a"; done\necho "$last" >> {record}\n')
+    os.chmod(notifier, 0o755)
+    env = {**os.environ, "ORQ_HOME": os.path.join(t, "home"), "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_OSASCRIPT": notifier, "ORQ_ALARME": "",
+           "ORCA_TERMINAL_HANDLE": "term_x", "ORQ_AGORA": "2026-10-02T10:00:00Z"}
+    return t, env, record
+
+
+def test_ticket228_it_should_warn_on_a_hook_that_does_not_import_at_most_once_every_10_minutes_and_count_the_failures():
+    t, env, record = _broken_install228()
+    hook = lambda **e: subprocess.run([sys.executable, os.path.join(t, "orq.py"), "hook", "stop"], input="{}", env={**env, **e}, capture_output=True, text=True)  # noqa: E731
+    r = hook()
+    assert (r.returncode, r.stderr) == (0, ""), r
+    msg = json.loads(r.stdout)["systemMessage"]
+    assert "hooks broken" in msg and "SyntaxError" in msg and "orqlib.py" in msg and "1 failure since" in msg and "orq.log" in msg, msg
+    assert len(open(record).read().splitlines()) == 1 and "SyntaxError" in open(record).read(), "the macOS notification went out with the same text"
+    r = hook(ORQ_AGORA="2026-10-02T10:05:00Z")
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), "five minutes later: nothing on stdout"
+    assert len(open(record).read().splitlines()) == 1
+    r = hook(ORQ_AGORA="2026-10-02T10:10:01Z")
+    assert "3 failures since" in json.loads(r.stdout)["systemMessage"], r.stdout
+    assert len(open(record).read().splitlines()) == 2
+    marker = json.load(open(os.path.join(env["ORQ_HOME"], "hook-failed.json")))
+    assert marker["count"] == 3 and marker["executable"] == sys.executable and marker["exception"].startswith("SyntaxError"), marker
+    assert open(env["ORQ_LOG"]).read().count("import failed") == 3
+    r = hook(ORQ_AGORA="2026-10-02T10:30:00Z", ORQ_ALARME="off")
+    assert "4 failures since" in json.loads(r.stdout)["systemMessage"] and len(open(record).read().splitlines()) == 2, "ORQ_ALARME=off keeps the message and drops the notification"
+
+
+def test_ticket228_it_should_stay_silent_as_before_when_the_marker_cannot_be_written():
+    t, env, record = _broken_install228()
+    open(os.path.join(t, "not-a-folder"), "w").write("x")
+    r = subprocess.run([sys.executable, os.path.join(t, "orq.py"), "hook", "stop"], input="{}", env={**env, "ORQ_HOME": os.path.join(t, "not-a-folder", "home")}, capture_output=True, text=True)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), r
+    assert not os.path.exists(record) and "import failed" in open(env["ORQ_LOG"]).read()
+
+
+def test_ticket228_it_should_exit_0_with_the_version_sentence_under_python_3_9_without_importing_orqlib():
+    t, env, record = _broken_install228("raise SystemExit(99)\n")  # imported, it would exit 99
+    orq_py = os.path.join(t, "orq.py")
+    code = f"import sys, runpy; sys.version_info = (3, 9, 6, 'final', 0); sys.argv = [{orq_py!r}, *sys.argv[1:]]; runpy.run_path({orq_py!r}, run_name='__main__')"
+    r = subprocess.run([sys.executable, "-c", code, "hook", "stop"], input="{}", env=env, capture_output=True, text=True)
+    assert (r.returncode, r.stderr) == (0, ""), r
+    assert f"orq needs Python 3.12+; this is 3.9.6 ({sys.executable})" in json.loads(r.stdout)["systemMessage"], r.stdout
+    r = subprocess.run([sys.executable, "-c", code, "status"], env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "orq needs Python 3.12+; this is 3.9.6" in r.stderr and "Traceback" not in r.stderr, "outside a hook the command is loud, without a traceback"
+
+
+def _slow_run_current228(a, kind, minutes, stdin, **env):
+    """The hook with Orca's run-current slower than the limit, `minutes` after the 10:00 clock."""
+    clock = (datetime(2026, 10, 2, 10, 0, tzinfo=timezone.utc) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return a.orq("hook", kind, stdin=json.dumps(stdin), FAKE_SLEEP="3", FAKE_SLEEP_CMD="run-current", ORQ_AGORA=clock, **env)
+
+
+def test_ticket228_it_should_keep_the_remembered_run_when_run_current_times_out_in_prompt_and_stop():
+    a = Env(run="run_a", ORQ_AGORA="2026-10-02T10:00:00Z")
+    assert a.prompt("oi").returncode == 0
+    before = len(a.events())
+    assert before, "the first prompt recorded the entry and remembered the Run"
+    minutes = 0
+    for kind, extra in (("prompt", {"prompt": "de novo"}), ("stop", {})):
+        for slow in ({"ORQ_ORCA_TIMEOUT": "0.3"}, {"ORQ_HOOK_TIMEOUT": "1", "ORQ_ORCA_TIMEOUT": "10"}):  # Orca's own limit, and the 3 s alarm shortened
+            minutes += 11
+            r = _slow_run_current228(a, kind, minutes, {"session_id": "abcdef123456", **extra}, **slow)
+            assert r.returncode == 0 and "hooks broken" in json.loads(r.stdout)["systemMessage"], (kind, slow, r)
+    assert len(a.events()) > before, "the prompt still became an entry: the hook went on with the remembered Run"
+
+
+def test_ticket228_it_should_exit_0_with_the_warning_when_run_current_times_out_and_there_is_no_remembered_run():
+    a = Env(run="run_a", ORQ_AGORA="2026-10-02T10:00:00Z")
+    new = {"session_id": "sessao-nova", "prompt": "oi"}
+    for kind in ("prompt", "stop"):
+        r = _slow_run_current228(a, kind, 0 if kind == "prompt" else 11, new, ORQ_ORCA_TIMEOUT="0.3")
+        assert r.returncode == 0 and "hooks broken" in json.loads(r.stdout)["systemMessage"], (kind, r)
+    assert a.events() == [], "no Run to write the entry into"
+    r = _slow_run_current228(a, "session", 22, {"session_id": "sessao-nova"}, ORQ_ORCA_TIMEOUT="0.3")
+    out = json.loads(r.stdout)
+    assert r.returncode == 0 and "orq status" in out["hookSpecificOutput"]["additionalContext"] and out["hookSpecificOutput"]["hookEventName"] == "SessionStart", r
+    r = _slow_run_current228(a, "session", 23, {"session_id": "sessao-nova"}, ORQ_ORCA_TIMEOUT="0.3")  # inside the 10 min: no systemMessage, but the context note is not rate limited
+    assert "systemMessage" not in json.loads(r.stdout) and "orq status" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
+
+
+def test_ticket228_it_should_clear_the_marker_when_the_failed_hook_runs_again_and_show_the_line_in_status_and_in_the_manager_round():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    marker = os.path.join(a.home, "hook-failed.json")
+    json.dump({"kind": "import", "count": 7, "first": "2026-10-02T09:12:00Z", "last": "2026-10-02T09:40:00Z", "exception": "SyntaxError: f-string: unmatched '('", "where": "orqlib.py:4420",
+               "executable": sys.executable, "python": "3.9.6"}, open(marker, "w"))
+    line = "orq hooks broken since " + datetime(2026, 10, 2, 9, 12, tzinfo=timezone.utc).astimezone().strftime("%H:%M") + " (Python 3.9.6): SyntaxError: f-string: unmatched '('"
+    status = a.orq("status")
+    assert status.stdout.splitlines()[0] == line, status.stdout
+    absorb = a.orq("gerente", "absorver")
+    assert line in absorb.stdout, absorb.stdout
+    (env,) = _log(a, "send.log")
+    assert env[env.index("--terminal") + 1] == "term_coord" and line in env[env.index("--text") + 1], "the coordinator is told once"
+    a.orq("gerente", "absorver")
+    assert len(_log(a, "send.log")) == 1, "not again while it is the same marker"
+    other = json.load(open(marker))
+    json.dump({**other, "executable": "/usr/bin/python3"}, open(marker, "w"))
+    assert a.orq("hook", "stop", stdin="{}", ORCA_TERMINAL_HANDLE="term_coord").returncode == 0
+    assert os.path.exists(marker), "another interpreter's marker stays: this one importing says nothing about it"
+    json.dump({**other, "executable": sys.executable}, open(marker, "w"))
+    assert a.orq("hook", "stop", stdin="{}", ORCA_TERMINAL_HANDLE="term_coord").returncode == 0
+    assert not os.path.exists(marker) and "hooks broken" not in a.orq("status").stdout, "the interpreter that failed loads orqlib again: the line goes away"
+
+
+def _old_python228():
+    """An interpreter that fails to import orqlib the way the 3.9 did (ticket 228); returns its path."""
+    path = os.path.join(tempfile.mkdtemp(), "python3-old")
+    open(path, "w").write("#!/bin/sh\necho 3.9.6\necho \"SyntaxError: f-string: f-string: unmatched '('\" >&2\nexit 1\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def _settings228(a, python):
+    """Rewrites the interpreter of every orq hook command in the Claude settings to `python`."""
+    cfg = json.load(open(a.env["ORQ_CLAUDE_SETTINGS"]))
+    for groups in cfg["hooks"].values():
+        for g in groups:
+            for h in g["hooks"]:
+                if "orq" in h["command"]:
+                    h["command"] = re.sub(r"^\S*python3", python, h["command"], count=1)
+    json.dump(cfg, open(a.env["ORQ_CLAUDE_SETTINGS"], "w"))
+
+
+def test_ticket228_doctor_hooks_should_name_the_hook_whose_interpreter_does_not_import_orqlib():
+    old_python = _old_python228()
+    a = _env97("claude")
+    _settings228(a, old_python)
+    r = a.orq("doctor", "hooks")
+    assert r.returncode == 1 and "orq.py hook" in r.stdout and f"`{old_python}` (Python 3.9.6) cannot import orqlib: SyntaxError" in r.stdout, r
+    loose = _env97("claude")
+    _settings228(loose, "python3")
+    r = loose.orq("doctor", "hooks")
+    assert r.returncode == 1 and "`python3` is loose" in r.stdout, r.stdout  # settings.hooks.example.json writes python3 loose until it is pinned
+    assert loose.orq("doctor", "hooks", "--pin").returncode == 0 and loose.orq("doctor", "hooks").stdout == "claude: hooks ok\n"
+
+
+def test_ticket228_start_should_point_at_the_broken_interpreter_and_pin_the_resolved_python_in_the_hooks_and_the_orq_link():
+    link = os.path.join(tempfile.mkdtemp(), "orq")
+    a = _env97("claude", ORQ_LINK=link)
+    _settings228(a, _old_python228())
+    r = a.orq("iniciar", "--agente", "claude", "--objetivo", "Frente X")
+    assert r.returncode == 0, r.stderr
+    assert "hooks: found:" in r.stdout and "cannot import orqlib" in r.stdout and f"Python pinned to {sys.executable}" in r.stdout and "hooks: ok" in r.stdout, r.stdout
+    commands = [h["command"] for groups in json.load(open(a.env["ORQ_CLAUDE_SETTINGS"]))["hooks"].values() for g in groups for h in g["hooks"] if "orq" in h["command"]]
+    assert commands and all(c.startswith(sys.executable + " ") for c in commands), commands
+    assert open(link).read().startswith("#!/bin/sh\nexec ") and sys.executable in open(link).read() and os.access(link, os.X_OK)
+    again = a.orq("iniciar", "--agente", "claude", "--run", "run_novo")
+    assert "Python pinned" not in again.stdout and "hooks: found" not in again.stdout and "hooks: ok" in again.stdout, "second run: nothing left to pin"
+
+
+def test_ticket228_the_pin_should_leave_the_other_hooks_and_the_file_formatting_alone():
+    a = _env97("claude")
+    _settings228(a, "python3")
+    before = open(a.env["ORQ_CLAUDE_SETTINGS"]).read()
+    r = a.orq("doctor", "hooks", "--pin")
+    after = open(a.env["ORQ_CLAUDE_SETTINGS"]).read()
+    assert r.returncode == 0, r
+    assert "python3 ~/.claude/hooks/worker-routing-guard.py" in after, "only orq's own commands are pinned"
+    assert after.count(sys.executable + " ~/.claude/orq/orq.py hook") + after.count(sys.executable + " ~/.claude/orq/precompact.py") == before.count("python3 ~/.claude/orq/")
+    assert after.replace(sys.executable, "python3") == before, "same file, only the interpreter changed"
 
 
 if __name__ == "__main__":

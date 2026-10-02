@@ -8,7 +8,7 @@
 A task register and noise filter for a Claude Code or Codex session that coordinates coding agents in [Orca](https://www.onorca.dev).
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python 3, stdlib only](https://img.shields.io/badge/python-3%20stdlib%20only-3776AB.svg)
+![Python 3.12+, stdlib only](https://img.shields.io/badge/python-3.12%2B%20stdlib%20only-3776AB.svg)
 
 ## Contents
 
@@ -65,7 +65,7 @@ Every state change is a line appended to `events.jsonl`. Open entries, live work
 
 ## Requirements
 
-- macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3 with the standard library only (developed on 3.14, but the code must import on 3.9: the hooks can run under the system `/usr/bin/python3` when a harness starts without Homebrew on PATH, and a syntax error there silences every hook; avoid 3.12-only syntax such as nested same-quote f-strings)
+- macOS or Linux (`fcntl` locks and `SIGALRM`), Python 3.12+ with the standard library only. The code uses 3.12 syntax (nested same-quote f-strings), so every entry point checks the version before it imports `orqlib` and, under an older Python, exits 0 with "orq needs Python 3.12+; this is X (path)". The hooks run with whatever `python3` the harness's PATH finds, which can be the system 3.9: `orq start` resolves a 3.12+ (Homebrew, mise, uv, `python3.12`; `ORQ_PYTHON` forces one) and writes its absolute path into the hook commands and the `orq` link
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://developers.openai.com/codex) for the coordinator and workers (either one, or both)
 - [Orca](https://www.onorca.dev) with the `orca` CLI on `PATH`
 - git
@@ -97,7 +97,7 @@ done
 ln -s ~/.claude/orq/skills/worker-routing ~/.claude/skills/worker-routing
 ln -s ~/.claude/orq/skills/orq-retro ~/.claude/skills/orq-retro   # the weekly retro analysis
 ln -s ~/.claude/orq/commands/away.md ~/.claude/commands/away.md   # /away slash command
-ln -s ~/.claude/orq/orq.py ~/.local/bin/orq                       # the manager loop calls `orq`
+ln -s ~/.claude/orq/orq.py ~/.local/bin/orq                       # the manager loop calls `orq`; `orq start` swaps the link for a wrapper that pins the Python
 ```
 
 Then register the hooks (details in [Configuration](#7-hooks-claude-code-and-codex)):
@@ -272,13 +272,13 @@ orq does its work in hooks, so the hooks are the one thing you must register. Bo
 | `PostToolUse` (`AskUserQuestion`) | `orq hook ask` | records the answer |
 | `PreCompact` / `SessionStart` (`compact`) | `precompact.py` | snapshots the coordinator's state and injects it back after `/compact` |
 
-Claude Code: merge the `hooks` section of `settings.hooks.example.json` into `~/.claude/settings.json`. The example commands call `python3 ~/.claude/orq/orq.py hook <kind>`; change the path if you cloned elsewhere. `orq start` refuses to run if a hook of the orq is missing from the harness's hooks file.
+Claude Code: merge the `hooks` section of `settings.hooks.example.json` into `~/.claude/settings.json`. The example commands call `/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook <kind>`; change the interpreter (any Python 3.12+) and the path if yours differ. `orq start` refuses to run if a hook of the orq is missing from the harness's hooks file, then replaces the loose `python3` in orq's hook commands with the absolute path of a Python 3.12+ and says so (`hooks: found: ...` for each interpreter that could not import `orqlib`). `orq doctor hooks` runs the same check without touching Orca (exit 1 while an interpreter cannot import `orqlib` or a `python3` is loose); `orq doctor hooks --pin` writes the path. Codex trusts a hook by what it says, so after pinning review the hooks once more in `/hooks`.
 
 Codex: `orq hooks-codex` appends the missing groups from `codex.hooks.example.json` to `~/.codex/hooks.json` at the end of each event, and never reorders or removes anything. Codex records hook trust by position, so inserting a group in the middle would unset the trust of the ones after it. Then review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Until they are trusted the orq does not see that terminal, and `orq status`, `orq agents` and the coordinator's session preamble start with a warning that says so. The Codex commands take a trailing `codex` argument (`orq hook prompt codex`).
 
 Every hook that reads the Bash command (`external`, `place`, `prlink`, `worker-routing-guard.py`) goes through `cmdnorm.py`, which removes `rtk`, `rtk proxy`, `env VAR=x`, `command`, `time`, `sudo` and loop keywords and splits compound commands, so `rtk git push` is judged exactly like `git push`.
 
-Hook names in English are `prompt`, `stop`, `ask`, `guard`, `session`, `place`, `external` and `prlink`. The old names `lugar`, `externas` and `prligar` are accepted for good, so hooks you installed earlier keep working without a new trust step. The hook path is fail-open: if `orqlib.py` fails to import, or the hook raises, it exits 0 with no output and logs the error to `orq.log` instead of breaking the turn.
+Hook names in English are `prompt`, `stop`, `ask`, `guard`, `session`, `place`, `external` and `prlink`. The old names `lugar`, `externas` and `prligar` are accepted for good, so hooks you installed earlier keep working without a new trust step. The hook path is fail-open but not silent: if `orqlib.py` fails to import, or a `session`, `prompt` or `stop` hook raises or runs out of time, the hook exits 0, logs the error to `orq.log`, writes `hook-failed.json` in `ORQ_HOME` (count, first and last time, exception, interpreter) and, at most once every 10 minutes, prints a `systemMessage` ("orq: hooks broken (SyntaxError in orqlib.py:4420), 3 failures since 13:20") and fires a macOS notification (`ORQ_ALARME=off` turns the notification off). `orq status` and the manager's round show "orq hooks broken since HH:MM (Python X): <error>" while the marker stands, and the manager types it once into the coordinator; the line goes away when the interpreter that failed imports and runs the hook again. When `orca orchestration run-current` times out, the session that already coordinated keeps its remembered Run; `hook session` that fails answers with a short "orq context did not load: run `orq status`".
 
 ## Usage
 
@@ -518,6 +518,7 @@ Weaker on Codex: there is no AskUserQuestion, so decisions go through `orq ask`;
 | a `backlog.md` you pick, outside this repo | the tasks-axi backlog | `ORQ_BACKLOG`, or the first line of `backlog.path` |
 | the dashboard's `pendencias.json` | the user's pending list (a mirror when a backlog is on) | `ORQ_PENDENCIAS` |
 | `~/.claude/logs/orq.log` | errors from hooks that failed open; uses of the Portuguese aliases | `ORQ_LOG` |
+| `hook-failed.json` | marker of the hook that is failing: what `orq status` and the manager show | `ORQ_HOME` |
 | `~/.claude/projects/` | Claude Code transcripts, read by `orq release`, `orq retro` and `orq audit-answers` | `ORQ_PROJETOS`, `ORQ_TRANSCRITOS` |
 | `~/.codex/config.toml` | `orq dispatch --agent codex` adds `trust_level = "trusted"` for the repository root and the new worktree | `ORQ_CODEX_CONFIG` (or `CODEX_HOME`) |
 
