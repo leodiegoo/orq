@@ -10627,7 +10627,7 @@ def test_ticket78_orq_retro_with_events_prints_json_pointers_and_compares_with_r
     pointer_line = int(j["sinais"]["nao_iniciou"]["casos"][0]["ponteiro"].split(":")[1])
     assert json.loads(open(os.path.join(a.home, "events.jsonl")).read().splitlines()[pointer_line - 1])["tipo"] == "nao_iniciou", "o ponteiro é a linha do log"
     assert a.orq(*args, "--gravar").returncode == 0
-    snaps = os.listdir(os.path.join(a.home, "retro"))
+    snaps = [n for n in os.listdir(os.path.join(a.home, "retro")) if n != "gaps.json"]  # the gap ledger (ticket 210) lives beside the rounds
     assert len(snaps) == 1, snaps
     r2 = a.orq("retro", "--desde", "2026-10-01", "--ate", "2026-10-08", "--sem-gh", "--sem-transcritos")
     assert "before" in r2.stdout and "nao_iniciou" in r2.stdout, r2.stdout
@@ -10643,6 +10643,136 @@ def test_ticket78_digest_shows_last_retro_rounds_only_when_they_exist():
     json.dump({"desde": "2026-09-22T00:00:00Z", "ate": "2026-09-29T00:00:00Z", "falhas": 4, "metricas": {"nao_iniciou": 1, "regra_violada": None}}, open(os.path.join(a.home, "retro", "2026-09-29T0000.json"), "w"))
     d1 = json.load(open(a.orq("digest").stdout.splitlines()[0]))
     assert d1["retro"] == [{"ate": "2026-09-29T00:00:00Z", "falhas": 4, "metricas": {"nao_iniciou": 1, "regra_violada": None}}], d1.get("retro")
+
+
+# ---------- ticket 210: the retro's gap ledger (what survives between weeks) ----------
+
+def _gap_log210(a, *dispatches):
+    """events.jsonl with one `nao_iniciou` per (dispatch, ts): each is a sighting of the gap `nao_iniciou` by that session."""
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        for dispatch, ts in dispatches:
+            f.write(json.dumps({"ts": ts, "tipo": "nao_iniciou", "run": "r", "task": "t_" + dispatch, "dispatch": dispatch}) + "\n")
+
+
+def _round210(a, since, until, *extra, **env):
+    r = a.orq("retro", "--desde", since, "--ate", until, "--sem-gh", "--sem-transcritos", "--gravar", *extra, **env)
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def _gaps210(a, **env):
+    r = a.orq("retro", "lacunas", "--json", **env)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def test_ticket210_same_session_twice_counts_once():
+    a = Env()
+    _gap_log210(a, ("ctx_a", "2026-09-29T10:00:00Z"), ("ctx_a", "2026-09-29T11:00:00Z"))
+    _round210(a, "2026-09-29", "2026-10-01")
+    _round210(a, "2026-09-29", "2026-10-01")  # the same window again changes nothing
+    g = _gaps210(a)["lacunas"][0]
+    assert g["id"] == "nao_iniciou" and g["sessoes"] == ["ctx_a"] and g["estado"] == "aberta" and len(g["ponteiros"]) == 2, g
+    assert g["primeira_vez"] == "2026-09-29T10:00:00Z" and g["ultima_vez"] == "2026-09-29T11:00:00Z" and g["classe"] == "checagem", g
+
+
+def test_ticket210_second_session_in_a_later_week_graduates_the_gap():
+    a = Env()
+    _gap_log210(a, ("ctx_a", "2026-09-29T10:00:00Z"), ("ctx_b", "2026-10-06T10:00:00Z"))
+    _round210(a, "2026-09-29", "2026-10-01")
+    assert _gaps210(a)["lacunas"][0]["estado"] == "aberta"
+    _round210(a, "2026-10-04", "2026-10-08")
+    out = _gaps210(a)
+    g = out["lacunas"][0]
+    assert g["estado"] == "proposta" and g["sessoes"] == ["ctx_a", "ctx_b"] and out["abertas"] == 1, out
+    assert g["ultima_vez"] == "2026-10-06T10:00:00Z", g
+    assert next(l for l in a.orq("retro", "lacunas").stdout.splitlines() if l.startswith("nao_iniciou")).split()[1:4] == ["proposta", "2", "session(s)"]
+
+
+def test_ticket210_rejected_proposal_only_comes_back_with_a_new_session():
+    a = Env()
+    _gap_log210(a, ("ctx_a", "2026-09-29T10:00:00Z"), ("ctx_b", "2026-10-06T10:00:00Z"), ("ctx_c", "2026-10-13T10:00:00Z"))
+    _round210(a, "2026-09-29", "2026-10-01")
+    _round210(a, "2026-10-04", "2026-10-08")
+    assert a.orq("retro", "rejeitar", "nao_iniciou").returncode != 0, "rejecting needs the reason"
+    r = a.orq("retro", "rejeitar", "nao_iniciou", "--motivo", "o spec já cobre isso")
+    assert r.returncode == 0 and "2 session(s)" in r.stdout, r.stderr + r.stdout
+    g = _gaps210(a)["lacunas"][0]
+    assert g["estado"] == "rejeitada" and g["rejeicao"]["sessoes"] == 2 and g["rejeicao"]["motivo"] == "o spec já cobre isso", g
+    _round210(a, "2026-10-04", "2026-10-08")
+    assert _gaps210(a)["lacunas"][0]["estado"] == "rejeitada", "no new session: still rejected"
+    assert _gaps210(a)["abertas"] == 0
+    _round210(a, "2026-10-11", "2026-10-15")
+    g = _gaps210(a)["lacunas"][0]
+    assert g["estado"] == "proposta" and len(g["sessoes"]) == 3 and "rejeicao" not in g, g
+    e = a.orq("retro", "rejeitar", "nao-existe", "--reason", "x")
+    assert e.returncode != 0 and "nao_iniciou" in e.stderr, "an unknown id lists the known ones"
+
+
+def test_ticket210_gap_expires_after_90_days_without_a_sighting():
+    a = Env()
+    _gap_log210(a, ("ctx_a", "2026-07-01T00:00:00Z"))
+    _round210(a, "2026-06-28", "2026-07-02")
+    assert len(_gaps210(a, ORQ_AGORA="2026-09-28T23:59:59Z")["lacunas"]) == 1
+    assert _gaps210(a, ORQ_AGORA="2026-09-29T00:00:00Z") == {"abertas": 0, "lacunas": []}
+    assert os.path.exists(os.path.join(a.home, "retro", "gaps.json"))
+
+
+def test_ticket210_window_without_gaps_says_zero_open_gaps():
+    a = Env()
+    assert a.orq("retro", "gaps").stdout.strip() == "open gaps: 0"
+    assert _gaps210(a) == {"abertas": 0, "lacunas": []}
+    _round210(a, "2026-09-29", "2026-10-01")
+    assert a.orq("retro", "lacunas").stdout.strip() == "open gaps: 0"
+
+
+def test_ticket210_accepted_gap_is_covered_when_its_ticket_closes():
+    a = Env()
+    assert _new(a, "Corrigir o nao_iniciou").returncode == 0
+    _gap_log210(a, ("ctx_a", "2026-09-29T10:00:00Z"), ("ctx_b", "2026-10-06T10:00:00Z"))
+    _round210(a, "2026-09-29", "2026-10-08")
+    assert a.orq("retro", "aceitar", "nao_iniciou", "--ticket", "07").returncode != 0, "a ticket that does not exist"
+    assert a.orq("retro", "aceitar", "nao_iniciou", "--ticket", "1").returncode == 0
+    g = _gaps210(a)["lacunas"][0]
+    assert g["estado"] == "aceita" and g["ticket"] == "01", g
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-10-09T00:00:00Z", "tipo": "ticket", "op": "fechar", "ticket": "01"}) + "\n")
+    assert _gaps210(a)["lacunas"][0]["estado"] == "coberta"
+    _gap_log210(a, ("ctx_a", "2026-10-10T00:00:00Z"))
+    _round210(a, "2026-10-09", "2026-10-11")
+    assert _gaps210(a)["lacunas"][0]["estado"] == "coberta", "a session already counted does not reopen it"
+    _gap_log210(a, ("ctx_z", "2026-10-12T00:00:00Z"))
+    _round210(a, "2026-10-11", "2026-10-13")
+    g = _gaps210(a)["lacunas"][0]
+    assert g["estado"] == "aberta" and g["sessoes"] == ["ctx_z"] and "ticket" not in g, "back after the fix: starts over"
+
+
+def test_ticket210_rule_violation_is_a_gap_by_the_rule_id():
+    case = {"regra": "push_de_worker", "dispatch": "ctx_1", "ts": "2026-09-29T10:30:00.250Z", "ponteiro": "s.jsonl:3"}
+    gaps = []
+    orq_mod._gaps_sight(gaps, "regra_violada", case, "2026-10-01T00:00:00Z")
+    orq_mod._gaps_sight(gaps, "regra_violada", {**case, "regra": "trailer"}, "2026-10-01T00:00:00Z")
+    orq_mod._gaps_sight(gaps, "liberado_sujo", {"task": "t", "ts": None, "ponteiro": "events.jsonl:9"}, "2026-10-01T00:00:00Z")
+    assert [(g["id"], g["classe"]) for g in gaps] == [("push_de_worker", "checagem"), ("trailer", "checagem"), ("liberado_sujo", "checagem")], gaps
+    assert gaps[0]["ultima_vez"] == "2026-09-29T10:30:00Z" and gaps[2]["ultima_vez"] == "2026-10-01T00:00:00Z" and gaps[2]["sessoes"] == ["t"], gaps
+    orq_mod._gaps_sight(gaps, "correcao_do_usuario", {"dispatch": "d", "ponteiro": "p"}, "2026-10-01T00:00:00Z")
+    assert gaps[3]["classe"] == "texto", gaps
+
+
+def test_ticket210_the_ledger_does_not_change_the_printed_round():
+    a = Env()
+    os.makedirs(a.home)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        for e in _events78():
+            f.write(json.dumps(e) + "\n")
+    args = ("retro", "--desde", "2026-09-29", "--ate", "2026-10-01", "--sem-gh", "--sem-transcritos")
+    before = a.orq(*args).stdout
+    assert not os.path.exists(os.path.join(a.home, "retro", "gaps.json")), "only --gravar writes the ledger"
+    assert a.orq(*args, "--gravar").stdout == before
+    gaps = _gaps210(a)["lacunas"]
+    assert {"nao_iniciou", "liberado_sujo", "worker_falhou"} <= {g["id"] for g in gaps} and all(g["ponteiros"] and g["sessoes"] for g in gaps), gaps
+    assert "binding_perdido" in {g["id"] for g in gaps}, "a case with no dispatch or task is counted by the session of the event"
 
 
 def _statusline(a, hud_output="X"):
@@ -16461,6 +16591,9 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("mate subir --tipo resumo --texto t", "mate raise --type summary --text t"),
     ("mate pedidos --grupo g", "mate requests --group g"),
     ("retro --desde 2026-10-01 --ate 2026-10-02 --projeto p --sem-gh --sem-transcritos --gravar", "retro --since 2026-10-01 --until 2026-10-02 --project p --no-gh --no-transcripts --save"),
+    ("retro lacunas --json", "retro gaps --json"),
+    ("retro rejeitar g --motivo m", "retro reject g --reason m"),
+    ("retro aceitar g --ticket 3", "retro accept g --ticket 3"),
     ("intake e1 tarefa", "intake e1 task"),
     ("intake e1 decisao", "intake e1 decision"),
     ("intake e1 conversa --nota n", "intake e1 conversation --note n"),
