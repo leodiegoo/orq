@@ -3174,7 +3174,7 @@ def pr_avisar():
 
 # ---------- obrigações dos avisos (ticket 114) ----------
 
-OBRIGACAO_MIN = float(os.environ.get("ORQ_OBRIGACAO_MIN") or 10)  # obrigação aberta há mais que isto: o Stop do coordenador avisa, uma vez
+OBRIGACAO_MIN = float(os.environ.get("ORQ_OBRIGACAO_MIN") or 10)  # obrigação aberta há mais que isto: o Stop do coordenador a barra, com o orçamento do GATE_BLOQUEIOS
 # o que o merge de um PR pede ao coordenador, pela base (README, "Obrigações dos avisos"). Obrigação que cita um campo sem valor não nasce:
 # sem issue não há comentário, sem ticket aberto da task não há o que fechar, sem próximo ambiente sugerido não há PR a abrir.
 _PROXIMO = ("proximo", "abrir o PR de {proximo}, ou adiar com o motivo de segurar")
@@ -3335,10 +3335,9 @@ def obrigacao_adiar(e, chave, motivo, run=None):
 
 
 def obrigacoes_a_cobrar(events, agora, minutos=None):
-    """As obrigações abertas há pelo menos `minutos` (OBRIGACAO_MIN) que o Stop ainda não cobrou: cada uma é cobrada uma vez só."""
+    """As obrigações abertas há pelo menos `minutos` (OBRIGACAO_MIN): o Stop do coordenador as barra (`hook_stop`)."""
     minutos = OBRIGACAO_MIN if minutos is None else minutos
-    cobradas = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "cobrada"}
-    return [o for o in obrigacoes_abertas(events) if (o["entrada"], o["chave"]) not in cobradas and (agora - _dt(o["ts"])).total_seconds() >= minutos * 60]
+    return [o for o in obrigacoes_abertas(events) if (agora - _dt(o["ts"])).total_seconds() >= minutos * 60]
 
 
 def _pergunta_aberta(events):
@@ -4655,10 +4654,12 @@ def hook_stop(ev, run):
                     return {"decision": "block", "reason": msg}
                 append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": sessao})
     if velhas:
-        for o in velhas[:4]:  # cobrada uma vez, só a que foi citada: o Stop avisa, não bloqueia em loop; as outras vêm no Stop seguinte
-            append_event({"tipo": "obrigacao", "op": "cobrada", "entrada": o["entrada"], "chave": o["chave"]})
         msg += (f" Obrigação aberta há mais de {OBRIGACAO_MIN:g} min: " + ", ".join(f"{o['entrada']} {o['chave']} ({o['texto']})" for o in velhas[:4])
-                + (f" +{len(velhas) - 4} no próximo Stop" if len(velhas) > 4 else "") + ': orq feito <e> <obrigação> --prova "…" ou orq adiar <e> <obrigação> --motivo "…".')
+                + (f" +{len(velhas) - 4}" if len(velhas) > 4 else "") + ': orq feito <e> <obrigação> --prova "…" ou orq adiar <e> <obrigação> --motivo "…" (o deploy que ainda builda se adia).')
+        ids, sessao = [f"{o['entrada']}:{o['chave']}" for o in velhas], (ev.get("session_id") or "")[:8]
+        if _gate_bloqueia(sessao, ids):
+            return {"decision": "block", "reason": msg}
+        append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": sessao})
     return {**({"systemMessage": msg} if sem or velhas else {}), **({"decision": "block", "reason": bloqueio} if bloqueio else {})}
 
 

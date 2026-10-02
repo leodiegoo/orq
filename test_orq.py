@@ -12633,25 +12633,44 @@ def test_ticket114_adiar_cria_um_ticket_com_o_motivo():
     assert a.orq("adiar", e, "limpeza").returncode == 2, "sem --motivo não adia"
 
 
-def test_ticket114_o_stop_avisa_uma_vez_da_obrigacao_velha():
+def test_ticket156_o_stop_barra_a_obrigacao_velha_citando_entrada_e_chave():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
     e = _merge_main(a)
-    m1 = json.loads(_stop(a).stdout)["systemMessage"]
-    assert "Obrigação aberta" in m1 and f"{e} comentario" in m1 and "orq feito" in m1, m1
-    m2 = json.loads(_stop(a).stdout or "{}").get("systemMessage", "")
-    assert "Obrigação aberta" not in m2, "uma vez só: não bloqueia em loop"
-    for chave in ("deploy", "comentario", "limpeza"):
-        a.orq("feito", e, chave, "--prova", "ok")
-    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
-        for n in range(6):  # seis obrigações velhas: o Stop cita quatro e só essas contam como cobradas
-            f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "obrigacao", "op": "nova", "entrada": "e90", "chave": f"k{n}", "texto": f"t{n}"}) + "\n")
-    m3 = json.loads(_stop(a).stdout)["systemMessage"]
-    assert "e90 k3" in m3 and "e90 k4" not in m3 and "+2 no próximo Stop" in m3, m3
-    m4 = json.loads(_stop(a).stdout)["systemMessage"]
-    assert "e90 k4" in m4 and "e90 k5" in m4 and "e90 k0" not in m4, "a que não foi citada não se perde"
+    out = json.loads(_stop(a).stdout)
+    assert out["decision"] == "block" and "Obrigação aberta" in out["reason"] and f"{e} comentario" in out["reason"], out
+    assert "orq feito" in out["reason"] and "orq adiar" in out["reason"], out
+
+
+def test_ticket156_obrigacao_com_menos_de_obrigacao_min_deixa_parar():
     b = _prs_env(ORQ_OBRIGACAO_MIN="10")
     _merge_main(b)
-    assert "Obrigação aberta" not in json.loads(_stop(b).stdout or "{}").get("systemMessage", ""), "a obrigação nova ainda não é cobrada"
+    assert "decision" not in json.loads(_stop(b).stdout or "{}"), "a obrigação nova ainda não barra"
+
+
+def test_ticket156_o_terceiro_stop_do_mesmo_conjunto_passa_com_gate_falhou():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    _merge_main(a)
+    for _ in range(2):
+        assert json.loads(_stop(a).stdout)["decision"] == "block"
+    out = json.loads(_stop(a).stdout)
+    assert "decision" not in out and "Obrigação aberta" in out["systemMessage"], out
+    assert [x for x in a.events() if x["tipo"] == "gate_falhou"], "o orçamento estourado deixa o evento"
+
+
+def test_ticket156_obrigacao_feita_ou_adiada_deixa_parar():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    e = _merge_main(a)
+    assert a.orq("feito", e, "deploy", "--prova", "v1").returncode == 0
+    assert a.orq("feito", e, "limpeza", "--prova", "ok").returncode == 0
+    assert a.orq("adiar", e, "comentario", "--motivo", "depois").returncode == 0
+    assert "decision" not in json.loads(_stop(a).stdout or "{}")
+
+
+def test_ticket156_sessao_de_mate_nunca_barra_pela_obrigacao():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    _merge_main(a)
+    r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}), ORQ_MATE="orq")
+    assert "decision" not in json.loads(r.stdout or "{}"), r.stdout
 
 
 def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
@@ -12661,7 +12680,7 @@ def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
     assert f"A fazer por você: {e} →" in _ctx(r), r.stdout
     assert a.orq("intake", "e2", "conversa").returncode == 0  # o Stop barra entrada sem intake do turno; este teste é da obrigação
     m = _aviso_do_stop(_hook_codex(a, "stop", _codex("stop", session_id="abcdef123456")).stdout)
-    assert "Obrigação aberta" in m and f"{e} deploy" in m, m
+    assert "Obrigação aberta" in m and f"{e} deploy" in m, m  # barra (reason): o Codex recebe o mesmo bloqueio
     for chave in ("deploy", "comentario", "limpeza"):
         assert a.orq("feito", e, chave, "--prova", "ok").returncode == 0
     assert "A fazer por você" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
