@@ -3577,7 +3577,7 @@ def test_despachar_roda_o_worker_start_com_modelo_e_effort_e_devolve_os_ids():
     (arg,) = _log(a, "started.log")
     assert arg[:1] == ["worker-start"] and arg[arg.index("--run") + 1] == "run_a" and arg[arg.index("--agent") + 1] == "claude"
     assert arg[arg.index("--model") + 1] == "claude-sonnet-5-5" and arg[arg.index("--effort") + 1] == "medium"
-    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n"
+    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.BLOCO_ESPERANDO + "\n"
     assert "--worktree" not in arg
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
     assert (ev["run"], ev["task"], ev["dispatch"], ev["titulo"], ev["modelo"], ev["effort"], ev["terminal"]) == \
@@ -3608,14 +3608,14 @@ def test_despachar_com_entrada_poe_o_pedido_literal_no_topo_do_spec():
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
     assert spec == ('# Ticket 05\n\n## Pedido do usuário\ncria o ticket 05, com "aspas" e acento\n\n'
-                    'O que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\nFaça X.\n'), spec
+                    'O que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\nFaça X.\n\n' + orq_mod.BLOCO_ESPERANDO + "\n"), spec
 
 
-def test_despachar_sem_entrada_nao_muda_o_spec():
+def test_despachar_sem_entrada_so_acrescenta_o_bloco_esperando_ao_spec():
     a = Amb(run="run_a")
     _despachar(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
-    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n"
+    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.BLOCO_ESPERANDO + "\n"
 
 
 def test_despachar_entrada_com_spec_sem_titulo_poe_o_pedido_depois_do_titulo_que_o_orq_acrescenta():
@@ -3624,6 +3624,16 @@ def test_despachar_entrada_com_spec_sem_titulo_poe_o_pedido_depois_do_titulo_que
     _despachar(a, "--entrada", "e1", spec=_spec(a, "Faça X.\n"))
     (arg,) = _log(a, "started.log")
     assert arg[arg.index("--spec") + 1].startswith("# Ticket 05\n\n## Pedido do usuário\npedido\n"), arg
+
+
+def test_despachar_poe_o_bloco_esperando_no_fim_do_spec_uma_vez():
+    a = Amb(run="run_a")
+    _despachar(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
+    (arg,) = _log(a, "started.log")
+    spec = arg[arg.index("--spec") + 1]
+    assert spec.count("## Esperando") == 1 and spec.rstrip().endswith("já espera dentro do comando."), spec
+    for regra in ("encerre o turno", "600000 ms", "repita o mesmo comando", "segundo plano"):
+        assert regra in spec, regra
 
 
 def test_despachar_entrada_inexistente_nao_despacha():
@@ -3679,7 +3689,7 @@ def test_despachar_spec_sem_titulo_ganha_o_titulo_como_primeira_linha():
     a = Amb(run="run_a")
     _despachar(a, spec=_spec(a, "Faça X.\n"))
     (arg,) = _log(a, "started.log")
-    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n", "o Claude Code tira o nome da aba do começo do prompt"
+    assert arg[arg.index("--spec") + 1] .startswith("# Ticket 05\n\nFaça X.\n"), "o Claude Code tira o nome da aba do começo do prompt"
 
 
 def test_despachar_falha_do_worker_start_nao_grava_evento():
@@ -3881,7 +3891,7 @@ def test_ticket_novo_cria_a_task_com_o_titulo_e_o_spec_curto():
     out = json.loads(_novo(a, "Título exato do ticket").stdout)
     (arg,) = _log(a, "created.log")
     assert arg[:1] == ["task-create"] and arg[arg.index("--task-title") + 1] == "Título exato do ticket"
-    assert arg[arg.index("--spec") + 1] == f"Leia e execute o ticket {out['arquivo']}", arg
+    assert arg[arg.index("--spec") + 1] .startswith(f"Leia e execute o ticket {out['arquivo']}\n\n## Esperando\n"), arg
     assert "--deps" not in arg and arg[arg.index("--run") + 1] == "run_a"
     tasks = json.load(open(os.path.join(a.fake, "tasks_run_a.json")))
     assert [(t["id"], t["task_title"], t["status"]) for t in tasks] == [("task_tk1", "Título exato do ticket", "ready")]

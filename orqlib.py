@@ -5431,6 +5431,13 @@ def responder(msg_id, texto):
 
 
 PEDIDO_TITULO = "## Pedido do usuário"
+# Ticket 117: cada turno reenvia o contexto inteiro, então esperar com sleep + checagem queima custo à toa. Vai no fim de todo spec e de toda task de ticket.
+BLOCO_ESPERANDO = """## Esperando
+
+- Depois de perguntar (`ask`) ou escalar, encerre o turno: a resposta chega como mensagem e abre o turno seguinte.
+- Espera externa (CI, PR, merge) vai dentro de um único comando bloqueante, com o timeout máximo da ferramenta (600000 ms no Bash): `gh pr checks --watch`, ou `until <checagem>; do sleep 30; done`.
+- Se o comando voltar sem mudança, repita o mesmo comando, sem checagem entre um e outro.
+- Nunca ponha em segundo plano para fazer polling. Não envolva `npm run test-app-e2e` nem `scripts/e2e-infra.sh` em loop seu: a fila de E2E já espera dentro do comando."""
 
 
 def _texto_da_entrada(entrada):
@@ -5645,7 +5652,7 @@ def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
             with open(caminho, "x", encoding="utf-8") as f:
                 f.write(txt)
         try:
-            res = orca("task-create", "--spec", f"Leia e execute o ticket {caminho}", "--task-title", titulo, "--run", alvo,
+            res = orca("task-create", "--spec", f"Leia e execute o ticket {caminho}\n\n{BLOCO_ESPERANDO}", "--task-title", titulo, "--run", alvo,
                        *(["--deps", json.dumps(deps)] if deps else []), timeout=20)
             task = (res.get("task") or res).get("id")
             if not task:
@@ -7356,6 +7363,8 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             cabeca, _, resto = spec.partition("\n")
             spec = (f"{cabeca}\n\n{PEDIDO_TITULO}\n{pedido}\n\nO que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\n"
                     f"{resto.lstrip(chr(10))}")
+        if spec is not None:
+            spec = f"{spec.rstrip()}\n\n{BLOCO_ESPERANDO}\n"
         ambiente = noite_ambiente() if noite_ativa(_cursor_ro()) else None  # na noite o worker sobe sem prompt de git (credencial, pinentry)
         pasta = (pasta_do_repo(repo) if repo else None) or os.getcwd()  # a raiz do repo do projeto; seletor sem pasta conhecida cai no cwd, como antes
         confiadas = confiar_codex(_raiz_do_repo(pasta) or pasta) if agente == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir

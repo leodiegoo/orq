@@ -357,6 +357,8 @@ Not done yet: the quota policy, a project column in `orq agentes` and `orq inici
 
 ## Claude Code and Codex
 
+**Waiting without turns.** Every spec `orq despachar` builds, and the task `orq ticket novo` creates, ends with an `## Esperando` block (`BLOCO_ESPERANDO`): end the turn after an `ask` or an escalation; run an external wait (CI, PR, merge) as one blocking command with the tool's maximum timeout (600000 ms in Bash); if it returns unchanged, repeat the same command with no check in between; never background a command to poll it. A worker that sleeps in a loop burns a full context per turn and never looks idle to `orq hibernar`; this block lets it stop for real. The E2E queue already waits inside its command, so the worker must not wrap it in a loop of its own.
+
 The coordinator can be a Claude Code or a Codex session, and each worker can be either: `orq despachar --agente codex --modelo gpt-6-sol --effort low ...` (the default is `claude`, or the harness of the project, below). What changes per agent sits in one table, `HARNESS` in `orqlib.py`: the resume command, the screen patterns and the accepted efforts. Orca builds the launch command itself from `worker-start --agent`. The rest goes through Orca for both:
 
 - `orq retomar` finds a session the hooks never recorded through Orca's session index (`orca search <dispatch id>`);
