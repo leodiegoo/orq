@@ -16123,6 +16123,65 @@ def test_ticket174_o_aviso_digitado_conta_como_aviso_do_orq_e_nao_como_prompt_do
     assert orq_mod.origem("orq: coordenador parado há 5 min: o ciclo do integrador deixou 2 commit(s) sem push") == "aviso_orq"
 
 
+def _g176(repo, *a):
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+
+
+def _cenario176():
+    """repo com origin; worktrees: pronta (contida), fora (commit fora da origin/main), suja, integracao (integra/x)."""
+    tmp = tempfile.mkdtemp()
+    origin = os.path.join(tmp, "origin.git")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True)
+    repo = _repo_com_branch(tmp)
+    _g176(repo, "remote", "add", "origin", origin)
+    raiz = os.path.join(tmp, "orq-wt")
+    for nome, b in (("1", "feat/pronta"), ("2", "feat/fora"), ("3", "feat/suja"), ("integracao", "integra/x")):
+        _g176(repo, "worktree", "add", "-q", "-b", b, os.path.join(raiz, nome))
+    _g176(os.path.join(raiz, "1"), "commit", "-q", "--allow-empty", "-m", "a")
+    _g176(os.path.join(raiz, "3"), "commit", "-q", "--allow-empty", "-m", "c")
+    _g176(os.path.join(raiz, "2"), "commit", "-q", "--allow-empty", "-m", "b")
+    _g176(repo, "merge", "-q", "--ff-only", "feat/pronta")
+    _g176(repo, "merge", "-q", "--no-edit", "feat/suja")
+    _g176(repo, "push", "-q", "origin", "main")
+    _g176(repo, "fetch", "-q", "origin")
+    open(os.path.join(raiz, "3", "novo.txt"), "w").write("x")
+    return repo, raiz
+
+
+def test_ticket176_limpa_so_a_worktree_cuja_branch_esta_na_origin_main():
+    repo, raiz = _cenario176()
+    os.remove(os.path.join(raiz, "3", "novo.txt"))  # a suja do cenário vira limpa: sai
+    open(os.path.join(raiz, "2", "novo.txt"), "w").write("x")
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, dry_run=True)
+    assert sorted(os.path.basename(x["pasta"]) for x in r["removidas"]) == ["1", "3"] and os.path.isdir(os.path.join(raiz, "1")), r
+    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    assert sorted(os.path.basename(x["pasta"]) for x in r["removidas"]) == ["1", "3"], r
+    assert not os.path.exists(os.path.join(raiz, "1")) and os.path.isdir(os.path.join(raiz, "2"))
+    branches = subprocess.run(["git", "-C", repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+    assert "feat/pronta" not in branches and "feat/fora" in branches
+
+
+def test_ticket176_branch_com_commit_fora_da_main_fica_com_o_motivo():
+    repo, raiz = _cenario176()
+    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    fica = {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}
+    assert "commit fora de origin/main" in fica["2"] and os.path.isdir(os.path.join(raiz, "2")), fica
+
+
+def test_ticket176_worktree_suja_fica_mesmo_com_a_branch_integrada():
+    repo, raiz = _cenario176()
+    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["3"] == "mudança não commitada"
+    assert os.path.exists(os.path.join(raiz, "3", "novo.txt"))
+
+
+def test_ticket176_worktree_do_integrador_fica():
+    repo, raiz = _cenario176()
+    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["integracao"] == "worktree do integrador"
+    assert os.path.isdir(os.path.join(raiz, "integracao"))
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

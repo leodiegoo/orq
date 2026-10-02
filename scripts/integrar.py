@@ -82,8 +82,15 @@ def avancar(wt):
     print(f"integrar: main em {git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}, worktree removida")
 
 
+def limpar(viva):
+    """Começo do ciclo: se o push da main já saiu, remove as worktrees do orq-wt cujas branches a origin/main contém. Falha vira aviso."""
+    r = subprocess.run([sys.executable, os.path.join(viva, "orq.py"), "worktrees", "limpar"], capture_output=True, text=True)
+    print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
+
+
 def integrar(branches):
     viva = vivo()
+    limpar(viva)
     slug = re.sub(r"[^\w.-]+", "-", "-".join(branches))[:60]
     wt = os.path.join(os.environ.get("ORQ_WT_DIR") or os.path.join(os.path.dirname(viva), "orq-wt"), f"integra-{slug}")
     if os.path.exists(wt):

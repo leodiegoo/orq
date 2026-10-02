@@ -543,6 +543,50 @@ def ciclo_feito(dispatch, hash_, nota=None, extra=None):
     return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {}), **(extra or {})})
 
 
+def _cwds_abertos():
+    """Os diretórios de trabalho dos processos vivos (`lsof`); vazio se o lsof não existe."""
+    try:
+        r = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    return [l[1:] for l in r.stdout.splitlines() if l.startswith("n")]
+
+
+def limpar_worktrees_orq(repo=None, raiz=None, ref="origin/main", dry_run=False):
+    """Remove as worktrees `<raiz>/<ticket>` do orq cuja branch já está contida em `ref` (ticket 176): o integrador faz fast-forward na main e o push é manual,
+    então ninguém mais as removia. Fica a worktree do integrador (`integra/*`, a pasta `integracao`), a de branch solta, a com mudança não commitada
+    (inclusive arquivo novo), a com processo dentro e a de branch fora de `ref`. Só `git worktree remove` e `git branch -d`, nunca `--force`/`-D`/`rm -rf`.
+    Devolve {removidas: [{pasta, branch}], ficaram: [{pasta, motivo}]}; com `dry_run` nada é removido (`removidas` é o que sairia)."""
+    repo = repo or HOME
+    raiz = raiz or os.environ.get("ORQ_WT_ROOT", os.path.expanduser("~/.claude/orq-wt"))
+    out, cwds = {"removidas": [], "ficaram": []}, None
+    for nome in sorted(os.listdir(raiz)) if os.path.isdir(raiz) else []:
+        d = os.path.join(raiz, nome)
+        if not os.path.exists(os.path.join(d, ".git")):
+            continue
+        branch = (_git(d, "branch", "--show-current") or "").strip()
+        motivo = ("branch solta (HEAD destacado)" if not branch else "worktree do integrador" if nome == "integracao" or branch.startswith("integra/")
+                  else "branch principal" if branch == "main" else None)
+        if not motivo and _git(repo, "merge-base", "--is-ancestor", branch, ref) is None:
+            motivo = f"{branch} tem commit fora de {ref}"
+        if not motivo and ((st := _git(d, "status", "--porcelain")) is None or st.strip()):
+            motivo = "mudança não commitada"
+        if not motivo:
+            cwds = _cwds_abertos() if cwds is None else cwds
+            real = os.path.realpath(d)
+            motivo = "processo dentro da pasta" if any(c == real or c.startswith(real + os.sep) for c in cwds) else None
+        if not motivo and not dry_run:
+            if _git(repo, "worktree", "remove", d) is None:
+                motivo = "git worktree remove recusou"
+            elif _git(repo, "branch", "-d", branch) is None:
+                motivo = f"pasta removida, mas git branch -d recusou {branch}"
+        if motivo:
+            out["ficaram"].append({"pasta": d, "motivo": motivo})
+        else:
+            out["removidas"].append({"pasta": d, "branch": branch})
+    return out
+
+
 def integrar_concluir(hash_, branches, dispatch=None):
     """O `integrar.py` avançou a main por fast-forward para `hash_`: fecha o que o ciclo integrou (ticket 154). Para cada branch que está na fila do integrador:
     tira o ticket da fila, `ticket_fechar` com o hash no Answer e `liberar` o worker do ticket. Branch fora da fila só entra no ciclo. Grava o `ciclo` do integrador
@@ -11333,6 +11377,8 @@ def main(argv=None):
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="o dispatch do integrador (padrão: o serviço de título integrador ainda não liberado)")
     igc.add_argument("branches", nargs="+")
+    wl = sub.add_parser("worktrees", help="orq worktrees limpar [--dry-run]: remove as worktrees do orq-wt já contidas na origin/main").add_subparsers(dest="op", required=True)
+    wl.add_parser("limpar").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("auditar-publicacao", help="orq auditar-publicacao <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
     au.add_argument("revs", nargs="+", help="args do git rev-list; em branch nova: <head> --not --remotes (depois de --)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
@@ -11669,6 +11715,10 @@ def main(argv=None):
         elif a.cmd == "integrar":
             itens = list(integracao_fila().values())
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (desde {_hora_local(i['ts'])})" for i in itens) or "fila do integrador vazia")
+        elif a.cmd == "worktrees":
+            r = limpar_worktrees_orq(dry_run=a.dry_run)
+            print(f"{'sairiam' if a.dry_run else 'removidas'}: {len(r['removidas'])}; ficaram: {len(r['ficaram'])}")
+            print("\n".join([f"  sai {x['pasta']} ({x['branch']})" for x in r["removidas"]] + [f"  fica {x['pasta']}: {x['motivo']}" for x in r["ficaram"]]))
         elif a.cmd == "auditar-publicacao":
             motivos = auditar_publicacao(a.revs)
             print("\n".join(f"auditar-publicacao: {m}" for m in motivos), file=sys.stderr)
