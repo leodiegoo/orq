@@ -5,4 +5,4 @@ allowed-tools: Bash(orq away:*)
 ---
 !`orq away $ARGUMENTS`
 
-Repita a linha acima ao usuário, sem mais nada.
+Repita a saída acima ao usuário, inteira (ao desligar ela traz o relatório da ausência e o caminho do arquivo), sem mais nada.
