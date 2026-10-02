@@ -585,7 +585,7 @@ def limpar_worktrees_orq(repo=None, raiz=None, ref="origin/main", dry_run=False,
         num = (nome[1:] if nome.startswith("t") else nome).zfill(2)
         branch = (_git(d, "branch", "--show-current") or "").strip()
         motivo = ("branch solta (HEAD destacado)" if not branch else "worktree do integrador" if nome == "integracao" or branch.startswith("integra/")
-                  else "branch principal" if branch == "main" else "dispatch vivo do ticket" if num in vivos
+                  else "branch principal" if _branch_de_ambiente(branch) else "dispatch vivo do ticket" if num in vivos
                   else "criada há menos de 24 h" if agora - _nascimento(d) < 86400 else None)
         contida = not motivo and _git(repo, "merge-base", "--is-ancestor", branch, ref) is not None
         if not motivo and not contida:

@@ -84,7 +84,10 @@ def avancar(wt):
 
 def limpar(viva):
     """Começo do ciclo: se o push da main já saiu, remove as worktrees do orq-wt cujas branches a origin/main contém. Falha vira aviso."""
-    r = subprocess.run([sys.executable, os.path.join(viva, "orq.py"), "worktrees", "limpar"], capture_output=True, text=True)
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # o orq.py roda dentro da main viva: nenhum __pycache__ suja a árvore
+    if os.environ.get("ORQ_WT_DIR"):
+        env["ORQ_WT_ROOT"] = os.environ["ORQ_WT_DIR"]  # a pasta de worktrees que este ciclo usa é a que se limpa
+    r = subprocess.run([sys.executable, os.path.join(viva, "orq.py"), "worktrees", "limpar"], capture_output=True, text=True, env=env)
     print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
 
 
