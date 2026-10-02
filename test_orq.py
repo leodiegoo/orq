@@ -7310,7 +7310,8 @@ def test_away_external_denies_merge_into_production_and_force_push_and_allows_th
                       (f"cd {r} & git push origin feat/x", "push-other"), ("git push origin 2>&1 HEAD:main", "push-env"),
                       ("git push origin 2>&1 --force feat/x", "push-force"), ("git push origin &>log HEAD:main", "push-env"), ("git push origin >&log HEAD:main", "push-env"),
                       (">/dev/null git push --force origin HEAD:main", "push-force"), ("git status && 2>/dev/null git push origin HEAD:main", "push-env"),
-                      ("true &&>/dev/null git push --force origin HEAD:main", "push-force"), ("> out git push origin HEAD:main", "push-env")):
+                      ("true &&>/dev/null git push --force origin HEAD:main", "push-force"), ("> out git push origin HEAD:main", "push-env"),
+                      ("git push origin >|log HEAD:main", "push-env"), (">|log git push --force origin HEAD:main", "push-force")):
         out = _external(a, cmd, cwd=r)
         assert out and out["permissionDecision"] == "deny", cmd
         assert f"line `{line}`" in out["permissionDecisionReason"] and "orq pend add" in out["permissionDecisionReason"], (cmd, out["permissionDecisionReason"])
