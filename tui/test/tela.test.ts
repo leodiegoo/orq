@@ -4,20 +4,20 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { cpSync, existsSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { lerEstado, montarBlocos } from "../src/dados"
+import { VISTA0, lerEstado, montarBlocos, texto } from "../src/dados"
 import { criarTela } from "../src/tela"
 
 const fixtures = join(import.meta.dir, "..", "fixtures")
 const agora = Date.parse("2026-10-01T12:00:30Z")
 
-test("it should be the six blocks built from the orq files", async () => {
-  const e = { ...lerEstado(fixtures, agora), vivoMs: agora - 5000 } // o mtime do carimbo não vai para o git
-  const setup = await createTestRenderer({ width: 140, height: 60 })
+test("it should be the seven blocks built from the orq files", async () => {
+  const e = { ...lerEstado(fixtures, agora, { backlog: join(fixtures, "backlog.md") }), vivoMs: agora - 5000 } // o mtime do carimbo não vai para o git
+  const setup = await createTestRenderer({ width: 140, height: 80 })
   try {
-    criarTela(setup.renderer, "orq gerente tui")(montarBlocos(e), "lido")
+    criarTela(setup.renderer, "orq gerente tui")(montarBlocos(e, VISTA0, { largura: 140, altura: 80 }), "lido")
     await setup.renderOnce()
     const quadro = setup.captureCharFrame()
-    for (const t of ["Gerente", "Workers vivos (1)", "Filas", "Pendências do usuário (1)", "Máquina contra o orçamento", "Últimos eventos"]) {
+    for (const t of ["Gerente", "Workers vivos (1)", "Backlog (pronto 3", "Filas", "Pendências do usuário (1)", "Máquina contra o orçamento", "Últimos eventos"]) {
       expect(quadro).toContain(t)
     }
     expect(quadro).toContain("vivo, última volta há 5 s (serve, pid 4242)")
@@ -38,10 +38,11 @@ test("it should be the six blocks built from the orq files", async () => {
 
 test("it should be a stopped manager when the stamp is old and the state file is stale", () => {
   const e = { ...lerEstado(fixtures, agora + 3600_000), vivoMs: agora - 600_000 }
-  const [gerente, workers] = montarBlocos(e)
-  expect(gerente.linhas[0]).toStartWith("PARADO há 70 min")
+  const blocos = montarBlocos(e)
+  const [gerente, workers] = ["gerente", "workers"].map((id) => blocos.find((b) => b.id === id)!)
+  expect(texto(gerente.linhas[0])).toStartWith("PARADO há 70 min")
   expect(workers.titulo).toContain("open.json")
-  expect(montarBlocos(e)[4].linhas[0]).toStartWith("sem leitura da máquina")
+  expect(texto(blocos.find((b) => b.id === "maquina")!.linhas[0])).toStartWith("sem leitura da máquina")
 })
 
 test("it should be the same blocks from the fixtures migrated to english", () => {
@@ -55,7 +56,8 @@ test("it should be the same blocks from the fixtures migrated to english", () =>
   })
   expect(r.exitCode).toBe(0)
   expect(existsSync(join(home, "open.json")) && !existsSync(join(home, "aberto.json"))).toBe(true)
-  const pt = montarBlocos({ ...lerEstado(fixtures, agora), vivoMs: agora - 5000 })
-  const en = montarBlocos({ ...lerEstado(home, agora), vivoMs: agora - 5000 })
+  const bl = { backlog: join(fixtures, "backlog.md") }
+  const pt = montarBlocos({ ...lerEstado(fixtures, agora, bl), vivoMs: agora - 5000 })
+  const en = montarBlocos({ ...lerEstado(home, agora, bl), vivoMs: agora - 5000 })
   expect(en).toEqual(pt)
 })

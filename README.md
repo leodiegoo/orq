@@ -299,9 +299,13 @@ orq manager serve --uninstall
 
 `serve` still needs the manager terminal from `orq start` or `orq manager bind`: Orca only accepts a handle that belongs to a terminal it has seen. Two `serve` processes at once is an error.
 
-`orq manager tui` opens a read-only terminal UI ([OpenTUI](https://github.com/sst/opentui), needs Bun) with the manager, live workers, the integrator, the queues, pending items, machine load and the latest events. Without Bun it prints the install steps and exits 1.
+`orq manager tui` opens a read-only terminal UI ([OpenTUI](https://github.com/sst/opentui), needs Bun) with the manager, the backlog, live workers, the integrator, the queues, pending items, machine load and the latest events. Without Bun it prints the install steps and exits 1.
 
 The TUI follows the terminal theme. It never paints a background; text and borders come from a light or a dark palette whose colors keep a 4.5:1 contrast or better against the theme background (checked by `bun test`). The theme comes from, in order: `--theme light|dark|auto` or `ORQ_TUI_THEME`, the terminal itself (OSC 11, background color), `COLORFGBG`, the macOS appearance (`defaults read -g AppleInterfaceStyle`), and dark if nothing answers. Force it with `orq manager tui --theme light`, or `ORQ_TUI_THEME=light` in the environment.
+
+The colors are GitHub's: Dark (`#0d1117` background, `#c9d1d9` text) and Light (`#ffffff`, `#1f2328`), key by key in `tui/src/tema.ts`. Green means ready, on time or done; yellow waiting or stopped; red blocked, stuck or failed; blue in progress; purple a decision with you; gray secondary. Color never carries a state alone: each one also has a symbol and a word (`● pronto`, `▶ andamento`, `■ bloqueado`, `⏸ retido`, `✓ feito`, `P1`/`P2`/`P3`).
+
+The Backlog block lists the tasks of the `tasks-axi` backlog bound to the machine (`ORQ_BACKLOG`, or the first line of `ORQ_HOME/backlog.path`) and of each group's backlog. The title counts the tasks by state. Each row shows state, priority, id, short title, repo and group, sorted by priority and then state; a blocked task adds who blocks it and whether that blocker is in progress, stopped or blocked too, an in-flight one adds its worker (model, phase, minutes without a sign of life, from `orq agents`), and a ready task waiting for a week or more says how long. Done tasks show only under the `feito` filter. Keys: `j`/`k` or the arrows scroll, `PgUp`/`PgDn` scroll a page, `e` cycles the state filter, `g` the group filter, `0` clears both, `q` quits. On a narrow terminal the counts move into the block's first line and each row is cut to the width.
 
 Record what each entry became:
 
