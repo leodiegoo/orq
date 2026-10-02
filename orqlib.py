@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,8 @@ ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
 LIMPAR = os.environ.get("ORQ_LIMPAR") or os.path.expanduser("~/.claude/scripts/limpar-mergeados.py")
 LIMPAR_ATRASO_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # o mesmo atraso do hook "merged"
+FECHADO_DIAS = float(os.environ.get("ORQ_FECHADO_DIAS") or 1)  # dias entre o último PR fechado sem merge da task e a limpeza automática da branch
+RELATORIOS = os.environ.get("ORQ_RELATORIOS") or os.path.expanduser("~/.claude/orquestrador-plan/relatorios")
 FINAL_BASE = os.environ.get("ORQ_FINAL_BASE")  # força a base que encerra a branch; sem ela vale a produção do projeto (o mesmo do limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 PERGUNTAR_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # quanto o `orq perguntar` espera a resposta antes de deixar a pendência aberta
@@ -116,6 +119,7 @@ _STRING_JSON = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 # o detector do próprio Orca (findOrcaDispatchPreambleStart): linha de abertura opcional, <pasted_content> opcional, e o preâmbulo;
 # hosts sem a linha de abertura mandam o preâmbulo puro
 DESPACHO_SEM_ABERTURA = re.compile(r"(?:<pasted_content\b[^>]*>\s*)?You are working inside Orca, a multi-agent IDE\.")
+FECHADOS = "limpar-fechados.json"  # {confirmado}: gravado pelo primeiro `orq limpar --fechados` de verdade; antes dele a limpeza automática só mostra a prévia
 PRS = "prs.json"  # {itens: [{task, url, numero, base, estado, ligado_em, avisado, ...}], ultimo_poll}: os PRs de cada feature, ligados por `orq pr ligar`
 PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # intervalo mínimo entre dois polls do gh (fora dos hooks); `orq pr poll --forcar` ignora
 PR_GH_S = 15  # tempo de cada `gh pr view`
@@ -2442,6 +2446,77 @@ def _limpar_pos_merge(i, branch):
     append_event({"tipo": "pr", "op": "limpeza", "task": i["task"], "url": i["url"], "branch": branch, "repo": repo})
 
 
+def _guardar_relatorios(wt):
+    """Copia o relatorio-final.md da worktree (`.scratch/*/relatorio-final.md` e `relatorio*.md` na raiz) para RELATORIOS/<worktree>-<caminho com - no lugar de />. Devolve os destinos."""
+    os.makedirs(RELATORIOS, exist_ok=True)
+    nome, out = os.path.basename(wt.rstrip("/")), []
+    for c in sorted(glob.glob(os.path.join(wt, ".scratch/*/relatorio-final.md")) + glob.glob(os.path.join(wt, "relatorio*.md"))):
+        d = os.path.join(RELATORIOS, f"{nome}-{os.path.relpath(c, wt).replace('/', '-')}")
+        shutil.copy2(c, d)
+        out.append(d)
+    return out
+
+
+def _limpar_branch_fechada(task, repo, b, itens, fx, dry):
+    """Limpa uma branch de PR fechado sem merge: guarda o relatório, tira a worktree pelo Orca, apaga a local e a remota. Devolve (linha, ok).
+    Nunca toca branch de ambiente nem branch com PR aberto (head ou base). Na dúvida (gh ou Orca sem resposta) não apaga."""
+    if b in fx["ambientes"] or b == fx["producao"]:
+        return f"{task}: {b} é branch de ambiente, não limpa", True
+    slug = itens[0]["url"].rsplit("/pull/", 1)[0].removeprefix("https://github.com/")
+    try:
+        r = subprocess.run([GH, "pr", "list", "--repo", slug, "--state", "open", "--limit", "200", "--json", "headRefName,baseRefName"], capture_output=True, text=True, timeout=PR_GH_S)
+        abertos = json.loads(r.stdout) if r.returncode == 0 else None
+        wts = orca("list", "--repo", f"path:{repo}", area="worktree", timeout=15)["worktrees"]
+    except (subprocess.TimeoutExpired, OSError, ValueError, RuntimeError, KeyError) as e:
+        return f"{task}: {b} não limpa, sem resposta do gh ou do Orca ({type(e).__name__})", False
+    if not isinstance(abertos, list) or any(b in (p.get("headRefName"), p.get("baseRefName")) for p in abertos if isinstance(p, dict)):
+        return f"{task}: {b} tem PR aberto, não limpa", True
+    wt = next((w for w in wts if (w.get("branch") or "").removeprefix("refs/heads/") == b and not w.get("isMainWorktree")), None)
+    numeros = ", ".join(f"#{i['numero']}" for i in itens)
+    o_que = ", ".join(x for x in (f"worktree {wt['path']}" if wt else "", "branch local", "branch remota") if x)
+    if dry:
+        return f"{task}: limparia {b} ({o_que}); PR {numeros} fechado sem merge", True
+    guardados = []
+    try:
+        if wt:
+            guardados = _guardar_relatorios(wt["path"])
+            orca("rm", "--worktree", f"path:{wt['path']}", "--run-hooks", area="worktree", timeout=120)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:  # sem a cópia ou sem tirar a worktree, apagar a branch perderia trabalho
+        return f"{task}: {b} não limpa, a worktree ficou ({e})", False
+    topo = (_git(repo, "ls-remote", "--heads", "origin", b) or "").split("\t")[0]
+    apagou = [_git(repo, "branch", "-D", b) is not None and "local", bool(topo) and _git(repo, "push", "origin", "--delete", b, timeout=60) is not None and "remota"]
+    append_event({"tipo": "pr", "op": "limpou_fechado", "task": task, "branch": b, "removidos": [x for x in apagou if x], "guardados": guardados, "ponta_remota": topo,
+                  "restaurar": f"o GitHub restaura a branch remota pelo botão Restore branch do PR {numeros}"})
+    return f"{task}: {b} limpa ({o_que}); PR {numeros} fechado sem merge. O GitHub restaura a branch remota pelo botão Restore branch do PR", True
+
+
+def limpar_fechados(agora=None, dias=None, dry=False, auto=False):
+    """Limpa as branches das tasks cujos PRs estão todos fechados sem merge (nenhum aberto ou mergeado). `dias`: só as fechadas há esse tempo (None: na hora,
+    `orq limpar --fechados`). `auto` (o poll): respeita FECHADO_DIAS e, até o primeiro `orq limpar --fechados` de verdade (limpar-fechados.json), só mostra a
+    prévia, uma vez por task. O repositório vem do projeto do despacho, senão do cwd. Devolve as linhas do que fez."""
+    agora = time.time() if agora is None else agora
+    if auto and not _read_json(_path(FECHADOS)):
+        dry = True
+    permitido = (None,) if auto else (None, "previa", "erro")
+    linhas, eventos, por = [], read_events(), {}
+    for i in _prs_ro()["itens"]:
+        por.setdefault(i["task"], []).append(i)
+    for task, xs in por.items():
+        fecho = max((_dt(x.get("resolvido_em") or x["ligado_em"]).timestamp() for x in xs if x.get("resolvido_em") or x.get("ligado_em")), default=agora)
+        espera = FECHADO_DIAS if auto else dias
+        if not all(x["estado"] == "fechado" for x in xs) or any(x.get("limpeza") not in permitido for x in xs) or (espera is not None and agora - fecho < espera * 86400):
+            continue
+        desp = next((e for e in reversed(eventos) if e.get("tipo") == "despacho" and e.get("task") == task), {})
+        repo = (pasta_do_repo(projetos()[desp["projeto"]]["repo"]) if desp.get("projeto") in projetos() else None) or os.getcwd()
+        res = [_limpar_branch_fechada(task, repo, b, xs, fluxo_da_task(task, eventos), dry) for b in sorted({x["head"] for x in xs if x.get("head")})]
+        linhas += [l for l, _ in res]
+        marca = "previa" if dry else "feita" if all(ok for _, ok in res) else "erro"
+        _mutar_prs(lambda d, t=task, m=marca: [x.update(limpeza=m) for x in d["itens"] if x["task"] == t])
+    if not dry and not auto and linhas:
+        _write_json(_path(FECHADOS), {"confirmado": now()})
+    return linhas
+
+
 def _aplica_prs(d, vistos, agora):
     """Passa ao estado novo cada PR aberto que o gh viu mergeado ou fechado: um evento `pr` e uma entrada `pr` por PR, uma vez só (o `ref` da
     entrada é a URL, então repetir a passagem não a duplica). Devolve as linhas do que mudou."""
@@ -2458,13 +2533,15 @@ def _aplica_prs(d, vistos, agora):
         if i["estado"] != "aberto" or not novo:
             i["base"] = visto.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
-        i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now())
+        i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now(), **({"head": visto["headRefName"]} if visto.get("headRefName") else {}))
         prox = pr_proximo([x for x in d["itens"] if x["task"] == i["task"]], fluxo_da_task(i["task"]))
         onde = f"{i['task']}" + (f", issue #{i['issue']}" if i.get("issue") else "")
         texto = f"PR #{i['numero']} entrou em {i['base']} ({onde})" + (f": {prox}" if prox else "") if novo == "mergeado" \
             else f"PR #{i['numero']} fechado sem merge (base {i['base']}, {onde})"
         append_event({"tipo": "pr", "op": "entrou" if novo == "mergeado" else "fechou", "task": i["task"], "url": i["url"], "numero": i["numero"],
                       "base": i["base"], **({"proximo": prox} if prox else {})})
+        if novo == "fechado" and all(x["estado"] == "fechado" for x in d["itens"] if x["task"] == i["task"]):  # todos fechados sem merge: a branch é candidata à limpeza
+            append_event({"tipo": "pr", "op": "fechada", "task": i["task"], "branch": i.get("head"), "limpeza_em_dias": FECHADO_DIAS})
         if novo == "mergeado" and i["base"] == (FINAL_BASE or fluxo_da_task(i["task"], eventos)["producao"]):
             _limpar_pos_merge(i, visto.get("headRefName") or i.get("head"))
         if i["url"] in ja:
@@ -2496,10 +2573,12 @@ def pr_poll(agora=None, forcar=False):
             return []
         d = _prs_ro()
         urls = [i["url"] for i in d["itens"] if i["estado"] == "aberto"]
-        if not urls or (not forcar and agora - (d.get("ultimo_poll") or 0) < PR_POLL_S):
+        if not urls:
+            return limpar_fechados(agora, auto=True)
+        if not forcar and agora - (d.get("ultimo_poll") or 0) < PR_POLL_S:
             return []
         vistos = _pr_lista_gh(urls)
-        return _mutar_prs(lambda d: _aplica_prs(d, vistos, agora))
+        return _mutar_prs(lambda d: _aplica_prs(d, vistos, agora)) + limpar_fechados(agora, auto=True)
 
 
 def pr_avisar():
@@ -8987,6 +9066,9 @@ def main(argv=None):
     pd2.add_argument("task")
     pd2.add_argument("url")
     pr.add_parser("poll", help="pergunta ao gh pelos PRs abertos; merge ou fechamento vira uma entrada, uma vez").add_argument("--forcar", action="store_true", help="ignora o intervalo mínimo")
+    lf = sub.add_parser("limpar", help="orq limpar --fechados [--dry-run]: limpa na hora a worktree e as branches das tasks com todos os PRs fechados sem merge")
+    lf.add_argument("--fechados", action="store_true", required=True)
+    lf.add_argument("--dry-run", action="store_true", help="só mostra o que apagaria")
     dg = sub.add_parser("digest", help="grava digest/atual.json (o contrato do painel): fila de merge, features, pendências, o que aconteceu e workers vivos")
     dg.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez do momento em que o modo ausente ligou ou da última mensagem do usuário")
     dg.add_argument("--html", action="store_true", help="grava também a página digest/<data>.html")
@@ -9259,6 +9341,8 @@ def main(argv=None):
             print(json.dumps(responder(a.msg_id, a.texto), ensure_ascii=False))
         elif a.cmd == "alerta":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
+        elif a.cmd == "limpar":
+            print("\n".join(limpar_fechados(dry=a.dry_run)) or "nenhuma task com todos os PRs fechados sem merge")
         elif a.cmd == "ocupadas":
             print("\n".join(sorted(worktrees_ocupadas())))
         elif a.cmd == "hooks-codex":

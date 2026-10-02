@@ -155,6 +155,17 @@ if sys.argv[1] == "repo" and cmd == "add":
     print(json.dumps({"ok": True, "result": {"repo": {"id": "r1"}}})); sys.exit(0)
 if sys.argv[1] == "repo" and cmd == "set-base-ref":
     print(json.dumps({"ok": True, "result": {"repo": {"worktreeBaseRef": opt("--ref")}}})); sys.exit(0)
+if sys.argv[1] == "worktree":
+    import subprocess
+    wts = ler("worktrees.json", [])
+    if cmd == "rm":
+        path = opt("--worktree").removeprefix("path:")
+        w = next(x for x in wts if x["path"] == path)
+        rel = os.environ.get("ORQ_RELATORIOS", "")
+        open(os.path.join(d, "wtrm.log"), "a").write(json.dumps({"args": a, "relatorios": os.listdir(rel) if os.path.isdir(rel) else []}) + "\\n")
+        subprocess.run(["git", "-C", w["repo"], "worktree", "remove", "--force", path], check=True, capture_output=True)
+        json.dump([x for x in wts if x is not w], open(os.path.join(d, "worktrees.json"), "w"))
+    print(json.dumps({"ok": True, "result": {"worktrees": wts}})); sys.exit(0)
 if sys.argv[1] == "repo" and cmd == "list":
     print(json.dumps({"ok": True, "result": {"repos": ler("repos.json", [])}})); sys.exit(0)
 if sys.argv[1] == "tab":
@@ -7055,7 +7066,8 @@ except OSError:
     dados = {}
 if sys.argv[2] == "list":
     repo = sys.argv[sys.argv.index("--repo") + 1]
-    print(json.dumps([{**v, "url": k} for k, v in dados.items() if k.startswith(f"https://github.com/{repo}/")])); sys.exit(0)
+    so_abertos = "--state" in sys.argv and sys.argv[sys.argv.index("--state") + 1] == "open"
+    print(json.dumps([{**v, "url": k} for k, v in dados.items() if k.startswith(f"https://github.com/{repo}/") and (v["state"] == "OPEN" or not so_abertos)])); sys.exit(0)
 if sys.argv[3] not in dados:
     sys.stderr.write("no pull requests found"); sys.exit(1)
 print(json.dumps(dados[sys.argv[3]]))
@@ -7212,7 +7224,7 @@ def test_pr_poll_fechado_sem_merge_vira_entrada_e_nao_sugere_o_proximo():
     assert a.orq("pr", "poll", "--forcar").returncode == 0
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
     assert "PR #1216 fechado sem merge" in ent["texto"] and "pronto para" not in ent["texto"], ent["texto"]
-    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "fechou"]
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "fechou", "fechada"]
 
 
 def test_pr_poll_pr_aberto_nao_gera_entrada():
@@ -12860,6 +12872,94 @@ def test_ticket125_mate_abrir_sem_o_projeto_no_orca_segue_no_checkout_atual():
     assert "--worktree" not in _log(a, "create.log")[0]
 
 
+# ---------- limpeza de PR fechado sem merge (ticket 104) ----------
+
+def _fechado_env(**env):
+    """Um origin bare, o checkout `repo` (main, development, staging), a branch feat/x com um commit empurrado e uma worktree dela com relatorio-final.md; o projeto aponta para o repo."""
+    a = Amb(run="run_a", **{"ORQ_FECHADO_DIAS": "1", **env})
+    a.env["ORQ_RELATORIOS"] = os.path.join(a.tmp.name, "relatorios")
+    base = a.tmp.name
+    a.origin, a.repo, a.wt = (os.path.join(base, n) for n in ("origin.git", "repo", "wt-x"))
+    g = lambda *args, cwd=None: subprocess.run(["git", "-C", cwd or a.repo, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True, text=True).stdout.strip()
+    a.g = g
+    subprocess.run(["git", "init", "-q", "--bare", a.origin], check=True)
+    subprocess.run(["git", "clone", "-q", a.origin, a.repo], check=True, capture_output=True)
+    g("checkout", "-q", "-b", "main")
+    g("commit", "-q", "--allow-empty", "-m", "x")
+    for amb in ("development", "staging"):
+        g("branch", amb)
+    g("push", "-q", "origin", "main", "development", "staging")
+    g("worktree", "add", "-q", "-b", "feat/x", a.wt)
+    os.makedirs(os.path.join(a.wt, ".scratch/x"))
+    open(os.path.join(a.wt, ".scratch/x/relatorio-final.md"), "w").write("feito")
+    g("commit", "-q", "--allow-empty", "-m", "trabalho", cwd=a.wt)
+    g("push", "-q", "origin", "feat/x", cwd=a.wt)
+    a.set("worktrees.json", [{"path": a.wt, "branch": "refs/heads/feat/x", "repo": a.repo}])
+    os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
+    with open(os.path.join(a.home, "projects", "p.json"), "w") as f:
+        json.dump({"repo": f"path:{a.repo}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao"}, f)
+    _gh(a)
+    return a
+
+
+def _fechados(a, *urls, estados=("CLOSED", "CLOSED"), head="feat/x"):
+    for u in urls:
+        _pr(a, u, "OPEN", "development", headRefName=head)
+        assert a.orq("pr", "ligar", "task_feat1", u, cwd=a.repo).returncode == 0
+    for u, est in zip(urls, estados):
+        _pr(a, u, est, "development", headRefName=head)
+    r = a.orq("pr", "poll", "--forcar", cwd=a.repo)
+    assert r.returncode == 0
+    return r.stdout
+
+
+def _ramos(a):
+    return {"local": "feat/x" in a.g("branch", "--list", "feat/x"), "remota": bool(a.g("ls-remote", "--heads", "origin", "feat/x"))}
+
+
+def test_it_should_mark_the_task_closed_and_clean_it_after_the_grace_period():
+    a = _fechado_env()
+    _fechados(a, PR1, PR2)
+    assert [e["op"] for e in a.events() if e["tipo"] == "pr" and e["op"] == "fechada"] == ["fechada"], "marca uma vez, quando o último PR fecha"
+    assert a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout.count("limpa") == 0 and _ramos(a) == {"local": True, "remota": True}, "dentro do prazo nada sai"
+    r = a.orq("limpar", "--fechados", "--dry-run", cwd=a.repo)
+    assert "limparia feat/x" in r.stdout and "#1216, #1220" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
+    r = a.orq("limpar", "--fechados", cwd=a.repo)
+    assert r.returncode == 0 and "Restore branch" in r.stdout, r
+    assert _ramos(a) == {"local": False, "remota": False} and not os.path.exists(a.wt)
+    (rm,) = _log(a, "wtrm.log")
+    assert "--run-hooks" in rm["args"] and rm["relatorios"] == ["wt-x-.scratch-x-relatorio-final.md"], "o relatório é guardado antes de tirar a worktree"
+    (ev,) = [e for e in a.events() if e.get("op") == "limpou_fechado"]
+    assert ev["removidos"] == ["local", "remota"] and "Restore branch" in ev["restaurar"], ev
+
+
+def test_it_should_not_clean_a_task_with_an_open_pr():
+    a = _fechado_env()
+    _fechados(a, PR1, PR2, estados=("CLOSED", "OPEN"))
+    r = a.orq("limpar", "--fechados", cwd=a.repo)
+    assert "nenhuma task" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
+    assert not [e for e in a.events() if e.get("op") in ("fechada", "limpou_fechado")]
+
+
+def test_it_should_never_touch_an_environment_branch_or_a_branch_with_an_open_pr():
+    a = _fechado_env()
+    _fechados(a, PR1, estados=("CLOSED",), head="development")
+    assert "branch de ambiente" in a.orq("limpar", "--fechados", cwd=a.repo).stdout
+    assert a.g("ls-remote", "--heads", "origin", "development") and "development" in a.g("branch", "--list", "development")
+    b = _fechado_env()  # outro PR aberto usa a branch como head (outra task): nada sai
+    _fechados(b, PR1, estados=("CLOSED",))
+    _pr(b, PR2, "OPEN", "development", headRefName="feat/x")
+    assert "tem PR aberto" in b.orq("limpar", "--fechados", cwd=b.repo).stdout and _ramos(b) == {"local": True, "remota": True}
+
+
+def test_it_should_only_preview_the_automatic_cleanup_until_the_first_real_one():
+    a = _fechado_env(ORQ_FECHADO_DIAS="0")
+    out = _fechados(a, PR1, estados=("CLOSED",))
+    assert "limparia feat/x" in out and _ramos(a) == {"local": True, "remota": True}, "a primeira vez é só prévia"
+    assert "limparia" not in a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout, "a prévia sai uma vez por task"
+    assert a.orq("limpar", "--fechados", cwd=a.repo).returncode == 0 and _ramos(a) == {"local": False, "remota": False}
+    assert os.path.exists(os.path.join(a.home, "limpar-fechados.json"))
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
@@ -12873,3 +12973,4 @@ if __name__ == "__main__":
             print(f"FALHOU  {nome}: {type(e).__name__}: {str(e)[-400:]!r}")
     print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
     sys.exit(1 if falhas else 0)
+
