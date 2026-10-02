@@ -16798,6 +16798,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("retro lacunas --json", "retro gaps --json"),
     ("retro rejeitar g --motivo m", "retro reject g --reason m"),
     ("retro aceitar g --ticket 3", "retro accept g --ticket 3"),
+("retro citacoes rel.md", "retro citations rel.md"),
     ("intake e1 tarefa", "intake e1 task"),
     ("intake e1 decisao", "intake e1 decision"),
     ("intake e1 conversa --nota n", "intake e1 conversation --note n"),
@@ -18463,6 +18464,74 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
     assert found == [("01", True), ("04", False)], found
     r = a.orq("phase", "#2039 fase 1")
     assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
+def _cite209(a, report_text, transcript_lines):
+    t = a.tmp.name
+    tr = os.path.join(t, "sessao.jsonl")
+    open(tr, "w").write("\n".join(transcript_lines) + "\n")
+    rep = os.path.join(t, "rel.md")
+    open(rep, "w").write(report_text.replace("TR", tr))
+    return rep, tr
+
+
+def test_ticket209_citations_present_confere_and_paraphrase_does_not():
+    a = Env()
+    rep, _ = _cite209(a, 'O monitor não era chamado (`transcript:TR:2`): "o monitor nunca roda no hook".\n'
+                         'Outro achado (TR:1): "o usuário pediu para trocar a fila".\n',
+                      ["o usuário pediu para trocar a fila", "o monitor nunca roda no hook de parada"])
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and "citações: 2 (2 confere, 0 não confere)" in r.stdout, r.stdout
+    rep2, _ = _cite209(a, 'Achado (TR:1): "o usuário quis outra fila de trabalho".\n', ["o usuário pediu para trocar a fila"])
+    r = a.orq("retro", "citacoes", rep2)
+    assert r.returncode == 1 and "not found" in r.stdout, "paráfrase não confere"
+
+
+def test_ticket330_retro_gaps_does_not_fall_into_citations_and_citations_takes_the_report_as_ref():
+    a = Env()
+    r = a.orq("retro", "gaps")
+    assert r.returncode == 0 and "usage: orq retro citacoes" not in r.stderr, r.stderr
+    rep, _ = _cite209(a, 'Achado (TR:1): "o usuário pediu para trocar a fila".\n', ["o usuário pediu para trocar a fila"])
+    for op in ("citacoes", "citations"):
+        r = a.orq("retro", op, rep)
+        assert r.returncode == 0 and "citações: 1 (1 confere" in r.stdout, r.stdout
+    r = a.orq("retro", "citacoes")
+    assert r.returncode == 1 and "usage: orq retro citacoes <report.md>" in r.stderr, r.stderr
+
+
+def test_ticket209_citations_missing_file_is_named_and_no_pointer_says_zero():
+    a = Env()
+    rep = os.path.join(a.tmp.name, "rel.md")
+    open(rep, "w").write('Achado (`transcript:/nao/existe/s.jsonl:3`): "uma frase que ninguém vai achar".\n')
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 1 and "file missing" in r.stdout and "/nao/existe/s.jsonl:3" in r.stdout, r.stdout
+    open(rep, "w").write("# Relatório sem ponteiro\n\nnada citado.\n")
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and r.stdout.strip() == "citações: 0", r.stdout
+
+
+def test_ticket209_citations_line_break_inside_the_quote_still_confere():
+    a = Env()
+    rep, _ = _cite209(a, "Achado (TR:1):\n> o usuário pediu\n> para trocar   a fila\n\nOutro (TR:2): \"duas\\nlinhas aqui no trecho\".\n",
+                      ["o usuário pediu para trocar a fila", '{"text": "duas\\nlinhas aqui no trecho"}'])
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and "citações: 2 (2 confere" in r.stdout, r.stdout
+
+
+def test_ticket209_ingest_of_a_report_with_a_false_quote_records_the_event_and_clean_report_records_nothing():
+    for quote, expect in (("frase que o transcrito não tem", 1), ("o usuário pediu para trocar a fila", 0)):
+        a = Env()
+        runs = _fix("automations_runs.json")
+        ok = [r for r in runs["result"]["runs"] if r["status"] == "completed" and r["createdAt"] > 1790600000000][:1]
+        os.makedirs(os.path.join(a.tmp.name, ".scratch", "x"))
+        rep, _ = _cite209(a, f'# R\n\nAchado (TR:1): "{quote}".\n', ["o usuário pediu para trocar a fila"])
+        moved = os.path.join(a.tmp.name, ".scratch", "x", "rel.md")
+        os.rename(rep, moved)
+        rep = moved
+        ok[0]["outputSnapshot"]["content"] = f"O relatório está em `{rep}`."
+        runs["result"]["runs"] = ok
+        _ingest_env(a, runs=runs)
+        assert a.orq("ingest").returncode == 0
+        bad = [e for e in a.events() if e.get("tipo") == "citacao_nao_confere"]
+        assert len(bad) == expect and (not expect or (bad[0]["n"] == 1 and bad[0]["ref"] == ok[0]["id"])), bad
 
 
 if __name__ == "__main__":

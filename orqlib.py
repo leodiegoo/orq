@@ -2078,6 +2078,7 @@ def complete_reports(runs, event_list):
                 continue
             for e in fresh_entries:
                 append_event(e, new_id=True)
+            flag_citations(r, path)
             for id_ in without[r["id"]]:
                 if id_ not in closed_ids:
                     append_event({"tipo": "intake", "entrada": id_, "efeito": "descartado", "nota": f"replaced by the items of {os.path.basename(path)}"})
@@ -2085,6 +2086,92 @@ def complete_reports(runs, event_list):
         except Exception as e:  # noqa: BLE001 - a poisonous run does not lock the others
             log(f"ingest automations: completing {r.get('id') if isinstance(r, dict) else r}: {type(e).__name__}: {e}")
     return n
+
+
+CITE_MIN = 8  # characters of a quote (spaces collapsed) below which it is not checked: "ok" would match any line
+_CITE_PTR = re.compile(r"(?:transcript:)?((?:~|\.{0,2}/)?[\w@%+.\-]+(?:/[\w@%+.\-]+)*\.[A-Za-z0-9]+):(\d+)")
+_CITE_QUOTE = re.compile(r'"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d|`([^`\n]+)`')
+
+
+def _squash(text_value):
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def citation_pairs(report):
+    """[(file, line, quote)] from a report: a `transcript:<file>:<line>` or `<file>:<line>` pointer plus the quote on the same line ("..", `..`),
+    or else the `>` block or the code fence right under it. The pointer itself is cut out first, so a pointer in backticks is not read as a quote.
+    ponytail: a quote shorter than CITE_MIN is skipped, not flagged."""
+    lines, out = report.splitlines(), []
+    for i, ln in enumerate(lines):
+        for m in _CITE_PTR.finditer(ln):
+            lo, hi = m.start(), m.end()
+            if ln[:lo].endswith("`") and ln[hi:].startswith("`"):  # a pointer in backticks: the pair goes with it
+                lo, hi = lo - 1, hi + 1
+            rest = ln[:lo] + " " + ln[hi:]
+            q = next((next(g for g in qm.groups() if g) for qm in _CITE_QUOTE.finditer(rest)), None)
+            if q is None:
+                j, block = i + 1, []
+                if j < len(lines) and lines[j].lstrip().startswith("```"):
+                    j += 1
+                    while j < len(lines) and not lines[j].lstrip().startswith("```"):
+                        block.append(lines[j])
+                        j += 1
+                else:
+                    while j < len(lines) and lines[j].lstrip().startswith(">"):
+                        block.append(lines[j].lstrip()[1:])
+                        j += 1
+                q = " ".join(block) if block else None
+            if q and len(_squash(q)) >= CITE_MIN:
+                out.append((m.group(1), int(m.group(2)), _squash(q)))
+    return out
+
+
+def check_citations(report_path):
+    """One row per pointer+quote of the report: {arquivo, linha, trecho, estado}, estado `confere`, `nao_achado` or `arquivo_ausente`.
+    The quote must be inside that line of the file (spaces collapsed; a JSON transcript line is also read with its escaped newline and quote undone)."""
+    with open(report_path) as f:
+        pairs = citation_pairs(f.read())
+    base, rows = os.path.dirname(os.path.abspath(report_path)), []
+    for name, n, q in pairs:
+        target = os.path.expanduser(name)
+        found = next((c for c in (target, os.path.join(base, target)) if os.path.isfile(c)), None)
+        state = "arquivo_ausente"
+        if found:
+            state = "nao_achado"
+            try:
+                with open(found, errors="replace") as f:
+                    ln = next((x for k, x in enumerate(f, 1) if k == n), "")
+            except OSError:
+                ln = ""
+            if any(q in _squash(v) for v in (ln, ln.replace("\\n", " ").replace('\\"', '"'))):
+                state = "confere"
+        rows.append({"arquivo": name, "linha": n, "trecho": q, "estado": state})
+    return rows
+
+
+def citations_text(rows):
+    if not rows:
+        return "citações: 0"
+    names = {"confere": "confere", "nao_achado": "not found", "arquivo_ausente": "file missing"}
+    ok = sum(r["estado"] == "confere" for r in rows)
+    return "\n".join([f"citações: {len(rows)} ({ok} confere, {len(rows) - ok} não confere)"] +
+                     [f"  {names[r['estado']]:<13} {r['arquivo']}:{r['linha']}  {r['trecho'][:60]!r}" for r in rows])
+
+
+def flag_citations(r, path):
+    """Right after a report's entries come in: a quote that is not in its transcript line records `citacao_nao_confere` (count + report) and warns the
+    coordinator. No pointers, or all matching, writes nothing."""
+    try:
+        bad = [x for x in check_citations(path) if x["estado"] != "confere"] if path and os.path.isfile(path) else []
+    except (OSError, ValueError):
+        return
+    if not bad:
+        return
+    append_event({"tipo": "citacao_nao_confere", "ref": r["id"], "caminho": path, "n": len(bad)}, new_id=True)
+    g = _manager_cfg()
+    if g and g.get("coordenador"):
+        notify_coordinator(g["coordenador"], f"orq: {len(bad)} citation(s) of {os.path.basename(path)} do not match the transcript "
+                           f"(first: {bad[0]['arquivo']}:{bad[0]['linha']}). Check with: orq retro citacoes {path}")
 
 
 def ingest_automations():
@@ -2112,6 +2199,7 @@ def ingest_automations():
                 continue
             for e in entries:
                 append_event(e, new_id=True)
+            flag_citations(r, run_path(r))
             _cursor_mut(lambda c, i=r["id"]: c["ingest"].__setitem__("runs", (c["ingest"]["runs"] + [i])[-200:]))
         except Exception as e:  # noqa: BLE001 - a poisonous run cannot lock the following ones
             key_name = f"auto:{r.get('id') or r.get('createdAt') if isinstance(r, dict) else r}"
@@ -12799,7 +12887,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "dispatch-queue": {"lista": "list", "descartar": "discard"},
        "worktrees": {"limpar": "clean"},
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
-    "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept"},
+    "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept", "citacoes": "citations"},
 }
 # the `choices` values (pt -> en): the CLI accepts both and delivers the pt one, which is what the code records today
 STOP_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
@@ -13202,8 +13290,8 @@ def parser():
     _arg(rr, "desde", help="start of the window (date or ISO)")
     _arg(rr, "ate", help="end of the window (default: now)")
     _arg(rr, "projeto", help="only the cases whose path, title or task contains the snippet")
-    rr.add_argument("op", nargs="?", choices=["gaps", "lacunas", "reject", "rejeitar", "accept", "aceitar"], metavar="{gaps,reject,accept}",
-                    help="gaps: the ledger of gaps kept between rounds; reject <id> --reason T: the proposal only comes back with more sessions; accept <id> --ticket N: the gap is covered when the ticket closes")
+    rr.add_argument("op", nargs="?", choices=["gaps", "lacunas", "reject", "rejeitar", "accept", "aceitar", "citations", "citacoes"], metavar="{gaps,reject,accept,citations}",
+                    help="gaps: the ledger of gaps kept between rounds; reject <id> --reason T: the proposal only comes back with more sessions; accept <id> --ticket N: the gap is covered when the ticket closes; citations <report.md>: checks the report's quotes against the transcript lines they point to (exit 1 if one does not match)")
     rr.add_argument("ref", nargs="?", help="the gap id (reject, accept)")
     rr.add_argument("--ticket", help="accept: the ticket that answers the gap")
     rr.add_argument("--json", action="store_true")
@@ -13618,6 +13706,12 @@ def main(argv=None):
                   f"{level}" + (f": {reason}" if reason else "") + (f" (week {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (no fresh HUD frame)"))
         elif a.cmd == "audit-answers":
             print(audit_answers(a.session), end="")
+        elif a.cmd == "retro" and a.op == "citations":
+            if not a.ref:
+                raise ValueError("usage: orq retro citacoes <report.md>")
+            rows = check_citations(a.ref)
+            print(json.dumps(rows, ensure_ascii=False) if a.json else citations_text(rows))
+            return int(any(x["estado"] != "confere" for x in rows))
         elif a.cmd == "retro":
             print(retro_cmd(a))
         else:
