@@ -14815,8 +14815,18 @@ def _entrega141(a, task="task_t141", body="branch feat/orq-x commit abc1234def",
     json.dump({"ingest": {"desde": "2000-01-01T00:00:00Z", "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
 
 
+def _repo_com_branch(base, *branches):
+    repo = os.path.join(base, "repo")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    for b in branches:
+        subprocess.run(["git", "-C", repo, "branch", b], check=True)
+    return repo
+
+
 def test_ticket141_worker_done_de_ticket_do_orq_entra_na_fila_e_avisa_o_integrador():
-    a = Amb(run="run_a")
+    tmp = tempfile.mkdtemp()
+    a = Amb(run="run_a", ORQ_REPOS=_repo_com_branch(tmp, "feat/orq-x"))
     _entrega141(a)
     assert a.orq("ingest").returncode == 0
     fila = json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
@@ -15208,6 +15218,28 @@ def test_ticket155_projeto_sem_deploy_check_nao_roda_nada_e_a_ultima_obrigacao_f
     _limpou155(a, removidos=["worktree:feat/x"])
     _volta155(a)
     assert os.path.exists(marca) and not _obrig(a, e) and e not in {x["id"] for x in orq_mod.abertas(a.events())}, "a última fechada fecha a entrada"
+def test_ticket169_branch_da_worktree_vence_o_texto_que_cita_um_arquivo():
+    tmp = tempfile.mkdtemp()
+    repo = _repo_com_branch(tmp)
+    wt = os.path.join(tmp, "wt")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat/x", wt], check=True)
+    a = Amb(run="run_a", ORQ_REPOS=repo)
+    _entrega141(a, body="atualizei docs/design.md, commit abc1234def")
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
+                           {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": wt}])
+    a.orq("ingest")
+    fila = json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in fila] == [("141", "feat/x")], fila
+
+
+def test_ticket169_nome_que_nao_e_branch_nao_entra_e_avisa_que_faltou_a_branch():
+    tmp = tempfile.mkdtemp()
+    a = Amb(run="run_a", ORQ_REPOS=_repo_com_branch(tmp))
+    _entrega141(a, body="atualizei docs/design.md, commit abc1234def")
+    a.orq("ingest")
+    assert not os.path.exists(os.path.join(a.home, "integrar-fila.json"))
+    (ev,) = [e for e in a.events() if e["tipo"] == "entrega" and any("sem branch" in x for x in e["avisos"])]
+    assert "141" in ev["avisos"][0], ev
 
 
 if __name__ == "__main__":

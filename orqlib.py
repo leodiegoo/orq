@@ -1874,6 +1874,12 @@ def _worktree_do_dispatch(run, dispatch):
     return wt if wt.startswith("/") else None
 
 
+def _branch_do_texto(texto):
+    """A primeira branch citada no texto que existe num repositório de ORQ_REPOS (`git rev-parse --verify`), ou None: `docs/design.md` não é branch."""
+    repos = [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+    return next((b for b in dict.fromkeys(BRANCH_RE.findall(texto)) if any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)), None)
+
+
 def _terminal_do_integrador(events):
     """O terminal do serviço de despacho que se chama integrador (o último que não foi liberado), ou None."""
     servicos, liberados = _servicos(events), _liberados(events)
@@ -1884,7 +1890,8 @@ def _terminal_do_integrador(events):
 
 def _entrega_do_orq(m, p):
     """worker_done `succeeded` de ticket do orq (a task é a `Task:` de um ticket de ISSUES; os do produto não entram) com branch no payload ou no texto ->
-    `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). Sem branch só o log: o coordenador adiciona à mão.
+    `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). A branch vem do payload, da branch atual da worktree do dispatch e só
+    por último do texto, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
     O aviso é digitado uma vez (ocupado: tenta enfileirar no turno; ainda assim não, fica só a fila, que o integrador lê no ciclo). Devolve o ticket ou None."""
     if p.get("outcome") != "succeeded" or not p.get("taskId"):
         return None
@@ -1892,13 +1899,15 @@ def _entrega_do_orq(m, p):
     if not t:
         return None
     texto = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
-    branch = p.get("branch") or next(iter(BRANCH_RE.findall(texto)), None)  # ponytail: a primeira branch citada; várias no texto, o worker deve usar o payload
+    wt = _worktree_do_dispatch(m.get("run_id"), p.get("dispatchId"))
+    branch = p.get("branch") or (wt and (_git(wt, "branch", "--show-current") or "").strip()) or _branch_do_texto(texto)
     if not branch:
         log(f"entrega do orq: ticket {t['num']} sem branch no worker_done {m['id']}; fica fora da fila do integrador")
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
+                      "avisos": [f"entrega do ticket {t['num']} sem branch: não entrou na fila do integrador; `orq integrar fila add <branch> {t['num']}`"]})
         return None
     commit = p.get("commit") or next(iter(SHA_RE.findall(texto)), None)
     ev = integrar_fila_add(branch, t["num"])
-    wt = _worktree_do_dispatch(m.get("run_id"), p.get("dispatchId"))
     aviso = f"orq: ticket {t['num']} entrou na fila. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
     h = _terminal_do_integrador(read_events())
     r = (digita(h, aviso) if h else "sem_integrador")
