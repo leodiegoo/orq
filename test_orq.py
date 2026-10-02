@@ -15658,7 +15658,11 @@ def test_ticket218_a_set_over_the_limit_is_refused_and_becomes_a_pending_item():
 FAKE_NM146 = """#!/usr/bin/env python3
 import json, os, sqlite3, sys, time
 d = os.environ["FAKE_DIR"]
-open(os.path.join(d, "nm.log"), "a").write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "nm_home": os.environ.get("NM_HOME")}) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("no-mistakes version v1.86.0 (abc1234) 2026-10-01")
+    sys.exit(0)
+stdin = sys.stdin.read() if sys.argv[1:3] == ["axi", "run"] else None
+open(os.path.join(d, "nm.log"), "a").write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "nm_home": os.environ.get("NM_HOME"), "stdin": stdin}) + "\\n")
 if sys.argv[1:3] == ["axi", "run"]:
     con = sqlite3.connect(os.path.join(os.environ["NM_HOME"], "state.sqlite"))
     con.execute("create table if not exists agent_invocations (started_at integer, input_tokens integer, output_tokens integer, cache_read_tokens integer, cache_creation_tokens integer, finding_count integer)")
@@ -15708,7 +15712,8 @@ def test_ticket146_review_runs_only_review_in_task_worktree_with_orq_nm_home():
     assert init["args"] == ["init"] and init["cwd"] == os.path.realpath(a.wt), init
     assert run["args"][:2] == ["axi", "run"] and run["cwd"] == os.path.realpath(a.wt), run
     assert run["args"][run["args"].index("--skip") + 1] == "test,document,lint,push,pr,ci"
-    assert "Revisar so o review" in run["args"][run["args"].index("--intent") + 1] and "Acceptance criteria" in run["args"][run["args"].index("--intent") + 1]
+    assert run["args"][run["args"].index("--intent") + 1] == "-", "o intent vai por stdin, não pelo argv"
+    assert "Revisar so o review" in run["stdin"] and "Acceptance criteria" in run["stdin"]
     assert abort["args"] == ["axi", "abort"] and abort["cwd"] == os.path.realpath(a.wt), "a run parada no gate é abortada: a branch volta a ser do worker"
     assert run["nm_home"] == a.env["ORQ_NM_HOME"] != os.path.expanduser("~/.no-mistakes"), "o NM_HOME é o do orq"
     assert "claude-sonnet-5-5" in open(os.path.join(a.env["ORQ_NM_HOME"], "config.yaml")).read()
@@ -15724,6 +15729,48 @@ def test_ticket146_review_writes_nm_review_with_duration_findings_and_tokens():
     assert e["task"] == "task_term_r1" and e["modelo"] == "claude-sonnet-5-5" and e["achados"] == 1 and e["duracao_s"] >= 0, e
     assert e["tokens"] == {"entrada": 8, "saida": 200, "cache_lido": 1500000, "cache_criado": 165000} and "erro" not in e, e
     assert not os.path.exists(os.path.join(a.home, "revisao-nm.json")) or _read_state(os.path.join(a.home, "revisao-nm.json")) == [], "o slot foi solto"
+
+
+def _long_ticket224(a, extra_boilerplate=0, what=0):
+    path = os.path.join(a.env["ORQ_ISSUES"], "146-t.md")
+    t = open(path).read().replace("\nx\n", "\n" + "x" * what + "\n", 1)
+    open(path, "w").write(t + "\n## Worktree do orq\n\n" + "w" * extra_boilerplate + "\n\n## Answer\n\nz\n")
+
+
+def test_ticket224_review_passes_8kb_ticket_whole_through_stdin_with_acceptance_criteria():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, extra_boilerplate=8000)
+    assert a.orq("revisar", "146").returncode == 0
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert len(run["stdin"].encode()) > 8000 and "## Acceptance criteria\n\n- [ ] y" in run["stdin"] and "## Worktree do orq" in run["stdin"] and run["stdin"].rstrip().endswith("z"), "inteiro, sem corte"
+
+
+def test_ticket224_review_over_ceiling_drops_only_boilerplate_sections():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, extra_boilerplate=50000)
+    assert a.orq("revisar", "146").returncode == 0
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert "## What to build" in run["stdin"] and "## Acceptance criteria\n\n- [ ] y" in run["stdin"] and "Worktree do orq" not in run["stdin"] and "## Answer" not in run["stdin"], run["stdin"]
+    assert run["stdin"].startswith("Revisar so o review")
+
+
+def test_ticket224_review_refuses_when_what_to_build_and_criteria_still_pass_ceiling():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, what=50000)
+    r = a.orq("revisar", "146")
+    assert r.returncode == 1 and "shorten the ticket" in r.stderr and not _log(a, "nm.log"), r
+
+
+def test_ticket224_review_event_has_intent_bytes_and_no_mistakes_version():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    assert a.orq("revisar", "146").returncode == 0
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert e["intent_bytes"] == len(run["stdin"].encode()) > 0 and e["nm_versao"].startswith("no-mistakes version v1.86.0"), e
 
 
 def test_ticket146_review_no_mistakes_failure_writes_error_and_exits_with_1():
