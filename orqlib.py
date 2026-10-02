@@ -129,6 +129,9 @@ PANEL_INTERVAL_MAX_S = 30  # ceiling of the `sleep` when the round exceeds PANEL
 REMEMBERED_ROUNDS = 10  # round durations kept in gerente.json `voltas_s`
 INTEGRATE_QUEUE_FILE = "integrate-queue.json"  # {itens: [{branch, ticket, ts}]}: the branches waiting for the integrator; the ticket's worker stays "aguardando integração" (awaiting integration)
 PANEL_CHECK = "manager-check.json"  # {ts, terminal, morto}: what the last `orq manager checar` (outside the hook) saw in Orca; the hook only reads it
+PANEL_RESPAWN = "manager-respawn.json"  # {terminal, tentativas, ts}: the on-its-own respawns (ticket 230) of the dead manager terminal `terminal`
+RESPAWN_MAX = 3  # attempts per dead terminal; after that only the manual notice (`orq manager spawn`) is left
+RESPAWN_WAIT_S = 300  # a new attempt on the same dead terminal waits this long
 MANAGER = "manager.json"  # {coordenador, gerente, runs}: the coordinator talks to Orca through the agent manager terminal
 RUN_STOPPED_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # a Run with no open task or message for this long leaves the manager
 RECENT_RUN_H = 24  # a Run with no open work only shows up in the summary until 24 h after the last activity; after that it goes to the archive (`orq runs --include_all`)
@@ -1009,8 +1012,12 @@ def panel_notice(now_at=None):
         return None
     ck = _dict(_read_json(_path(PANEL_CHECK)))
     if ck.get("morto") and ck.get("terminal") == g.get("gerente"):
+        tried = _respawn_state(g["gerente"])["tentativas"]
+        if tried < RESPAWN_MAX:
+            return (f"the agent manager terminal ({g['gerente']}) vanished from Orca: orq is bringing it back up on its own (attempt {max(tried, 1)} of {RESPAWN_MAX}, "
+                    f"one every {RESPAWN_WAIT_S // 60} min); worker_done messages wait in the inbox meanwhile.")
         return (f"the agent manager terminal ({g['gerente']}) vanished from Orca: no worker notice arrives and the worker_done messages stay in the inbox. "
-                "Bring it back up with: orq manager spawn")
+                f"Spawning it on its own failed {tried} times. Bring it back up with: orq manager spawn")
     if age is not None and age <= panel_limit_s(g):  # the process is alive, the round is just slow (high load)
         media = _avg_rounds(g)
         return (f"slow panel ({media:.0f} s per loop)" if media else f"slow panel ({int(age)} s without a stamp)") + ": the process is alive, worker notices are delayed"
@@ -1019,9 +1026,65 @@ def panel_notice(now_at=None):
     return f"agent manager panel stopped for {int(age // 60)} min: no worker notice arrives; restart painel-agent-manager.sh in its terminal"
 
 
+def _respawn_state(terminal):
+    """{terminal, tentativas, ts} of the on-its-own respawns of `terminal`; zeroed when the file is about another terminal (a new manager starts over)."""
+    st = _dict(_read_json(_path(PANEL_RESPAWN)))
+    if st.get("terminal") == terminal and isinstance(st.get("tentativas"), int) and isinstance(st.get("ts"), (int, float)):
+        return st
+    return {"terminal": terminal, "tentativas": 0, "ts": 0}
+
+
+def _respawn_due(st, now_at):
+    return st["tentativas"] < RESPAWN_MAX and (not st["tentativas"] or now_at - st["ts"] >= RESPAWN_WAIT_S)
+
+
+@contextlib.contextmanager
+def _lock_try(item_name):
+    """Non-blocking flock on HOME/<nome>: yields False when someone else holds it."""
+    os.makedirs(HOME, exist_ok=True)
+    with open(_path(item_name), "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+
+
+def manager_respawn_alone(dead, now_at=None):
+    """Outside the hook, after `manager_check` found `dead` (the gerente.json terminal) vanished from Orca: this coordinator brings the manager back up
+    itself (`manager_start`, which still demands Orca's proof). Single flight: a non-blocking flock on manager.lock (whoever loses does nothing), one
+    attempt per RESPAWN_WAIT_S and RESPAWN_MAX per dead terminal; then only the manual notice is left. Returns the `subiu_sozinho` event or None."""
+    now_at = now_at or time.time()
+    if not _respawn_due(_respawn_state(dead), now_at):
+        return None
+    with _lock_try("manager.lock") as got:
+        if not got:
+            return None
+        _MANAGER_LOCK[0] = 1  # manager_bind below takes the same lock: the flock is not reentrant across file descriptors
+        try:
+            g = _manager_cfg()
+            st = _respawn_state(dead)
+            if g.get("gerente") != dead or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE") or not _respawn_due(st, now_at):
+                return None  # another process already brought it back, or it is not this coordinator's manager (never take the manager of another)
+            _write_json(_path(PANEL_RESPAWN), {"terminal": dead, "tentativas": st["tentativas"] + 1, "ts": now_at})
+            try:
+                res = manager_start()
+            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                log(f"gerente subir sozinho {dead}: {type(e).__name__}: {e}")
+                return None
+        finally:
+            _MANAGER_LOCK[0] = 0
+    ev = append_event({"tipo": "gerente", "op": "subiu_sozinho", "terminal": res["terminal"], "anterior": dead})
+    with contextlib.suppress(Exception):
+        notify_coordinator(g["coordenador"], f"orq: agent manager came back up on its own (terminal {res['terminal']})")
+    return ev
+
+
 def check_manager_bg(now_at=None):
-    """In the coordinator prompt: `manager-alive` stamp old (or missing) and the last check more than PANEL_STOPPED_S ago, asks Orca in the background
-    whether the manager's terminal still exists (`orq manager checar`). The hook does not wait for Orca: the notice comes out on the next prompt, via panel_notice."""
+    """In the coordinator's prompt, Stop and SessionStart hooks: `manager-alive` stamp old (or missing) and the last check more than PANEL_STOPPED_S ago, asks Orca in the background
+    whether the manager's terminal still exists (`orq manager checar`), which brings a dead one back up on its own. The hook does not wait for Orca: the notice comes
+    out on the next prompt, via panel_notice."""
     g = _manager_cfg()
     if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return
@@ -5258,7 +5321,19 @@ def record_coordinator_resume():
         append_event({"tipo": "coordenador_retomou"})
 
 
+def _check_manager_hook():
+    """The dead-manager check on the hook path: fail-open, and the hook's alarm still cuts it."""
+    try:
+        check_manager_bg()
+    except TimeoutError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log(f"check_manager_bg: {type(e).__name__}: {e}")
+
+
 def hook_stop(ev, run):
+    if not os.environ.get("ORQ_MATE"):
+        _check_manager_hook()  # an idle coordinator with the away mode on has no prompt: the Stop is the turn it still has
     out = _hook_stop(ev, run)
     if not os.environ.get("ORQ_MATE") and not (out or {}).get("decision") == "block":
         try:
@@ -5533,6 +5608,8 @@ def hook_session(ev, run):
     """SessionStart: injects the state and the open tickets so the new session resumes without anyone telling it anything."""
     if not os.path.exists(_path("open.json")):
         refresh_bg()  # with no cache the summary says "refresh em andamento" (refresh in progress): it asks for the refresh (B27)
+    if not os.environ.get("ORQ_MATE"):
+        _check_manager_hook()
     ctx = session_context()
     if other_handoff := _coordinator_handoff_to(ev):
         ctx += "\n\n" + other_handoff
@@ -10106,6 +10183,8 @@ def manager_check():
     live = _alive_terminals()
     ck = {"ts": time.time(), "terminal": g["gerente"], "morto": live is not None and g["gerente"] not in live}
     _write_json(_path(PANEL_CHECK), ck)
+    if ck["morto"] and g.get("coordenador") == os.environ.get("ORCA_TERMINAL_HANDLE"):
+        manager_respawn_alone(g["gerente"])
     return ck
 
 
