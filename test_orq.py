@@ -15011,9 +15011,10 @@ def test_ticket141_release_worktree_current_closes_no_setup_terminal():
 def _procs147(a, wt):
     os.makedirs(wt + "/web", exist_ok=True)
     os.makedirs(wt + "-irma", exist_ok=True)
-    ps = [{"pid": 300, "ppid": 1, "rss": 5000, "args": "node meteor", "cwd": wt + "/web"},
+    ps = [{"pid": 299, "ppid": 1, "rss": 5000, "args": "claude worker", "cwd": wt},  # the worker's agent: the anchor of its tree (ticket 218)
+          {"pid": 300, "ppid": 299, "rss": 5000, "args": "node meteor", "cwd": wt + "/web"},
           {"pid": 301, "ppid": 300, "rss": 5000, "args": "docker compose up", "cwd": wt},
-          {"pid": 302, "ppid": 1, "rss": 5000, "args": "node teimoso", "cwd": wt, "ignora_term": True},
+          {"pid": 302, "ppid": 299, "rss": 5000, "args": "node teimoso", "cwd": wt, "ignora_term": True},
           {"pid": 303, "ppid": 1, "rss": 5000, "args": "node de outra pasta", "cwd": wt + "-irma"},
           {"pid": 304, "ppid": 1, "rss": 5000, "args": "claude coordenador", "cwd": os.path.dirname(wt)}]
     a.set("../procs147.json", ps)
@@ -15034,8 +15035,8 @@ def test_ticket147_release_ends_only_processes_with_cwd_inside_worktree():
     assert r.returncode == 0, r.stderr
     assert {p["pid"] for p in json.load(open(file_path))} == {303, 304}, "dentro cai (o teimoso no KILL); fora e o coordenador ficam"
     (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
-    assert (ev["encerrados"], ev["kill"]) == (3, 1), ev
-    assert "3 worktree process(es)" in json.loads(r.stdout)["aviso"]
+    assert (ev["encerrados"], ev["kill"]) == (4, 1), ev
+    assert "4 worktree process(es)" in json.loads(r.stdout)["aviso"]
 
 
 def test_ticket147_release_with_kept_terminal_ends_no_process():
@@ -15049,27 +15050,16 @@ def test_ticket147_release_with_kept_terminal_ends_no_process():
     a.inbox(("worker_done", {"taskId": "task_w1", "dispatchId": "ctx_term_w1"}))
     file_path = _procs147(a, wt)
     assert a.orq("liberar", "ctx_term_w1").returncode == 0
-    assert len(json.load(open(file_path))) == 5
+    assert len(json.load(open(file_path))) == 6
 
 
 def test_ticket147_end_spares_orq_itself_and_its_caller():
-    import orqlib
     a = Env(run="run_a")
-    wt = os.path.join(a.tmp.name, "wt147")
-    os.makedirs(wt)
-    open(os.path.join(wt, ".git"), "w").write("gitdir: /tmp/x/.git/worktrees/wt147\n")
+    wt = _wt218(a)
     eu, parent = os.getpid(), os.getppid()
-    file_path = os.path.join(a.tmp.name, "p.json")
-    json.dump([{"pid": 400, "ppid": 1, "args": "node", "cwd": wt}, {"pid": parent, "ppid": 1, "args": "coordenador", "cwd": wt},
-               {"pid": eu, "ppid": parent, "args": "orq", "cwd": wt}], open(file_path, "w"))
-    before = {k: os.environ.get(k) for k in ("ORQ_PROCESSOS", "ORQ_HOME")}
-    os.environ.update(ORQ_PROCESSOS=file_path, ORQ_HOME=a.home)
-    try:
-        res = orqlib.terminate_worktree_processes(wt, wait_s=0.2)
-    finally:
-        for k, v in before.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-    assert res["encerrados"] == 1 and {p["pid"] for p in json.load(open(file_path))} == {parent, eu}, res
+    res, left = _sweep218(a, wt, [{"pid": 399, "ppid": 1, "args": "claude worker", "cwd": wt}, {"pid": 400, "ppid": 399, "args": "node", "cwd": wt},
+                                   {"pid": parent, "ppid": 1, "args": "coordenador", "cwd": wt}, {"pid": eu, "ppid": parent, "args": "orq", "cwd": wt}])
+    assert res["encerrados"] == 2 and left == {parent, eu}, res
 
 
 def test_hotfix147_main_checkout_never_has_process_ended():
@@ -15088,6 +15078,101 @@ def test_hotfix147_main_checkout_never_has_process_ended():
         for k, v in before.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
     assert res is None and len(json.load(open(file_path))) == 2, res
+
+
+# ---------- ticket 218: the sweep ends only the worker's processes, with a circuit breaker ----------
+
+def _wt218(a):
+    wt = os.path.join(a.tmp.name, "wt218")
+    os.makedirs(wt + "/web")
+    open(os.path.join(wt, ".git"), "w").write("gitdir: /tmp/x/.git/worktrees/wt218\n")
+    return wt
+
+
+def _sweep218(a, wt, ps, **kw):
+    import orqlib
+    file_path = os.path.join(a.tmp.name, "p218.json")
+    json.dump(ps, open(file_path, "w"))
+    before = {k: os.environ.get(k) for k in ("ORQ_PROCESSOS", "ORQ_HOME")}
+    mod = (orqlib.HOME, orqlib.PENDING, orqlib.BACKLOG)  # fixed at import: without this the events and the pending item go to the real state
+    os.environ.update(ORQ_PROCESSOS=file_path, ORQ_HOME=a.home)
+    orqlib.HOME, orqlib.PENDING, orqlib.BACKLOG = a.home, a.env["ORQ_PENDENCIAS"], None
+    try:
+        res = orqlib.terminate_worktree_processes(wt, wait_s=0.2, **kw)
+    finally:
+        orqlib.HOME, orqlib.PENDING, orqlib.BACKLOG = mod
+        for k, v in before.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    return res, {p["pid"] for p in json.load(open(file_path))}
+
+
+def _ps218(wt):
+    return [{"pid": 10, "ppid": 1, "args": "claude worker", "cwd": wt}, {"pid": 11, "ppid": 10, "args": "node meteor", "cwd": wt},
+            {"pid": 20, "ppid": 1, "args": "vim notas.md", "cwd": wt}, {"pid": 21, "ppid": 1, "args": "tail -f log", "cwd": wt + "/web"}]
+
+
+def test_ticket218_cwd_inside_but_outside_the_worker_tree_stays():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    res, left = _sweep218(a, wt, _ps218(wt))
+    assert (res["encerrados"], res["nao_encerrados"]) == (2, 2) and left == {20, 21}, (res, left)
+    (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
+    assert [x["pid"] for x in ev["lista"]] == [10, 11] and [x["pid"] for x in ev["restantes"]] == [20, 21] and ev["lista"][1]["comando"] == "node meteor", ev
+
+
+def test_ticket218_without_an_anchor_nothing_is_ended_and_the_event_says_so():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    res, left = _sweep218(a, wt, _ps218(wt)[2:])
+    assert res["encerrados"] == 0 and res["nao_encerrados"] == 2 and left == {20, 21}, (res, left)
+    (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
+    assert ev["nao_encerrados"] == 2 and not ev["lista"], ev
+    import orqlib
+    assert "orq release d1 --processos" in " ".join(orqlib.sweep_notices(res, "d1"))
+
+
+def test_ticket218_snapshot_taken_before_the_terminal_closed_ends_the_orphans():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    res, left = _sweep218(a, wt, _ps218(wt)[1:], owned={11})  # the agent is gone: node meteor lost its parent
+    assert res["encerrados"] == 1 and left == {20, 21}, (res, left)
+
+
+def test_ticket218_all_cwd_flag_ends_every_process_in_the_worktree():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    res, left = _sweep218(a, wt, _ps218(wt), all_cwd=True)
+    assert res["encerrados"] == 4 and res["nao_encerrados"] == 0 and not left, (res, left)
+
+
+def test_ticket218_release_leaves_a_stranger_and_processos_flag_ends_it():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    _release_env(a)
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "active", "release": "released", "worktree": wt}])
+    file_path = _procs147(a, wt)
+    ps = json.load(open(file_path)) + [{"pid": 305, "ppid": 1, "rss": 5000, "args": "vim notas.md", "cwd": wt}]
+    json.dump(ps, open(file_path, "w"))
+    r = a.orq("liberar", "ctx_term_w1")
+    assert r.returncode == 0, r.stderr
+    assert 305 in {p["pid"] for p in json.load(open(file_path))}, "the editor is not below the worker's agent"
+    assert "1 worktree process(es) not terminated" in json.loads(r.stdout)["aviso"] and "--processos" in json.loads(r.stdout)["aviso"]
+    r = a.orq("liberar", "ctx_term_w1", "--processos")
+    assert r.returncode == 0, r.stderr
+    assert 305 not in {p["pid"] for p in json.load(open(file_path))}, r.stdout
+
+
+def test_ticket218_a_set_over_the_limit_is_refused_and_becomes_a_pending_item():
+    a = Env(run="run_a")
+    wt = _wt218(a)
+    ps = [{"pid": 10, "ppid": 1, "args": "claude worker", "cwd": wt}] + [{"pid": 100 + i, "ppid": 10, "args": f"node {i}", "cwd": wt} for i in range(12)]
+    res, left = _sweep218(a, wt, ps)  # 13 with the agent
+    assert res["recusado"] == 13 and res["encerrados"] == 0 and len(left) == 13, (res, left)
+    (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
+    assert ev["op"] == "recusado" and ev["limite"] == 12 and len(ev["lista"]) == 13, ev
+    assert "processos-wt218" in _pending_ids(a), _pending(a)
+    res, left = _sweep218(a, wt, ps[:12])  # 12 is at the limit: it goes
+    assert res["encerrados"] == 12 and not left, (res, left)
 
 
 # ---------- ticket 146: orq revisar (only no-mistakes' review) ----------

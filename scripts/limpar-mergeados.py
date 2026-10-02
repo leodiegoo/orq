@@ -385,7 +385,9 @@ def main():
             if v == "remove" and not a.dry_run:
                 try:
                     from orqlib import terminate_worktree_processes
-                    terminate_worktree_processes(w["path"])
+                    r = terminate_worktree_processes(w["path"])
+                    if r and (r["nao_encerrados"] or r["recusado"]):
+                        print(f"limpar-mergeados: {w['path']}: {r['nao_encerrados']} process(es) not terminated (not the worker's), {r['recusado']} refused over the limit; see the processes event", file=sys.stderr)
                 except Exception as e:  # without orq the cleanup carries on; Orca removes the worktree the same way
                     print(f"limpar-mergeados: worktree processes not terminated: {e}", file=sys.stderr)
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
