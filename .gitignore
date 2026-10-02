@@ -52,3 +52,4 @@ logs/
 tui/node_modules/
 !tui/fixtures/**
 !tui/bun.lock
+integrar-fila.json
