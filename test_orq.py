@@ -16019,3 +16019,29 @@ def test_ticket158_a_linha_do_prompt_aparece_com_o_cache_e_some_quando_o_worker_
 def test_ticket158_o_stop_com_away_conta_o_sem_terminal_como_trabalho_sem_usuario():
     ags = [{"dispatch": "ctx_w", "task": "task_w", "estado": "sem_terminal"}]
     assert "perderam o terminal" in orq_mod.proximo_sem_usuario([], ags, {}, [], [], {}, None)
+
+
+def _testes_depois_do_main(src):
+    """Nomes de `def test_` definidos depois do `if __name__ == "__main__":`: o runner já listou os testes e nunca os vê."""
+    _, achou, resto = src.partition('\nif __name__ == "__main__":\n')
+    return re.findall(r"^def (test_\w+)", resto, re.M) if achou else []
+
+
+def test_ticket173_guarda_recusa_def_test_depois_do_main():
+    assert _testes_depois_do_main('def test_a(): pass\nif __name__ == "__main__":\n    pass\n'.replace("pass\nif", "pass\n\nif")) == []
+    assert _testes_depois_do_main('\nif __name__ == "__main__":\n    pass\n\ndef test_tarde(): pass\n') == ["test_tarde"]
+    assert _testes_depois_do_main(open(__file__).read()) == [], "def test_ depois do __main__ nunca roda: mova para antes"
+
+if __name__ == "__main__":
+    filtro = sys.argv[1] if len(sys.argv) > 1 else ""
+    testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
+    falhas = [f"{n} (definido depois do __main__)" for n in _testes_depois_do_main(open(__file__).read())]
+    for nome, fn in testes:
+        try:
+            fn()
+            print(f"ok      {nome}")
+        except Exception as e:  # noqa: BLE001 - o relatório mostra todas as falhas de uma vez
+            falhas.append(nome)
+            print(f"FALHOU  {nome}: {type(e).__name__}: {str(e)[-400:]!r}")
+    print(f"{len(testes) - len(falhas)}/{len(testes)} testes passaram")
+    sys.exit(1 if falhas else 0)

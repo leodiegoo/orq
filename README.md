@@ -330,6 +330,7 @@ Closing the last obligation closes the entry, as before.
 
 ```sh
 python3 test_orq.py              # fake Orca, temporary ORQ_HOME
+# the runner fails on any `def test_` placed after `if __name__ == "__main__":` (it would never run); define tests above that block
 python3 test_precompact.py
 python3 scripts/limpar-mergeados.py --self-test
 ```
