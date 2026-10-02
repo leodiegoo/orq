@@ -16041,6 +16041,55 @@ def test_ticket158_o_stop_com_away_conta_o_sem_terminal_como_trabalho_sem_usuari
     assert "perderam o terminal" in orq_mod.proximo_sem_usuario([], ags, {}, [], [], {}, None)
 
 
+def _doctor_antigos178(terminais, ticket_status="resolved", w_status="completed", horas=48, sem_worker=False, extra=()):
+    """Roda o doctor_antigos sobre um despacho de `horas` atrás (ticket 14, task t14) com tudo simulado; devolve (resultado, liberar chamados, eventos gravados)."""
+    chamados, gravados = [], []
+    ev = [{"ts": now_iso(-horas * 3600), "tipo": "despacho", "dispatch": "ctx_old", "task": "t14", "ticket": "14", "run": "run_a", "terminal": "term_old"}, *extra]
+    w = {"dispatchId": "ctx_old", "dispatchStatus": w_status, "agentTerminalHandle": "term_old"}
+    trocas = {"read_events": lambda: ev, "_terminais_vivos": lambda: terminais, "_workers_todos": lambda run=None: [] if sem_worker else [w],
+              "tickets": lambda: [{"num": "14", "task": "t14", "status": ticket_status}], "liberar": lambda d, run=None: chamados.append(d),
+              "append_event": lambda e, novo_id=False: gravados.append(e)}
+    velhos = {k: getattr(orq_mod, k) for k in trocas}
+    try:
+        for k, v in trocas.items():
+            setattr(orq_mod, k, v)
+        return orq_mod.doctor_antigos(True), chamados, gravados
+    finally:
+        for k, v in velhos.items():
+            setattr(orq_mod, k, v)
+
+
+def test_ticket178_despacho_antigo_sem_terminal_e_ticket_resolvido_aparece_e_sai_dos_vivos():
+    r, chamados, _ = _doctor_antigos178({"term_outro"})
+    assert [x["dispatch"] for x in r["antigos"]] == ["ctx_old"] and r["liberados"] == ["ctx_old"] and chamados == ["ctx_old"], r
+    assert "liberado: ctx_old" in orq_mod.texto_doctor_antigos(r, True)
+
+
+def test_ticket178_sem_registro_no_worker_list_grava_liberar_com_motivo_antigo():
+    r, chamados, gravados = _doctor_antigos178({"term_outro"}, sem_worker=True)
+    assert not chamados and [(g["tipo"], g["dispatch"], g["motivo"], g["fechado"]) for g in gravados] == [("liberar", "ctx_old", "antigo", True)], gravados
+
+
+def test_ticket178_released_com_terminal_ja_morto_sai_dos_vivos_e_release_unknown_so_grava_o_evento():
+    assert not _doctor_antigos178({"term_outro"}, extra=[{"tipo": "liberar", "dispatch": "ctx_old", "estado": "already_released", "fechado": False}])[0]["antigos"]
+    r, chamados, gravados = _doctor_antigos178({"term_outro"}, extra=[{"tipo": "liberar", "dispatch": "ctx_old", "estado": "release_unknown", "fechado": False}])
+    assert r["liberados"] == ["ctx_old"] and not chamados and gravados[0]["motivo"] == "antigo", "não repete o worker-release"
+
+
+def test_ticket178_worker_dispatched_nunca_e_liberado():
+    r, chamados, gravados = _doctor_antigos178({"term_outro"}, w_status="dispatched")
+    assert r["ficam"][0]["motivo"] == "worker ainda dispatched" and not chamados and not gravados, "dispatched nunca é liberado"
+
+
+def test_ticket178_terminal_vivo_ticket_aberto_e_despacho_recente_ficam():
+    assert _doctor_antigos178({"term_old"})[0]["ficam"][0]["motivo"] == "terminal vivo"
+    assert _doctor_antigos178({"term_outro"}, ticket_status="claimed")[0]["ficam"][0]["motivo"] == "ticket aberto"
+    r, chamados, _ = _doctor_antigos178({"term_outro"}, horas=2)
+    assert not r["antigos"] and not r["ficam"] and not chamados, "menos de 24 h não entra"
+    r, chamados, _ = _doctor_antigos178(None)
+    assert not r["antigos"] and not chamados and r["avisos"], "Orca sem lista de terminais não prova nada"
+
+
 def _testes_depois_do_main(src):
     """Nomes de `def test_` definidos depois do `if __name__ == "__main__":`: o runner já listou os testes e nunca os vê."""
     _, achou, resto = src.partition('\nif __name__ == "__main__":\n')

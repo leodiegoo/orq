@@ -6866,6 +6866,64 @@ def texto_doctor_tasks(r, dry_run=False):
     return "\n".join(ls) or "nenhuma task presa"
 
 
+def doctor_antigos(liberar_=False, horas=24, so_tickets=()):
+    """`orq doctor antigos`: despachos sem `liberar` fechado há mais de `horas`, sem terminal no `orca terminal list` e com o ticket resolvido: os que seguram
+    worktree no `worktrees limpar` sem ninguém usando. Com `liberar_`, cada um sai dos vivos: `orq liberar` se o worker-list ainda o tem, senão um evento
+    `liberar` com motivo `antigo`. Terminal vivo, ticket aberto/sem ticket ou worker ainda `dispatched` só são listados em `ficam` (com o motivo).
+    `so_tickets` restringe aos números dados. Orca sem lista de terminais não prova nada: nada é tocado. Devolve {antigos: [{dispatch, ticket, terminal}], ficam: [...], liberados: [dispatch], avisos}."""
+    events = read_events()
+    vivos = _terminais_vivos()
+    if vivos is None:
+        return {"antigos": [], "ficam": [], "liberados": [], "avisos": ["terminal list indisponível: sem prova de quem morreu"]}
+    try:
+        ws = {w.get("dispatchId"): w for w in _workers_todos()}
+        avisos = []
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        ws, avisos = {}, [f"worker-list falhou ({e}): só o log de eventos vale"]
+    ts = tickets()
+    por_num, por_task = {t["num"]: t for t in ts}, {t["task"]: t for t in ts if t["task"]}
+    tentados = {e.get("dispatch") for e in events if e.get("tipo") == "liberar"}
+    # `released`/`already_released` com `fechado` false: o Orca já tinha soltado e o terminal não existia mais; o evento não conta em _liberados (que é do terminal fechado)
+    feitos = _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") in ("released", "already_released")}
+    corte = datetime.now(timezone.utc) - timedelta(hours=horas)
+    antigos, ficam, liberados = [], [], []
+    for e in events:
+        d = e.get("dispatch")
+        if e.get("tipo") != "despacho" or not d or d in feitos or (_ts(e.get("ts")) or corte) > corte:
+            continue
+        w, t = ws.get(d, {}), por_num.get(str(e.get("ticket") or "")) or por_task.get(e.get("task"))
+        item = {"dispatch": d, "ticket": t["num"] if t else e.get("ticket"), "terminal": w.get("agentTerminalHandle") or e.get("terminal")}
+        if so_tickets and str(item["ticket"]).zfill(2) not in {str(n).zfill(2) for n in so_tickets}:
+            continue
+        motivo = ("terminal vivo" if item["terminal"] in vivos else "worker ainda dispatched" if w.get("dispatchStatus") == "dispatched"
+                  else "ticket sem registro" if not t else "ticket aberto" if t["status"] != STATUS_FECHADO else None)
+        if motivo:
+            ficam.append({**item, "motivo": motivo})
+            continue
+        antigos.append(item)
+        if not liberar_:
+            continue
+        try:
+            if w and d not in tentados:  # já tentado (retained, release_unknown): repetir worker-release não adianta, o terminal está morto
+                liberar(d)
+            else:
+                append_event({"tipo": "liberar", "dispatch": d, "task": e.get("task"), "run": e.get("run"), "fechado": True, "motivo": "antigo"})
+            liberados.append(d)
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired) as x:
+            avisos.append(f"{d}: não liberou ({x})")
+    return {"antigos": antigos, "ficam": ficam, "liberados": liberados, "avisos": avisos}
+
+
+def texto_doctor_antigos(r, liberar_=False):
+    """Uma linha por despacho antigo (liberado ou a liberar) e uma por o que fica."""
+    ls = [f"{'liberado' if x['dispatch'] in r['liberados'] else 'antigo'}: {x['dispatch']} (ticket {x['ticket']}, sem terminal)" for x in r["antigos"]]
+    ls += [f"fica: {x['dispatch']} (ticket {x['ticket']}): {x['motivo']}" for x in r["ficam"]]
+    ls += [f"aviso: {x}" for x in r["avisos"]]
+    if r["antigos"] and not liberar_:
+        ls.append("rode `orq doctor antigos --liberar` para tirá-los dos vivos")
+    return "\n".join(ls) or "nenhum despacho antigo sem liberar"
+
+
 def doctor_backlog():
     """`orq doctor backlog` (M6): cruza os tickets dos backlogs (o do processo, o da máquina e os dos grupos) com as tasks do Orca e diz o conserto de cada diferença, sem escrever nada.
 
@@ -11440,6 +11498,11 @@ def main(argv=None):
     dt = dc.add_parser("tasks", help="completa a task blocked/pending de ticket resolvido (supersededBy) e lista a que não tem ticket")
     dt.add_argument("--dry-run", action="store_true", help="só lista")
     dt.add_argument("--json", action="store_true")
+    da = dc.add_parser("antigos", help="lista (e com --liberar tira dos vivos) o despacho de mais de 24 h sem liberar, sem terminal e com ticket resolvido")
+    da.add_argument("--liberar", action="store_true")
+    da.add_argument("--horas", type=float, default=24, help="idade mínima do despacho (padrão 24)")
+    da.add_argument("--ticket", action="append", default=[], help="só este ticket (repetível)")
+    da.add_argument("--json", action="store_true")
     dbk = dc.add_parser("backlog", help="cruza os tickets dos backlogs com as tasks do Orca e imprime o conserto de cada diferença (não escreve nada)")
     dbk.add_argument("--json", action="store_true")
     te = tk.add_parser("editar", help="troca o modelo, o effort, o despacho ou a espera de um ticket (valor vazio tira o campo)")
@@ -11771,6 +11834,9 @@ def main(argv=None):
             r = doctor_backlog()
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_backlog(r))
             return 1 if r["problemas"] else 0
+        elif a.cmd == "doctor" and a.op == "antigos":
+            r = doctor_antigos(a.liberar, a.horas, a.ticket)
+            print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_antigos(r, a.liberar))
         elif a.cmd == "doctor":
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))

@@ -147,6 +147,8 @@ Implicit intake (ticket 157). The Stop block of ticket 150 is the backstop; this
 
 `passagem` stays manual because nothing reliably detects a plan-limit screen; `doctor tasks` stays an escape because `ticket fechar` completes the task; `iniciar` is a decision (which front), and SessionStart already injects the state.
 
+**`orq doctor antigos`.** `liberar` only counts a dispatch as closed when it closed the terminal (`fechado`), so a dispatch whose terminal was already gone (`released`, `already_released`) or whose release answered `release_unknown` stayed "alive" and held its worktree forever (ticket 178, 12 folders). `doctor_antigos` cross-checks the `despacho` events, `terminal list` and the ticket status; it never touches a live terminal, an open ticket or a `dispatched` worker, and does nothing when the terminal list fails (no proof of death). Repeating `worker-release` on a dead terminal does not help, so a dispatch already tried gets only the `liberar` event with reason `antigo`.
+
 ## Report ingestion
 
 `orq ingest` runs in the background after each prompt and after each Orca notice. It reads two sources.
