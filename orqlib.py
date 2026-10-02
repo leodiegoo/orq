@@ -3656,6 +3656,7 @@ def digest_json(d):
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
             "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"],
+            **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
             **({"retro": d["retro"]} if d.get("retro") else {})}  # aditivo: sem rodada gravada o contrato v1 fica como era
 
 
@@ -3687,6 +3688,7 @@ def html_digest(d):
             if isinstance(pg.get("poll"), (int, float)) else "O estado dos PRs ainda não foi lido por nenhum poll (`orq pr poll`); esta página não consulta o GitHub.")
     desde = f"Desde as {_hora_local(pg['desde'])}." if pg["desde"] else "Desde o início do log."
     retro = ('<h2>Falhas por rodada do retro</h2><ul class="sub">' + "".join(f'<li>até {e(r["ate"][:10])}: {r["falhas"]} falha(s)</li>' for r in d["retro"]) + "</ul>") if d.get("retro") else ""
+    ausencia = f'<h2>Relatório da ausência</h2><pre>{e(chr(10).join(d["ausencia"]))}</pre>' if d.get("ausencia") else ""
     legenda = "".join(f'<span><span class="dot {c}"></span> {e(n)}</span>' for n, c in pg["pontos"].items())
     antes_de = [n for n, c in pg["pontos"].items() if c != "p"]  # a ordem dos ambientes antes da produção, dentro de cada passo
     depois = f" Dentro de cada passo, {' antes de '.join(antes_de)}." if len(antes_de) > 1 else ""
@@ -3698,7 +3700,7 @@ def html_digest(d):
             f'{fila}<h2>Com você</h2>{f"<div class=grid>{pend}</div>" if pend else "<p class=sub>Nada esperando por você.</p>"}'
             f'<h2>Rodando agora</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>Nenhum worker rodando: nada vivo.</p>"}{vagas}'
             f'<h1 style="margin-top:36px">O que aconteceu</h1>{antes}'
-            f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}{retro}</main></body></html>')
+            f'{f"<ol class=tl>{linha}</ol>" if linha else "<p class=sub>Nada desde então.</p>"}{ausencia}{retro}</main></body></html>')
 
 
 def digest_gerar(agora=None, desde=None, com_html=False):
@@ -3713,6 +3715,8 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     d = monta_digest(events, _prs_ro(), _pend_ro(), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
                     {"max_workers": maquina_cfg()["max_workers"], "fila": len(fila_despacho_itens())})
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rodadas()[-4:]]  # as últimas rodadas do `orq retro --gravar`
+    with contextlib.suppress(OSError), open(_path(os.path.join(DIGEST, "ausencia.md")), encoding="utf-8") as f:  # o último `orq away off`
+        d["ausencia"] = f.read().rstrip().splitlines()
     os.makedirs(_path(DIGEST), exist_ok=True)
     _write_json(_path(os.path.join(DIGEST, "atual.json")), digest_json(d), indent=2)
     pagina = None
@@ -3765,14 +3769,6 @@ def away_ligado():
     return bool(_dict(_cursor_ro().get("ausente")))
 
 
-def pendencias_da_ausencia(desde):
-    """Linhas das pendências abertas que nasceram depois de `desde` (ts do `ausente_ligar`): decisões primeiro, cada uma com o link do Lavish, se houver."""
-    nascidas = {e["pend"] for e in read_events() if e.get("tipo") == "pend" and e.get("op") == "add" and (e.get("ts") or "") >= desde}
-    abertas = [i for i in _load_pend()["itens"] if i.get("id") in nascidas]
-    abertas.sort(key=lambda i: i.get("tipo") != "decisao")  # estável: a ordem de criação fica dentro de cada grupo
-    return [f"  {i.get('tipo')} {i['id']}: {_cita(i.get('titulo'), 70)} — {i.get('link') or 'sem link'}" for i in abertas]
-
-
 def linhas_ausente(cur):
     """O estado do modo ausente para `orq ausente`: uma linha, mais o aviso de que ninguém roda o poll dos PRs sem o gerente."""
     a = _dict(_dict(cur).get("ausente"))
@@ -3785,9 +3781,50 @@ def linhas_ausente(cur):
 PAINEL_URL = "http://localhost:8765/"
 
 
+def relatorio_ausencia(desde):
+    """O relatório da ausência em linhas pt-BR, só do que o orq guarda (events.jsonl e a lista de pendências), sem LLM, só com o que nasceu depois de
+    `desde`. Seções na ordem: decisões, problemas, resumos, entregas, PRs, tickets; seção vazia não aparece."""
+    evs = [e for e in read_events() if (e.get("ts") or "") >= desde]
+    nascidas = {e["pend"] for e in evs if e.get("tipo") == "pend" and e.get("op") == "add"}
+    abertas = [i for i in _load_pend()["itens"] if i.get("id") in nascidas]
+    linha_pend = lambda i: f"{i['id']}: {_cita(i.get('titulo'), 90)} — {i.get('link') or 'sem link'}"  # noqa: E731
+    decisoes = [linha_pend(i) for i in abertas if i.get("tipo") == "decisao"]
+    ok = lambda e: e.get("outcome") == "succeeded"  # noqa: E731
+    secoes = [
+        ("Decisões que ficaram para você", decisoes),
+        ("Outras pendências abertas", [f"{i.get('tipo')} {linha_pend(i)}" for i in abertas if i.get("tipo") != "decisao"]),
+        ("Problemas", [f"worker falhou: {_cita(e.get('subject'), 100)}" for e in evs if e.get("tipo") == "worker_done" and not ok(e)]
+         + [f"alerta: {_cita(e.get('texto') or e.get('alerta') or e.get('tipo'), 100)}" for e in evs if e.get("tipo") == "alerta"]
+         + [f"gate recusou: {e.get('gate')}" for e in evs if e.get("tipo") == "gate_falha"]
+         + [f"PR fechado sem merge: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") == "fechou"]),
+        ("Resumos", [f"{_hora_local(e['ts'])} {_cita(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo" and e.get("texto")]),
+        ("Entregas dos workers", [_cita(e.get("subject"), 100) for e in evs if e.get("tipo") == "worker_done" and ok(e)]),
+        ("PRs", [f"{'aberto' if e['op'] == 'ligar' else 'mergeado em ' + str(e.get('base'))}: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") in ("ligar", "entrou")]),
+        ("Tickets", [f"{'aberto' if e['op'] == 'novo' else 'fechado'} {e.get('ticket')}" + (f": {_cita(e.get('titulo'), 80)}" if e.get("titulo") else "")
+                     for e in evs if e.get("tipo") == "ticket" and e.get("op") in ("novo", "fechar")]),
+    ]
+    linhas = [f"Relatório da ausência (desde {_hora_local(desde)})"]
+    for titulo, itens in secoes:
+        if itens:
+            linhas += ["", f"{titulo} ({len(itens)}):", *[f"- {i}" for i in itens]]
+    return linhas if len(linhas) > 1 else [*linhas, "", "Nada aconteceu na janela."]
+
+
+def gravar_relatorio_ausencia(linhas):
+    """Grava o relatório em `digest/ausencia.md` (o digest o mostra) e em `<ORQ_RESUMOS|./.scratch/resumos>/<data>-ausencia.md`. Devolve o caminho do segundo."""
+    txt = "\n".join(linhas) + "\n"
+    os.makedirs(_path(DIGEST), exist_ok=True)
+    _escrever(_path(os.path.join(DIGEST, "ausencia.md")), txt)
+    pasta = os.environ.get("ORQ_RESUMOS") or os.path.join(os.getcwd(), ".scratch", "resumos")
+    os.makedirs(pasta, exist_ok=True)
+    caminho = os.path.join(pasta, f"{datetime.now().strftime('%Y-%m-%d')}-ausencia.md")
+    _escrever(caminho, txt)
+    return caminho
+
+
 def away(op=None):
     """`orq away` / `/away`: liga, desliga ou mostra o modo ausente; sem op alterna. Devolve as linhas para imprimir.
-    Ao desligar só mostra o link do painel da 8765 e a contagem; não abre aba."""
+    Ao desligar mostra o link do painel da 8765, a contagem e o relatório da ausência (gravado em arquivo; o caminho vai por último); não abre aba."""
     cur = _dict(_cursor_ro().get("ausente"))
     op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
     if op == "status":
@@ -3799,9 +3836,12 @@ def away(op=None):
         return [f"away mode ligado desde {desde}; o digest registra cada resposta"]
     n = len(digest_gerar()[0]["linha"]) if cur else 0
     ausente_desligar()
-    abertas = pendencias_da_ausencia(cur["ligada_em"]) if cur else []
-    return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}",
-            *([f"{len(abertas)} pendência(s) abertas durante a ausência (decisões primeiro):", *abertas] if abertas else [])]
+    if not cur:
+        return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}"]
+    rel = relatorio_ausencia(cur["ligada_em"])
+    arq = gravar_relatorio_ausencia(rel)
+    digest_gerar()  # o atual.json já leva o relatório
+    return [f"away mode desligado; {n} entradas na linha do tempo, veja o painel {PAINEL_URL}", "", *rel, "", f"Relatório salvo em {arq}; entregue-o ao usuário na primeira resposta."]
 
 
 def _ultima_resposta(ev):

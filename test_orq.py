@@ -437,7 +437,7 @@ class Amb:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.maquina()
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
@@ -8206,6 +8206,33 @@ def test_away_alterna_e_aceita_on_off_status_sem_tirar_o_ausente():
     assert not os.path.exists(os.path.join(a.fake, "calls.log")) or "8765" not in open(os.path.join(a.fake, "calls.log")).read()
     assert "ligado" in a.orq("away", "on").stdout and "ligado" in a.orq("ausente").stdout
     assert "away mode desligado" in a.orq("away", "off").stdout
+
+
+def test_away_off_entrega_o_relatorio_da_ausencia_so_com_a_janela_do_away():
+    a = Amb(run="run_a")
+    pasta = os.path.join(a.tmp.name, "resumos")
+    a.orq("away", "on")
+    a.set("../pendencias.json", {"itens": [{"id": "freio", "tipo": "decisao", "titulo": "Escolher o freio", "link": "http://127.0.0.1:4387/session/x"}]})
+    novo, velho = "2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z"
+    evs = [{"ts": velho, "tipo": "resumo", "texto": "de antes do away"},
+           {"ts": novo, "tipo": "pend", "op": "add", "pend": "freio"},
+           {"ts": novo, "tipo": "resumo", "texto": "Fechei o passo 1"},
+           {"ts": novo, "tipo": "worker_done", "outcome": "succeeded", "subject": "ticket 7 pronto"},
+           {"ts": novo, "tipo": "worker_done", "outcome": "failed", "subject": "ticket 8 quebrou"},
+           {"ts": novo, "tipo": "pr", "op": "entrou", "url": PR1, "base": "main", "numero": 1},
+           {"ts": novo, "tipo": "ticket", "op": "fechar", "ticket": "07"}]
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.writelines(json.dumps(e) + "\n" for e in evs)
+    r = a.orq("away", "off")
+    assert r.returncode == 0, r
+    out = r.stdout
+    ordem = [out.index(t) for t in ("Decisões que ficaram", "Problemas", "Resumos", "Entregas dos workers", "PRs (", "Tickets")]
+    assert ordem == sorted(ordem), out
+    assert "http://127.0.0.1:4387/session/x" in out and PR1 in out and "Fechei o passo 1" in out and "ticket 8 quebrou" in out
+    assert "de antes do away" not in out
+    arq = [f for f in os.listdir(pasta) if f.endswith("-ausencia.md")]
+    assert len(arq) == 1 and PR1 in open(os.path.join(pasta, arq[0])).read()
+    assert any("Relatório da ausência" in l for l in _atual(a)["ausencia"])
 
 
 def _stop(a, **ev):
