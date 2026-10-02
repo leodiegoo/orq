@@ -220,7 +220,7 @@ Opening a mate is a proposal, not automatic. When a group with no mate gathers `
 
 How this compares with firstmate: there, creating a secondmate is an explicit decision of the model or the captain, and routing uses a natural-language `scope:` that the model judges; what is deterministic is the registry, the relaunch of a dead mate and the status channel. orq keeps the same decision for opening a mate (a proposal) but makes routing a rule, because the group file already says what belongs to it.
 
-Commands: `orq groups` lists groups and mates; `orq mate open <group>` opens the mate (or resumes its session); `orq mate request <group> --text T [--deadline 120] [--answers eN]` sends it work; the mate answers with `orq mate raise --corr pN --type answer --text ...` and raises `decision`, `pr`, `blocker` and `summary` items, each an entry the coordinator closes with `orq intake`. A mate never opens AskUserQuestion and never pushes. An idle mate sleeps (`ORQ_MATE_OCIOSO_MIN`, `ORQ_MATE_DORMIR_MIN`; `orq mate sleep <group>` by hand) and wakes on the next request. See `docs/design.md`, "Secondmates by group".
+Commands: `orq groups` lists groups and mates; `orq mate open <group>` opens the mate (or resumes its session); `orq mate request <group> --text T [--deadline 120] [--answers eN]` sends it work; the mate answers with `orq mate raise --corr pN --type answer --text ...` and raises `decision`, `pr`, `blocker` and `summary` items, each an entry the coordinator closes with `orq intake`. A mate never opens AskUserQuestion and never pushes. Its Stop blocks (same 2-block cap as the coordinator's, then a warning) while an entry of its group has no effect, an obligation of its group is open for 10 minutes, or a request from the coordinator has no reply; `orq doctor hooks` warns when a project of the group turns hooks off (`disableAllHooks`), and the manager adds "no turn recorded" to the escalation of a request when the mate's hooks recorded no turn. An idle mate sleeps (`ORQ_MATE_OCIOSO_MIN`, `ORQ_MATE_DORMIR_MIN`; `orq mate sleep <group>` by hand) and wakes on the next request. See `docs/design.md`, "Secondmates by group".
 
 ### 4. Backlog switches
 
@@ -453,7 +453,7 @@ orq fulfill e484 comentario --proof "https://github.com/<org>/<repo>/issues/2045
 orq defer e484 deploy --reason "the deploy runs tomorrow"   # creates a "to do later" ticket with the reason
 ```
 
-While an entry has an open obligation, `conversation` and `discarded` are refused; closing the last obligation closes the entry. The Stop hook blocks the end of the turn while an obligation is open for more than 10 minutes (`ORQ_OBRIGACAO_MIN`), at most 2 times per set of open obligations per session. A secondmate never blocks.
+While an entry has an open obligation, `conversation` and `discarded` are refused; closing the last obligation closes the entry. The Stop hook blocks the end of the turn while an obligation is open for more than 10 minutes (`ORQ_OBRIGACAO_MIN`), at most 2 times per set of open obligations per session. The obligations of a PR dispatched by a mate's Run belong to the mate (the PR entry carries `grupo`): its prompt shows them, its Stop chases them and its `orq fulfill`/`orq defer` close them, and the coordinator does not see them.
 
 Some close by themselves, with the proof orq saw:
 
