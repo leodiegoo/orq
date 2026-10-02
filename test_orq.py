@@ -2576,6 +2576,15 @@ def test_guard_le_a_segunda_pagina_e_o_arquivo_off_libera():
 AVISO_A = "You have 1 orchestration message. Run `orca orchestration check --run run_a`."
 
 
+def _sem_dica(saida):
+    """O que o hook de prompt deixou passar sem a dica `orq caixa <run> --ack` que ele soma ao aviso de outro Run (ticket 140): "" quando só havia a dica."""
+    if not (saida or "").strip():
+        return ""
+    ctx = json.loads(saida).get("hookSpecificOutput", {}).get("additionalContext", "")
+    resto = [l for l in ctx.splitlines() if not l.startswith("orq: leia e confirme a caixa com `orq caixa ")]
+    return "\n".join(resto)
+
+
 def _hb(fase, dispatch="ctx_1", task="task_1"):
     return ("heartbeat", {"taskId": task, "dispatchId": dispatch, "phase": fase})
 
@@ -2616,7 +2625,7 @@ def test_heartbeat_misto_passa_sem_consumir_nem_confirmar():
     a = Amb()
     a.caixa(_hb("lendo"), ("worker_done", {"taskId": "task_1"}))
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), r
     assert set(a.estados().values()) == {"unread"}
     assert [("--peek" in c) for c in _chamadas_check(a)] == [True], "só olhou com --peek"
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
@@ -2628,18 +2637,18 @@ def test_heartbeat_tipo_desconhecido_passa():
         a = Amb()
         a.caixa(_hb("lendo"), (tipo, {}))
         r = a.prompt(AVISO_A)
-        assert (r.returncode, r.stdout) == (0, ""), (tipo, r)
+        assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), (tipo, r)
         assert set(a.estados().values()) == {"unread"}, tipo
     a = Amb()
     a.caixa((None, {}))
-    assert a.prompt(AVISO_A).stdout == "" and set(a.estados().values()) == {"unread"}
+    assert _sem_dica(a.prompt(AVISO_A).stdout) == "" and set(a.estados().values()) == {"unread"}
 
 
 def test_heartbeat_run_diferente_do_ligado_passa_sem_chamar_o_check():
     a = Amb(run="run_a")
     a.caixa(_hb("lendo"), run="run_b")
     r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`.")
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), r
     assert _chamadas_check(a) == [], "consumer_fenced evitado: nem tentou"
     assert a.estados() == {"msg_1": "unread"}
 
@@ -2657,7 +2666,7 @@ def test_heartbeat_orca_fora_do_ar_passa():
         a.caixa(_hb("lendo"))
         t = time.time()
         r = a.prompt(AVISO_A)
-        assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 4.5, (falha, r)
+        assert (r.returncode, _sem_dica(r.stdout)) == (0, "") and time.time() - t < 4.5, (falha, r)
         assert set(a.estados().values()) == {"unread"}, falha
         assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
 
@@ -2666,7 +2675,7 @@ def test_heartbeat_falha_no_ack_passa_e_nada_e_gravado():
     a = Amb(FAKE_FAIL_ACK="1")
     a.caixa(_hb("lendo"))
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), r
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"] and "heartbeat:" in a.log()
     assert a.estados() == {"msg_1": "out"}, "consumido e sem ack: o Orca repete a entrega no check do coordenador"
 
@@ -2691,7 +2700,7 @@ def test_heartbeat_lote_com_worker_done_no_meio_passa_e_nada_e_consumido():
     a = Amb()
     a.caixa(_hb("a"), ("worker_done", {"taskId": "t"}), _hb("b"))
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, ""), "há worker_done na caixa: o aviso passa"
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), "há worker_done na caixa: o aviso passa"
     assert set(a.estados().values()) == {"unread"}
 
 
@@ -2718,13 +2727,13 @@ def test_heartbeat_aviso_atrasado_de_lote_ja_absorvido_tambem_bloqueia():
     c["hb_absorvido"]["run_a"] -= orq_mod.HB_JANELA_S + 1
     json.dump(c, open(os.path.join(a.home, "cursor.json"), "w"))
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, ""), "passou a janela: caixa vazia sem lote recente passa"
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), "passou a janela: caixa vazia sem lote recente passa"
 
 
 def test_heartbeat_caixa_vazia_sem_lote_recente_passa():
     a = Amb()
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, "") and not a.events()
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, "") and not a.events()
 
 
 def test_heartbeat_mensagem_nova_depois_do_lote_absorvido_passa():
@@ -2733,7 +2742,7 @@ def test_heartbeat_mensagem_nova_depois_do_lote_absorvido_passa():
     assert _bloqueado(a.prompt(AVISO_A))
     a.caixa(("worker_done", {"taskId": "t"}))
     r = a.prompt(AVISO_A)
-    assert (r.returncode, r.stdout) == (0, ""), "a janela só vale para a caixa vazia: worker_done acorda o coordenador"
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), "a janela só vale para a caixa vazia: worker_done acorda o coordenador"
     assert a.estados()["msg_2"] == "unread"
 
 
@@ -3821,23 +3830,23 @@ def test_aviso_de_outro_run_com_outra_mensagem_passa():
         a = Amb(run="run_a")
         _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900), _hb_inbox(a, "ctx_9", "x", -3, 901, tipo=tipo))
         r = a.prompt(AVISO_B)
-        assert (r.returncode, r.stdout) == (0, "") and _chamadas(a, "check") == [] and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (tipo, r)
+        assert (r.returncode, _sem_dica(r.stdout)) == (0, "") and _chamadas(a, "check") == [] and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (tipo, r)
 
 
 def test_aviso_de_outro_run_sem_mensagem_recente_passa():
     a = Amb(run="run_a")
     _inbox(a, {**_hb_inbox(a, "ctx_9", "fase-4", -600, 900), "read": 1})  # já lido: não é o do aviso (M11: vale o `read`, não a idade)
-    assert a.prompt(AVISO_B).stdout == ""
+    assert _sem_dica(a.prompt(AVISO_B).stdout) == ""
     b = Amb(run="run_a")
     _inbox(b, _hb_inbox(b, "ctx_9", "fase-4", -5, 900, run="run_c"))  # heartbeat de um terceiro Run
-    assert b.prompt(AVISO_B).stdout == ""
+    assert _sem_dica(b.prompt(AVISO_B).stdout) == ""
 
 
 def test_aviso_de_outro_run_com_o_orca_fora_do_ar_passa():
     a = Amb(run="run_a")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900))
     r = a.prompt(AVISO_B, FAKE_FAIL="inbox")
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), r
 
 
 def test_heartbeat_visto_de_outro_run_mantem_o_dispatch_vivo_no_resumo_e_no_agentes():
@@ -3862,7 +3871,7 @@ def test_heartbeat_de_outro_run_bloqueado_nao_perde_o_worker_done_que_chega_depo
     a.caixa(("worker_done", {"taskId": "t", "dispatchId": "ctx_9"}), run="run_b")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -8, 900), {**_hb_inbox(a, "ctx_9", "", -2, 901, tipo="worker_done")})
     r = a.prompt(AVISO_B)
-    assert (r.returncode, r.stdout) == (0, ""), "o worker_done acorda"
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), "o worker_done acorda"
     assert set(a.estados().values()) == {"unread"}, "nada foi confirmado"
     a.set("run.json", {"id": "run_b"})  # o coordenador faz run-use no Run: a caixa sai inteira, lote a lote
     got = subprocess.run([a.bin, "orchestration", "check", "--run", "run_b", "--all", "--json"], env=a.env, capture_output=True, text=True)
@@ -4495,7 +4504,7 @@ def test_review5_m11_aviso_de_outro_run_com_worker_done_nao_lido_e_antigo_passa_
     a = Amb(run="run_a")
     _inbox(a, _hb_inbox(a, "ctx_9", "", -200, 900, tipo="worker_done"), _hb_inbox(a, "ctx_9", "fase-4", -30, 901))
     r = a.prompt(AVISO_B)
-    assert (r.returncode, r.stdout) == (0, ""), r
+    assert (r.returncode, _sem_dica(r.stdout)) == (0, ""), r
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_visto"]
     b = Amb(run="run_a")  # o worker_done já lido não segura: o aviso era dele e ele foi confirmado
     _inbox(b, {**_hb_inbox(b, "ctx_9", "", -200, 900, tipo="worker_done"), "read": 1}, _hb_inbox(b, "ctx_9", "fase-4", -30, 901))
@@ -4611,7 +4620,7 @@ def test_review5_b26_aviso_do_orca_colado_no_texto_do_usuario_e_separado_e_marca
     (e,) = [x for x in b.events() if x["tipo"] == "entrada"]
     assert not e.get("com_aviso") and e["texto"].startswith("me lembra"), e
     c = Amb(run="run_a")
-    assert c.prompt(AVISO_A).stdout == "" and c.events() == [], "aviso puro segue sem virar entrada"
+    assert _sem_dica(c.prompt(AVISO_A).stdout) == "" and c.events() == [], "aviso puro segue sem virar entrada"
 
 
 # B27
@@ -4894,7 +4903,7 @@ def test_gerente_aviso_repassado_passa_no_hook_do_coordenador():
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
     r = a.prompt(env[env.index("--text") + 1], ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode == 0 and not r.stdout.strip(), "o aviso passa: o coordenador acorda para o worker_done"
+    assert r.returncode == 0 and not _sem_dica(r.stdout).strip(), "o aviso passa: o coordenador acorda para o worker_done"
     assert a.estados() == {"msg_1": "out"}
 
 
@@ -5100,7 +5109,7 @@ def test_gerente_aviso_de_run_que_nao_e_o_ligado_passa_no_hook_do_coordenador():
     texto = env[env.index("--text") + 1]
     a.set("binds.json", {"run_a": {"handle": "term_ger", "gen": 9}, "run_b": {"handle": None, "gen": 9}})  # o painel já andou para run_a
     r = a.prompt(texto, ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode == 0 and not r.stdout.strip(), "o aviso passa: o coordenador acorda para o worker_done"
+    assert r.returncode == 0 and not _sem_dica(r.stdout).strip(), "o aviso passa: o coordenador acorda para o worker_done"
     assert _binds(a)["run_b"] == "term_ger", "o hook ligou o gerente ao Run do aviso antes de ler"
 
 
