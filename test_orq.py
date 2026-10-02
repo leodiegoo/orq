@@ -10748,6 +10748,27 @@ def test_ticket55_main_only_advances_by_fast_forward_after_the_tests():
     assert not os.path.exists(os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")), "worktree removida depois de entrar"
 
 
+def test_ticket216_a_red_night_replay_keeps_main_and_leaves_a_pending_line_the_manager_reads():
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    integrate, cycles = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integracao", "ciclos.log")
+    before = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrate, "um"], cwd=alive, env={**env, "ORQ_REPLAY": "false"}, capture_output=True, text=True)
+    assert r.returncode != 0 and "night replay failing" in r.stderr and g("rev-parse", "HEAD").stdout == before, r.stdout + r.stderr
+    (line,) = open(cycles).read().splitlines()
+    assert line.startswith("[PENDENTE: main did not advance, night replay failed]") and "integra/um" in line, line
+    cycles_before = orq_mod.CYCLES_LOG
+    orq_mod.CYCLES_LOG = cycles
+    try:
+        assert orq_mod._integrator_pending([])["linha"] == line, "the manager's ticket 137 reader turns it into a notice"
+    finally:
+        orq_mod.CYCLES_LOG = cycles_before
+    shutil.rmtree(os.path.join(env["ORQ_WT_DIR"], "integra-um"))
+    g("worktree", "prune")
+    g("branch", "-D", "integra/um")
+    r = subprocess.run([sys.executable, integrate, "um"], cwd=alive, env={**env, "ORQ_REPLAY": "true"}, capture_output=True, text=True)
+    assert r.returncode == 0 and re.search(r"night replay ok in \d+\.\d s", r.stdout), r.stdout + r.stderr
+
+
 def test_ticket55_advance_refuses_forgotten_conflict_marker():
     alive, env, g = _alive_repo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
     integrate = os.path.join(alive, "scripts", "integrar.py")

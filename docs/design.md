@@ -1053,6 +1053,34 @@ The review stops at its approval gate, so after reading the output the orq runs 
 
 `test_orq.py` builds its test list when the `if __name__ == "__main__":` block starts, so a `def test_` below that block is never collected and its suite passes green without it (tickets 135 and 158 shipped that way). `_tests_after_main` scans the source for such definitions: the runner lists them as failures on every run, filtered or not, and `test_ticket173_guard_refuses_def_test_after_main` covers the scan and fails if the file has one.
 
+## Night replay (ticket 216)
+
+The unit tests call pure functions with events written by hand, and the failures of the night of 10/01 were in the composition: what a producer really writes against what a consumer reads. Ticket 180 is the clearest one: the tests of 174 wrote the `ciclo` event, the integrator never wrote it, and the coordinator sat idle from 06:22 to 07:35 with away on. The same shape as gnhf's lesson: a test that crosses a process or IO boundary runs the real commands against a fake agent; a pure function stays in the unit test.
+
+`test_noite_replay.py` replays the night from `fixtures/noite-2026-10-01/`:
+
+- `events.jsonl`: the real log from 01/10 17:40Z to 02/10 10:40Z (1718 lines), with every free-text field emptied (prompts, subjects, notes). Out of it: what the Stop writes on each turn (`away_bloqueio`, `gate_aviso`, `gate_falha`, `pendente_avisado`; `resposta_coordenador` stays and gives the Stop moments, not fed), the 22 `processos` lines the ticket 147 tests leaked into the real log, and what the ingest of the deliveries of tickets 155 and 165 wrote (worker_done, the queue entry with `docs/design.md` and the coordinator's manual repair), which the replay writes again.
+- `ciclos.log`: the integrator's lines of the same window (local time); `cursor.json`: away on since 22:34:29Z.
+- `verdade.json`: what the log does not hold, from the tickets' reports: unpushed commits over time (it becomes `ORQ_SEM_PUSH`), the stretches the coordinator sat idle (03:34–08:21Z and 09:10–10:34Z) and each delivery's real branch and text.
+
+The events go into a temporary `ORQ_HOME` in log order, with `ORQ_AGORA` as the clock (`now_dt()`: the Stop, `wake_stopped` and `active_coordinator` read it). At each step the real command runs in a subprocess against the test_orq fake Orca: `orq hook stop` at each real end of turn (at most one per 2 min), `orq gerente absorver` every 5 min of the idle stretches, `orq ingest` at each delivery with the worker_done in the inbox. Between steps the replay stands in for the producers whose output is a file, not an event: `integrate-queue.json` from the `integrar_fila` events, the `agentes` of `open.json` as the refresh would build them (every dispatch without `fim_dispatch` or `liberar`, `entregue` after its worker_done) and the plan's tickets from `ticket novo|fechar`. Invariants, any one fails the run:
+
+- (a) an idle stretch with unpushed commits gets a notice typed into the coordinator within 10 min (from the start of the commits);
+- (b) no Stop blocks for a service dispatch, a sent-back one, or a queue give-up whose ticket or title was dispatched after it;
+- (c) the branch a delivery puts on the integrator queue is the branch of its `<ORQ_WT>/<ticket>` worktree.
+
+Measured on 02/10: 1629 events fed, 49 Stops, 75 manager rounds, 2 ingests, 13 notices, about 31 s. Each fix of that night reverted alone breaks it: without the always-read `_no_push` (180) both idle stretches fail (a); with the branch taken from the text first (169) both deliveries enter as `docs/design.md` (c); without `_services` in `reassess` (135) the Stop blocks for the integrator `ctx_259ad79640aa` from 01:15Z (b); without the title match of `away_abandoned` (175) it blocks for the give-up `fd125fe1` from 02:08Z (b). `test_ticket216_the_replay_fails_with_the_wake_up_turned_off` keeps one of these in the suite (`ORQ_ACORDA_PARADO_MIN` out of reach).
+
+`scripts/integrar.py` runs it in the integration worktree before the tests and prints `night replay ok in N s`. Red, main stays where it was and the script appends `[PENDENTE: main did not advance, night replay failed] <time> <branch> in <worktree>` to `ciclos.log`, which `_integrator_pending` turns into the notice of ticket 137. `ORQ_REPLAY` replaces the command; with `ORQ_TESTES` set and no `ORQ_REPLAY`, it does not run (the integrar tests).
+
+### Producer→consumer contract
+
+`EVENTOS_LIDOS` in `test_orq.py` is the table of event types the Stop (`hook_stop`) and the manager's wake-up (`wake_stopped`) read, with everything they reach by name. `event_contract` rebuilds it from orqlib's AST: every `x.get("tipo") == "..."` (or `in (...)`) in that reach, against every `{"tipo": "..."}` literal reachable from `main`. The test fails when a type read has no producer, when the code reads a type the table lacks, or when the table lists one nobody reads. `decisao` is compared on `tipo` there too but is a pending item's type. It found one gap on its first run: `away_report` built its "Summaries" section from `resumo` events, which nothing writes (`orq summary add` writes `resumo_add`), and its test wrote `resumo` by hand; it now reads `resumo_add` and the test writes the summaries with the real command. Its limit: it sees code that can write the type, not whether the real flow calls it, so ticket 180 itself (the `ciclo` producer existed, the integrator never ran it) is the replay's to catch, not this test's.
+
+### The suite and the real log
+
+orqlib reads `ORQ_HOME` once, at import. `test_ticket147_end_spares_orq_itself_and_its_caller` set the variable after the import and called `terminate_worktree_processes` in-process, so each run wrote a `processos` line with a `/var/folders/.../wt147` worktree into the real log (88 lines by 02/10 19:12Z, in the clone's log; three more in the old install path's log, written by a run whose orq still resolved it). They stay where they are. `test_orq.py` now points `ORQ_HOME` at a temporary folder before importing orq, the 147 test patches `orqlib.HOME`, and the runner snapshots size and hash of both real logs before the tests and fails after them if the old bytes changed or an appended line carries the name of a temporary folder the run created (the runner records every `mkdtemp`, which `TemporaryDirectory` goes through too), so the suites of other worktrees running at the same time, on code from before this ticket, are not this run's failure: on 02/10 they appended eight more `wt147` lines while the full suite ran. A new line alone is not a failure either: the live coordinator keeps writing.
+
 ## Why the defaults are what they are (moved out of the README)
 
 
