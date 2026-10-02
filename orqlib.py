@@ -12622,7 +12622,8 @@ NM_MODEL, NM_EFFORT = "claude-sonnet-5-5", "low"  # the cheap review; the config
 NM_CONFIG = f"agent: claude\nagent_config:\n  claude:\n    model: {NM_MODEL}\n    effort: {NM_EFFORT}\nauto_fix:\n  review: 0\nintent:\n  enabled: false\n"
 NM_SKIP = "test,document,lint,push,pr,ci"  # what remains is the rebase and the review; test brings up a stack outside the E2E queue, push and pr belong to the coordinator
 NM_WAIT_S = 720  # `axi run` waits until the first gate (--wait); the process gets slack on top
-NM_INTENT_MAX = 6000
+NM_INTENT_MAX = 49122  # bytes: the ceiling of no-mistakes for `--intent -` (>= v1.86.0); past it, it refuses instead of cutting
+NM_INTENT_KEEP = ("What to build", "Acceptance criteria")  # what survives when the ticket is past the ceiling
 REVIEW = "revisao-nm.json"  # [{pid, task, ts}]: the reviews in progress, which count as an expensive slot
 
 
@@ -12634,6 +12635,25 @@ def _nm_model():
     except OSError:
         m = None
     return (m.group(1) if m else NM_MODEL), NM_EFFORT
+
+
+def _nm_intent(titulo, corpo):
+    """The whole ticket as the review intent. Past NM_INTENT_MAX bytes keeps only the title, `## What to build` and `## Acceptance criteria`; still past it, raises ValueError (never cuts)."""
+    intent = f"{titulo}\n\n## {corpo}"
+    if len(intent.encode()) > NM_INTENT_MAX:
+        keep = [x for x in f"## {corpo}".split("\n## ") if x.removeprefix("## ").startswith(NM_INTENT_KEEP)]
+        intent = f"{titulo}\n\n" + "\n\n".join(x if x.startswith("## ") else f"## {x}" for x in keep)
+    if len(intent.encode()) > NM_INTENT_MAX:
+        raise ValueError(f"the intent has {len(intent.encode())} bytes even with only the title, What to build and Acceptance criteria; no-mistakes takes {NM_INTENT_MAX}: shorten the ticket")
+    return intent
+
+
+def _nm_version():
+    """`no-mistakes --version` (first line), or '' when it can't be read."""
+    try:
+        return subprocess.run([NM_BIN, "--version"], capture_output=True, text=True, timeout=10).stdout.strip().split("\n")[0]
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
 
 
 def _ongoing_reviews():
@@ -12687,7 +12707,7 @@ def review(task):
     """`orq review <task>`: only the no-mistakes review in the task's worktree, with the cheap model from orq's NM_HOME.
 
     `task` is the task id or the ticket number. Refuses on `pause` or `segura` from `orq usage` (any priority: the review is optional spend), under machine
-    pressure and without an expensive slot. The `--intent` is the ticket text (or the dispatch title). Returns {task, worktree, modelo, effort, duracao_s, achados, tokens, saida}
+    pressure and without an expensive slot. The intent is the whole ticket text (or the dispatch title), through stdin (`--intent -`), never cut. Returns {task, worktree, modelo, effort, duracao_s, intent_bytes, nm_versao, achados, tokens, saida}
     and records `revisao_nm` in events.jsonl. `output` is what `axi run` printed: the findings and the gate it stopped at."""
     tk = next((t for t in tickets() if task in (t["num"], t["task"]) or task.zfill(2) == t["num"]), None)
     task = tk["task"] if tk and tk["task"] else task
@@ -12700,7 +12720,7 @@ def review(task):
     usage_check(2)
     if tk:
         body_text = open(tk["arquivo"], encoding="utf-8").read().split("\n## ", 1)
-        intent = f"{tk['titulo']}\n\n## {body_text[1]}"[:NM_INTENT_MAX] if len(body_text) > 1 else tk["titulo"]
+        intent = _nm_intent(tk["titulo"], body_text[1]) if len(body_text) > 1 else tk["titulo"]
     else:
         intent = ev.get("titulo") or task
     model, effort = _nm_model()
@@ -12710,12 +12730,12 @@ def review(task):
             f.write(NM_CONFIG)
     env = {**os.environ, "NM_HOME": NM_HOME}
     _review_slot(task)
-    t0, start_time, error, output = int(time.time()), time.monotonic(), None, ""
+    t0, start_time, error, output, nm_version = int(time.time()), time.monotonic(), None, "", _nm_version()
     try:
         init = subprocess.run([NM_BIN, "init"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)  # per repository; repeating is harmless
         if init.returncode and "already" not in (init.stdout + init.stderr).lower():
             raise RuntimeError(f"no-mistakes init failed: {(init.stderr or init.stdout).strip()[-300:]}")
-        r = subprocess.run([NM_BIN, "axi", "run", "--intent", intent, "--skip", NM_SKIP, "--wait", f"{NM_WAIT_S}s"], cwd=wt, env=env,
+        r = subprocess.run([NM_BIN, "axi", "run", "--intent", "-", "--skip", NM_SKIP, "--wait", f"{NM_WAIT_S}s"], cwd=wt, env=env, input=intent,
                            capture_output=True, text=True, timeout=NM_WAIT_S + 60)
         output = r.stdout.strip()
         if r.returncode:
@@ -12727,7 +12747,7 @@ def review(task):
             subprocess.run([NM_BIN, "axi", "abort"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)
         _loose_review()
     usage = _nm_usage(t0)
-    res = {"task": task, "worktree": wt, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), **usage, "saida": output}
+    res = {"task": task, "worktree": wt, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), "intent_bytes": len(intent.encode()), "nm_versao": nm_version, **usage, "saida": output}
     append_event({"tipo": "revisao_nm", **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
     if error:
         raise RuntimeError(error)

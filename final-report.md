@@ -1,0 +1,8 @@
+# 224: orq revisar passes the whole intent
+
+`revisar` sends the ticket through stdin (`--intent -`), never cut. Over 49,122 bytes it keeps title, What to build and Acceptance criteria; past that it refuses. `revisao_nm` records `intent_bytes` and `nm_versao`. no-mistakes updated v1.84.0 -> v1.86.1 (`update --beta`; the stable channel had only v1.84.0, which reads `--intent -` as the literal "-").
+
+## Conformance
+1. red→green `test_ticket224_review_passes_8kb_ticket_whole_through_stdin_with_acceptance_criteria`, `test_ticket224_review_over_ceiling_drops_only_boilerplate_sections`, `test_ticket224_review_refuses_when_what_to_build_and_criteria_still_pass_ceiling`, `test_ticket224_review_event_has_intent_bytes_and_no_mistakes_version` (test_orq.py, ticket 224 block); all 4 FAIL on origin/main's orqlib.py (0/4) and pass now (4/4); full suite 1168/1169, the one failure (`test_ticket134_run_that_really_stopped_is_still_detected_after_expiry`) is timing-based and passes alone
+2. manual: real v1.86.1 `no-mistakes axi run --intent - --skip test,document,lint,push,pr,ci` with the 10,011-byte intent of ticket 124 on stdin in a scratch repo: `intent: completed`, `rebase: completed`, `review: awaiting_approval`, 1 finding; stdin ran through `_nm_intent` (6000 chars before). I did not read the intent back out of `axi run`'s output, which does not print it; I ran it through the real binary, not through `orq revisar` (there is no dispatched worktree for a long ticket)
+3. README.md (`orq review` bullet) and docs/design.md ("Intent without a cut (ticket 224)" in the `orq review` section, minimum version v1.86.0 and the v1.86.1 install)
