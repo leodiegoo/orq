@@ -1362,6 +1362,7 @@ def _no_run(target):
 
 INBOX_BODY = 160  # characters of a message body in `orq inbox`
 INBOX_BATCHES = 20  # consecutive batches that an `orq inbox --ack` confirms per Run
+INBOX_BODY_HOOK = 1500  # characters of a message body that the prompt hook injects into the context (ticket 182)
 
 
 def _box_line(m):
@@ -1373,8 +1374,44 @@ def _box_line(m):
                                   body_text[:INBOX_BODY] + ("…" if len(body_text) > INBOX_BODY else ""), summary[:INBOX_BODY]) if x)
 
 
-def _run_box(run, coord_handle, ack):
-    """Reads (and with `ack` confirms) a Run's inbox in the same generation: binds the coordinator (its `--from`) to the Run, then check and ack."""
+def _done_by_orq(msg_id, events):
+    """What orq already did on its own with the message (ingest, tickets 171/141): the report entry, the integrator queue, the notice to it and the alerts."""
+    done = []
+    for e in events:
+        if e.get("ref") == msg_id and e.get("origem") == "relatorio_worker":
+            done.append("report entry created")
+        if e.get("msg") != msg_id:
+            continue
+        if e.get("tipo") == "entrega_orq":
+            done.append(f"ticket {e.get('ticket')} entered the integrator queue (branch {e.get('branch')}); notice to the integrator: {e.get('aviso')}")
+        elif e.get("tipo") == "entrega" and e.get("avisos"):
+            done.append("; ".join(e["avisos"]))
+        elif e.get("tipo") == "alerta":
+            done.append(f"alert {e.get('alerta')}")
+    return done
+
+
+def _box_block(m, events):
+    """A whole message for the coordinator's context: header, body up to INBOX_BODY_HOOK characters, summarized payload, what orq already did and,
+    on a worker question, the reply command ready to run."""
+    p = _payload(m)
+    summary = " ".join(f"{k}={v}" for k, v in p.items() if isinstance(v, (str, int, float, bool)))
+    body_text = str(m.get("body") or "").strip()
+    ln = [f"{m.get('id')} {m.get('type')} de {m.get('from_handle') or '?'}" + (f" | {m['subject']}" if m.get("subject") else "")]
+    if body_text:
+        ln.append("  " + body_text[:INBOX_BODY_HOOK].replace("\n", "\n  ") + ("…" if len(body_text) > INBOX_BODY_HOOK else ""))
+    if summary:
+        ln.append(f"  payload: {summary[:INBOX_BODY_HOOK // 5]}")
+    ln += [f"  orq already did: {x}" for x in _done_by_orq(m.get("id"), events)]
+    if m.get("type") == "question":
+        ln.append(f'  reply with: orq reply {m.get("id")} "<text>"')
+    return ln
+
+
+def _run_box(run, coord_handle, ack, detail=False):
+    """Reads (and with `ack` confirms) a Run's inbox in the same generation: binds the coordinator (its `--from`) to the Run, then check and ack.
+
+    `detail` (the prompt hook, ticket 182): each message that is not a heartbeat comes whole (`_box_block`), after the ingest."""
     line_list, hb, n = [], 0, 0
     if _is_manager_run(run):  # o gerente segura o Run: o orca() o liga sob a trava
         acting_as = None
@@ -1389,7 +1426,11 @@ def _run_box(run, coord_handle, ack):
         hb += sum(1 for m in msgs if m.get("type") == "heartbeat")
         if ack:
             ingest_mailbox(msgs)
-        line_list += [_box_line(m) for m in msgs if m.get("type") != "heartbeat"]
+        if detail:
+            events = read_events()
+            line_list += [l for m in msgs if m.get("type") != "heartbeat" for l in _box_block(m, events)]
+        else:
+            line_list += [_box_line(m) for m in msgs if m.get("type") != "heartbeat"]
         n += len(msgs)
         if not ack:
             break
@@ -1398,7 +1439,7 @@ def _run_box(run, coord_handle, ack):
     return [cab, *("  " + l for l in line_list)]
 
 
-def inbox(run=None, ack=False, all_listing=False):
+def inbox(run=None, ack=False, all_listing=False, detail=False):
     """`orq inbox [<run>] [--ack] [--all_listing]`: reads Orca's inbox, and with `ack` confirms it, in the consumer's same generation.
 
     The coordinator's terminal comes from orq's state (gerente.json) and only then from the env. `--all_listing` walks the Runs with unread messages (the inbox
@@ -1415,7 +1456,7 @@ def inbox(run=None, ack=False, all_listing=False):
     output = []
     try:
         for r in targets:
-            output += _run_box(r, coord_handle, ack)
+            output += _run_box(r, coord_handle, ack, detail)
     finally:
         if before and any(r != before and not _is_manager_run(r) for r in targets):
             try:
@@ -4803,6 +4844,20 @@ def heartbeat_blocker(ev, run):
     return {"decision": "block", "reason": f"{MARK} {len(ev['heartbeats'])} heartbeats absorbed ({_short_run(target)})"}
 
 
+def inbox_in_prompt(run_id):
+    """The context lines for the Orca notice of `run_id` (ticket 182): the hook itself does the `orq inbox --ack` (with the ingest of 171, binding the
+    coordinator to the Run and restoring the link) and brings each message whole. If the read fails, only the command hint comes back, for the coordinator to run."""
+    tip = [f"orq: read and confirm the inbox with `orq inbox {run_id} --ack` (binds the coordinator to the Run and restores the link)"]
+    try:
+        header, *msgs = inbox(run_id, ack=True, detail=True)
+    except TimeoutError:
+        raise  # the hook's 3 s ceiling applies to the whole hook
+    except Exception as e:  # noqa: BLE001 - fail-open: without reading, the coordinator gets the hint
+        log(f"inbox in prompt: {type(e).__name__}: {e}")
+        return tip
+    return [f"orq: the hook read and confirmed the inbox (nothing to run). {header}", *msgs] if msgs else tip  # nothing to show (empty, or only heartbeats): the old hint
+
+
 ONLY_ORQ_COMMAND = re.compile(r"\s*/away(\s+\w+)?\s*$")
 
 
@@ -4830,7 +4885,7 @@ def hook_prompt(ev, run):
     if org != "usuario":
         ln = night_lines(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # the night wakes the coordinator by notice, not by user
         if org == "orca" and (r := NOTICE_RUN.search(ev.get("prompt") or "")):
-            ln = [f"orq: read and confirm the inbox with `orq inbox {r.group(1)} --ack` (binds the coordinator to the Run and restores the link)", *ln]
+            ln = [*inbox_in_prompt(r.group(1)), *ln]
         if org == "aviso_orq" and text_value.lstrip().startswith("orq: PR ") and (obligation_part := obligations_line(read_events())):
             ln = [*ln, obligation_part]  # the merge notice arrives already carrying what it asks for
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None

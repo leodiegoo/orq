@@ -2676,6 +2676,11 @@ def _no_tip(output):
     return "\n".join(rest)
 
 
+def _hook_ctx(r):
+    """The additionalContext of the prompt hook ("" with no output)."""
+    return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if (r.stdout or "").strip() else ""
+
+
 def _hb(phase, dispatch="ctx_1", task="task_1"):
     return ("heartbeat", {"taskId": task, "dispatchId": dispatch, "phase": phase})
 
@@ -2712,13 +2717,13 @@ def test_heartbeat_writes_the_event_with_run_ids_and_phase_of_each():
     assert not any(e["tipo"] == "entrada" for e in a.events()), "absorvido não vira entrada nem ingest"
 
 
-def test_heartbeat_mixed_passes_without_consuming_or_confirming():
+def test_heartbeat_mixed_passes_and_the_hook_reads_and_confirms():
     a = Env()
     a.inbox(_hb("lendo"), ("worker_done", {"taskId": "task_1"}))
     r = a.prompt(NOTICE_A)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
-    assert set(a.states().values()) == {"unread"}
-    assert [("--peek" in c) for c in _check_calls(a)] == [True], "só olhou com --peek"
+    assert r.returncode == 0 and "msg_2 worker_done" in _hook_ctx(r), r
+    assert set(a.states().values()) == {"acked"}, "ticket 182: the hook reads and confirms the mixed inbox"
+    assert "--peek" in _check_calls(a)[0], "looked with --peek before reading"
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
     assert _read_state(os.path.join(a.home, "cursor.json"))["chegada"]["origem"] == "orca", "o aviso segue o caminho de sempre"
 
@@ -2728,20 +2733,19 @@ def test_heartbeat_unknown_kind_passes():
         a = Env()
         a.inbox(_hb("lendo"), (type_name, {}))
         r = a.prompt(NOTICE_A)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, ""), (type_name, r)
-        assert set(a.states().values()) == {"unread"}, type_name
+        assert r.returncode == 0 and "msg_2 " in _hook_ctx(r), (type_name, r)  # ticket 182: read, not absorbed
+        assert set(a.states().values()) == {"acked"}, type_name
     a = Env()
     a.inbox((None, {}))
-    assert _no_tip(a.prompt(NOTICE_A).stdout) == "" and set(a.states().values()) == {"unread"}
+    assert "msg_1 " in _hook_ctx(a.prompt(NOTICE_A)) and set(a.states().values()) == {"acked"}
 
 
-def test_heartbeat_run_different_from_the_linked_passes_without_calling_the_check():
+def test_heartbeat_run_different_from_the_linked_passes_and_the_hook_confirms_only_the_heartbeat():
     a = Env(run="run_a")
     a.inbox(_hb("lendo"), run="run_b")
     r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`.")
     assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
-    assert _check_calls(a) == [], "consumer_fenced evitado: nem tentou"
-    assert a.states() == {"msg_1": "unread"}
+    assert a.states() == {"msg_1": "acked"}, "ticket 182: the hook binds the coordinator to the Run, reads and confirms; heartbeats alone do not become context"
 
 
 def test_heartbeat_notice_without_run_passes():
@@ -2787,12 +2791,12 @@ def test_heartbeat_consecutive_heartbeat_batches_enter_the_same_pass():
     assert set(a.states().values()) == {"acked"}
 
 
-def test_heartbeat_batch_with_worker_done_in_the_middle_passes_and_nothing_is_consumed():
+def test_heartbeat_batch_with_worker_done_in_the_middle_passes_and_the_hook_reads_and_confirms():
     a = Env()
     a.inbox(_hb("a"), ("worker_done", {"taskId": "t"}), _hb("b"))
     r = a.prompt(NOTICE_A)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), "há worker_done na caixa: o aviso passa"
-    assert set(a.states().values()) == {"unread"}
+    assert r.returncode == 0 and "msg_2 worker_done" in _hook_ctx(r), "there is a worker_done in the inbox: the notice passes with it read (ticket 182)"
+    assert set(a.states().values()) == {"acked"}
 
 
 def test_heartbeat_message_arriving_between_the_peek_and_the_next_batch_is_left_for_the_coordinator():
@@ -2833,8 +2837,8 @@ def test_heartbeat_new_message_after_the_absorbed_batch_passes():
     assert _blocked(a.prompt(NOTICE_A))
     a.inbox(("worker_done", {"taskId": "t"}))
     r = a.prompt(NOTICE_A)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), "a janela só vale para a caixa vazia: worker_done acorda o coordenador"
-    assert a.states()["msg_2"] == "unread"
+    assert "msg_2 worker_done" in _hook_ctx(r), "the window only holds for an empty inbox: worker_done wakes the coordinator, already read (ticket 182)"
+    assert a.states()["msg_2"] == "acked"
 
 
 def test_heartbeat_worker_neither_absorbs_nor_calls_the_check():
@@ -3921,7 +3925,7 @@ def test_notice_from_other_run_with_other_message_passes():
         a = Env(run="run_a")
         _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900), _hb_inbox(a, "ctx_9", "x", -3, 901, type_name=type_name))
         r = a.prompt(NOTICE_B)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and _calls_of(a, "check") == [] and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
+        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
 
 
 def test_notice_from_other_run_without_recent_message_passes():
@@ -3962,8 +3966,8 @@ def test_heartbeat_from_blocked_other_run_does_not_lose_the_worker_done_that_arr
     a.inbox(("worker_done", {"taskId": "t", "dispatchId": "ctx_9"}), run="run_b")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -8, 900), {**_hb_inbox(a, "ctx_9", "", -2, 901, type_name="worker_done")})
     r = a.prompt(NOTICE_B)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), "o worker_done acorda"
-    assert set(a.states().values()) == {"unread"}, "nada foi confirmado"
+    assert "msg_2 worker_done" in _hook_ctx(r), "the worker_done wakes, already read (ticket 182)"
+    assert set(a.states().values()) == {"acked"}, "the hook confirmed the Run's inbox"
     a.set("run.json", {"id": "run_b"})  # o coordenador faz run-use no Run: a caixa sai inteira, lote a lote
     got = subprocess.run([a.bin, "orchestration", "check", "--run", "run_b", "--all", "--json"], env=a.env, capture_output=True, text=True)
     assert [m["type"] for m in json.loads(got.stdout)["result"]["messages"]] == ["heartbeat", "worker_done"]
@@ -4994,8 +4998,8 @@ def test_manager_forwarded_notice_passes_in_the_coordinator_hook():
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
     r = a.prompt(env[env.index("--text") + 1], ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode == 0 and not _no_tip(r.stdout).strip(), "o aviso passa: o coordenador acorda para o worker_done"
-    assert a.states() == {"msg_1": "out"}
+    assert r.returncode == 0 and "msg_1 worker_done" in _hook_ctx(r), "the notice passes with the message read: the coordinator wakes for the worker_done (ticket 182)"
+    assert a.states() == {"msg_1": "acked"}
 
 
 def test_manager_absorb_outside_the_manager_does_nothing():
@@ -5200,7 +5204,7 @@ def test_manager_notice_from_run_that_is_not_the_linked_passes_in_the_coordinato
     text_value = env[env.index("--text") + 1]
     a.set("binds.json", {"run_a": {"handle": "term_ger", "gen": 9}, "run_b": {"handle": None, "gen": 9}})  # the panel already moved on to run_a
     r = a.prompt(text_value, ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode == 0 and not _no_tip(r.stdout).strip(), "o aviso passa: o coordenador acorda para o worker_done"
+    assert r.returncode == 0 and "msg_1 worker_done" in _hook_ctx(r), "the notice passes with the message read: the coordinator wakes for the worker_done (ticket 182)"
     assert _binds(a)["run_b"] == "term_ger", "o hook ligou o gerente ao Run do aviso antes de ler"
 
 
@@ -16905,6 +16909,68 @@ def test_it_should_keep_the_head_of_the_branch_in_the_linked_pr_so_the_next_pr_i
     _dispatch_by_name(a, "task_e2e", "fix/e2e-x", "ctx_e")
     _post_pr(a, p, cmd="gh pr create --head fix/e2e-x --base development")
     assert _prs_json(a)["itens"][0]["head"] == "fix/e2e-x"
+
+
+# ---------- ticket 182: the prompt hook reads and confirms the inbox ----------
+
+def _body182(a, msg_id, body_text, sender="term_w1"):
+    """Puts a body and a sender on a message of the fake mailbox (`a.inbox` has neither)."""
+    p = os.path.join(a.fake, "mailbox.json")
+    box = json.load(open(p))
+    for m in box["msgs"]:
+        if m["id"] == msg_id:
+            m.update(body=body_text, from_handle=sender)
+    json.dump(box, open(p, "w"))
+
+
+def _ctx182(r):
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ticket182_orca_notice_becomes_context_with_the_body_already_confirmed_and_ingested():
+    a = Env()
+    _delivery141(a, body="sem texto", branch="fix/da-caixa")
+    a.inbox(_hb("lendo"), ("worker_done", {"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"}))
+    _body182(a, "msg_2", "entreguei o ticket. " + "x" * 2000)
+    a.set("inbox.json", {"result": {"messages": [{"id": "msg_2", "run_id": "run_a", "type": "worker_done", "subject": "worker_done", "body": "", "sequence": 5, "read": 0,
+                                                    "created_at": "2099-01-01T00:00:00Z",
+                                                    "payload": json.dumps({"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"})}]}})
+    ctx = _ctx182(a.prompt(NOTICE_A))
+    assert "msg_2 worker_done" in ctx and "entreguei o ticket." in ctx and "x" * 1400 in ctx and "x" * 1501 not in ctx, ctx
+    assert "taskId=task_t141" in ctx and "outcome=succeeded" in ctx, ctx
+    assert "entered the integrator queue" in ctx and "fix/da-caixa" in ctx and "confirmadas" in ctx, ctx
+    assert "1 heartbeat" in ctx and "lendo" not in ctx, ctx
+    assert set(a.states().values()) == {"acked"}
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_2"]
+    assert len([e for e in a.events() if e["tipo"] == "integrar_fila"]) == 1
+    assert "orq inbox run_a --ack" not in ctx, "already read: the hint to run the command is gone"
+
+
+def test_ticket182_worker_question_carries_the_msg_id_and_the_reply_command():
+    a = Env()
+    a.inbox(("question", {"taskId": "task_1", "dispatchId": "ctx_1"}))
+    _body182(a, "msg_1", "uso a coluna a ou b?")
+    ctx = _ctx182(a.prompt(NOTICE_A))
+    assert "uso a coluna a ou b?" in ctx and 'orq reply msg_1 "' in ctx, ctx
+
+
+def test_ticket182_notice_from_another_run_reads_and_restores_the_link():
+    a = Env()
+    _multi(a, {"run_a": "term_coord", "run_b": None})
+    a.inbox(("escalation", {"taskId": "task_b"}), run="run_b")
+    _body182(a, "msg_1", "travei no merge")
+    ctx = _ctx182(a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`."))
+    assert "msg_1 escalation" in ctx and "travei no merge" in ctx, ctx
+    assert a.states() == {"msg_1": "acked"} and _binds(a)["run_a"] == "term_coord", _binds(a)
+
+
+def test_ticket182_read_failure_keeps_the_command_hint():
+    a = Env(FAKE_FAIL_ACK="1")
+    a.inbox(("question", {"taskId": "task_1"}))
+    ctx = _ctx182(a.prompt(NOTICE_A))
+    assert "orq inbox run_a --ack" in ctx, ctx
+
 
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
