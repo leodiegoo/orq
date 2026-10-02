@@ -433,6 +433,8 @@ On 01/10 the closing of tickets 101 and 141 queued 167 and 154 for automatic dis
 - `_libera_dependentes` used `new-top-level` with no `--name`. `_worktree_do_liberado` now picks `current` for an orq ticket (ticket 136 already tells the worker where to work) and, for a project ticket, `new-top-level` plus `--name` from the title: `_slug`, cut to 40 letters, trailing dash removed.
 - `desistiu` was only an event. `despacho_drenar` now writes `ticket`, `run` and the hand-dispatch command into the event, and `_avisa_desistiu` types one notice into the coordinator (the item leaves the queue, so it cannot repeat). `away_desistidos` feeds `proximo_sem_usuario`, so the away Stop hook blocks while a `desistiu` has no later `despacho` for the same ticket (or Run and title) and the ticket is still `ready` with no open blocker. Ticket 172: the notice and the Stop reason carry the real command, `orq despachar --run <run> --ticket <n> --modelo <m> --effort <e>` (the event stores `modelo` and `effort`; older events without `comando` get it rebuilt from the ticket header, never `None`). The notice puts the command first because `digita` cuts at `AVISO_MAX`.
 
+Ticket 175: `away_desistidos` also matches by title, because events written before 172 carry only `id` and `titulo`. A later `despacho` with the same title, or a ticket with that title that is no longer `ready` or is blocked, clears the item. `orq fila-despacho descartar <id> --motivo` writes a `descartado` event that clears it by id (the manual escape). `desistiu` now also stores `task`, and `_comando_desistido` omits `--run` when the item has none.
+
 Known limit: a busy coordinator loses the typed notice; the Stop block is the net.
 
 ## Hibernating idle workers (ticket 60)

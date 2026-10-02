@@ -15371,6 +15371,26 @@ def test_ticket172_desistencia_seguida_de_despacho_manual_ou_com_ticket_bloquead
     assert _desistidos172(b, evs) is None
 
 
+def test_ticket175_desistencia_antiga_sem_ticket_casa_pelo_titulo_e_descartar_tira_o_item():
+    a = Amb(run="run_a")
+    old = {"tipo": "despacho_fila", "op": "desistiu", "id": "fd125fe1", "titulo": "orq: ligar o backlog", "erro": "boom"}  # sem ticket, task, run
+    msg = _desistidos172(a, [old])
+    assert msg and "None" not in msg, msg
+    assert _desistidos172(a, [old, {"tipo": "despacho", "run": "run_b", "task": "t", "dispatch": "d", "titulo": "orq: ligar o backlog"}]) is None
+    assert _desistidos172(a, [old, {"tipo": "despacho_fila", "op": "descartado", "id": "fd125fe1", "motivo": "ja entregue"}]) is None
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "90-x.md"), "w") as f:
+        f.write("# 90: orq: ligar o backlog\n\nStatus: resolved\nBlocked by: (nenhum)\nRun: run_a\nModelo: m\nEffort: medium\n\n## What to build\n\nx\n")
+    assert _desistidos172(a, [old]) is None
+
+
+def test_ticket175_desistiu_novo_grava_ticket_e_run_e_o_comando_nao_tem_none():
+    assert "None" not in orq_mod._comando_desistido({"titulo": "x y", "run": None})
+    assert "--run run_a" in orq_mod._comando_desistido({"titulo": "x y", "run": "run_a"})
+    src = open(orq_mod.__file__).read()
+    assert 'fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), task=it.get("task"), run=it.get("run")' in src
+
+
 def test_ticket169_nome_que_nao_e_branch_nao_entra_e_avisa_que_faltou_a_branch():
     tmp = tempfile.mkdtemp()
     a = Amb(run="run_a", ORQ_REPOS=_repo_com_branch(tmp))

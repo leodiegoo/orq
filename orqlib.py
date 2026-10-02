@@ -9272,14 +9272,14 @@ def _sobe_da_fila(it):
 
 def _comando_ticket(run, ticket, modelo, effort):
     """`orq despachar --run <run> --ticket <n> --modelo <m> --effort <e>`: o que falta no cabeçalho do ticket fica de fora."""
-    return " ".join(["orq despachar"] + [f"{f} {v}" for f, v in (("--run", run), ("--ticket", ticket), ("--modelo", modelo), ("--effort", effort)) if v])
+    return " ".join(["orq despachar"] + [f"{f} {v}" for f, v in (("--run", run), ("--ticket", ticket), ("--modelo", modelo), ("--effort", effort)) if v and v != "None"])
 
 
 def _comando_desistido(it):
     """O comando para despachar à mão o item que a fila largou."""
     if it.get("ticket"):
         return _comando_ticket(it["run"], it["ticket"], it.get("modelo"), it.get("effort"))
-    return f"orq despachar --run {it.get('run')} --titulo {shlex.quote(it.get('titulo') or '')} --spec-arquivo <spec>"
+    return "orq despachar " + (f"--run {it['run']} " if it.get("run") else "") + f"--titulo {shlex.quote(it.get('titulo') or '')} --spec-arquivo <spec>"
 
 
 def _avisa_desistiu(it, falhas, erro, cmd):
@@ -9292,19 +9292,25 @@ def _avisa_desistiu(it, falhas, erro, cmd):
 
 
 def away_desistidos(tks, events):
-    """Motivo (ou None) para o Stop do away: item que a fila de despacho largou (`desistiu`) e ninguém despachou depois. Ticket que saiu de ready, ficou bloqueado ou foi
-    despachado (evento `despacho` com o ticket) sai; item sem ticket sai com um `despacho` do mesmo Run e título."""
+    """Motivo (ou None) para o Stop do away: item que a fila de despacho largou (`desistiu`) e ninguém despachou depois. Sai o item cujo ticket (ou ticket de mesmo
+    título, para o evento antigo sem `ticket`) saiu de ready ou ficou bloqueado, o despachado depois (evento `despacho` com o mesmo ticket, ou Run e título, ou só o título)
+    e o descartado à mão (`orq fila-despacho descartar`)."""
     abertos, por_num = {}, {t["num"]: t for t in tks}
     for e in events:
+        if e.get("tipo") != "despacho_fila" and e.get("tipo") != "despacho":
+            continue
         if e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu":
             abertos[e.get("ticket") or (e.get("run"), e.get("titulo"))] = e
+        elif e.get("tipo") == "despacho_fila" and e.get("op") == "descartado":
+            abertos = {k: v for k, v in abertos.items() if not e.get("id") or v.get("id") != e["id"]}
         elif e.get("tipo") == "despacho":
-            abertos.pop(e.get("ticket") or (e.get("run"), e.get("titulo")), None)
+            abertos = {k: v for k, v in abertos.items() if k != (e.get("ticket") or (e.get("run"), e.get("titulo"))) and not (e.get("titulo") and v.get("titulo") == e["titulo"])}
     for k, e in abertos.items():
-        t = por_num.get(k) or {}
-        if e.get("ticket") and (t.get("status") != STATUS_NOVO or any((por_num.get(b) or {}).get("status") != STATUS_FECHADO for b in t.get("blocked_by") or [])):
+        t = por_num.get(e.get("ticket")) or next((x for x in tks if e.get("titulo") and x.get("titulo") == e["titulo"]), None) or {}
+        if t and (t.get("status") != STATUS_NOVO or any((por_num.get(b) or {}).get("status") != STATUS_FECHADO for b in t.get("blocked_by") or [])):
             continue
-        cmd = e.get("comando") or (_comando_ticket(e.get("run"), e["ticket"], e.get("modelo") or t.get("modelo"), e.get("effort") or t.get("effort")) if e.get("ticket") else _comando_desistido(e))
+        num = e.get("ticket") or t.get("num")
+        cmd = e.get("comando") or (_comando_ticket(e.get("run"), num, e.get("modelo") or t.get("modelo"), e.get("effort") or t.get("effort")) if num else _comando_desistido(e))
         return f"a fila de despacho desistiu de {_cita(e.get('titulo'), 60)} ({_cita(str(e.get('erro')), 120)}): `{cmd}`"
     return None
 
@@ -9343,7 +9349,7 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
             falhas = it.get("falhas", 0) + (0 if segurado else 1)
             if falhas >= FALHAS_FILA:
                 cmd = _comando_desistido(it)
-                fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), run=it.get("run"), modelo=it.get("modelo"), effort=it.get("effort"), comando=cmd)
+                fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), task=it.get("task"), run=it.get("run"), modelo=it.get("modelo"), effort=it.get("effort"), comando=cmd)
                 _avisa_desistiu(it, falhas, e, cmd)
                 linhas.append(f"fila: {it['titulo']} saiu da fila depois de {falhas} erros ({e}); despache de novo à mão")
                 continue
@@ -11422,6 +11428,9 @@ def main(argv=None):
     fd = sub.add_parser("fila-despacho", help="os despachos e retomadas que esperam vaga na máquina: lista | rm <id>").add_subparsers(dest="op", required=True)
     fd.add_parser("lista").add_argument("--json", action="store_true")
     fd.add_parser("rm").add_argument("id")
+    dc = fd.add_parser("descartar", help="dá a desistência `desistiu` por resolvida: tira o item do Stop do away")
+    dc.add_argument("id")
+    dc.add_argument("--motivo", required=True)
     cx = sub.add_parser("caixa", help="lê a caixa do Orca (check) e com --ack a confirma na mesma geração; volta o vínculo ao Run anterior")
     cx.add_argument("run", nargs="?")
     cx.add_argument("--ack", action="store_true")
@@ -11787,6 +11796,11 @@ def main(argv=None):
             if not fila_despacho_rm(a.id):
                 raise ValueError(f"{a.id} não está na fila de despacho")
             print(f"{a.id} saiu da fila de despacho")
+        elif a.cmd == "fila-despacho" and a.op == "descartar":
+            if not any(e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu" and e.get("id") == a.id for e in read_events()):
+                raise ValueError(f"{a.id} não tem desistência registrada")
+            append_event({"tipo": "despacho_fila", "op": "descartado", "id": a.id, "motivo": a.motivo})
+            print(f"{a.id} descartado do Stop do away")
         elif a.cmd == "fila-despacho":
             itens = fila_despacho_itens()
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(
