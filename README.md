@@ -311,6 +311,18 @@ orq adiar e484 deploy --motivo "the deploy runs tomorrow"   # creates an "a faze
 
 While an entry has an open obligation, `orq intake eN conversa` and `descartado` are refused. Closing the last obligation closes the entry too. Whatever orq can confirm by itself it closes and only records: `orq ticket fechar NN` closes the `ticket` obligation. The coordinator's Stop hook warns once about each obligation open for more than 10 minutes (`ORQ_OBRIGACAO_MIN`); it never blocks.
 
+Three more close by themselves, with the proof orq saw (ticket 155):
+
+- `limpeza`: the `pr`/`limpou` event of `limpar-mergeados` for the task's branch. It closes when something was removed and nothing was kept or skipped; the event is the proof. If it kept (`guardados`) or skipped (`pulados`), the obligation stays open and its line in the prompt shows why.
+- `proximo`: `orq pr ligar` or `orq pr auto` of a request of the same task whose base is the environment the obligation asks for. The proof is the request's URL.
+- `deploy`: an optional `"deploy_check": "<command with {base} and {sha}>"` in `projects/<name>.json`. The manager lap runs it for each open `deploy` obligation, at most every 2 minutes (`ORQ_PR_POLL_S`, like `pr poll`), in the project's folder; `{base}` is the environment the request entered and `{sha}` its merge commit. Exit 0 closes with the first stdout line as proof; exit 2 means "still building" and leaves it open; any other exit (or more than 60 s) warns the coordinator once. Without the key nothing runs. Writing a project's command is up to the project:
+
+```json
+{"repo": "path:/Users/me/app", "deploy_check": "my-deploy-status --env {base} --commit {sha}"}
+```
+
+Closing the last obligation closes the entry, as before.
+
 ## Tests
 
 ```sh

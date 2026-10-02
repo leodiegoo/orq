@@ -14993,6 +14993,119 @@ def test_ticket165_devolver_manda_a_correcao_grava_o_evento_e_volta_a_task_para_
     (ev,) = [e for e in a.events() if e["tipo"] == "devolver"]
     assert (ev["task"], ev["dispatch"], ev["run"]) == ("task_feita", "ctx_0", "run_a"), ev
     assert a.orq("devolver", "task_fantasma", "x").returncode == 1
+# ---------- ticket 155: obrigação que o orq consegue provar fecha sozinha ----------
+
+def _py155(a, codigo):
+    """Roda `codigo` (Python, com orqlib importado) no ORQ_HOME do ambiente de teste e devolve o stdout."""
+    r = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {AQUI!r}); import orqlib as o; {codigo}"], capture_output=True, text=True, env=a.env, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _limpou155(a, **campos):
+    _py155(a, f"o.append_event({{'tipo': 'pr', 'op': 'limpou', 'task': 'task_feat1', 'branch': 'feat/x', 'removidos': [], 'guardados': [], 'pulados': [], **{campos!r}}}); "
+              f"o.limpou_fecha(o.read_events()[-1])")
+
+
+def test_ticket155_limpou_com_remocao_fecha_a_limpeza_com_o_evento_como_prova():
+    a = _prs_env()
+    e = _merge_main(a)
+    _limpou155(a, removidos=["worktree:feat/x", "local:feat/x", "remote:feat/x"])
+    assert "limpeza" not in _obrig(a, e) and {"deploy", "comentario"} <= set(_obrig(a, e))
+    (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito"]
+    assert f["chave"] == "limpeza" and "worktree:feat/x" in f["prova"], f
+
+
+def test_ticket155_limpou_que_guardou_ou_pulou_nao_fecha_e_a_linha_mostra_o_motivo():
+    a = _prs_env()
+    e = _merge_main(a)
+    _limpou155(a, removidos=["local:feat/x"], pulados=["worktree:feat/x (tem alteração não commitada)"])
+    assert "limpeza" in _obrig(a, e)
+    assert "tem alteração não commitada" in _ctx(a.prompt("e agora?")), "o motivo aparece na linha da obrigação"
+    _limpou155(a, removidos=["worktree:feat/x"], guardados=["/x/relatorio.md"])
+    assert "limpeza" in _obrig(a, e), "guardou: fica aberta"
+
+
+def test_ticket155_limpou_de_outra_task_nao_fecha_a_limpeza():
+    a = _prs_env()
+    e = _merge_main(a)
+    _limpou155(a, task="task_outra", removidos=["worktree:feat/y"])
+    assert "limpeza" in _obrig(a, e)
+
+
+def test_ticket155_pr_da_mesma_task_para_o_ambiente_seguinte_fecha_o_proximo():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    a.orq("pr", "poll", "--forcar")
+    assert "proximo" in _obrig(a)
+    prs = {n: PR2.replace("1220", n) for n in ("1221", "1222", "1223")}
+    _pr(a, prs["1221"], "OPEN", "main")
+    a.orq("pr", "ligar", "task_feat1", prs["1221"])
+    assert "proximo" in _obrig(a), "main não é o ambiente seguinte de development"
+    _pr(a, prs["1222"], "OPEN", "staging")
+    a.orq("pr", "ligar", "task_outra", prs["1222"])
+    assert "proximo" in _obrig(a), "PR de outra task não fecha"
+    _pr(a, prs["1223"], "OPEN", "staging")
+    assert a.orq("pr", "ligar", "task_feat1", prs["1223"]).returncode == 0
+    assert "proximo" not in _obrig(a) and "deploy" in _obrig(a)
+    (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito"]
+    assert f["chave"] == "proximo" and f["prova"] == prs["1223"], f
+
+
+def _deploy155(a, cmd):
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
+        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao",
+                   **({"deploy_check": cmd} if cmd else {})}, f)
+
+
+def _volta155(a):
+    return _py155(a, "print(chr(10).join(o.deploy_verificar(1e12)))")
+
+
+def test_ticket155_deploy_check_saida_0_fecha_com_a_primeira_linha_e_recebe_base_e_sha():
+    a = _prs_env()
+    _deploy155(a, "echo versao-{base}-{sha}; echo segunda")
+    e = _merge_main(a)
+    (n,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "nova" and x["chave"] == "deploy"]
+    assert n["base"] == "main", n
+    assert "deploy" in _obrig(a, e)
+    assert "deploy de main conferido" in _volta155(a)
+    assert "deploy" not in _obrig(a, e)
+    (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito" and x["chave"] == "deploy"]
+    assert f["prova"].startswith("versao-main-") and "segunda" not in f["prova"], f
+
+
+def test_ticket155_deploy_check_saida_2_mantem_aberta_e_nao_avisa():
+    a = _prs_env()
+    _deploy155(a, "echo buildando; exit 2")
+    e = _merge_main(a)
+    assert _volta155(a) == "" and "deploy" in _obrig(a, e)
+    assert not [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "falhou"]
+
+
+def test_ticket155_deploy_check_outra_saida_avisa_o_coordenador_uma_vez():
+    a = _prs_env()
+    _deploy155(a, "exit 1")
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]}, open(os.path.join(a.home, "gerente.json"), "w"))
+    e = _merge_main(a)
+    _volta155(a)
+    _volta155(a)
+    assert "deploy" in _obrig(a, e)
+    assert len([x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "falhou"]) == 1, "uma vez só"
+    assert "deploy_check de main saiu 1" in json.dumps(_py155(a, "print(o._cursor_ro().get('avisos'))")) + json.dumps(_log(a, "calls.log")), "o coordenador foi avisado"
+
+
+def test_ticket155_projeto_sem_deploy_check_nao_roda_nada_e_a_ultima_obrigacao_fecha_a_entrada():
+    a = _prs_env()
+    marca = os.path.join(a.home, "rodou")
+    e = _merge_main(a)
+    assert _volta155(a) == "" and not os.path.exists(marca) and "deploy" in _obrig(a, e)
+    _deploy155(a, f"touch {marca}; echo ok")
+    a.orq("feito", e, "comentario", "--prova", "x")
+    _limpou155(a, removidos=["worktree:feat/x"])
+    _volta155(a)
+    assert os.path.exists(marca) and not _obrig(a, e) and e not in {x["id"] for x in orq_mod.abertas(a.events())}, "a última fechada fecha a entrada"
 
 
 if __name__ == "__main__":

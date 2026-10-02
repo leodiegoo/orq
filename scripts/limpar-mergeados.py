@@ -434,11 +434,13 @@ def evento_orq(task, branch, items):
     """Grava no log do orq o que a limpeza removeu, guardou e pulou. Orq fora do lugar ou log inacessível: segue sem o evento."""
     try:
         sys.path.insert(0, ORQ_DIR)
-        from orqlib import append_event
-        append_event({"tipo": "pr", "op": "limpou", "task": task, "branch": branch,
+        from orqlib import append_event, limpou_fecha
+        ev = {"tipo": "pr", "op": "limpou", "task": task, "branch": branch,
                       "removidos": [f"{i['kind']}:{i['name']}" for i in items if i["action"] == "removed"],
                       "guardados": [g for i in items for g in i.get("guardados", [])],
-                      "pulados": [f"{i['kind']}:{i['name']} ({i['reason']})" for i in items if i["action"] in ("skip", "error")]})
+                      "pulados": [f"{i['kind']}:{i['name']} ({i['reason']})" for i in items if i["action"] in ("skip", "error")]}
+        append_event(ev)
+        limpou_fecha(ev)
     except Exception as e:  # noqa: BLE001 - o evento é registro, não pode derrubar a limpeza
         print(f"evento não gravado: {type(e).__name__}: {e}", file=sys.stderr)
 

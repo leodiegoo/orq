@@ -2425,7 +2425,7 @@ def _pr_lista_gh(urls):
     for repo, us in por_repo.items():
         try:
             r = subprocess.run([GH, "pr", "list", "--repo", repo, "--state", "all", "--limit", "300", "--json",
-                                "url,state,mergedAt,baseRefName,headRefName,title,mergeable,statusCheckRollup"], capture_output=True, text=True, timeout=PR_GH_S)
+                                "url,state,mergedAt,mergeCommit,baseRefName,headRefName,title,mergeable,statusCheckRollup"], capture_output=True, text=True, timeout=PR_GH_S)
             lista = json.loads(r.stdout) if r.returncode == 0 else None
         except (subprocess.TimeoutExpired, OSError, ValueError):
             lista = None
@@ -2540,7 +2540,9 @@ def pr_ligar(task, url, issue=None, tag=None, nota=None):
                       **({"issue": item["issue"]} if issue else {})})
         return item
 
-    return _mutar_prs(add)
+    item = _mutar_prs(add)
+    _fecha_proximo(item)
+    return item
 
 
 def _primeiro_paragrafo(texto, limite=120):
@@ -2998,7 +3000,8 @@ def _aplica_prs(d, vistos, agora):
         if i["estado"] != "aberto" or not novo:
             i["base"] = visto.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
-        i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now(), **({"head": visto["headRefName"]} if visto.get("headRefName") else {}))
+        i.update(estado=novo, base=visto.get("baseRefName") or i.get("base"), resolvido_em=now(), **({"head": visto["headRefName"]} if visto.get("headRefName") else {}),
+                 **({"sha": visto["mergeCommit"]["oid"]} if isinstance(visto.get("mergeCommit"), dict) and visto["mergeCommit"].get("oid") else {}))
         prox = pr_proximo([x for x in d["itens"] if x["task"] == i["task"]], fluxo_da_task(i["task"]))
         onde = f"{i['task']}" + (f", issue #{i['issue']}" if i.get("issue") else "")
         texto = f"PR #{i['numero']} entrou em {i['base']} ({onde})" + (f": {prox}" if prox else "") if novo == "mergeado" \
@@ -3018,7 +3021,7 @@ def _aplica_prs(d, vistos, agora):
             tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_FECHADO), None)
             for chave, txt in obrigacoes_do_merge(i, prox, tk, fluxo_da_task(i['task'], eventos)):
                 append_event({"tipo": "obrigacao", "op": "nova", "entrada": ent["id"], "chave": chave, "texto": txt, "task": i["task"],
-                              **({"ticket": tk["num"]} if chave == "ticket" else {})})
+                              **({"ticket": tk["num"]} if chave == "ticket" else {}), **({"base": i["base"], "sha": i.get("sha") or ""} if chave == "deploy" else {})})
         linhas.append(f"{i['task']}: {texto}")
     return linhas
 
@@ -3120,7 +3123,7 @@ def linha_obrigacoes(events):
     obs = [] if os.environ.get("ORQ_MATE") else obrigacoes_abertas(events)
     if not obs:
         return ""
-    return ("A fazer por você: " + "; ".join(f"{e} → " + ", ".join(f"{o['chave']} ({o['texto']})" for o in os_) for e, os_ in _por_entrada(obs).items())
+    return ("A fazer por você: " + "; ".join(f"{e} → " + ", ".join(f"{o['chave']} ({o['texto']}" + (f"; {m}" if o["chave"] == "limpeza" and (m := _motivo_limpeza(events, o.get("task"))) else "") + ")" for o in os_) for e, os_ in _por_entrada(obs).items())
             + '. Feche: orq feito <e> <obrigação> --prova "<url, versão, hash>" | orq adiar <e> <obrigação> --motivo "…".')
 
 
@@ -3139,6 +3142,79 @@ def _fechar_obrigacao(o, op, **campos):
     if not obrigacoes_abertas(eventos, o["entrada"]) and not any(x.get("tipo") == "intake" and x.get("entrada") == o["entrada"] for x in eventos):
         append_event({"tipo": "intake", "entrada": o["entrada"], "efeito": "conversa", "nota": "obrigações cumpridas"})
     return ev
+
+
+def _fechar_auto(chave, task, prova, quando=lambda o: True):
+    """Fecha com `feito` as obrigações abertas de `chave` da `task` para as quais `quando(o)` vale, com a prova que o orq mesmo viu. Devolve quantas."""
+    achadas = [o for o in obrigacoes_abertas(read_events()) if o["chave"] == chave and o.get("task") == task and quando(o)]
+    for o in achadas:
+        _fechar_obrigacao(o, "feito", prova=prova, auto=True)
+    return len(achadas)
+
+
+def limpou_fecha(ev):
+    """O evento `pr`/`limpou` do limpar-mergeados fecha a `limpeza` da task quando removeu algo e nada ficou guardado nem pulado; senão a obrigação
+    segue aberta e a linha dela mostra o motivo (`_motivo_limpeza`)."""
+    if ev.get("removidos") and not ev.get("pulados") and not ev.get("guardados"):
+        return _fechar_auto("limpeza", ev.get("task"), "limpou: " + ", ".join(ev["removidos"]))
+    return 0
+
+
+def _motivo_limpeza(events, task):
+    """Por que a última limpeza da task não fechou a obrigação (o que pulou ou guardou), ou ''."""
+    ev = next((e for e in reversed(events) if e.get("tipo") == "pr" and e.get("op") == "limpou" and e.get("task") == task), None)
+    return "; ".join([*(ev or {}).get("pulados", []), *(f"guardou {g}" for g in (ev or {}).get("guardados", []))])
+
+
+def _fecha_proximo(item):
+    """PR ligado à task cuja base é o ambiente que a obrigação `proximo` pede (`abrir o PR de <ambiente>, …`): fecha com a URL dele."""
+    if item.get("base"):
+        _fechar_auto("proximo", item["task"], item["url"], lambda o: (re.match(r"abrir o PR de (\S+?),", o["texto"]) or [None, None])[1] == item["base"])
+
+
+DEPLOY_ERRO_S = 60  # o `deploy_check` que passa disto conta como falha
+
+
+def _deploy_de(o):
+    """(comando, pasta) do `deploy_check` do projeto da task da obrigação `o`, ou None (sem projeto ou sem a chave)."""
+    run = next((e.get("run") for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == o.get("task")), None)
+    try:
+        nome = projeto_do_despacho(None, run)
+    except ValueError:
+        return None
+    p = projetos().get(nome) or {}
+    return (p["deploy_check"], pasta_do_repo(p["repo"]) or os.getcwd()) if p.get("deploy_check") else None
+
+
+def deploy_verificar(agora=None):
+    """Roda o `deploy_check` do projeto para cada obrigação `deploy` aberta, no máximo a cada PR_POLL_S por obrigação. Saída 0: fecha com a primeira
+    linha do stdout; 2: ainda buildando, segue aberta; outra (ou estouro de tempo): avisa o coordenador uma vez (evento `obrigacao falhou`). Sem a chave, nada roda.
+    Devolve as linhas do painel."""
+    agora = time.time() if agora is None else agora
+    arq, linhas = _path("deploy-check.json"), []
+    vistos = _dict(_read_json(arq))
+    for o in [o for o in obrigacoes_abertas(read_events()) if o["chave"] == "deploy"]:
+        chave = f"{o['entrada']}/{o['chave']}"
+        dep = _deploy_de(o)
+        if not dep or agora - vistos.get(chave, 0) < PR_POLL_S:
+            continue
+        vistos[chave] = agora
+        cmd = dep[0].replace("{base}", shlex.quote(o.get("base") or "")).replace("{sha}", shlex.quote(o.get("sha") or ""))
+        try:
+            r = subprocess.run(cmd, shell=True, cwd=dep[1], capture_output=True, text=True, timeout=DEPLOY_ERRO_S)
+            rc, saida = r.returncode, (r.stdout or "").strip().splitlines()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            rc, saida = -1, [type(e).__name__]
+        if rc == 0 and saida:
+            _fechar_obrigacao(o, "feito", prova=saida[0], auto=True)
+            linhas.append(f"{o['task']}: deploy de {o.get('base')} conferido ({saida[0]})")
+        elif rc not in (0, 2) and not any(e.get("tipo") == "obrigacao" and e.get("op") == "falhou" and (e.get("entrada"), e.get("chave")) == (o["entrada"], o["chave"]) for e in read_events()):
+            g = _gerente_cfg()
+            if g and g.get("coordenador") and avisa_coordenador(g["coordenador"], f"orq: deploy_check de {o.get('base')} saiu {rc} ({o['task']}, entrada {o['entrada']}): confira à mão e feche com orq feito.",
+                                                                   contexto=False) in ("enviado", "adiado"):
+                append_event({"tipo": "obrigacao", "op": "falhou", "entrada": o["entrada"], "chave": o["chave"], "saida": rc})
+    _write_json(arq, vistos)
+    return linhas
 
 
 def obrigacao_feito(e, chave, prova):
@@ -7614,7 +7690,8 @@ def projetos():
                 f"harness {harness!r} não existe no orq ({', '.join(HARNESSES)})" if harness not in HARNESS else
                 f"{sem_texto} não é um caminho (texto)" if sem_texto else erro_amb)
         achados[nome] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": amb, "producao": producao, "fluxo": fluxo,
-                         "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": erro}
+                         "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": erro,
+                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None}
     return achados
 
 
@@ -9873,7 +9950,7 @@ def gerente_absorver():
     except Exception as e:  # noqa: BLE001 - a tela ilegível não derruba o painel; a próxima volta tenta
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        linhas += [*pr_poll(), *pr_avisar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex"), *avisos_entregar()]
+        linhas += [*pr_poll(), *pr_avisar(), *deploy_verificar(), *avisa_fila_e2e(), *uso_avisar(), *uso_avisar(agente="codex"), *avisos_entregar()]
     except Exception as e:  # noqa: BLE001 - idem: o gh fora do ar não derruba o painel
         log(f"prs: {type(e).__name__}: {e}")
     try:
