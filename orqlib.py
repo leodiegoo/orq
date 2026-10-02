@@ -1563,30 +1563,45 @@ def _box_block(m, events):
     return ln
 
 
-def _run_box(run, coord_handle, ack, detail=False):
-    """Reads (and with `ack` confirms) a Run's inbox in the same generation: binds the coordinator (its `--from`) to the Run, then check and ack.
+def _box_lines(msgs, detail):
+    """(heartbeats, lines) of a batch: heartbeats are only counted; `detail` (the prompt hook, ticket 182) brings each other message whole (`_box_block`)."""
+    hb = sum(1 for m in msgs if m.get("type") == "heartbeat")
+    events = read_events() if detail else []
+    return hb, [l for m in msgs if m.get("type") != "heartbeat" for l in (_box_block(m, events) if detail else [_box_line(m)])]
 
-    `detail` (the prompt hook, ticket 182): each message that is not a heartbeat comes whole (`_box_block`), after the ingest."""
+
+def _global_box(run, ack):
+    """Reads the Run's unread messages from Orca's global inbox (`inbox --full`), without `run-use` (ticket 336): Orca binds one Run per terminal and a
+    coordinator `run-use` on a Run it does not command takes it off whoever holds it, the agent manager included. Nothing is consumed or acknowledged
+    (the delivery would be consumer_fenced anyway); with `ack` each `worker_done` still goes through the ingest, so the report entry and the integrator queue
+    do not wait for the coordinator to bind the Run."""
+    msgs = sorted((m for m in orca("inbox", "--limit", "200", "--full", timeout=20)["messages"]
+                   if isinstance(m, dict) and m.get("to_handle") == f"run:{run}" and not m.get("read")), key=lambda m: m.get("sequence") or 0)
+    if ack:
+        ingest_mailbox(msgs)
+    return msgs
+
+
+def _run_box(run, coord_handle, ack, detail=False, own=None):
+    """Reads (and with `ack` confirms) a Run's inbox in the same generation: check and ack by the handle that commands the Run.
+
+    A Run that neither the agent manager nor the coordinator (`own`, the Run bound to its terminal) commands is read from the global inbox, with no binding
+    and no ack (`_global_box`). `detail` (the prompt hook, ticket 182): each message that is not a heartbeat comes whole (`_box_block`), after the ingest."""
+    if not _is_manager_run(run) and run != own:
+        msgs = _global_box(run, ack)
+        hb, line_list = _box_lines(msgs, detail)
+        return [f"{run}: {len(msgs)} mensagem(ns)" + (f", {hb} heartbeat(s)" if hb else "") + (", lidas sem ligar o Run" if msgs else ""), *("  " + l for l in line_list)]
     line_list, hb, n = [], 0, 0
-    if _is_manager_run(run):  # o gerente segura o Run: o orca() o liga sob a trava
-        acting_as = None
-    else:
-        acting_as = coord_handle
-        orca("run-use", "--id", run, acting_as=acting_as)
+    acting_as = None if _is_manager_run(run) else coord_handle  # o gerente segura o Run: o orca() o liga sob a trava
     res = orca("check", "--run", run, acting_as=acting_as)
     for _ in range(INBOX_BATCHES):
         msgs = res.get("messages") or []
         if not res.get("deliveryId") or not msgs:
             break
-        hb += sum(1 for m in msgs if m.get("type") == "heartbeat")
         if ack:
             ingest_mailbox(msgs)
-        if detail:
-            events = read_events()
-            line_list += [l for m in msgs if m.get("type") != "heartbeat" for l in _box_block(m, events)]
-        else:
-            line_list += [_box_line(m) for m in msgs if m.get("type") != "heartbeat"]
-        n += len(msgs)
+        batch_hb, batch_lines = _box_lines(msgs, detail)
+        hb, line_list, n = hb + batch_hb, line_list + batch_lines, n + len(msgs)
         if not ack:
             break
         res = orca("check", "--run", run, "--ack", res["deliveryId"], acting_as=acting_as)
@@ -1598,7 +1613,7 @@ def inbox(run=None, ack=False, all_listing=False, detail=False):
     """`orq inbox [<run>] [--ack] [--all_listing]`: reads Orca's inbox, and with `ack` confirms it, in the consumer's same generation.
 
     The coordinator's terminal comes from orq's state (gerente.json) and only then from the env. `--all_listing` walks the Runs with unread messages (the inbox
-    covers all). At the end the binding goes back to the Run the coordinator was on."""
+    covers all). A Run the coordinator does not command is read without binding it (ticket 336): the binding stays where it was."""
     coord_handle = (_manager_cfg() or {}).get("coordenador") or os.environ.get("ORCA_TERMINAL_HANDLE")
     before = _current_run_id(acting_as=coord_handle)
     if all_listing:
@@ -1609,15 +1624,8 @@ def inbox(run=None, ack=False, all_listing=False, detail=False):
     if not all(targets):
         raise ValueError("no Run bound: pass the Run (`orq inbox <run>`)")
     output = []
-    try:
-        for r in targets:
-            output += _run_box(r, coord_handle, ack, detail)
-    finally:
-        if before and any(r != before and not _is_manager_run(r) for r in targets):
-            try:
-                orca("run-use", "--id", before, acting_as=coord_handle)
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
-                log(f"inbox: run-use back to Run {before}: {type(e).__name__}: {e}")
+    for r in targets:
+        output += _run_box(r, coord_handle, ack, detail, own=before)
     return output or ["inbox empty"]
 
 
@@ -5682,9 +5690,9 @@ def heartbeat_blocker(ev, run):
 
 
 def inbox_in_prompt(run_id):
-    """The context lines for the Orca notice of `run_id` (ticket 182): the hook itself does the `orq inbox --ack` (with the ingest of 171, binding the
-    coordinator to the Run and restoring the link) and brings each message whole. If the read fails, only the command hint comes back, for the coordinator to run."""
-    tip = [f"orq: read and confirm the inbox with `orq inbox {run_id} --ack` (binds the coordinator to the Run and restores the link)"]
+    """The context lines for the Orca notice of `run_id` (ticket 182): the hook itself does the `orq inbox --ack` (with the ingest of 171, without binding
+    the coordinator to a Run it does not command, ticket 336) and brings each message whole. If the read fails, only the command hint comes back, for the coordinator to run."""
+    tip = [f"orq: read the inbox with `orq inbox {run_id} --ack` (does not bind the Run)"]
     try:
         header, *msgs = inbox(run_id, ack=True, detail=True)
     except TimeoutError:
@@ -5692,7 +5700,7 @@ def inbox_in_prompt(run_id):
     except Exception as e:  # noqa: BLE001 - fail-open: without reading, the coordinator gets the hint
         log(f"inbox in prompt: {type(e).__name__}: {e}")
         return tip
-    return [f"orq: the hook read and confirmed the inbox (nothing to run). {header}", *msgs] if msgs else tip  # nothing to show (empty, or only heartbeats): the old hint
+    return [f"orq: the hook read the inbox (nothing to run). {header}", *msgs] if msgs else tip  # nothing to show (empty, or only heartbeats): the old hint
 
 
 ONLY_ORQ_COMMAND = re.compile(r"\s*/away(\s+\w+)?\s*$")
@@ -14021,7 +14029,7 @@ def parser():
     dc = fd.add_parser("discard", aliases=["descartar"], help="marks the `desistiu` give-up as resolved: takes the item off the away Stop")
     dc.add_argument("id")
     _arg(dc, "motivo", required=True)
-    cx = sub.add_parser("inbox", aliases=["caixa"], help="reads the Orca inbox (check) and with --ack acknowledges it in the same generation; returns the binding to the previous Run")
+    cx = sub.add_parser("inbox", aliases=["caixa"], help="reads the Orca inbox; with --ack acknowledges what the coordinator or the manager commands in the same generation and never binds another Run")
     cx.add_argument("run", nargs="?")
     cx.add_argument("--ack", action="store_true")
     _arg(cx, "todas", action="store_true", help="goes through the Runs with an unread message")
