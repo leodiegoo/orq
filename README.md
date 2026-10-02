@@ -191,6 +191,7 @@ Step by step:
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
 9. `tests` is optional: the globs of the unit-test files `orq prove-red` looks for in a branch (`["**/*.unit-test.js"]`), or `{"globs": [...], "command": "cd web && npx jest ../{file}"}` to also set the command (`{file}` is the test file). Without it: `test_*.py` for orq's own tickets, `**/*.unit-test.js` for a product's.
+10. `sem_ci` is optional (`true`): the project has no CI. `orq fila` reads a PR with no registered check as `? no check registered for N min` and does not count it as ready (the workflow may not have fired, the checks may not be registered yet, or a conflicting PR gets no workflow); with `sem_ci: true` an empty list is ready. Checks that do show up keep counting.
 
 Check it with `orq projects` (an invalid file shows `invalid: <why>` and is never picked on its own) and `orq flow --repo <path>`.
 

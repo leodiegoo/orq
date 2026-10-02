@@ -3230,7 +3230,9 @@ def _gh_ci(seen_item, now_at, flow_info):
             failures.append(item_name)
     base_item = _dict(seen_item.get("_base"))
     on_base = [f for f in failures if f in (base_item.get("falhas") or [])]
+    # An empty rollup is not green: no check registered (workflow did not fire, not registered yet, conflicting PR). Only the project's `sem_ci: true` makes it ready.
     return {"mergeable": seen_item.get("mergeable") or "UNKNOWN", "falhas": failures, "rodando": running, "outro_ambiente": other_item, "lido_em": now_at,
+            "sem_check": "statusCheckRollup" in seen_item and not seen_item["statusCheckRollup"] and not flow_info.get("sem_ci"),
             **({"falhas_na_base": on_base, "base_vermelha_desde": base_item.get("desde")} if on_base else {})}
 
 
@@ -4430,6 +4432,10 @@ def _pr_reading(i, now_at=None):
     marks = ([("✗", ", ".join(own))] if own else []) \
         + ([("✗", f"already red on {base_name}: " + ", ".join(on_base))] if on_base and own else [("⛔", f"blocked by base: red on {base_name}: " + ", ".join(on_base))] if on_base else []) + ([("⚠", "conflict")] if ci.get("mergeable") == "CONFLICTING" else []) \
         + ([("⏳", "CI running")] if ci.get("rodando") else []) + ([("?", "conflict not computed yet")] if ci.get("mergeable") == "UNKNOWN" and not ci.get("falhas") and not ci.get("rodando") else [])
+    if ci.get("sem_check"):
+        linked = i.get("ligado_em")
+        since = f" for {max(0, ((ci.get('lido_em') or now_at) - _dt(linked).timestamp()) / 60):.0f} min" if linked else ""
+        marks.append(("?", f"no check registered{since}"))
     old = age > OLD_READ_MIN
     note = [("ℹ", "failure in another environment: " + ", ".join(ci["outro_ambiente"]))] if ci.get("outro_ambiente") else []  # informs, does not block
     return {"marcas": (marks or [("✓", "ready")]) + note, "pronto": not marks and not old, "velha": old, "idade": age, "bloqueada_pela_base": _blocked_by_base(ci)}
@@ -9990,7 +9996,8 @@ def projects():
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
-                         "tests": _file_tests(d.get("tests"))}
+                         "tests": _file_tests(d.get("tests")),
+                         "sem_ci": d.get("sem_ci") is True}
     return findings
 
 
@@ -10053,7 +10060,7 @@ def project_flow(item_name):
     environment, the default branch of the repo's remote (the project folder, or the cwd), with a direct flow; `declarado` says which of the two."""
     d = projects().get(item_name) or {}
     if d.get("ambientes") and not d.get("erro"):
-        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True}
+        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False)}
     default = default_branch((d.get("repo") and repo_folder(d["repo"])) or os.getcwd())
     return {"ambientes": [default], "producao": default, "fluxo": "direto", "declarado": False}
 
