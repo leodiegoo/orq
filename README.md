@@ -244,12 +244,15 @@ Away mode is for when you leave the keyboard. It changes what the coordinator do
 ```
 /away on        # Claude Code slash command (commands/away.md)
 $away on        # Codex skill (skills/away): Codex has no user slash commands
-orq away on|off|status     # the same thing from a shell
+orq away on [--until HH:MM] [--max-dispatches N] [--max-failures 3]     # the same thing from a shell
+orq away off|status
 ```
 
 With it on: the Stop hook logs each reply and refreshes the digest; the AskUserQuestion guard denies the box and points to `orq pend add --type decision` (park the decision, keep going on what does not depend on it); `orq ask` builds the decision page but returns at once; the manager types notices into the coordinator whenever it is stopped (with it off, only when its prompt box is empty, ticket 182); and the Stop hook blocks the end of a turn (at most 3 times in 30 minutes) while there is work that needs no user. `orq away off` prints the away report (decisions first) and saves it to `digest/ausencia.md` and `$ORQ_RESUMOS/<date>-ausencia.md` (default `./.scratch/resumos`; the file names keep their Portuguese spelling). A bare `/away` toggles. `statusline.sh` adds `away since HH:MM` to the first HUD line while it is on. See `docs/design.md`, "Digest and away mode".
 
-For a bounded unattended stretch, night mode adds a budget: `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]`. `orq dispatch` refuses past the end time, at the dispatch ceiling or after N failures in a row; push, PR merge, deploy and `--no-verify` are denied by the external-action guard; `orq night off` frees it. `orq summary --night` prints the morning card.
+Away on also arms the night budget, so an unattended night is never unbounded: `--until` defaults to the next 08:00 local, `--max-failures` to 3, and `--max-dispatches` to no cap. `orq dispatch` refuses past the end, at the cap or after N failures in a row, parks "away: stopped dispatching: <reason>" as a decision (once per arming; `orq away off` lists it), and workers start with `GIT_TERMINAL_PROMPT=0` and `commit.gpgsign=false`. `orq away on --until HH:MM` re-arms it; `orq away off` disarms both. The external-action guard stays off under away alone (away pushes after the audit); `orq night on` turns it on.
+
+For a bounded unattended stretch without away, night mode adds a budget: `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]`. `orq dispatch` refuses past the end time, at the dispatch ceiling or after N failures in a row; push, PR merge, deploy and `--no-verify` are denied by the external-action guard; `orq night off` frees it. `orq summary --night` prints the morning card.
 
 ### 7. Hooks (Claude Code and Codex)
 

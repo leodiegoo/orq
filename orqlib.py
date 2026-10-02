@@ -4232,12 +4232,22 @@ def _away_marker(hora):
         pass
 
 
-def away_on():
-    """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). Returns the stored state."""
-    state_ = {"ligada_em": now()}
-    _cursor_mut(lambda c: c.__setitem__("ausente", state_))
-    _away_marker(_hora_local(state_["ligada_em"]))
-    append_event({"tipo": "ausente_ligar"})
+NIGHT_FAILURES = 3  # consecutive failures that close the dispatch (night and away)
+AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:00 local
+
+
+def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES):
+    """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
+    marked `via: away` so `orq hook external` stays inert): the end time, the dispatch cap and the failure breaker. Already on, it keeps the original
+    `ligada_em` and only re-arms the budget. Returns the stored state."""
+    _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
+    was = _dict(_cursor_ro().get("ausente"))
+    state_ = was or {"ligada_em": now()}
+    if not was:
+        _cursor_mut(lambda c: c.__setitem__("ausente", state_))
+        _away_marker(_hora_local(state_["ligada_em"]))
+        append_event({"tipo": "ausente_ligar"})
+    night_on(until_at, max_dispatches, max_failures, via="away")
     return state_
 
 
@@ -4248,6 +4258,7 @@ def away_off():
     _away_marker(None)
     if bound:
         append_event({"tipo": "ausente_desligar"})
+        night_off()  # away on armed the night budget; off disarms both
     return bound
 
 
@@ -4309,18 +4320,19 @@ def write_away_report(line_list):
     return path
 
 
-def away(op=None):
+def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES):
     """`orq away` / `/away`: turns away mode on, off or shows it; without op it toggles. Returns the lines to print.
+    On, the flags set the night budget (`--until` default 08:00, `--max-dispatches` default none, `--max-failures` default 3); on again with no flag keeps the budget as it is.
     On turning off it shows the link to the 8765 panel, the count and the absence report (written to a file; the path goes last); it does not open a tab."""
     cur = _dict(_cursor_ro().get("ausente"))
     op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
     if op == "status":
         return away_lines(_cursor_ro())[:1]
     if op == "on":
-        if not cur:
-            away_on()
+        if not cur or not night_active(_cursor_ro()) or until_at or max_dispatches is not None or max_failures != NIGHT_FAILURES:
+            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures)
         since = _hora_local(_dict(_cursor_ro().get("ausente")).get("ligada_em"))
-        return [f"away mode on since {since}; the digest records each reply"]
+        return [f"away mode on since {since}; the digest records each reply", *night_lines(_cursor_ro(), read_events())[1:]]
     n = len(digest_generate()[0]["linha"]) if cur else 0
     away_off()
     if not cur:
@@ -4415,7 +4427,6 @@ def digest_no_stop(ev):
 
 # ---------- night mode: budget and circuit breaker ----------
 
-NIGHT_FAILURES = 3  # consecutive failures that close the dispatch
 
 
 def night_active(cur):
@@ -4478,7 +4489,15 @@ def night_check(now_at=None):
         msgs = None
     reason = night_reason(night, events, msgs, now_at or datetime.now(timezone.utc))
     if reason:
+        first = not _since_night(events, night, "noite_parou")
         append_event({"tipo": "noite_parou", "motivo": reason})
+        if night.get("via") == "away":
+            if first:  # one pending item per arming, so `away off` lists it with the decisions
+                try:
+                    pending_add("away-parou", "decisao", f"away: stopped dispatching: {reason}; re-arm with `orq away on --until HH:MM`")
+                except (ValueError, OSError) as e:  # an open item of an earlier stop, or a disk failure: the refusal below still holds
+                    log(f"away: pending item of the stop not created ({type(e).__name__}: {e})")
+            raise ValueError(f"away mode: {reason}; nothing was dispatched. Leave the decision in orq pend add or re-arm with orq away on --until HH:MM")
         raise ValueError(f"night mode: {reason}; nothing was dispatched. Leave the decision in orq pend add or run orq night off")
 
 
@@ -4490,13 +4509,16 @@ def night_lines(cur, events):
     has_stopped = next((e for e in reversed(_since_night(events, night, "noite_parou"))), None)
     cap = night.get("max_despachos")
     spent = f"{len(_since_night(events, night, 'despacho'))}/{cap if cap is not None else '∞'} dispatches, until {_hora_local(night['ate'])}"
+    if night.get("via") == "away":  # away keeps its own rules (ticket 126) and pushes after the audit: only the budget is added
+        return ["[orq away] Rules: park decisions with orq pend add (no AskUserQuestion), stop dispatching when the budget runs out.",
+                ("[orq away] Stopped dispatching: " + has_stopped["motivo"] + " (" + str(spent) + "); orq away on --until HH:MM re-arms it.") if has_stopped else ("[orq away] Budget: " + str(spent) + ", " + str(night.get("max_falhas") or NIGHT_FAILURES) + " consecutive failures close it.")]
     return ["[orq night] Rules: no AskUserQuestion (park the decision with orq pend add and carry on with what is independent), no push or merge, "
             "stop dispatching when the budget runs out.",
             ("[orq night] Stopped dispatching: " + has_stopped["motivo"] + " (" + str(spent) + "); orq night off lifts it.") if has_stopped else ("[orq night] Budget: " + str(spent) + ", " + str(night.get("max_falhas") or NIGHT_FAILURES) + " consecutive failures close it.")]
 
 
-def night_on(until_at, max_dispatches=None, max_failures=NIGHT_FAILURES, now_at=None):
-    """Turns night mode on until the next local HH:MM. Returns the recorded state."""
+def _night_state(until_at, max_dispatches=None, max_failures=NIGHT_FAILURES, now_at=None, via=None):
+    """The night state to store (validated, nothing written): the end as the next local HH:MM, the cap and the breaker; `via: away` when away mode armed it."""
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", until_at or "")
     if not m or int(m[1]) > 23 or int(m[2]) > 59:
         raise ValueError(f"--until expects HH:MM (got {until_at!r})")
@@ -4505,7 +4527,13 @@ def night_on(until_at, max_dispatches=None, max_failures=NIGHT_FAILURES, now_at=
     now_at = (now_at or datetime.now(timezone.utc)).astimezone()
     end = now_at.replace(hour=int(m[1]), minute=int(m[2]), second=0, microsecond=0)
     end += timedelta(days=1) if end <= now_at else timedelta(0)
-    night = {"ate": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ligada_em": now(), "max_despachos": max_dispatches, "max_falhas": max_failures}
+    return {"ate": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ligada_em": now(), "max_despachos": max_dispatches, "max_falhas": max_failures, **({"via": via} if via else {})}
+
+
+def night_on(until_at, max_dispatches=None, max_failures=NIGHT_FAILURES, now_at=None, via=None):
+    """Turns night mode on until the next local HH:MM. It is the same `noite` key that away mode arms, so a second call replaces the state, never adds one.
+    Returns the recorded state."""
+    night = _night_state(until_at, max_dispatches, max_failures, now_at, via)
     _cursor_mut(lambda c: c.__setitem__("noite", night))
     append_event({"tipo": "noite_ligar", **{k: v for k, v in night.items() if k != "ligada_em"}})
     return night
@@ -4673,7 +4701,8 @@ def _external_denied(ev, cur):
     segs = cmdnorm.segments(ev["tool_input"]["command"])
     found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
     m = None if found_item else next(filter(None, map(_EXT_RESET.search, segs)), None)
-    if not (found_item or m) or not night_active(cur):
+    night = night_active(cur)
+    if not (found_item or m) or not night or night.get("via") == "away":  # away pushes after the audit (126, 139): only the budget is armed
         return None
     if found_item:
         return found_item
@@ -12133,6 +12162,9 @@ def parser():
     fi.add_parser("list", aliases=["lista"], help="the declared steps")
     aw = sub.add_parser("away", aliases=["ausente"], help="away mode: orq away [on|off|status]; with no op it toggles; when turned off it shows the panel link (the `ausente` alias keeps the old behavior: with no op it shows the state)")
     aw.add_argument("op", nargs="?", choices=["on", "off", "status", "ligar", "desligar"])
+    _arg(aw, "ate", help="on: end of the budget, next HH:MM local (default 08:00)")
+    _arg(aw, "max-despachos", type=int, help="on: dispatch cap (default none)")
+    _arg(aw, "max-falhas", type=int, default=NIGHT_FAILURES, help="on: consecutive worker failures that stop dispatching (default 3)")
     sub.add_parser("steers", help="redelivers the notice of the adjustments the stopped worker did not read and records the alert on the third failure (the manager panel already does it)")
     rp = sub.add_parser("reply", aliases=["responder"], help="answers a worker's question through the manager, binding the message's Run first")
     rp.add_argument("msg_id")
@@ -12564,7 +12596,7 @@ def main(argv=None):
                 away_off()
             print("\n".join(away_lines(_cursor_ro())))
         elif a.cmd == "away":
-            print("\n".join(away(a.op)))
+            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures)))
         elif a.cmd == "night":
             if a.op == "on":
                 night_on(a.until_at, a.max_dispatches, a.max_failures)

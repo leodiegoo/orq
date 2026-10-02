@@ -7120,6 +7120,122 @@ def test_dispatch_outside_the_night_does_not_touch_the_environment():
     assert "ambiente" not in [e for e in a.events() if e["tipo"] == "despacho"][0]
 
 
+# ---- away arms the night budget (ticket 213) ----
+
+def _away(a, until_h=2, **extra):
+    """Turns on away mode through the CLI, then moves the budget the way `_night` does (until_h hours from now, extra keys)."""
+    assert a.orq("away", "on").returncode == 0
+    cur = _cursor(a)
+    cur["noite"].update(ate=(datetime.now(timezone.utc) + __import__("datetime").timedelta(hours=until_h)).strftime("%Y-%m-%dT%H:%M:%SZ"), ligada_em="2026-01-01T00:00:00Z", **extra)
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+
+
+def test_ticket213_away_on_without_flags_arms_the_budget_until_08_and_noite_shows_it():
+    a = Env(run="run_a")
+    r = a.orq("away", "on")
+    assert r.returncode == 0 and "away mode on" in r.stdout, r
+    cur = _cursor(a)
+    assert cur["ausente"]["ligada_em"] and cur["noite"]["via"] == "away", cur
+    assert _hour_of(cur["noite"]["ate"]) == "08:00" and cur["noite"]["max_falhas"] == 3 and cur["noite"]["max_despachos"] is None, cur
+    out = a.orq("noite").stdout
+    assert "[orq away]" in out and "0/∞ dispatches" in out and "3 consecutive failures" in out, out
+    assert [e["tipo"] for e in a.events() if e["tipo"] in ("ausente_ligar", "noite_ligar")] == ["ausente_ligar", "noite_ligar"]
+
+
+def test_ticket213_away_on_takes_the_budget_flags_and_on_again_rearms_without_moving_the_window():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    since = _cursor(a)["ausente"]["ligada_em"]
+    assert "away mode on" in a.orq("away", "on").stdout and _cursor(a)["noite"]["max_despachos"] is None, "sem flag mantém o orçamento"
+    r = a.orq("away", "on", "--until", "06:30", "--max-dispatches", "5", "--max-failures", "2")
+    assert r.returncode == 0 and "0/5 dispatches" in r.stdout, r
+    cur = _cursor(a)
+    assert cur["ausente"]["ligada_em"] == since and cur["noite"]["max_despachos"] == 5 and cur["noite"]["max_falhas"] == 2 and _hour_of(cur["noite"]["ate"]) == "06:30", cur
+    assert a.orq("away", "on", "--ate", "25:00").returncode != 0 and _cursor(a)["noite"]["max_falhas"] == 2, "flag inválido não grava nada"
+
+
+def test_ticket213_dispatch_is_refused_after_the_end_at_the_cap_and_on_the_third_failure_with_only_away_on():
+    a = Env(run="run_a")
+    _away(a, until_h=-1)
+    r = _dispatch(a)
+    assert r.returncode != 0 and "past the end" in r.stderr and "away mode" in r.stderr, r.stderr
+    assert not _log(a, "started.log")
+    a = Env(run="run_a")
+    _away(a, max_despachos=2)
+    _dispatch_ev(a, "d1"), _dispatch_ev(a, "d2")
+    assert "cap of 2 dispatches" in _dispatch(a).stderr
+    a = Env(run="run_a")
+    _away(a)
+    for d in ("d1", "d2", "d3"):
+        _dispatch_ev(a, d)
+    _wd(a, ("d1", "failed", False), ("d2", "failed", False))
+    assert _dispatch(a).returncode == 0, "duas falhas ainda despacham"
+    _wd(a, ("d1", "failed", False), ("d2", "failed", False), ("d3", "failed", False))
+    assert "3 consecutive worker failures" in _dispatch(a).stderr
+    assert "noite_ligar" not in [e["tipo"] for e in a.events() if e.get("via") != "away"], "ninguém chamou orq noite ligar"
+
+
+def test_ticket213_a_refusal_creates_the_pending_item_once_and_away_off_lists_it_and_clears_both():
+    a = Env(run="run_a")
+    _away(a, until_h=-1)
+    for _ in range(3):
+        assert _dispatch(a).returncode != 0
+    listing = a.orq("pend", "list").stdout
+    assert listing.count("away-parou") == 1 and "away: stopped dispatching: past the end" in listing and "orq away on --until" in listing, listing
+    assert len([e for e in a.events() if e["tipo"] == "noite_parou"]) == 3
+    out = a.orq("away", "off").stdout
+    assert "away-parou" in out and "stopped dispatching" in out, out
+    cur = _cursor(a)
+    assert "ausente" not in cur and "noite" not in cur, cur
+    assert _dispatch(a).returncode == 0, "desarmado despacha"
+
+
+def test_ticket213_a_refusal_with_only_noite_ligar_creates_no_pending_item():
+    a = Env(run="run_a")
+    _night(a, until_h=-1)
+    assert _dispatch(a).returncode != 0
+    assert "away-parou" not in a.orq("pend", "list").stdout
+
+
+def test_ticket213_noite_ligar_with_away_on_replaces_the_state_without_duplicating_it():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    assert a.orq("noite", "ligar", "--ate", "05:00", "--max-despachos", "4").returncode == 0
+    cur = _cursor(a)
+    assert sorted(k for k in cur if k in ("ausente", "noite")) == ["ausente", "noite"] and "via" not in cur["noite"], cur
+    assert _hour_of(cur["noite"]["ate"]) == "05:00" and cur["noite"]["max_despachos"] == 4
+    assert "[orq night] Rules" in a.orq("noite").stdout, "explícito volta às regras do noite"
+    assert _external(a, "git push")["permissionDecision"] == "deny"
+    a.orq("away", "off")
+    assert "noite" not in _cursor(a)
+
+
+def test_ticket213_external_hook_stays_inert_with_only_away_on():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    for cmd in EXTERNAL_COMMANDS:
+        assert _external(a, cmd) is None, cmd
+
+
+def test_ticket213_away_dispatch_starts_the_worker_without_git_prompt():
+    a = Env(run="run_a")
+    _no_git_env(a)
+    a.orq("away", "on")
+    assert _dispatch(a).returncode == 0
+    env = _log(a, "started-env.log")[0]
+    assert {k: v for k, v in env.items() if v} == {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"}, env
+
+
+def test_ticket213_away_hooks_inject_the_budget_rules_and_stay_under_100_ms():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    notice = a.orq("hook", "prompt", stdin=json.dumps({"prompt": "You have 1 orchestration messages. Run `orca orchestration check`", "session_id": "abcdef123456"}))
+    assert "[orq away] Rules" in notice.stdout and "budget" in notice.stdout and "push or merge" not in notice.stdout, notice.stdout
+    t0 = time.time()
+    orq_mod.night_lines(orq_mod._cursor_ro(), [])
+    assert time.time() - t0 < 0.1
+
+
 # ---------- morning card and stop reason per dispatch (ticket 40) ----------
 
 T0 = "2026-09-30T02:00:00Z"
