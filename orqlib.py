@@ -1182,6 +1182,69 @@ def _no_run(alvo):
                 log(f"run-use de volta ao Run {antes}: {type(e).__name__}: {e}")
 
 
+CAIXA_CORPO = 160  # caracteres do corpo de uma mensagem em `orq caixa`
+CAIXA_LOTES = 20  # lotes seguidos que um `orq caixa --ack` confirma por Run
+
+
+def _linha_caixa(m):
+    """Uma mensagem do Orca em uma linha: id, tipo, de quem, assunto, corpo cortado e o payload resumido (k=v)."""
+    p = _payload(m)
+    resumo = " ".join(f"{k}={v}" for k, v in p.items() if isinstance(v, (str, int, float, bool)))
+    corpo = re.sub(r"\s+", " ", str(m.get("body") or ""))
+    return " | ".join(x for x in (f"{m.get('id')} {m.get('type')} de {m.get('from_handle') or '?'}", m.get("subject") or "",
+                                  corpo[:CAIXA_CORPO] + ("…" if len(corpo) > CAIXA_CORPO else ""), resumo[:CAIXA_CORPO]) if x)
+
+
+def _caixa_do_run(run, coord, ack):
+    """Lê (e com `ack` confirma) a caixa de um Run na mesma geração: liga o coordenador (`--from` dele) ao Run, check e ack em seguida."""
+    linhas, hb, n = [], 0, 0
+    if _do_gerente(run):  # o gerente segura o Run: o orca() o liga sob a trava
+        como = None
+    else:
+        como = coord
+        orca("run-use", "--id", run, como=como)
+    res = orca("check", "--run", run, como=como)
+    for _ in range(CAIXA_LOTES):
+        msgs = res.get("messages") or []
+        if not res.get("deliveryId") or not msgs:
+            break
+        hb += sum(1 for m in msgs if m.get("type") == "heartbeat")
+        linhas += [_linha_caixa(m) for m in msgs if m.get("type") != "heartbeat"]
+        n += len(msgs)
+        if not ack:
+            break
+        res = orca("check", "--run", run, "--ack", res["deliveryId"], como=como)
+    cab = f"{run}: {n} mensagem(ns)" + (f", {hb} heartbeat(s)" if hb else "") + (", confirmadas" if ack and n else "")
+    return [cab, *("  " + l for l in linhas)]
+
+
+def caixa(run=None, ack=False, todas=False):
+    """`orq caixa [<run>] [--ack] [--todas]`: lê a caixa do Orca, e com `ack` a confirma, na mesma geração do consumidor.
+
+    O terminal do coordenador vem do estado do orq (gerente.json) e só então da env. `--todas` percorre os Runs com mensagem não lida (o inbox
+    cobre todos). Ao fim o vínculo volta ao Run em que o coordenador estava."""
+    coord = (_gerente_cfg() or {}).get("coordenador") or os.environ.get("ORCA_TERMINAL_HANDLE")
+    antes = _run_atual_id(como=coord)
+    if todas:
+        alvos = list(dict.fromkeys(x["to_handle"][4:] for x in orca("inbox", "--limit", "200", como=coord)["messages"]
+                                   if isinstance(x, dict) and str(x.get("to_handle")).startswith("run:") and not x.get("read")))
+    else:
+        alvos = [run or antes]
+    if not all(alvos):
+        raise ValueError("sem Run ligado: passe o Run (`orq caixa <run>`)")
+    saida = []
+    try:
+        for r in alvos:
+            saida += _caixa_do_run(r, coord, ack)
+    finally:
+        if antes and any(r != antes and not _do_gerente(r) for r in alvos):
+            try:
+                orca("run-use", "--id", antes, como=coord)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                log(f"caixa: run-use de volta ao Run {antes}: {type(e).__name__}: {e}")
+    return saida or ["caixa vazia"]
+
+
 def _gerente_cfg():
     """gerente.json como {coordenador, gerente, runs}; {} se ausente ou de forma errada. O formato do ticket 17 (`run`) vale como runs=[run]."""
     g = _dict(_read_json(_path(GERENTE)))
@@ -4094,6 +4157,10 @@ def hook_prompt(ev, run):
         refresh_bg(refresh=False)  # o aviso do Orca é o sinal de mensagem nova: ingere o inbox já, sem refazer o aberto.json (um heartbeat por 100 s)
     if org != "usuario":
         ln = linhas_noite(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # a noite acorda o coordenador por aviso, não por usuário
+        if org == "orca" and (r := AVISO_RUN.search(ev.get("prompt") or "")):
+            ln = [f"orq: leia e confirme a caixa com `orq caixa {r.group(1)} --ack` (liga o coordenador ao Run e volta o vínculo)", *ln]
+        if org == "orca" and (r := AVISO_RUN.search(ev.get("prompt") or "")):
+            ln = [f"orq: leia e confirme a caixa com `orq caixa {r.group(1)} --ack` (liga o coordenador ao Run e volta o vínculo)", *ln]
         if org == "aviso_orq" and texto.lstrip().startswith("orq: PR ") and (ob := linha_obrigacoes(read_events())):
             ln = [*ln, ob]  # o aviso do merge chega já com o que ele pede
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
@@ -10316,6 +10383,10 @@ def main(argv=None):
     fd = sub.add_parser("fila-despacho", help="os despachos e retomadas que esperam vaga na máquina: lista | rm <id>").add_subparsers(dest="op", required=True)
     fd.add_parser("lista").add_argument("--json", action="store_true")
     fd.add_parser("rm").add_argument("id")
+    cx = sub.add_parser("caixa", help="lê a caixa do Orca (check) e com --ack a confirma na mesma geração; volta o vínculo ao Run anterior")
+    cx.add_argument("run", nargs="?")
+    cx.add_argument("--ack", action="store_true")
+    cx.add_argument("--todas", action="store_true", help="percorre os Runs com mensagem não lida")
     ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
     ru.add_argument("--todos", action="store_true")
     ru.add_argument("--json", action="store_true")
@@ -10430,6 +10501,8 @@ def main(argv=None):
         elif a.cmd == "transcrito":
             r = transcrito(a.dispatch, a.ultimos)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_transcrito(r))
+        elif a.cmd == "caixa":
+            print("\n".join(caixa(a.run, a.ack, a.todas)))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))

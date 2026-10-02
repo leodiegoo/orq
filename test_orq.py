@@ -14515,6 +14515,83 @@ def test_ticket142_proximo_sem_usuario_respeita_os_dois_cabecalhos():
     assert prox(tks=esp, events=ciclo, sem_push=0) and "push" in prox(tks=esp, events=ciclo, sem_push=2), "o ciclo com commits sem push já é outro passo"
 
 
+# ---------- orq caixa (ticket 140) ----------
+
+def _caixa140(a, runs=("run_a", "run_b"), ligado="run_a"):
+    """Runs no Orca falso (um Run por terminal): o coordenador (term_coord) está ligado a `ligado`; o orq roda de outro shell (term_outro)."""
+    _multi(a, {r: ("term_coord" if r == ligado else None) for r in runs})
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, open(os.path.join(a.home, "gerente.json"), "w"))
+    a.env["ORCA_TERMINAL_HANDLE"] = "term_outro"  # o terminal do coordenador vem do estado do orq, não da env
+
+
+def test_ticket140_caixa_le_e_da_ack_na_mesma_geracao():
+    a = Amb()
+    _caixa140(a)
+    a.caixa(("worker_done", {"taskId": "task_1", "outcome": "succeeded"}))
+    r = a.orq("caixa", "run_a", "--ack")
+    assert r.returncode == 0, r.stderr
+    assert "msg_1 worker_done" in r.stdout and "task_1" in r.stdout and "confirmadas" in r.stdout, r.stdout
+    assert a.estados() == {"msg_1": "acked"}
+    assert {h for _, h in _log(a, "binds.log")} <= {"term_coord"}, "todo run-use sai com o --from do coordenador"
+
+
+def test_ticket140_caixa_sem_ack_so_le():
+    a = Amb()
+    _caixa140(a)
+    a.caixa(("worker_done", {"taskId": "task_1"}))
+    r = a.orq("caixa", "run_a")
+    assert r.returncode == 0 and "msg_1" in r.stdout and a.estados() == {"msg_1": "out"}, (r.stdout, r.stderr)
+
+
+def test_ticket140_caixa_de_outro_run_volta_o_vinculo_ao_anterior():
+    a = Amb()
+    _caixa140(a, ligado="run_a")
+    a.caixa(("worker_done", {"taskId": "task_b"}), run="run_b")
+    r = a.orq("caixa", "run_b", "--ack")
+    assert r.returncode == 0 and "msg_1 worker_done" in r.stdout, (r.stdout, r.stderr)
+    assert _binds(a) == {"run_a": "term_coord", "run_b": None}, "o vínculo voltou ao Run em que o coordenador estava"
+
+
+def test_ticket140_caixa_todas_percorre_os_runs_com_mensagem():
+    a = Amb()
+    _caixa140(a, runs=("run_a", "run_b", "run_c"))
+    a.caixa(("worker_done", {"taskId": "task_a"}), run="run_b")
+    a.caixa(("escalation", {"taskId": "task_c"}), run="run_c")
+    a.set("inbox.json", {"result": {"messages": [
+        {"id": "msg_1", "to_handle": "run:run_b", "read": 0, "sequence": 1}, {"id": "msg_2", "to_handle": "run:run_c", "read": 0, "sequence": 2}]}})
+    r = a.orq("caixa", "--todas", "--ack")
+    assert r.returncode == 0, r.stderr
+    assert "run_b: 1" in r.stdout and "run_c: 1" in r.stdout and "run_a" not in r.stdout, r.stdout
+    assert set(a.estados().values()) == {"acked"} and _binds(a)["run_a"] == "term_coord"
+
+
+def test_ticket140_caixa_conta_heartbeat_sem_listar_o_corpo():
+    a = Amb()
+    _caixa140(a)
+    a.caixa(_hb("lendo"), _hb("testando"))
+    r = a.orq("caixa", "run_a", "--ack")
+    assert r.returncode == 0 and "2 heartbeat(s)" in r.stdout and "lendo" not in r.stdout and "testando" not in r.stdout, r.stdout
+
+
+def test_ticket140_ack_por_outro_handle_da_consumer_fenced():
+    """O erro que o ticket corrige: o run-use sem o --from do coordenador liga outro handle e o ack volta consumer_fenced."""
+    a = Amb()
+    _caixa140(a)
+    a.caixa(("worker_done", {"taskId": "task_1"}))
+    out = subprocess.run([a.bin, "orchestration", "check", "--run", "run_a"], capture_output=True, text=True, env={**a.env, "ORCA_TERMINAL_HANDLE": "term_coord"})
+    entrega = json.loads(out.stdout)["result"]["deliveryId"]
+    subprocess.run([a.bin, "orchestration", "run-use", "--id", "run_a"], capture_output=True, text=True, env=a.env)  # handle errado: term_outro
+    fim = subprocess.run([a.bin, "orchestration", "check", "--run", "run_a", "--ack", entrega], capture_output=True, text=True, env=a.env)
+    assert "consumer_fenced" in fim.stdout, fim.stdout
+
+
+def test_ticket140_aviso_do_orca_sugere_orq_caixa():
+    a = Amb()
+    r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_zz`.")
+    assert r.returncode == 0 and "orq caixa run_zz --ack" in r.stdout, (r.stdout, r.stderr)
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

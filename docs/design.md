@@ -251,6 +251,10 @@ Notice for another Run. `check` on a Run the terminal is not bound to fails, so 
 
 The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same function. Acknowledging the same delivery twice is harmless in Orca, so the hook, the waiter and the manager loop can race without losing messages. The recorded heartbeats feed `orq agentes`: a running dispatch whose last heartbeat is older than 15 minutes is shown as stuck, with the `orq steer` command to send.
 
+## Reading the mailbox (ticket 140)
+
+Orca binds one Run per terminal and cancels a delivery (`consumer_fenced`) when the consumer that read it loses the binding before the ack. Doing this by hand meant `run-use --id <run> --from <coordinator>`, `check --json`, then `check --ack <deliveryId>`, and binding back to the main Run afterwards. `orq caixa [<run>] [--ack] [--todas]` does it as one step: every call carries the coordinator's handle (the manager config's `coordenador`, else the environment), so the bind, the read and the ack share one generation. Heartbeats are counted, never printed. A Run the manager holds goes through the manager's own bind under its lock. With `--todas` the Runs come from the global inbox (unread messages addressed to `run:<id>`). The Run the coordinator was on is bound back at the end. The prompt hook adds `orq caixa <run> --ack` to its context when an Orca notice names a Run.
+
 ## Releasing workers
 
 `orq liberar <dispatch>` acknowledges pending messages that belong only to that dispatch (a batch mixing another worker's messages is left alone), calls `worker-release`, and, if Orca reports the terminal as `retained`, decides whether to close it.
