@@ -1929,19 +1929,21 @@ def _branch_do_texto(texto):
     return next((b for b in dict.fromkeys(BRANCH_RE.findall(texto)) if any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)), None)
 
 
-BRANCHES_DE_AMBIENTE = ("main", "development", "staging")
+def _branch_de_ambiente(b):
+    """`b` é a branch padrão sem remoto ou uma branch de ambiente declarada em algum projeto (`ambientes` de projects/<nome>.json): nunca é a entrega de um ticket."""
+    return b == BRANCH_SEM_REMOTO or any(b in (p.get("ambientes") or []) for p in projetos().values())
 
 
 def _branch_do_orq(b):
-    """`b` se é branch de trabalho do orq (existe num repositório de ORQ_REPOS e não é main/development/staging), senão None: a worktree de um produto não entra na fila."""
+    """`b` se é branch de trabalho do orq (existe num repositório de ORQ_REPOS e não é branch de ambiente), senão None: a worktree de um produto não entra na fila."""
     repos = [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
-    ok = b and b not in BRANCHES_DE_AMBIENTE and any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)
+    ok = b and not _branch_de_ambiente(b) and any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)
     return b if ok else None
 
 
 def _branch_do_payload(b):
-    """A branch que o worker declarou no worker_done vale sem conferir o repositório, menos main/development/staging."""
-    return b if b and b not in BRANCHES_DE_AMBIENTE else None
+    """A branch que o worker declarou no worker_done vale sem conferir o repositório, menos a de ambiente."""
+    return b if b and not _branch_de_ambiente(b) else None
 
 
 def _branch_da_orq_wt(num):
@@ -1971,7 +1973,7 @@ def _terminal_do_integrador(events):
 def _entrega_do_orq(m, p):
     """worker_done `succeeded` de ticket do orq (a task é a `Task:` de um ticket de ISSUES; os do produto não entram) com branch no payload ou no texto ->
     `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). A branch vem do payload, da worktree `orq-wt/<ticket>`, da branch atual da worktree do dispatch e só
-    por último do texto; main/development/staging e branch fora de ORQ_REPOS nunca entram, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
+    por último do texto; branch de ambiente e branch fora de ORQ_REPOS nunca entram, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
     O aviso é digitado uma vez (ocupado: tenta enfileirar no turno; ainda assim não, fica só a fila, que o integrador lê no ciclo). Devolve o ticket ou None."""
     if p.get("outcome") != "succeeded" or not p.get("taskId") or _ja_tem_evento("entrega_orq", m["id"]):
         return None
