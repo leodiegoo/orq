@@ -5895,9 +5895,9 @@ def _request_text(corr, text_value, deadline, again=False):
     return f"orq ▸ request {corr}{' again, no reply on the channel' if again else ''} from the coordinator: {text_value}{answer_text}"
 
 
-def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=None):
+def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=None, fila=None):
     """Records the request (`mate_pedido`, corr pN) before typing it into the mate's terminal; if the mate is in the middle of a turn, the manager delivers it later.
-    `responde`: the entry the mate raised and this request answers (the decision coming back); it closes with the `mate` effect."""
+    `responde`: the entry the mate raised and this request answers (the decision coming back); it closes with the `mate` effect. `fila`: the dispatch queue item the request came from."""
     if group_name not in groups():
         raise ValueError(f"group {group_name} does not exist in {GROUPS_DIR}/")
     m0 = _dict(_mates().get(group_name))
@@ -5916,7 +5916,7 @@ def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=N
     with _lock("cursor.lock"):
         n = 1 + max((int(e["corr"][1:]) for e in read_events() if e.get("tipo") == "mate_pedido" and re.fullmatch(r"p\d+", str(e.get("corr")))), default=0)
         corr = f"p{n}"
-        _write_event({"tipo": "mate_pedido", "corr": corr, "grupo": group_name, "texto": text_value[:2000], "prazo": deadline, **({"responde": responde} if responde else {})})
+        _write_event({"tipo": "mate_pedido", "corr": corr, "grupo": group_name, "texto": text_value[:2000], "prazo": deadline, **({"responde": responde} if responde else {}), **({"fila": fila} if fila else {})})
     if responde:
         intake(responde, "mate", corr)
     before = now()  # the mate's hook records the turn start before the typing returns: the delivery counts from before it
@@ -10706,6 +10706,20 @@ def _abandoned_command(it):
     return "orq dispatch " + (f"--run {it['run']} " if it.get("run") else "") + f"--title {shlex.quote(it.get('titulo') or '')} --spec-file <spec>"
 
 
+def _mate_owning(run):
+    """The group whose mate owns the Run (the Runs its dispatches opened, `_mate_mut(run=)`), or None: the coordinator and the manager do not command it."""
+    return next((g for g, m in _mates().items() if run and run in (_dict(m).get("runs") or [])), None)
+
+
+def _forward_to_mate(it, group_name):
+    """A queue item of a Run the mate owns (the coordinator cannot start it): becomes an `orq mate request` with the dispatch command, and leaves the queue without counting as giving up.
+    Raises ValueError if the mate cannot take the request (the item stays and follows the normal path)."""
+    cmd = f"{_abandoned_command(it)} --priority {it['prioridade']}" + (f" --worktree {it['worktree']}" if it.get("worktree") else "")
+    r = mate_request(group_name, f"dispatch queue item {it['id']} in your Run {it['run']}, which the coordinator does not command: `{cmd}`. Answer with the worker's dispatch id.", fila=it["id"])
+    dispatch_queue_rm(it["id"], "mate", grupo=group_name, corr=r["corr"])
+    return f"queue: {it['titulo']} went to mate {group_name} ({r['corr']})"
+
+
 def _notify_abandoned(it, failures, error, cmd):
     """Types into the coordinator, once (the item leaves the queue on giving up), that the queue gave up on the item, with the error and the command to dispatch by hand. The away Stop
     keeps charging until the item is dispatched (away_abandoned). Coordinator busy or no manager: only the Stop remains."""
@@ -10757,6 +10771,10 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
             dispatch_queue_rm(it["id"], "saiu", motivo="the dispatch already finished or already came back")
             line_list.append(f"queue: {it['titulo']} left (the dispatch already finished or already came back)")
             continue
+        if it["tipo"] == "despacho" and it.get("ticket") and not it.get("mate") and (owner := _mate_owning(it.get("run"))):  # ticket 351: the mate's Run is not the coordinator's to start
+            with contextlib.suppress(ValueError):
+                line_list.append(_forward_to_mate(it, owner))
+                continue
         exempt = (only_exempt or machine_slot(it.get("modelo"), occupancy, cfg)) and (bool(it.get("servico")) or it.get("prioridade") == 1) and exempt_run(it.get("run"), cfg)  # only asks Orca when there is something to exempt
         if only_exempt and not exempt:
             continue

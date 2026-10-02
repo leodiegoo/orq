@@ -10175,6 +10175,44 @@ def test_ticket79_queue_item_that_fails_three_times_leaves_and_the_one_held_by_u
     assert not _queue79(b) and [e["op"] for e in b.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu" and not _log(b, "started.log")
 
 
+def _mate_queue351(a, run, **extra):
+    """The mate `orq` is alive and owns `run`; the dispatch queue holds one item of that Run (the coordinator queued it, so it carries no `mate`)."""
+    _group(a)
+    _manager(a)
+    _fleet79(a)
+    _mate_alive(a)
+    c = _read_state(os.path.join(a.home, "cursor.json"))
+    c["mates"]["orq"]["runs"] = ["run_mate"]
+    _write_state(os.path.join(a.home, "cursor.json"), c)
+    item = {"id": "fd351", "tipo": "despacho", "run": run, "titulo": "orq: Ticket 88", "modelo": SONNET, "effort": "medium", "prioridade": 1, "ticket": "88", "worktree": "current", "ts": "2026-10-02T10:00:00Z", "falhas": 0}
+    _write_state(os.path.join(a.home, "fila-despacho.json"), {"itens": [{**item, **extra}]})
+
+
+def test_ticket351_queue_item_of_a_mate_run_goes_to_the_mate_instead_of_giving_up():
+    a = _panel79()
+    _mate_queue351(a, "run_mate")
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert not _queue79(a) and not _log(a, "started.log"), "the item left the queue and the coordinator started nothing"
+    ev = a.events()
+    assert not [e for e in ev if e["tipo"] == "despacho_fila" and e["op"] == "desistiu"], "forwarding to the mate is not giving up"
+    assert [e["op"] for e in ev if e["tipo"] == "despacho_fila"][-1] == "mate", ev
+    (pedido,) = [e for e in ev if e["tipo"] == "mate_pedido"]
+    assert pedido["grupo"] == "orq" and pedido["fila"] == "fd351", pedido
+    cmd = f"orq dispatch --run run_mate --ticket 88 --model {SONNET} --effort medium --priority 1 --worktree current"
+    assert cmd in pedido["texto"], pedido["texto"]
+    assert any("request p1" in " ".join(e) for e in _sent_notices(a, "term_mate")), "the mate's terminal received the request"  # the typed text is cut at NOTICE_MAX; the event keeps it whole
+
+
+def test_ticket351_queue_item_of_the_coordinator_run_keeps_giving_up_after_three_errors():
+    a = _panel79()
+    _mate_queue351(a, "run_a")
+    for _ in range(orq_mod.QUEUE_FAILURES):
+        a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL=SONNET)
+    assert not _queue79(a) and [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu"
+    assert not [e for e in a.events() if e["tipo"] == "mate_pedido"], "a Run the mate does not own never goes to it"
+
+
 def test_ticket79_real_system_reading_has_four_measures_on_macos():
     if sys.platform != "darwin":
         return

@@ -63,7 +63,7 @@ The model does the classifying. The code only checks that a classification was r
 | `pr` (`op: ligar/desligar/sem_task/entrou/fechou/avisado`) | `orq pr`, the `prlink` hook, the poll, the manager loop |
 | `usage_notice`, `usage_stopped` | the manager loop warns the coordinator once per level and window; `orq dispatch` refuses on budget |
 | `priority` | `orq priority <task> <1-3>`: `task`, `valor` |
-| `dispatch_queued` (`op: entrou/subiu/saiu/removido/desistiu`), `machine_notice` | the dispatch queue of the machine budget; the manager loop warns the coordinator once per pressure episode |
+| `dispatch_queued` (`op: entrou/subiu/saiu/removido/desistiu/mate`), `machine_notice` | the dispatch queue of the machine budget; the manager loop warns the coordinator once per pressure episode |
 | `plan_pause`, `pause_end` | `orq pause` parked a worker (session, cwd, model, `encerrados`: the background processes it ended, `{pid, args, sinal}`); `orq resume --paused` resumed it |
 | `hibernate`, `wake` | `orq hibernate` (or the manager loop) closed an idle worker's terminal (`motivo`, `rss_antes_mb`, `rss_depois_mb`, `rss_liberado_mb`); `orq wake`, `steer`, `reply` or the loop's triggers resumed it (`terminal`, `motivo`) |
 | `worker_done` | ingest: `msg`, `task`, `dispatch`, `outcome`, `subject`, one per inbox message (no report needed) |
@@ -465,6 +465,8 @@ On 01/10 the closing of tickets 101 and 141 queued 167 and 154 for automatic dis
 Ticket 175: `away_abandoned` also matches by title, because events written before 172 carry only `id` and `titulo`. A later `dispatch` with the same title, or a ticket with that title that is no longer `ready` or is blocked, clears the item. `orq dispatch-queue discard <id> --reason` writes a `descartado` event that clears it by id (the manual escape). `desistiu` now also stores `task`, and `_abandoned_command` omits `--run` when the item has none.
 
 Known limit: a busy coordinator loses the typed notice; the Stop block is the net.
+
+Ticket 351: on 02/10 the queue gave up on 347, 348, 325 and 343 because their Run belongs to the orq mate and the manager runs in the coordinator's context, which does not command it (`the dispatch is for Run X, which the coordinator does not command`); the mate dispatched the four by hand. `drain_dispatch` now checks, before any attempt or slot test, whether a ticket item without `mate` has a Run listed in some mate's `runs` (`_mate_owning`, the same list `_mate_mut(run=)` fills). If so, `_forward_to_mate` sends `orq mate request` with `_abandoned_command` plus `--priority` and `--worktree`, records the queue item id in the `mate_pedido` (`fila`) and removes the item with `op: mate`, which is not `desistiu`, so the away Stop does not chase it. Items the mate queued itself (`mate` set), items of the coordinator's or manager's Run, and items with no ticket (their spec copy dies with the item) follow the old path; a mate that cannot take the request (not open or asleep, `mate_request` raises) leaves the item queued for the old path.
 
 ## Hibernating idle workers (ticket 60)
 
