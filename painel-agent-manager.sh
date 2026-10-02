@@ -8,7 +8,9 @@ n=0
 while true; do
   touch "$h/manager-alive"
   line=$(orq manager absorb 2>&1)
-  if [ $? -eq 3 ]; then
+  rc=$?
+  [ $rc -eq 0 ] && touch "$h/manager-ok"  # progress stamp (ticket 229): only a round that exited 0 counts, even when orq.py does not import
+  if [ $rc -eq 3 ]; then
     clear
     printf 'agent manager (orq) — %s\n%s\n\n' "$(date '+%H:%M:%S')" "$line"
     tail -n 20 "$h/logs/gerente.log" 2>/dev/null
