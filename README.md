@@ -188,6 +188,7 @@ Step by step:
 6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered), `{sha}` (its merge commit) and `{orq}` (orq's clone) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
+9. `sem_ci` is optional (`true`): the project has no CI. `orq fila` reads a PR with no registered check as `? no check registered for N min` and does not count it as ready (the workflow may not have fired, the checks may not be registered yet, or a conflicting PR gets no workflow); with `sem_ci: true` an empty list is ready. Checks that do show up keep counting.
 
 Check it with `orq projects` (an invalid file shows `invalid: <why>` and is never picked on its own) and `orq flow --repo <path>`.
 

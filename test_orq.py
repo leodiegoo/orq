@@ -7481,11 +7481,11 @@ def _gh_calls(a):
     return _log(a, "gh.log")
 
 
-def _neo(a):
+def _neo(a, sem_ci=False):
     """The three-environment project file (development, staging, main), found by cwd: the git flow the PR tests always assumed."""
     os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
     with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
-        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao"}, f)
+        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao", **({"sem_ci": True} if sem_ci else {})}, f)
 
 
 def _prs_env(**env):
@@ -8204,10 +8204,10 @@ def _ck(item_name, conclusion="SUCCESS", status="COMPLETED"):
     return {"__typename": "CheckRun", "name": item_name, "status": status, "conclusion": conclusion}
 
 
-def _ci_queue(**by_pr):
+def _ci_queue(sem_ci=False, **by_pr):
     """Two PRs (1216 and 1220) in two steps; each PR reads the given `mergeable` and checks and the poll runs once."""
     a = Env(run="run_a")
-    _neo(a)
+    _neo(a, sem_ci)
     _gh(a)
     for url, k in ((PR1, "pr1"), (PR2, "pr2")):
         _pr(a, url, "OPEN", "development", **{"mergeable": "MERGEABLE", "statusCheckRollup": [_ck("lint")], "headRefName": "feat/" + k, **by_pr.get(k, {})})
@@ -8234,6 +8234,30 @@ def test_queue_list_shows_the_red_check_by_name_the_conflict_and_the_ci_running(
     assert "#1216 open ✗ lint, e2e" in l1, l1
     assert "#1220 open ⚠ conflict ⏳ CI running" in l2, l2
     assert end == "Next to merge: no step ready"
+
+
+def test_ticket223_empty_rollup_is_not_ready_and_says_how_long_without_check():
+    a = _ci_queue(pr1={"statusCheckRollup": []})
+    out = a.orq("fila", "lista").stdout
+    assert "no check registered for" in out and "min" in out, out
+    assert "Next to merge: step 2" in out, out  # step 1 is not ready, step 2 is
+
+
+def test_ticket223_empty_rollup_is_ready_when_the_project_declares_sem_ci():
+    a = _ci_queue(sem_ci=True, pr1={"statusCheckRollup": []})
+    out = a.orq("fila", "lista").stdout
+    assert "no check registered" not in out and "Next to merge: step 1" in out, out
+
+
+def test_ticket223_checks_that_show_up_in_a_sem_ci_project_still_count():
+    a = _ci_queue(sem_ci=True, pr1={"statusCheckRollup": [_ck("lint", "FAILURE")]})
+    out = a.orq("fila", "lista").stdout
+    assert "✗ lint" in out and "Next to merge: step 2" in out, out
+
+
+def test_ticket223_one_green_check_is_still_ready():
+    out = _ci_queue().orq("fila", "lista").stdout
+    assert "no check registered" not in out and "Next to merge: step 1" in out, out
 
 
 def _ckw(item_name, workflow, conclusion="SUCCESS"):

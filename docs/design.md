@@ -1115,3 +1115,5 @@ The review stops at its approval gate, so after reading the output the orq runs 
 - Codex hook position trust (ticket 77): Codex records hook trust by position (`hooks.json:<event>:<group>:<hook>`), so inserting a group in the middle unsets the trust of the ones after it.
 - Codex request_user_input only works in Plan mode and is refused in Default mode (codex-cli 0.159.3).
 - Orca's own "You have N orchestration messages" notice has no off switch; orq keeps the coordinator from being the Run's coordinator_handle.
+
+**A PR with no check is not ready (ticket 223).** `_gh_ci` stores `sem_check` when gh returned an empty `statusCheckRollup` and the project file does not declare `sem_ci: true`; `_pr_reading` then adds `("?", "no check registered for N min")` (`lido_em` against the PR's `ligado_em`) and `pronto` is false, so `orq fila` does not suggest the merge. Time, grace periods, the workflow file and the branch name are not evidence. With `sem_ci: true` an empty list is ready, and checks that appear keep their real state. The `pr_poll` of the manager is the only trigger; no new command.
