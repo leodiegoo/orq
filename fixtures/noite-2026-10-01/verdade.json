@@ -1,0 +1,21 @@
+{
+  "fonte": "What the log does not hold, from the reports of tickets 174, 180, 169 and 135 and from ciclos.log (local time UTC-3). Times in UTC.",
+  "run": "run_e9410bf401fb",
+  "sem_push": [
+    ["2026-10-01T17:40:00Z", 0],
+    ["2026-10-02T03:46:00Z", 4, "ciclos.log 00:46 FF b16660a..3c07344, not pushed until the user came back at 05:21 (ticket 174)"],
+    ["2026-10-02T03:58:00Z", 6, "ciclos.log 00:58 FF 3c07344..0a8aba1"],
+    ["2026-10-02T09:08:00Z", 0, "main published at 06:08 (ticket 180)"],
+    ["2026-10-02T09:22:34Z", 2, "ciclos.log 06:22 FF 3f078a3..e7aeffa, never recorded as a cycle event (ticket 180)"]
+  ],
+  "coordenador_parado": [
+    ["2026-10-02T03:34:19Z", "2026-10-02T08:21:12Z", "last coordinator answer, then the user's 'esta desde 00:34 sem trabalhar?' (ticket 174)"],
+    ["2026-10-02T09:10:26Z", "2026-10-02T10:34:51Z", "last coordinator answer, then 'ainda tem tasks do orq? por que parou?' (ticket 180)"]
+  ],
+  "entregas": [
+    {"msg": "msg_668798b51518", "ts": "2026-10-02T01:59:13Z", "dispatch": "ctx_45a43f9ce865", "task": "task_e5f3241ccf57", "ticket": "165",
+     "branch": "feat/orq-devolver-entrega", "corpo": "165 pronto: orq devolver; README e docs/design.md atualizados, commit 66b3dd1"},
+    {"msg": "msg_de8396765b31", "ts": "2026-10-02T01:59:22Z", "dispatch": "ctx_96af111089d1", "task": "task_8fe865587c22", "ticket": "155",
+     "branch": "feat/obrigacao-prova-sozinha", "corpo": "t155: limpeza, proximo e deploy fecham sozinhos; docs/design.md atualizado, commit d857466"}
+  ]
+}

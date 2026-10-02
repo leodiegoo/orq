@@ -6,22 +6,27 @@
                               creates ORQ_WT_DIR/integra-<branches> from main, merges each branch, runs the tests and advances main
   integrar.py --avancar <wt>  after resolving a conflict (and committing) in the worktree: checks, runs the tests and advances main
 
+Before the tests it runs the night replay (test_noite_replay.py, ticket 216) and prints its time; a red replay leaves main where it was and writes a
+`[PENDENTE` line to ciclos.log, which the manager turns into a notice to the coordinator (ticket 137).
 After the fast-forward it calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
 
 The live clone is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
 markers in orqlib.py and takes everything down. Here the conflict only exists in the worktree.
-Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests)."""
+Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests), ORQ_REPLAY (default: the night
+replay; off when ORQ_TESTES replaces the tests), ORQ_CICLOS_LOG (default: <ORQ_WT_DIR>/integracao/ciclos.log)."""
 import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True  # this runs inside the live main: no __pycache__ dirties the tree
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import orqpaths  # noqa: E402
 
 TESTS = "python3 test_orq.py && python3 test_precompact.py"
+REPLAY = "python3 test_noite_replay.py"
 
 
 def git(cwd, *args):
@@ -75,6 +80,16 @@ def advance(wt):
     markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
     if markers:
         die(f"leftover conflict marker:\n{markers}")
+    replay = os.environ.get("ORQ_REPLAY", "" if os.environ.get("ORQ_TESTES") else REPLAY)
+    if replay:
+        started = time.time()
+        if subprocess.run(replay, shell=True, cwd=wt).returncode:
+            log_path = os.environ.get("ORQ_CICLOS_LOG") or os.path.join(os.environ.get("ORQ_WT_DIR") or orqpaths.WT, "integracao", "ciclos.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[PENDENTE: main did not advance, night replay failed] {time.strftime('%Y-%m-%d %H:%M')} {branch} in {wt}\n")
+            die(f"night replay failing in {wt} ({time.time() - started:.1f} s); main did not advance")
+        print(f"integrar: night replay ok in {time.time() - started:.1f} s")
     tests = os.environ.get("ORQ_TESTES") or TESTS
     if subprocess.run(tests, shell=True, cwd=wt).returncode:
         die(f"tests failing in {wt}; main did not advance")
