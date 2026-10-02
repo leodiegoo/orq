@@ -19586,7 +19586,7 @@ EVENTOS_LIDOS = {
     "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
     "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
     "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
-    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta": "wake_stopped",
+    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped", "resposta": "wake_stopped",
     "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
     "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
 }
