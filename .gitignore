@@ -46,3 +46,9 @@ maquina.json
 suite_integra.py
 gerente-checagem.json
 estado/
+gerente-serve.pid
+gerente-estado.json
+logs/
+tui/node_modules/
+!tui/fixtures/**
+!tui/bun.lock

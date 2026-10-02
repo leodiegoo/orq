@@ -178,6 +178,28 @@ orq gerente ligar --terminal term_manager
 orq gerente desligar --run run_demo  # hand one Run back; without --run, all of them
 ```
 
+The manager loop can also run outside any terminal, so closing the manager's tab no longer stops it:
+
+```sh
+orq gerente serve              # foreground; log in ~/.claude/orq/logs/gerente.log, pid in gerente-serve.pid
+orq gerente serve --instalar   # launchd agent com.orq.gerente: starts at login, restarts if it dies
+orq gerente serve --status     # running?, pid, launchd installed?, last lap
+orq gerente serve --parar      # stops it (with launchd installed, until the next login)
+orq gerente serve --desinstalar
+```
+
+`serve` still needs the manager terminal from `orq iniciar` or `orq gerente ligar`: Orca only accepts a handle that belongs to a terminal it has seen, so that terminal stays as the anchor for the binding. Each lap runs `orq gerente absorver` with the handle from `gerente.json`. While `serve` is alive, `painel-agent-manager.sh` in that terminal stops absorbing and just shows the tail of the log. If `serve` dies, the panel picks the work back up on its next lap. Two `serve` processes at once is an error.
+
+To watch it, `orq gerente tui` opens a read-only terminal UI built on [OpenTUI](https://github.com/sst/opentui). It shows whether the manager is alive, live workers (model, phase, age), the integrator, dispatch and merge queues, the user's pending items, machine load against the budget, and the latest events, and refreshes every 3 s (`ORQ_TUI_S`). `q` quits. The TUI needs [Bun](https://bun.sh); the rest of orq stays Python stdlib only:
+
+```sh
+curl -fsSL https://bun.sh/install | bash   # or: brew install oven-sh/bun/bun
+cd ~/.claude/orq/tui && bun install
+orq gerente tui
+```
+
+Without Bun, `orq gerente tui` prints these steps and exits 1.
+
 Record what each entry became:
 
 ```sh

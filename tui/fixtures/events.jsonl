@@ -1,0 +1,3 @@
+{"ts": "2026-10-01T11:55:00Z", "tipo": "intake", "titulo": "ruido"}
+{"ts": "2026-10-01T11:56:00Z", "tipo": "worker_done", "run": "run_a", "subject": "125 pronto: orq projeto add"}
+{"ts": "2026-10-01T11:57:00Z", "tipo": "ticket", "op": "novo", "titulo": "orq: em inglês, fase 4"}

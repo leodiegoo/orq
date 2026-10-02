@@ -1,0 +1,15 @@
+{
+  "name": "orq-gerente-tui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.14"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

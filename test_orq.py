@@ -13197,6 +13197,82 @@ def test_ticket127_orq_mate_dormir_a_mao_e_a_recusa_com_pedido_aberto():
     assert r.returncode != 0 and "pedido" in r.stderr and not _log(b, "close.log"), (r.stdout, r.stderr)
 
 
+
+def _serve128(a, **env):
+    """Um `orq gerente serve` em segundo plano no Amb (volta de 0,2 s); espera o pid file ter o pid dele."""
+    p = subprocess.Popen([sys.executable, ORQ, "gerente", "serve"], env={**a.env, "ORQ_GERENTE_VOLTA_S": "0.2", **env},
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pid = os.path.join(a.home, orq_mod.SERVE_PID)
+    fim = time.time() + 15
+    while time.time() < fim and not (os.path.exists(pid) and open(pid).read().strip() == str(p.pid)):
+        time.sleep(0.05)
+    assert open(pid).read().strip() == str(p.pid), p
+    return p
+
+
+def test_ticket128_serve_trava_um_gerente_so_e_status_e_parar_acham_o_pid():
+    a = Amb(run="run_a")
+    _gerente(a)
+    p = _serve128(a)
+    try:
+        r = a.orq("gerente", "serve", "--voltas", "1")
+        assert r.returncode == 1 and f"pid {p.pid}" in r.stderr, r
+        antes = len(_calls(a, "check"))
+        r = a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger")
+        assert r.returncode == 3 and "serve" in r.stdout, "o painel não absorve com o serve vivo: dois gerentes leriam a mesma caixa"
+        assert len(_calls(a, "check")) - antes <= 2, "só as voltas do próprio serve leram a caixa"
+        st = json.loads(a.orq("gerente", "serve", "--status").stdout)
+        assert st["rodando"] and st["pid"] == p.pid and st["log"].endswith(os.path.join("logs", "gerente.log")), st
+        r = a.orq("gerente", "serve", "--parar")
+        assert r.returncode == 0, r.stderr
+        assert p.wait(timeout=15) == 0
+    finally:
+        p.kill()
+    st = json.loads(a.orq("gerente", "serve", "--status").stdout)
+    assert not st["rodando"] and st["pid"] is None, st
+    assert a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger").returncode == 0, "serve parado: o painel volta a absorver"
+    assert "parou" in open(os.path.join(a.home, "logs", "gerente.log")).read()
+
+
+def test_ticket128_serve_faz_uma_volta_sem_tty_com_o_handle_do_gerente():
+    a = Amb(run="run_a")  # o serve herda term_coord e o pane key de quem o chamou: a volta usa o handle do gerente.json
+    _gerente(a)
+    a.caixa(_hb("lendo"), _hb("testando"))
+    r = subprocess.run([sys.executable, ORQ, "gerente", "serve", "--voltas", "1"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       env={**a.env, "ORCA_PANE_KEY": "x:y"}, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert set(a.estados().values()) == {"acked"}, "a volta absorveu os heartbeats pelo handle do gerente"
+    assert time.time() - os.path.getmtime(os.path.join(a.home, orq_mod.PAINEL_VIVO)) < 30, "carimbo de vida tocado"
+    est = json.load(open(os.path.join(a.home, orq_mod.SERVE_ESTADO)))
+    assert est["terminal"] == "term_ger" and any("heartbeat" in x for x in est["linhas"]), est
+    assert isinstance(est["agentes"], list) and est["maquina"]["cfg"]["max_workers"] and est["maquina"]["leitura"]["carga"] == 2.0, est
+    assert "run_a: 2 heartbeat(s)" in open(os.path.join(a.home, "logs", "gerente.log")).read()
+    assert os.path.exists(os.path.join(a.home, "digest", "atual.json")), "a primeira volta grava o digest, como o painel"
+
+
+def test_ticket128_serve_instalar_grava_o_launchd_e_desinstalar_tira():
+    a = Amb(run="run_a")
+    t = os.path.dirname(a.home)
+    agentes_dir, lctl = os.path.join(t, "LaunchAgents"), os.path.join(t, "launchctl")
+    with open(lctl, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {t}/launchctl.log\n")
+    os.chmod(lctl, 0o755)
+    env = {"ORQ_LAUNCH_AGENTS": agentes_dir, "ORQ_LAUNCHCTL": lctl}
+    r = a.orq("gerente", "serve", "--instalar", **env)
+    assert r.returncode == 0, r.stderr
+    import plistlib
+    pl = plistlib.load(open(os.path.join(agentes_dir, orq_mod.LAUNCHD_LABEL + ".plist"), "rb"))
+    assert pl["ProgramArguments"][-2:] == ["gerente", "serve"] and pl["ProgramArguments"][1].endswith("orq.py"), pl
+    assert pl["KeepAlive"] and pl["RunAtLoad"] and pl["EnvironmentVariables"]["ORQ_HOME"] == a.home, pl
+    assert pl["StandardErrorPath"] == os.path.join(a.home, "logs", "gerente.log"), pl
+    assert not [k for k in pl["EnvironmentVariables"] if k.startswith("ORCA_")], "o handle do coordenador não vai para o launchd"
+    assert json.loads(a.orq("gerente", "serve", "--status", **env).stdout)["instalado"]
+    assert a.orq("gerente", "serve", "--desinstalar", **env).returncode == 0
+    assert not os.path.exists(os.path.join(agentes_dir, orq_mod.LAUNCHD_LABEL + ".plist"))
+    chamadas = open(os.path.join(t, "launchctl.log")).read()
+    assert "bootstrap" in chamadas and "bootout" in chamadas, chamadas
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

@@ -8865,6 +8865,176 @@ def gerente_absorver():
     return "\n".join(linhas)
 
 
+
+# ---------- agent manager sem terminal: orq gerente serve (ticket 128) ----------
+
+SERVE_PID = "gerente-serve.pid"  # o pid do `orq gerente serve` e a trava dele (flock enquanto vive): trava livre é serve parado, seja qual for o pid escrito
+SERVE_ESTADO = "gerente-estado.json"  # {ts, pid, terminal, linhas, agentes, maquina: {cfg, leitura}}: o que a TUI lê do gerente
+SERVE_LOG = os.path.join("logs", "gerente.log")
+SERVE_VOLTA_S = float(os.environ.get("ORQ_GERENTE_VOLTA_S") or 10)  # o intervalo do painel-agent-manager.sh
+SERVE_DIGEST_VOLTAS = 6  # o digest a cada ~60 s, como o painel
+SERVE_OCUPADO = 3  # código de saída do `orq gerente absorver` com o serve vivo: o painel só mostra
+LAUNCHD_LABEL = "com.orq.gerente"
+LAUNCH_AGENTS = os.environ.get("ORQ_LAUNCH_AGENTS") or os.path.expanduser("~/Library/LaunchAgents")
+LAUNCHCTL = os.environ.get("ORQ_LAUNCHCTL") or "launchctl"
+
+
+def serve_dono():
+    """O pid do `orq gerente serve` vivo, ou None: quem segura o flock do SERVE_PID. A trava, e não o pid escrito, diz se há serve (pid reaproveitado não engana)."""
+    try:
+        f = open(_path(SERVE_PID), "r")
+    except OSError:
+        return None
+    with f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return int(f.read().strip() or 0) or -1
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return None
+
+
+def _serve_log(msg):
+    p = _path(SERVE_LOG)
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            f.write(f"{now()} {msg}\n")
+
+
+def _plist_serve():
+    return os.path.join(LAUNCH_AGENTS, LAUNCHD_LABEL + ".plist")
+
+
+def serve_status():
+    """O que `orq gerente serve --status` mostra: se roda, o pid, se o launchd está instalado, o log e a última volta (o carimbo `gerente-vivo`)."""
+    try:
+        volta = datetime.fromtimestamp(os.path.getmtime(_path(PAINEL_VIVO)), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        volta = None
+    pid = serve_dono()
+    return {"rodando": pid is not None, "pid": pid, "instalado": os.path.exists(_plist_serve()), "log": _path(SERVE_LOG), "ultima_volta": volta}
+
+
+def gerente_estado_gravar(linhas):
+    """Depois de uma volta do serve: grava o SERVE_ESTADO com os workers (o mesmo do `orq agentes --json`) e a máquina contra o orçamento. Só leitura do Orca."""
+    try:
+        ags = agentes()
+    except Exception as e:  # noqa: BLE001 - Orca fora do ar: a TUI mostra os workers do aberto.json
+        log(f"gerente estado: agentes: {type(e).__name__}: {e}")
+        ags = None
+    _write_json(_path(SERVE_ESTADO), {"ts": now(), "pid": int(os.environ.get("ORQ_SERVE_PID") or 0) or None, "terminal": _gerente_cfg().get("gerente"),
+                                      "linhas": [x for x in linhas.splitlines() if x], "agentes": ags,
+                                      "maquina": {"cfg": maquina_cfg(), "leitura": maquina_ler()}})
+
+
+def gerente_serve(voltas=None):
+    """O agent manager sem terminal (spike em relatorios/t128-gerente-sem-terminal.md): o Orca aceita o consumidor fora do terminal com o handle do
+    gerente.json, então cada volta roda `orq gerente absorver` com esse handle e sem nenhuma outra variável ORCA_* (o pane key de quem chamou ganharia do
+    handle). A volta é um processo novo: o orq atualizado vale na volta seguinte, sem reiniciar o serve. O terminal do gerente fica só como âncora do
+    vínculo; o painel nele vê a trava e só mostra. Dois serves é erro."""
+    f = open(_path(SERVE_PID), "a+")
+    for tentativa in range(5):  # o `serve_dono` de outro processo segura um LOCK_SH por um instante
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if tentativa == 4:
+                f.seek(0)
+                dono = f.read().strip() or "?"
+                f.close()
+                raise ValueError(f"já há um agent manager servindo (pid {dono}): orq gerente serve --status | --parar")
+            time.sleep(0.2)
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    parar = []
+    signal.signal(signal.SIGTERM, lambda *_: parar.append(1))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ORCA_")} | {"ORQ_SERVE_PID": str(os.getpid())}
+    orq_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py")
+    _serve_log(f"serve: pid {os.getpid()} subiu (volta de {SERVE_VOLTA_S:g} s)")
+    n = 0
+    try:
+        while not parar and (voltas is None or n < voltas):
+            n += 1
+            inicio = time.time()
+            _toca_painel()  # como o shell do painel: o carimbo sai antes do orq, vale mesmo com o orqlib quebrado
+            g = _gerente_cfg()
+            e = {**env, **({"ORCA_TERMINAL_HANDLE": g["gerente"]} if g else {})}
+            try:
+                r = subprocess.run([sys.executable, orq_py, "gerente", "absorver", "--estado"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=300)
+                linha = (r.stdout + r.stderr).strip()
+                if n % SERVE_DIGEST_VOLTAS == 1:
+                    subprocess.run([sys.executable, orq_py, "digest"], stdin=subprocess.DEVNULL, capture_output=True, env=e, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as x:
+                linha = f"volta falhou: {type(x).__name__}: {x}"
+            _serve_log(f"volta {n} ({time.time() - inicio:.1f} s): " + " | ".join(linha.splitlines()))
+            fim = time.time() + SERVE_VOLTA_S
+            while not parar and (voltas is None or n < voltas) and time.time() < fim:
+                time.sleep(min(0.2, SERVE_VOLTA_S))
+    finally:
+        _serve_log(f"serve: pid {os.getpid()} parou depois de {n} volta(s)")
+        f.seek(0)
+        f.truncate()
+        f.close()
+    return n
+
+
+def serve_parar(espera_s=15):
+    """Para o serve: pelo launchd quando instalado (o KeepAlive o subiria de novo; volta no próximo login), senão SIGTERM no pid. Espera a trava soltar."""
+    if os.path.exists(_plist_serve()):
+        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+    pid = serve_dono()
+    if pid and pid > 0:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+    fim = time.time() + espera_s
+    while serve_dono() and time.time() < fim:
+        time.sleep(0.1)
+    if serve_dono():
+        raise ValueError(f"o serve (pid {serve_dono()}) não parou em {espera_s} s")
+    return serve_status()
+
+
+def serve_instalar():
+    """Grava o launchd agent (sobe no login, KeepAlive o reinicia se cair) e o carrega. O ambiente é o PATH de agora e o ORQ_HOME; nada de ORCA_*."""
+    os.makedirs(LAUNCH_AGENTS, exist_ok=True)
+    os.makedirs(os.path.dirname(_path(SERVE_LOG)), exist_ok=True)
+    import plistlib
+    pl = {"Label": LAUNCHD_LABEL, "ProgramArguments": [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py"), "gerente", "serve"],
+          "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ORQ_HOME": HOME}, "RunAtLoad": True, "KeepAlive": True,
+          "ThrottleInterval": 30, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
+    with open(_plist_serve(), "wb") as f:
+        plistlib.dump(pl, f)
+    alvo = f"gui/{os.getuid()}"
+    subprocess.run([LAUNCHCTL, "bootout", f"{alvo}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)  # já carregado: recarrega com o plist novo
+    r = subprocess.run([LAUNCHCTL, "bootstrap", alvo, _plist_serve()], capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise ValueError(f"launchctl bootstrap falhou: {(r.stderr or r.stdout).strip()}")
+    return serve_status()
+
+
+def serve_desinstalar():
+    if os.path.exists(_plist_serve()):
+        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+        os.remove(_plist_serve())
+    return serve_status()
+
+
+def gerente_tui():
+    """`orq gerente tui`: a TUI em tui/ (OpenTUI sobre Bun), só leitura dos arquivos do ORQ_HOME. Sem Bun ou sem as dependências, diz como instalar."""
+    tui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tui")
+    bun = shutil.which("bun")
+    if not bun:
+        print("orq gerente tui pede o Bun: curl -fsSL https://bun.sh/install | bash (ou brew install oven-sh/bun/bun) e depois cd "
+              f"{shlex.quote(tui)} && bun install", file=sys.stderr)
+        return 1
+    if not os.path.isdir(os.path.join(tui, "node_modules")):
+        print(f"faltam as dependências da TUI: cd {shlex.quote(tui)} && bun install", file=sys.stderr)
+        return 1
+    return subprocess.run([bun, "run", os.path.join(tui, "src", "index.ts")], env={**os.environ, "ORQ_HOME": HOME}).returncode
+
 # ---------- retro: o coletor de sinais de falha (ticket 78) ----------
 
 ORQ_INSTALL = os.path.realpath(os.environ.get("ORQ_INSTALL") or os.path.expanduser("~/.claude/orq"))  # o checkout que roda (hooks, painel): ninguém trabalha nele
@@ -9384,7 +9554,15 @@ def main(argv=None):
     gs = ge.add_parser("subir", help="no coordenador: o terminal do agent manager sumiu; cria outro com o painel e religa todos os Runs do gerente.json")
     gs.add_argument("--forcar", action="store_true", help="sobe mesmo com o terminal antigo ainda no Orca")
     ge.add_parser("intervalo", help="quantos segundos o painel dorme antes da próxima volta (o shell do painel chama)")
-    ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
+    ga = ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
+    ga.add_argument("--estado", action="store_true", help=argparse.SUPPRESS)  # o serve: grava o gerente-estado.json depois da volta
+    gv = ge.add_parser("serve", help="o agent manager sem terminal: absorve em laço fora do Orca, com log em logs/gerente.log")
+    gv.add_argument("--voltas", type=int, help=argparse.SUPPRESS)
+    gvo = gv.add_mutually_exclusive_group()
+    for op, ajuda in (("status", "se roda, o pid, o launchd e a última volta"), ("parar", "para o serve (e o launchd até o próximo login)"),
+                      ("instalar", "grava e carrega o launchd agent: sobe no login e reinicia se cair"), ("desinstalar", "tira o launchd agent")):
+        gvo.add_argument(f"--{op}", action="store_true", help=ajuda)
+    ge.add_parser("tui", help="abre a TUI (OpenTUI, pede Bun) que acompanha o gerente, os workers e as filas; só leitura")
     rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
     rt.add_argument("--dry-run", action="store_true", help="só lista")
     rt.add_argument("--run", help="só os dispatches deste Run")
@@ -9650,8 +9828,23 @@ def main(argv=None):
                 print(json.dumps(gerente_subir(a.forcar), ensure_ascii=False))
             elif a.op == "intervalo":
                 print(painel_intervalo_s(_read_json(_path(GERENTE))))
+            elif a.op == "serve":
+                acao = serve_status if a.status else serve_parar if a.parar else serve_instalar if a.instalar else serve_desinstalar if a.desinstalar else None
+                if acao:
+                    print(json.dumps(acao(), ensure_ascii=False))
+                else:
+                    gerente_serve(a.voltas)
+            elif a.op == "tui":
+                return gerente_tui()
             else:
-                print(gerente_absorver())
+                dono = serve_dono()
+                if dono and str(dono) != os.environ.get("ORQ_SERVE_PID"):
+                    print(f"orq gerente serve rodando (pid {dono}): este painel não absorve, o log está em {_path(SERVE_LOG)}")
+                    return SERVE_OCUPADO
+                linha = gerente_absorver()
+                print(linha)
+                if a.estado:
+                    gerente_estado_gravar(linha)
         elif a.cmd == "retomar" and a.pausados:
             r = {"gerente": None, "workers": retomar_pausados(a.run, a.forcar)}
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
