@@ -5133,6 +5133,12 @@ def _inteiro(texto):
     return open(texto.split("completo em ")[1], encoding="utf-8").read() if "completo em /" in texto else texto
 
 
+def _aviso_inteiro(texto):
+    """O aviso como o coordenador o lê: o texto digitado e, quando passou do teto (ticket 98), o arquivo que ele cita com o texto inteiro."""
+    achou = re.search(r"completo em (\S+\.txt)", texto)
+    return texto if not achou else open(achou.group(1), encoding="utf-8").read()
+
+
 def _avisos_enviados(a, handle="term_coord"):
     """Os send.log de `orca terminal send` para o terminal, só os que digitam texto."""
     return [e for e in _log(a, "send.log") if "--text" in e and e[e.index("--terminal") + 1] == handle]
@@ -9104,7 +9110,7 @@ def test_ticket52_gerente_avisa_o_coordenador_uma_vez_e_o_agentes_mostra_a_pergu
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0 and "pergunta na tela (permissao)" in r.stdout, r
     (env,) = _avisos_enviados(a)
-    texto = env[env.index("--text") + 1]
+    texto = _aviso_inteiro(env[env.index("--text") + 1])
     assert "Do you want to proceed?" in texto and "1) Yes" in texto and "orq responder-tela task_term_w1 <opção>" in texto, texto
     a.orq("gerente", "absorver")
     assert len(_avisos_enviados(a)) == 1, "o mesmo menu não é avisado de novo"
@@ -10532,8 +10538,9 @@ def _repo_vivo55(branches):
     t = tempfile.mkdtemp()
     vivo = os.path.join(t, "orq")
     os.makedirs(os.path.join(vivo, "scripts"))
-    for f in ("orq.py", "orqlib.py", "falha_segura.py"):
-        shutil.copy(os.path.join(AQUI, f), vivo)
+    for f in sorted(os.listdir(AQUI)):  # os módulos da raiz que o orqlib importa (falha_segura, backlog, ...), sem os testes
+        if f.endswith(".py") and not f.startswith(("test_", "suite_")) and os.path.isfile(os.path.join(AQUI, f)):
+            shutil.copy(os.path.join(AQUI, f), vivo)
     shutil.copy(os.path.join(AQUI, "scripts", "integrar.py"), os.path.join(vivo, "scripts"))
     open(os.path.join(vivo, "nota.txt"), "w").write("a\nb\nc\n")
     env = {**os.environ, "ORQ_WT_DIR": os.path.join(t, "orq-wt"), "ORQ_TESTES": "true", "ORQ_LOG": os.path.join(t, "orq.log"),
@@ -10638,7 +10645,7 @@ _FORA85 = [_p85(200, 1, 146, "/System/Library/Frameworks/CoreServices.framework/
 
 def _texto_aviso85(a):
     (env,) = _log(a, "send.log")
-    return env[env.index("--text") + 1]
+    return _aviso_inteiro(env[env.index("--text") + 1])
 
 
 def test_ticket85_carga_vinda_de_fora_segura_o_despacho_lista_os_culpados_e_nao_sugere_pausa():
@@ -11011,8 +11018,9 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     assert "--worktree" not in cria[0], cria[0]
     assert not _env_claude(cria), "env VAR=x claude roda não interativo num terminal do Orca (ticket 106)"
-    texto = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
-    assert "secondmate do grupo orq" in texto and "/h/regras-orq.md" in texto and "orq mate subir" in texto and "\n" not in texto, texto
+    digitado = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
+    texto = _aviso_inteiro(digitado)
+    assert "secondmate do grupo orq" in texto and "/h/regras-orq.md" in texto and "orq mate subir" in texto and "\n" not in digitado, texto
     assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
     r = a.orq("mate", "abrir", "orq")
     assert r.returncode != 0 and "aberto" in r.stderr  # um mate por grupo
@@ -11025,7 +11033,7 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     cmd = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))][1]
     cmd = cmd[cmd.index("--command") + 1]
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
-    textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    textos = [_aviso_inteiro(c[c.index("--text") + 1]) for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
     assert len(textos) == 2 and "terminal caiu" in textos[1], textos
 
 
@@ -13698,7 +13706,7 @@ def test_ticket90_gerente_avisa_o_coordenador_do_limite_uma_vez_so():
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0 and "limite do plano" in r.stdout, r
     (env,) = _avisos_enviados(a)
-    texto = env[env.index("--text") + 1]
+    texto = _aviso_inteiro(env[env.index("--text") + 1])
     assert "task_term_w1" in texto and "session limit" in texto and texto.startswith("orq: worker "), texto
     a.orq("gerente", "absorver")
     a.set("screens.json", {"term_w1": ["● seguindo"]})
