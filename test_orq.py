@@ -14188,6 +14188,46 @@ def test_it_should_type_at_most_aviso_max_characters_and_cite_the_file_with_the_
         orq_mod.terminal_livre, orq_mod.orca, orq_mod.HOME, orq_mod.AVISO_GAP_S, orq_mod._tela_de_turno_sem_rascunho = antes
 
 
+def test_it_should_be_that_an_orq_ticket_spec_gets_the_worktree_block():
+    a = Amb(run="run_a")
+    for _ in range(2):
+        r = a.orq("despachar", "--run", "run_a", "--titulo", "orq: algo", "--spec-arquivo", _spec(a, "# orq: algo\n\nFaça X.\n"), "--modelo", "claude-sonnet-5-5", "--effort", "medium")
+        assert r.returncode == 0, r.stderr
+    for arg in _log(a, "started.log"):
+        spec = arg[arg.index("--spec") + 1]
+        assert spec.count("## Worktree do orq") == 1 and "~/.claude/orq-wt/" in spec and "Nunca commite na `main`" in spec, spec
+
+
+def test_it_should_be_that_a_non_orq_ticket_spec_gets_no_worktree_block():
+    a = Amb(run="run_a")
+    a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium")
+    (arg,) = _log(a, "started.log")
+    assert "Worktree do orq" not in arg[arg.index("--spec") + 1]
+
+
+def test_it_should_be_that_dispatching_an_orq_ticket_by_number_appends_the_block_once():
+    a = Amb(run="run_a")
+    _novo(a, "orq: mexe no orq")
+    for _ in range(2):
+        a.orq("despachar", "--run", "run_a", "--ticket", "01", "--modelo", "claude-sonnet-5-5", "--effort", "medium", FAKE_FAIL="")
+    txt = open(next(os.path.join(a.env["ORQ_ISSUES"], n) for n in os.listdir(a.env["ORQ_ISSUES"]) if n.startswith("01-"))).read()
+    assert txt.count("## Worktree do orq") == 1 and "~/.claude/orq-wt/01" in txt, txt
+
+
+def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_not_the_integrator():
+    hook = os.path.join(AQUI, "githooks", "pre-commit")
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        subprocess.run(["git", "-C", repo, "checkout", "-qB", "main"], check=True)
+        run = lambda **env: subprocess.run(["sh", hook], cwd=repo, capture_output=True, text=True, env={**os.environ, **env})  # noqa: E731
+        r = run(ORQ_INTEGRADOR="")
+        assert r.returncode == 1 and "worktree" in r.stderr, r.stderr
+        assert "recusado" not in run(ORQ_INTEGRADOR="1").stderr
+        wt = os.path.join(t, "wt")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat/x", wt], check=True)
+        assert "recusado" not in subprocess.run(["sh", hook], cwd=wt, capture_output=True, text=True, env={**os.environ, "ORQ_INTEGRADOR": ""}).stderr
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

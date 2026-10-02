@@ -5499,6 +5499,8 @@ BLOCO_ESPERANDO = """## Esperando
 - Se o comando voltar sem mudança, repita o mesmo comando, sem checagem entre um e outro.
 - Nunca ponha em segundo plano para fazer polling. Não envolva `npm run test-app-e2e` nem `scripts/e2e-infra.sh` em loop seu: a fila de E2E já espera dentro do comando."""
 
+ORQ_WT_TITULO = "## Worktree do orq"  # o bloco que o despacho de um ticket do próprio orq anexa ao spec (ticket 136)
+
 
 def _texto_da_entrada(entrada):
     """Texto literal da entrada no events.jsonl (o hook grava até 2000 caracteres), ou None sem `entrada`. ValueError se não existe."""
@@ -7434,6 +7436,23 @@ def projeto_add(alvo, nome=None, harness=None, grupo=None, proposta_arq=None, de
         os.replace(tmp, caminho_yaml)
     return {**out, "registrado_no_orca": registrar, "arquivo_novo": not existe}
 
+def ticket_do_orq(titulo, projeto=None):
+    """True se o despacho mexe no próprio orq: projeto `orq`, ou título que começa com `orq` (`orq: ...`, `orq ...`)."""
+    return projeto == "orq" or bool(re.match(r"orq\b", (titulo or "").strip(), re.I))
+
+
+def bloco_worktree_orq(num=None):
+    """O bloco que manda o worker de um ticket do orq trabalhar em worktree própria: o checkout vivo `~/.claude/orq` recebe só o integrador."""
+    n = num or "<ticket>"
+    return (f"{ORQ_WT_TITULO}\n\nNunca commite na `main` do checkout vivo `~/.claude/orq`: o integrador avança essa `main`, e o hook pre-commit recusa o commit.\n"
+            f"Crie a worktree `~/.claude/orq-wt/{n}` de `origin/main` numa branch própria (`git -C ~/.claude/orq worktree add -b <tipo>/<descrição> ~/.claude/orq-wt/{n} origin/main`) "
+            "e trabalhe e commite só nela.\n")
+
+
+def _com_bloco_orq(txt, num=None):
+    """`txt` com o bloco da worktree no fim; se o bloco já está lá, devolve `txt` como veio."""
+    return txt if ORQ_WT_TITULO in txt else txt.rstrip("\n") + "\n\n" + bloco_worktree_orq(num)
+
 
 def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=None, base_branch=None, entrada=None, ticket=None, prioridade=None, agente=None, projeto=None, _drenando=False, servico=False):
     """worker-start (com --model e --effort, o que o hook worker-routing-guard exige) + evento `despacho` + intake da entrada.
@@ -7508,6 +7527,14 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
             raise SemVaga(motivo)
         if motivo:
             return _enfileirar_despacho(motivo, run, titulo, spec, modelo, effort, worktree, name, base_branch, entrada, tk, prio, agente, projeto, servico)
+        if ticket_do_orq(titulo, projeto):
+            if spec is not None:
+                spec = _com_bloco_orq(spec)
+            else:  # o conteúdo do ticket é o arquivo: o bloco entra nele, uma vez
+                with open(tk["arquivo"], encoding="utf-8") as f:
+                    txt = f.read()
+                if ORQ_WT_TITULO not in txt:
+                    _escrever(tk["arquivo"], _com_bloco_orq(txt, tk["num"]))
         if spec is not None and not spec.lstrip().startswith("#"):
             spec = f"# {titulo}\n\n{spec}"  # o Claude Code tira o nome da aba do começo do prompt
         if spec is not None and pedido is not None:  # o pedido literal fica no topo, separado do que o coordenador escreveu; o review mede contra ele
