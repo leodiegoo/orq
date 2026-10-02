@@ -26,7 +26,7 @@ class OldPython(RuntimeError):
 
 
 def marker_path():
-    return os.path.join(os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq"), MARKER)
+    return os.path.join(os.environ.get("ORQ_HOME") or HERE, MARKER)  # the clone that runs the hooks; no import, this file has to load alone
 
 
 def _clock():

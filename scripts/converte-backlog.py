@@ -23,6 +23,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 import backlog  # noqa: E402
+import orqpaths  # noqa: E402
 
 STATE = {"resolved": "done", "claimed": "in_flight", "ready-for-agent": "queued"}
 
@@ -137,9 +138,9 @@ def ready_ids(cli_output):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--saida", default=os.environ.get("ORQ_BACKLOG"), dest="output")
-    ap.add_argument("--issues", default=os.environ.get("ORQ_ISSUES") or os.path.expanduser("~/.claude/orquestrador-plan/issues"))
+    ap.add_argument("--issues", default=os.environ.get("ORQ_ISSUES") or os.path.join(orqpaths.PLAN, "issues"))
     ap.add_argument("--pendencias", default=os.environ.get("ORQ_PENDENCIAS") or os.path.expanduser("~/.claude/dashboard/data/pendencias.json"), dest="pending_items")
-    ap.add_argument("--eventos", default=os.path.join(os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq"), "events.jsonl"), dest="event_list")
+    ap.add_argument("--eventos", default=os.path.join(orqpaths.HOME, "events.jsonl"), dest="event_list")
     ap.add_argument("--forcar", action="store_true", help="sobrescreve a saída que já existe", dest="force")
     ap.add_argument("--completa", action="store_true", help="acrescenta ao backlog que existe os tickets de issues/ que ele ainda não tem (pela CLI, sem reescrever o arquivo)", dest="complete")
     ap.add_argument("--outros", action="append", default=[], help="outro backlog que já guarda tickets (os de grupos/*/backlog.md ao lado da saída entram sozinhos); --completa não os repete", dest="others")

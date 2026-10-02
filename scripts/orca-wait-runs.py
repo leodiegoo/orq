@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the checkout of this script (installed as a symlink into ~/.claude/orq)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the clone of this script (~/.claude/scripts/ links here)
 try:
     import orq
 except Exception:  # noqa: BLE001 - without orq the waiter confirms the heartbeat on its own, without recording the event

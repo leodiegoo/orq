@@ -1,4 +1,4 @@
 scripts:
   setup: |
     git config core.hooksPath githooks
-    [ -f ~/.claude/scripts/trust-cwd.py ] && python3 ~/.claude/scripts/trust-cwd.py || true
+    python3 scripts/trust-cwd.py || true

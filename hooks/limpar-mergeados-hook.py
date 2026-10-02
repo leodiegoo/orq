@@ -10,7 +10,7 @@ import signal
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the checkout of this hook (installed as ~/.claude/orq/hooks/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the clone of this hook (~/.claude/hooks/ links here)
 try:
     from orq import coordinator, origin_name
 except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver falha_segura.py)

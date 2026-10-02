@@ -76,7 +76,7 @@ Optional: Node 20+ and `tasks-axi@0.2.6` (`npm i -g tasks-axi@0.2.6`), only if y
 
 From scratch, the agent does the setup. You only clone and open the harness:
 
-1. Clone this repository where you want the code to live (the examples use `~/.claude/orq`, the default `ORQ_HOME`).
+1. Clone this repository where you want it to live. The clone also holds the state, the plan and the integration worktrees, all gitignored (see [Where things live](#where-things-live)).
 2. Open your harness (`claude` or `codex`) inside an Orca terminal, with the clone as the working directory.
 3. Ask the agent to set orq up. It checks the tools (`orca`, `git`, `python3`, and the optional ones above), asks before installing anything, runs the steps in [Install](#install), then `orq start --objective "<what you are working on>"` to turn that session into the coordinator.
 4. Add your projects by talking to it ("add my project at ~/code/my-app"): it runs `orq project add <path|url>` (see [Projects](#projects)), which writes `projects/<name>.json`, registers the repository in Orca and writes `orca.yaml`.
@@ -85,31 +85,20 @@ From scratch, the agent does the setup. You only clone and open the harness:
 ## Install
 
 ```sh
-git clone <this-repo-url> ~/.claude/orq
-mkdir -p ~/.claude/hooks ~/.claude/scripts ~/.claude/skills ~/.claude/commands ~/.local/bin
-
-for f in worker-routing-guard.py limpar-mergeados-hook.py; do
-  ln -s ~/.claude/orq/hooks/$f ~/.claude/hooks/$f
-done
-for f in limpar-mergeados.py orca-wait-runs.py trust-cwd.py; do
-  ln -s ~/.claude/orq/scripts/$f ~/.claude/scripts/$f
-done
-ln -s ~/.claude/orq/skills/worker-routing ~/.claude/skills/worker-routing
-ln -s ~/.claude/orq/skills/orq-retro ~/.claude/skills/orq-retro   # the weekly retro analysis
-ln -s ~/.claude/orq/commands/away.md ~/.claude/commands/away.md   # /away slash command
-ln -s ~/.claude/orq/orq.py ~/.local/bin/orq                       # the manager loop calls `orq`; `orq start` swaps the link for a wrapper that pins the Python
+git clone <this-repo-url> ~/Developer/orq   # anywhere you like
+cd ~/Developer/orq
+python3 orq.py install
 ```
 
-Then register the hooks (details in [Configuration](#7-hooks-claude-code-and-codex)):
+`orq install` wires the harnesses to the clone it runs from. It is safe to run again: a second run changes nothing.
 
-- Claude Code: merge the `hooks` section of [`settings.hooks.example.json`](settings.hooks.example.json) into `~/.claude/settings.json`, next to any hooks you already have.
-- Codex: run `orq hooks-codex`, or merge [`codex.hooks.example.json`](codex.hooks.example.json) into `~/.codex/hooks.json` by hand. Then link the skills where Codex reads them:
+- Claude Code: it appends the groups of [`settings.hooks.example.json`](settings.hooks.example.json) that `~/.claude/settings.json` does not have yet, and points orq's commands that are already there (and an orq `statusline.sh` in `statusLine`) at this clone.
+- Codex: the same with [`codex.hooks.example.json`](codex.hooks.example.json) and `~/.codex/hooks.json`. New groups go at the end of each event and nothing is reordered, because Codex records hook trust by position. Review the new or changed hooks once in `/hooks`.
+- Links into the clone: `~/.claude/hooks/worker-routing-guard.py` and `limpar-mergeados-hook.py`; `~/.claude/scripts/limpar-mergeados.py`, `limpar-mergeados.keep`, `orca-wait-runs.py` and `trust-cwd.py`; `~/.claude/skills/worker-routing`; `~/.claude/commands/away.md` (the `/away` command); and, for Codex, `~/.agents/skills/worker-routing` and `~/.agents/skills/away` (`$away on|off|status`, since Codex has no user slash commands). A link that points anywhere else is replaced. A real file in its place is kept and reported.
+- `~/.local/bin/orq`: a two-line wrapper that runs this clone's `orq.py` with a Python 3.12+. The manager loop calls `orq`.
+- If the launchd agent of `orq manager serve` points at another folder, it says so. `orq manager serve --install` rewrites it.
 
-```sh
-mkdir -p ~/.agents/skills
-ln -s ~/.claude/orq/skills/worker-routing ~/.agents/skills/worker-routing
-ln -s ~/.claude/orq/skills/away ~/.agents/skills/away   # `$away on|off|status`: Codex has no user slash commands
-```
+The weekly retro skill is opt-in: `ln -s "$PWD/skills/orq-retro" ~/.claude/skills/orq-retro`.
 
 The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
 
@@ -117,7 +106,7 @@ Branch cleanup (`limpar-mergeados.py`) reads the branch patterns to keep from `~
 
 ## Configuration
 
-orq reads plain files on every call: no daemon, no cache. Everything lives under `ORQ_HOME` (default `~/.claude/orq`) unless noted. A file you never create means "use the defaults", so you can start with none and add them as you need.
+orq reads plain files on every call: no daemon, no cache. Everything lives under `ORQ_HOME` (default: the clone itself) unless noted. A file you never create means "use the defaults", so you can start with none and add them as you need.
 
 On disk the keys are English; the older Portuguese key names are still read, so an old file keeps working.
 
@@ -213,10 +202,10 @@ You talk to one coordinator. When a domain gets big (say, everything about `my-a
   "harness": "claude",
   "model": "<model-id>",
   "effort": "medium",
-  "rules": "~/.claude/orq/rules-my-app.md",
+  "rules": "~/Developer/orq/rules-my-app.md",
   "cwd": "~/code/my-app",
   "mate_project": "~/code/my-app",
-  "backlog": "~/.claude/orq/groups/my-app/backlog.md"
+  "backlog": "~/Developer/orq/groups/my-app/backlog.md"
 }
 ```
 
@@ -272,7 +261,7 @@ orq does its work in hooks, so the hooks are the one thing you must register. Bo
 | `PostToolUse` (`AskUserQuestion`) | `orq hook ask` | records the answer |
 | `PreCompact` / `SessionStart` (`compact`) | `precompact.py` | snapshots the coordinator's state and injects it back after `/compact` |
 
-Claude Code: merge the `hooks` section of `settings.hooks.example.json` into `~/.claude/settings.json`. The example commands call `/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook <kind>`; change the interpreter (any Python 3.12+) and the path if yours differ. `orq start` refuses to run if a hook of the orq is missing from the harness's hooks file, then replaces the loose `python3` in orq's hook commands with the absolute path of a Python 3.12+ and says so (`hooks: found: ...` for each interpreter that could not import `orqlib`). `orq doctor hooks` runs the same check without touching Orca (exit 1 while an interpreter cannot import `orqlib` or a `python3` is loose); `orq doctor hooks --pin` writes the path. Codex trusts a hook by what it says, so after pinning review the hooks once more in `/hooks`.
+Claude Code: merge the `hooks` section of `settings.hooks.example.json` into `~/.claude/settings.json`. The example commands call `/opt/homebrew/bin/python3 /path/to/orq/orq.py hook <kind>`; `orq install` writes this clone's path and a Python 3.12+ in their place. `orq start` refuses to run if a hook of the orq is missing from the harness's hooks file, then replaces the loose `python3` in orq's hook commands with the absolute path of a Python 3.12+ and says so (`hooks: found: ...` for each interpreter that could not import `orqlib`). `orq doctor hooks` runs the same check without touching Orca (exit 1 while an interpreter cannot import `orqlib` or a `python3` is loose); `orq doctor hooks --pin` writes the path. Codex trusts a hook by what it says, so after pinning review the hooks once more in `/hooks`.
 
 Codex: `orq hooks-codex` appends the missing groups from `codex.hooks.example.json` to `~/.codex/hooks.json` at the end of each event, and never reorders or removes anything. Codex records hook trust by position, so inserting a group in the middle would unset the trust of the ones after it. Then review the new hooks once in `/hooks`, or start Codex with `--dangerously-bypass-hook-trust`. Until they are trusted the orq does not see that terminal, and `orq status`, `orq agents` and the coordinator's session preamble start with a warning that says so. The Codex commands take a trailing `codex` argument (`orq hook prompt codex`).
 
@@ -286,7 +275,7 @@ Start the manager in a plain shell terminal inside Orca, then bind your Run to i
 
 ```sh
 # manager terminal
-~/.claude/orq/painel-agent-manager.sh
+~/Developer/orq/painel-agent-manager.sh   # from your clone
 
 # coordinator, one command (creates the Run, raises the manager, binds the Run to it)
 orq start --objective "Auth work"
@@ -476,7 +465,7 @@ Turning it off: delete `backlog.path` (or run a command with `ORQ_BACKLOG=`), an
 Migrate with a rehearsal on a fresh file, then point `ORQ_BACKLOG` at it:
 
 ```sh
-python3 ~/.claude/orq/scripts/converte-backlog.py --saida /tmp/rehearsal/backlog.md   # reads the tickets and the pending list; never writes them
+python3 scripts/converte-backlog.py --saida /tmp/rehearsal/backlog.md   # reads the tickets and the pending list; never writes them
 ORQ_BACKLOG=/tmp/rehearsal/backlog.md orq backlog
 ```
 
@@ -511,10 +500,11 @@ Weaker on Codex: there is no AskUserQuestion, so decisions go through `orq ask`;
 
 | Path | Contents | Override |
 |---|---|---|
-| `~/.claude/orq/` | runtime state: `events.jsonl`, `cursor.json`, `open.json`, `manager.json`, `manager-alive`, `machine.json`, `merge-queue.json`, `dispatch-queue.json`, `turns.json`, locks, `handoff/` (all gitignored) | `ORQ_HOME` |
+| the clone | runtime state: `events.jsonl`, `cursor.json`, `open.json`, `manager.json`, `manager-alive`, `machine.json`, `merge-queue.json`, `dispatch-queue.json`, `turns.json`, locks, `handoff/` (all gitignored) | `ORQ_HOME` |
 | `projects/`, `groups/` under `ORQ_HOME` | one JSON per project and per group | `ORQ_HOME` |
 | `avisos/`, `retro/`, `digest/` under `ORQ_HOME` | full text of long notices; numbers of each saved retro; the digest | `ORQ_HOME` |
-| `~/.claude/orquestrador-plan/issues/` | tickets, `NN-<slug>.md` | `ORQ_ISSUES` |
+| `plan/` in the clone (gitignored) | the plan: tickets in `issues/` (`NN-<slug>.md`), reports in `relatorios/`, the design map `desenho.md`, `termos-proibidos.txt` | `ORQ_PLAN` (`ORQ_ISSUES` for the tickets alone) |
+| `.worktrees/` in the clone (gitignored) | the orq ticket worktrees and the integrator's | `ORQ_WT` |
 | a `backlog.md` you pick, outside this repo | the tasks-axi backlog | `ORQ_BACKLOG`, or the first line of `backlog.path` |
 | the dashboard's `pendencias.json` | the user's pending list (a mirror when a backlog is on) | `ORQ_PENDENCIAS` |
 | `~/.claude/logs/orq.log` | errors from hooks that failed open; uses of the Portuguese aliases | `ORQ_LOG` |
@@ -541,7 +531,7 @@ python3 scripts/limpar-mergeados.py --self-test
 
 The test runner fails on any `def test_` placed after `if __name__ == "__main__":` (it would never run); define tests above that block.
 
-Editing orq: hooks and the manager panel execute `orq.py` while it runs, so a half-edited file stops them. Work in a separate worktree (`git worktree add ../orq-<topic>`), run the tests there, and move the live copy only through `scripts/integrar.py <branch>...`, never `git merge`, `git pull` or `git checkout` inside the live checkout. It merges in a separate worktree, runs the tests there and advances `main` by fast-forward only when they pass; on a conflict you resolve in that worktree, commit, and run `integrar.py --avancar <worktree>`. Right after the fast-forward it runs `orq integrate conclude --hash <new main> <branch>...`. The `githooks/pre-commit` hook refuses a commit on `main` of the live checkout (a checkout that is not a linked worktree) and says to create a worktree; `ORQ_INTEGRADOR=1` is the explicit bypass. If `orqlib.py` fails to import, the hooks exit 0 with no output and log the failure instead of breaking the worker's turn. See `docs/design.md`, "Integrating branches outside the live checkout".
+Editing orq: hooks and the manager panel execute `orq.py` while it runs, so a half-edited file stops them. Work in a separate worktree (`git worktree add .worktrees/<topic>`), run the tests there, and move the live copy only through `scripts/integrar.py <branch>...`, never `git merge`, `git pull` or `git checkout` inside the live checkout. It merges in a separate worktree, runs the tests there and advances `main` by fast-forward only when they pass; on a conflict you resolve in that worktree, commit, and run `integrar.py --avancar <worktree>`. Right after the fast-forward it runs `orq integrate conclude --hash <new main> <branch>...`. The `githooks/pre-commit` hook refuses a commit on `main` of the live checkout (a checkout that is not a linked worktree) and says to create a worktree; `ORQ_INTEGRADOR=1` is the explicit bypass. If `orqlib.py` fails to import, the hooks exit 0 with no output and log the failure instead of breaking the worker's turn. See `docs/design.md`, "Integrating branches outside the live checkout".
 
 ## Portability and lock-in
 

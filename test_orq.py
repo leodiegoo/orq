@@ -6754,7 +6754,7 @@ def test_review8_m19_panel_touches_the_stamp_before_orq_and_with_broken_orq():
 
 def test_review8_m19_orq_worker_spec_requires_own_worktree():
     skill = open(os.path.join(HERE, "skills", "worker-routing", "SKILL.md")).read()
-    assert "git worktree add" in skill and "git pull" in skill and "~/.claude/orq" in skill
+    assert "git worktree add" in skill and "git pull" in skill and "orq clone" in skill
 
 
 # ---------- review-9 (B49 to B53 and the test Runs filter) ----------
@@ -9393,7 +9393,7 @@ def test_ticket73_hook_with_unknown_harness_exits_0_and_codex_example_installs_e
     cfg = json.load(open(os.path.join(HERE, "codex.hooks.example.json")))["hooks"]
     cmds = {h["command"] for g in cfg.values() for x in g for h in x["hooks"]}
     for k in ("prompt", "stop", "session", "place", "external", "prlink"):
-        assert f"/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook {k} codex" in cmds, k  # the example shows the interpreter path (ticket 228)
+        assert f"/opt/homebrew/bin/python3 /path/to/orq/orq.py hook {k} codex" in cmds, k  # the example shows the interpreter path (ticket 228)
     assert "apply_patch" in next(x["matcher"] for x in cfg["PreToolUse"] if "hook place" in json.dumps(x))
     assert not [c for c in cmds if "hook guard" in c or "hook ask" in c], "o Codex não tem AskUserQuestion"
 
@@ -10758,7 +10758,7 @@ def test_ticket55_advance_refuses_forgotten_conflict_marker():
 
 def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_log():
     t = tempfile.mkdtemp()
-    for f in ("orq.py", "precompact.py", "fail_safe.py"):
+    for f in ("orq.py", "precompact.py", "fail_safe.py", "orqpaths.py"):
         shutil.copy(os.path.join(HERE, f), t)
     open(os.path.join(t, "orqlib.py"), "w").write("<<<<<<< HEAD\nx = 1\n=======\nx = 2\n>>>>>>> outro\n")
     log = os.path.join(t, "orq.log")
@@ -10773,7 +10773,7 @@ def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_
     # the cleanup hook imports the orq of the installation (HOME/.claude/orq)
     home_dir = os.path.join(t, "casa")
     os.makedirs(os.path.join(home_dir, ".claude", "orq"))
-    for f in ("orq.py", "orqlib.py", "fail_safe.py"):
+    for f in ("orq.py", "orqlib.py", "fail_safe.py", "orqpaths.py"):
         shutil.copy(os.path.join(t, f), os.path.join(home_dir, ".claude", "orq"))
     r = subprocess.run([sys.executable, CLEAN_SCRIPT], input="{}", env={**env, "HOME": home_dir}, capture_output=True, text=True)
     assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), (r.returncode, r.stdout, r.stderr)
@@ -14497,7 +14497,7 @@ def test_it_should_be_that_an_orq_ticket_spec_gets_the_worktree_block():
         assert r.returncode == 0, r.stderr
     for arg in _log(a, "started.log"):
         spec = arg[arg.index("--spec") + 1]
-        assert spec.count("## orq worktree") == 1 and "~/.claude/orq-wt/" in spec and "Never commit on `main`" in spec, spec
+        assert spec.count("## orq worktree") == 1 and a.env["ORQ_WT_ROOT"] + "/" in spec and "Never commit on `main`" in spec, spec
 
 
 def test_it_should_be_that_a_non_orq_ticket_spec_gets_no_worktree_block():
@@ -14513,7 +14513,7 @@ def test_it_should_be_that_dispatching_an_orq_ticket_by_number_appends_the_block
     for _ in range(2):
         a.orq("despachar", "--run", "run_a", "--ticket", "01", "--modelo", "claude-sonnet-5-5", "--effort", "medium", FAKE_FAIL="")
     txt = open(next(os.path.join(a.env["ORQ_ISSUES"], n) for n in os.listdir(a.env["ORQ_ISSUES"]) if n.startswith("01-"))).read()
-    assert txt.count("## orq worktree") == 1 and "~/.claude/orq-wt/01" in txt, txt
+    assert txt.count("## orq worktree") == 1 and os.path.join(a.env["ORQ_WT_ROOT"], "01") in txt, txt
 
 
 def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_not_the_integrator():
@@ -17031,7 +17031,7 @@ def test_ticket182_read_failure_keeps_the_command_hint():
 def _broken_install228(source='x = f"{"a"}" +\n'):
     """Temporary install with an orqlib that does not compile; returns (folder, env with ORQ_HOME/ORQ_LOG inside it, the notifier's record file)."""
     t = tempfile.mkdtemp()
-    for f in ("orq.py", "precompact.py", "fail_safe.py"):
+    for f in ("orq.py", "precompact.py", "fail_safe.py", "orqpaths.py"):
         shutil.copy(os.path.join(HERE, f), t)
     open(os.path.join(t, "orqlib.py"), "w").write(source)
     record = os.path.join(t, "notified.log")
@@ -17197,6 +17197,170 @@ def test_ticket228_the_pin_should_leave_the_other_hooks_and_the_file_formatting_
     assert "python3 ~/.claude/hooks/worker-routing-guard.py" in after, "only orq's own commands are pinned"
     assert after.count(sys.executable + " ~/.claude/orq/orq.py hook") + after.count(sys.executable + " ~/.claude/orq/precompact.py") == before.count("python3 ~/.claude/orq/")
     assert after.replace(sys.executable, "python3") == before, "same file, only the interpreter changed"
+
+
+# ---------- ticket 124: the code finds itself; state, plan and worktrees live in the clone; `orq install` wires the harnesses ----------
+
+PATH_VARS124 = ("ORQ_HOME", "ORQ_PLAN", "ORQ_WT", "ORQ_WT_ROOT", "ORQ_LINK", "ORQ_CLAUDE_SETTINGS", "ORQ_CODEX_HOOKS", "ORQ_CODEX_CONFIG", "CODEX_HOME", "ORQ_LAUNCH_AGENTS")
+
+
+def _clone124(t):
+    """A copy of the code in `t/clone` (the root modules, the examples and the folders `orq install` links), without git and without state."""
+    clone = os.path.join(t, "clone")
+    os.makedirs(clone)
+    for f in os.listdir(HERE):
+        if (f.endswith(".py") and not f.startswith(("test_", "suite_"))) or f.endswith(".example.json"):
+            shutil.copy(os.path.join(HERE, f), clone)
+    for d in ("hooks", "scripts", "skills", "commands"):
+        shutil.copytree(os.path.join(HERE, d), os.path.join(clone, d), ignore=shutil.ignore_patterns("__pycache__"))
+    return clone
+
+
+def _env124(home, **extra):
+    env = {k: v for k, v in os.environ.items() if k not in PATH_VARS124}
+    return {**env, "HOME": home, "ORQ_ORCA": "/nao/existe/orca", "ORQ_LOG": os.path.join(home, "orq.log"), "ORQ_PYTHON": sys.executable, **extra}
+
+
+def test_ticket124_orq_runs_with_the_code_in_one_folder_and_the_state_in_another():
+    t = os.path.realpath(tempfile.mkdtemp())
+    clone, state = _clone124(t), os.path.join(t, "state")
+    run = lambda **e: subprocess.run([sys.executable, os.path.join(clone, "orq.py"), "alert", "seen", "t1"], env=_env124(t, **e), capture_output=True, text=True)  # noqa: E731
+    r = run(ORQ_HOME=state)
+    assert r.returncode == 0, r.stderr
+    assert os.path.exists(os.path.join(state, "events.jsonl")) and not os.path.exists(os.path.join(clone, "events.jsonl")), os.listdir(clone)
+    r = run()
+    assert r.returncode == 0 and os.path.exists(os.path.join(clone, "events.jsonl")), "without ORQ_HOME the state lives in the clone itself"
+    where = subprocess.run([sys.executable, "-c", "import orqpaths as p; print(p.HOME, p.PLAN, p.WT, sep='\\n')"], cwd=clone, env=_env124(t), capture_output=True, text=True)
+    assert where.stdout.split() == [clone, os.path.join(clone, "plan"), os.path.join(clone, ".worktrees")], where
+
+
+def test_ticket124_the_old_plan_and_worktrees_are_read_only_while_the_old_link_stands_and_the_new_folders_do_not_exist():
+    t = os.path.realpath(tempfile.mkdtemp())
+    clone = _clone124(t)
+    os.makedirs(os.path.join(t, ".claude", "orquestrador-plan"))
+    os.makedirs(os.path.join(t, ".claude", "orq-wt"))
+    show = lambda: subprocess.run([sys.executable, "-c", "import orqpaths as p; print(p.PLAN, p.WT)"], cwd=clone, env=_env124(t), capture_output=True, text=True).stdout.split()  # noqa: E731
+    assert show() == [os.path.join(clone, "plan"), os.path.join(clone, ".worktrees")], "no old link: the new folders, even before they exist"
+    os.symlink(clone, os.path.join(t, ".claude", "orq"))
+    assert show() == [os.path.join(t, ".claude", "orquestrador-plan"), os.path.join(t, ".claude", "orq-wt")], "the link stands and the plan has not moved yet"
+    os.makedirs(os.path.join(clone, "plan"))
+    os.makedirs(os.path.join(clone, ".worktrees"))
+    assert show() == [os.path.join(clone, "plan"), os.path.join(clone, ".worktrees")], "moved: the new folders win"
+
+
+def test_ticket124_a_linked_worktree_finds_the_main_checkout():
+    t = os.path.realpath(tempfile.mkdtemp())
+    repo = os.path.join(t, "orq")
+    g = lambda *x: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True)  # noqa: E731
+    os.makedirs(repo)
+    g("init", "-q", "-b", "trunk")
+    g("commit", "-q", "--allow-empty", "-m", "base")
+    g("worktree", "add", "-q", "-b", "feat/x", os.path.join(repo, ".worktrees", "124"))
+    g("worktree", "add", "-q", "-b", "feat/y", os.path.join(t, "elsewhere"))
+    assert orq_mod.orqpaths.main_checkout(repo) == repo
+    assert orq_mod.orqpaths.main_checkout(os.path.join(repo, ".worktrees", "124")) == repo
+    assert orq_mod.orqpaths.main_checkout(os.path.join(t, "elsewhere")) == repo
+    assert orq_mod.orqpaths.main_checkout(t) == t, "not a repository: the folder itself"
+
+
+def test_ticket124_install_repoints_hooks_in_place_appends_the_missing_ones_and_links_everything_in_a_test_home():
+    t = os.path.realpath(tempfile.mkdtemp())
+    clone = _clone124(t)
+    old = "/old/place/orq"
+    os.makedirs(os.path.join(t, ".claude", "skills", "worker-routing"))  # a real folder: never replaced
+    os.makedirs(os.path.join(t, ".agents", "skills"))
+    os.symlink(f"{old}/skills/away", os.path.join(t, ".agents", "skills", "away"))
+    settings = os.path.join(t, ".claude", "settings.json")
+    json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/mine.py"}]},
+                                  {"hooks": [{"type": "command", "command": f"/usr/bin/python3 {old}/orq.py hook stop"}]}]},
+               "statusLine": {"type": "command", "command": 'D=$HOME/.claude; W=$D/orq/statusline.sh; sh "$W"'}}, open(settings, "w"), indent=2)
+    hooks = os.path.join(t, ".codex", "hooks.json")
+    os.makedirs(os.path.dirname(hooks))
+    json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]},
+                                  {"hooks": [{"type": "command", "command": f"/usr/bin/python3 {old}/orq.py hook stop codex"}]}]}}, open(hooks, "w"), indent=2)
+    plists = os.path.join(t, "Library", "LaunchAgents")
+    os.makedirs(plists)
+    import plistlib
+    plistlib.dump({"Label": "com.orq.gerente", "ProgramArguments": [sys.executable, f"{old}/orq.py", "gerente", "serve"], "EnvironmentVariables": {"ORQ_HOME": old}},
+                  open(os.path.join(plists, "com.orq.gerente.plist"), "wb"))
+    install = lambda: subprocess.run([sys.executable, os.path.join(clone, "orq.py"), "install"], env=_env124(t), capture_output=True, text=True)  # noqa: E731
+    r = install()
+    assert r.returncode == 0, r.stderr
+    s = json.load(open(settings))
+    assert s["hooks"]["Stop"][0]["hooks"][0]["command"] == "python3 ~/.claude/hooks/mine.py", "a hook that is not orq's is left alone"
+    assert s["hooks"]["Stop"][1]["hooks"][0]["command"] == f"/usr/bin/python3 {clone}/orq.py hook stop", "repointed where it was, interpreter kept"
+    assert s["statusLine"]["command"] == f'D=$HOME/.claude; W={clone}/statusline.sh; sh "$W"', s["statusLine"]
+    commands = [h["command"] for groups in s["hooks"].values() for g in groups for h in g["hooks"]]
+    assert sum("hook stop" in c for c in commands) == 1, "the repointed Stop is not appended again"
+    assert any(c == f"{sys.executable} {clone}/orq.py hook prompt" for c in commands), commands
+    c = json.load(open(hooks))["hooks"]
+    assert [g["hooks"][0]["command"] for g in c["Stop"]] == ["mine", f"/usr/bin/python3 {clone}/orq.py hook stop codex"], "Codex keeps each group in its position"
+    assert any(f"{clone}/orq.py hook prompt codex" in g["hooks"][0]["command"] for g in c["UserPromptSubmit"])
+    for link, target in orq_mod.INSTALL_LINKS:
+        link = link.replace("~", t, 1)
+        if link.endswith(".claude/skills/worker-routing"):
+            assert not os.path.islink(link) and f"kept: {link} is not a link" in r.stdout, r.stdout
+        else:
+            assert os.readlink(link) == os.path.join(clone, target), (link, os.readlink(link))
+    assert os.path.exists(os.path.join(t, ".agents", "skills", "away", "SKILL.md")), "the link through the old path now points at the clone"
+    wrapper = open(os.path.join(t, ".local", "bin", "orq")).read()
+    assert wrapper == f"#!/bin/sh\nexec {sys.executable} {clone}/orq.py \"$@\"\n", wrapper
+    assert "launchd:" in r.stdout and "orq manager serve --install" in r.stdout, r.stdout
+    before = [open(f).read() for f in (settings, hooks)]
+    again = install()
+    assert again.returncode == 0 and "linked:" not in again.stdout and "repointed" not in again.stdout and "added" not in again.stdout, again.stdout
+    assert [open(f).read() for f in (settings, hooks)] == before, "idempotent: the second run writes nothing"
+
+
+def test_ticket124_no_fixed_install_plan_or_worktree_path_in_the_versioned_files():
+    files = subprocess.run(["git", "-C", HERE, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], capture_output=True, text=True, check=True).stdout.split("\0")
+    pattern = re.compile(r"\.claude/(?:orq|orquestrador-plan|orq-wt)\b")
+    hits = []
+    for f in filter(None, files):
+        if f.startswith("fixtures/") or re.match(r"test_\w+\.py$", f):
+            continue  # recorded outputs and the tests' own inputs
+        try:
+            lines = open(os.path.join(HERE, f), encoding="utf-8").read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        hits += [f"{f}:{n}: {line.strip()[:120]}" for n, line in enumerate(lines, 1) if pattern.search(line) and "legacy" not in line]
+    assert not hits, "\n".join(hits)
+
+
+def test_ticket124_install_takes_a_hook_written_differently_as_the_same_hook_and_keeps_a_symlinked_settings_a_link():
+    t = os.path.realpath(tempfile.mkdtemp())
+    clone = _clone124(t)
+    dotfiles = os.path.join(t, "dotfiles", "settings.json")
+    os.makedirs(os.path.dirname(dotfiles))
+    os.makedirs(os.path.join(t, ".claude"))
+    os.symlink(dotfiles, os.path.join(t, ".claude", "settings.json"))
+    example = json.load(open(os.path.join(HERE, "settings.hooks.example.json")))
+    for groups in example["hooks"].values():  # the user's file: the example as installed long ago (absolute home, pt hook names, another folder)
+        for g in groups:
+            for h in g["hooks"]:
+                h["command"] = (h["command"].replace("~/", t + "/").replace("hook place", "hook lugar").replace("hook external", "hook externas")
+                                .replace("hook prlink", "hook prligar").replace("/path/to/orq/", "/old/orq/"))
+    example["hooks"]["PreCompact"].append({"hooks": [{"type": "command", "command": "python3 /opt/plugin/precompact.py --flag"}]})
+    example["hooks"]["Stop"][0]["hooks"][0]["command"] += " 2>>/tmp/orq.py.log"
+    json.dump(example, open(dotfiles, "w"), indent=2)
+    os.chmod(dotfiles, 0o600)
+    r = subprocess.run([sys.executable, os.path.join(clone, "orq.py"), "install"], env=_env124(t), capture_output=True, text=True)
+    assert r.returncode == 0 and "claude: added" not in r.stdout, r.stdout
+    assert os.path.islink(os.path.join(t, ".claude", "settings.json")) and oct(os.stat(dotfiles).st_mode & 0o777) == "0o600", "the dotfiles link and the mode stay"
+    commands = [h["command"] for groups in json.load(open(dotfiles))["hooks"].values() for g in groups for h in g["hooks"]]
+    assert sum("worker-routing-guard.py" in c for c in commands) == 1 and sum("hook lugar" in c or "hook place" in c for c in commands) == 1, commands
+    assert "python3 /opt/plugin/precompact.py --flag" in commands, "another tool's precompact.py is not orq's"
+    assert f"{clone}/orq.py hook stop 2>>/tmp/orq.py.log" in " ".join(commands), "only the orq script moves, not a log path"
+
+
+def test_ticket124_an_edit_in_a_ticket_worktree_inside_the_clone_is_not_the_checkout_in_use():
+    live, wt = orq_mod.ORQ_INSTALL, orq_mod.WT_ROOT
+    try:
+        orq_mod.WT_ROOT = os.path.join(live, ".worktrees")
+        assert orq_mod._in_live_checkout(os.path.join(live, "orqlib.py"))
+        assert not orq_mod._in_live_checkout(os.path.join(live, ".worktrees", "124", "orqlib.py"))
+    finally:
+        orq_mod.WT_ROOT = wt
 
 
 if __name__ == "__main__":

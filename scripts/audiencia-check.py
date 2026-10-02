@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Looks for forbidden terms in the versioned files of the public repository.
 
-The list lives outside the repository (ORQ_TERMOS, default ~/.claude/orquestrador-plan/termos-proibidos.txt): one term per line,
+The list is not versioned (ORQ_TERMOS, default termos-proibidos.txt in the plan, ORQ_PLAN): one term per line,
 case-insensitive; `re:` at the start of a line makes it a regular expression; `#` comments. Without the list, it warns and exits 0.
 Fails (1) with file:line. Usage: audiencia-check.py [repository-root]"""
 import os
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import orqpaths  # noqa: E402
 
 
 def terms(path):
@@ -35,7 +38,7 @@ def findings(root, defaults):
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    listing = os.environ.get("ORQ_TERMOS") or os.path.expanduser("~/.claude/orquestrador-plan/termos-proibidos.txt")
+    listing = os.environ.get("ORQ_TERMOS") or os.path.join(orqpaths.PLAN, "termos-proibidos.txt")
     if not os.path.exists(listing):
         print(f"audiencia-check: sem {listing}, checagem pulada", file=sys.stderr)
         return 0

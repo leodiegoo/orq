@@ -28,20 +28,23 @@ from datetime import datetime, timedelta, timezone
 import backlog
 import cmdnorm
 import fail_safe
+import orqpaths
 
 
 def ThreadPoolExecutor(n):  # late import: concurrent.futures costs ~11 ms and only the panel and the ingest use it (ticket 49)
     from concurrent.futures import ThreadPoolExecutor as _T
     return _T(n)
 
-HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
+HOME = orqpaths.HOME  # the clone (ORQ_HOME overrides); the plan and the integration worktrees live in it too (ticket 124)
+PLAN = orqpaths.PLAN  # tickets, specs, reports and the design map (ORQ_PLAN)
+WT_ROOT = orqpaths.WT  # the orq ticket worktrees and the integrator's (ORQ_WT)
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
 GIT = os.environ.get("ORQ_GIT") or "git"
-CLEAN_SCRIPT = os.environ.get("ORQ_LIMPAR") or os.path.expanduser("~/.claude/scripts/limpar-mergeados.py")
+CLEAN_SCRIPT = os.environ.get("ORQ_LIMPAR") or os.path.join(orqpaths.HERE, "scripts", "limpar-mergeados.py")
 CLEAN_DELAY_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # the same delay as the "merged" hook
 CLOSED_DAYS = float(os.environ.get("ORQ_FECHADO_DIAS") or 1)  # days between the task's last PR closed without merge and the automatic branch cleanup
-REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.expanduser("~/.claude/orquestrador-plan/relatorios")
+REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(PLAN, "relatorios")
 FINAL_BASE = os.environ.get("ORQ_FINAL_BASE")  # forces the base that closes out the branch; without it, the project's production applies (same as limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 ASK_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # how long `orq ask` waits for the answer before leaving the pending item open
@@ -137,8 +140,8 @@ MUTA_RUN = {"worker-start", "send", "check", "reply", "task-create", "task-updat
 NOTICE_FINAL = re.compile(r"You have \d+ orchestration messages?\. Run `orca orchestration check --run run_\w+(?: --terminal [\w-]+)?`\.?\s*$")  # the Orca notice at the end of the prompt (B26)  # the Orca notice cites the Run: "Run `orca orchestration check --run <r>`."
 WAIT_REPORT_S = 3600  # Orca marks the terminal automation as completed before the agent writes the report: waits up to 1 h for the file
 CHOICE_LAVISH = ("escolha", "escolhida", "decidido", "manter", "trocar")  # disposicao of a Lavish item that closes the decision (with an answer); the rest is a free-form answer
-ISSUES = os.environ.get("ORQ_ISSUES") or os.path.expanduser("~/.claude/orquestrador-plan/issues")  # one file per ticket: NN-<slug>.md
-MAP = os.environ.get("ORQ_MAPA") or os.path.expanduser("~/.claude/orquestrador-plan/desenho.md")  # plan map (optional): Destino, Notes, Decisões até aqui, Não especificado; see docs/design.md
+ISSUES = os.environ.get("ORQ_ISSUES") or os.path.join(PLAN, "issues")  # one file per ticket: NN-<slug>.md
+MAP = os.environ.get("ORQ_MAPA") or os.path.join(PLAN, "desenho.md")  # plan map (optional): Destino, Notes, Decisões até aqui, Não especificado; see docs/design.md
 STATUS_NEW = "ready-for-agent"  # the triage role from docs/agents/triage-labels.md: complete ticket, ready for an agent
 STATUS_IN_PROGRESS = "claimed"  # despachar --ticket sets this status: the ticket already has a worker (B24)
 STATUS_CLOSED = "resolved"
@@ -172,7 +175,7 @@ SCREEN_FAILURE = ("No conversation found", "command not found")  # claude --resu
 
 # ---------- harness (claude | codex) ----------
 # What changes from one agent to another, in a table: the resume command (the launch is Orca's, `worker-start --agent`) and the screen patterns.
-# An agent outside the table has no orq hook and no screen read: its state stays `unknown`. Design: ~/.claude/orquestrador-plan/orq-claude-e-codex.md
+# An agent outside the table has no orq hook and no screen read: its state stays `unknown`. Design: orq-claude-e-codex.md in the plan (ORQ_PLAN)
 HARNESS = {
     "claude": {
         "resume": lambda session, model, effort, msg: ["claude", "--resume", session, *(["--model", model] if model else []),
@@ -469,7 +472,7 @@ def audit_publication(revs, repo=None):
     git = lambda *x: subprocess.run(["git", *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
     expected = os.environ.get("ORQ_AUTOR") or git("config", "user.email").strip()
     terms = []
-    listing = os.environ.get("ORQ_TERMOS") or os.path.expanduser("~/.claude/orquestrador-plan/termos-proibidos.txt")
+    listing = os.environ.get("ORQ_TERMOS") or os.path.join(PLAN, "termos-proibidos.txt")
     if os.path.exists(listing):
         spec = importlib.util.spec_from_file_location("audiencia_check", os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "audiencia-check.py"))
         mod = importlib.util.module_from_spec(spec)
@@ -573,8 +576,8 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
     Never `--force` nor `rm -rf`. `resolved_tickets` and `live` are sets of ticket numbers (default: the tickets with Status resolved; the unreleased dispatches).
     Returns {removidas: [{pasta, branch, via}], ficaram: [{pasta, motivo}], bundle}; with `dry_run` nothing is removed or recorded."""
     repo = repo or HOME
-    root = root or os.environ.get("ORQ_WT_ROOT", os.path.expanduser("~/.claude/orq-wt"))
-    backups = backups or os.path.expanduser("~/.claude/orquestrador-plan/backups")
+    root = root or WT_ROOT
+    backups = backups or os.path.join(PLAN, "backups")
     now_at = now_at if now_at is not None else time.time()
     if resolved_tickets is None:
         resolved_tickets = {t["num"] for t in tickets() if t["status"] == STATUS_CLOSED}
@@ -1518,7 +1521,7 @@ def handle_orca():
     return g["gerente"] if isinstance(g, dict) and mine and g.get("coordenador") == mine and g.get("gerente") else mine
 
 
-# ---------- state in English on disk (phase 2 of the migration; plan in ~/.claude/orquestrador-plan/orq-ingles-plano.md) ----------
+# ---------- state in English on disk (phase 2 of the migration; plan in orq-ingles-plano.md, in the plan) ----------
 # The code keeps reading and building the keys in pt; the ORQ_HOME disk stays in English. Every write goes through to_en and every read through
 # to_pt, which accepts both formats: a stray pt event (a worker or an old branch) is still read. The same map serves scripts/migrar-ingles.py.
 # A new key written in English cannot be a destination of this map (the read would swap it for the pt key); the map's test checks the fixture's keys.
@@ -2186,7 +2189,7 @@ def _pr_commits(url):
 
 
 def _worker_repos(m, p):
-    """The dispatch's worktree (worker-list) and then the ORQ_REPOS repositories (default ~/.claude/orq)."""
+    """The dispatch's worktree (worker-list) and then the ORQ_REPOS repositories (default: the orq clone)."""
     repos = []
     try:
         for w in _all_workers(m["run_id"]):
@@ -2195,7 +2198,7 @@ def _worker_repos(m, p):
                 repos += [wt] if wt.startswith("/") else []
     except Exception as e:  # noqa: BLE001
         log(f"delivery: worker-list failed ({type(e).__name__}: {e}); ORQ_REPOS only")
-    return repos + [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+    return repos + [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]
 
 
 def _already_has_event(type_name, msg):
@@ -2230,7 +2233,7 @@ def _dispatch_worktree(run, dispatch):
 
 def _text_branch(text_value):
     """The first branch cited in the text that exists in an ORQ_REPOS repository (`git rev-parse --verify`), or None: `docs/design.md` is not a branch."""
-    repos = [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+    repos = [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]
     return next((b for b in dict.fromkeys(BRANCH_RE.findall(text_value)) if any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)), None)
 
 
@@ -2241,7 +2244,7 @@ def _environment_branch(b):
 
 def _orq_branch(b):
     """`b` if it is an orq working branch (exists in an ORQ_REPOS repository and is not an environment branch), otherwise None: a product's worktree does not enter the queue."""
-    repos = [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+    repos = [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]
     ok = b and not _environment_branch(b) and any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)
     return b if ok else None
 
@@ -2252,9 +2255,9 @@ def _payload_branch(b):
 
 
 def _orq_wt_branch(number):
-    """The branch of the `~/.claude/orq-wt/<ticket>` convention worktree (or `t<ticket>`; ORQ_WT_ROOT changes the root), or None. An orq ticket is dispatched with `--worktree
+    """The branch of the `<ORQ_WT>/<ticket>` convention worktree (or `t<ticket>`), or None. An orq ticket is dispatched with `--worktree
     current`: the dispatch's worktree is the product's, and the one holding the delivery branch is this one."""
-    root = os.environ.get("ORQ_WT_ROOT", os.path.expanduser("~/.claude/orq-wt"))
+    root = WT_ROOT
     for item_name in dict.fromkeys((number, number.lstrip("0"), f"t{number}", f"t{number.lstrip('0')}")):
         d = os.path.join(root, item_name)
         if os.path.isdir(d) and (b := _orq_branch((_git(d, "branch", "--show-current") or "").strip())):
@@ -2277,7 +2280,7 @@ def _integrator_terminal(events):
 
 def _orq_delivery(m, p):
     """worker_done `succeeded` of an orq ticket (the task is the `Task:` of an ISSUES ticket; the product's do not enter) with a branch in the payload or the text ->
-    `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `orq-wt/<ticket>` worktree, the dispatch worktree's current branch and only
+    `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `<ORQ_WT>/<ticket>` worktree, the dispatch worktree's current branch and only
     last from the text; an environment branch and a branch outside ORQ_REPOS never enter, if it exists in the orq repository. With no branch: log and `delivery` event with a warning, the coordinator adds it by hand.
     The notice is typed once (busy: tries to queue it on the turn; if still not, only the queue remains, which the integrator reads in its cycle). Returns the ticket or None."""
     if p.get("outcome") != "succeeded" or not p.get("taskId") or _already_has_event("entrega_orq", m["id"]):
@@ -3919,7 +3922,7 @@ def _pr_contract(i, now_at=None):
 def _merge_tree(a, b):
     """The files in conflict when merging branches `a` and `b` (`git merge-tree`, touching nothing), [] if they merge cleanly, None if it could not be determined
     (branch outside the clone, old git). Searches the repositories in ORQ_REPOS, by `origin/<branch>` and then by the local branch."""
-    for repo in [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]:
+    for repo in [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]:
         refs = [next((r for r in (f"origin/{h}", h) if _git(repo, "rev-parse", "--verify", "-q", r + "^{commit}")), None) for h in (a, b)]
         if not all(refs):
             continue
@@ -4941,7 +4944,7 @@ def _no_push():
         return None
 
 
-CYCLES_LOG = os.environ.get("ORQ_CICLOS_LOG") or os.path.expanduser("~/.claude/orq-wt/integracao/ciclos.log")
+CYCLES_LOG = os.environ.get("ORQ_CICLOS_LOG") or os.path.join(WT_ROOT, "integracao", "ciclos.log")
 
 
 def _integrator_pending(events):
@@ -5262,7 +5265,7 @@ def hook_guard(ev, run):
               'resposta (the answer) and disposicao; only the disposicao "escolha" (or "manter"/"trocar") with a resposta closes the decision, "livre", "adiar" and "conversar" '
               "leave it open), run `lavish-axi poll <file.html>` and record the poll output, raw, with `orq lavish-answer <file>` "
               "(`-` reads from stdin). AskUserQuestion only applies with no active worker. Stuck dispatch? "
-              "`orca orchestration worker-stop --dispatch <id>` or `touch ~/.claude/orq/ask-guard.off`.")
+              f"`orca orchestration worker-stop --dispatch <id>` or `touch {shlex.quote(_path('ask-guard.off'))}`.")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
 
 
@@ -5509,7 +5512,7 @@ def run_hook(kind, harness="claude"):
 
 
 # ---------- grupos e secondmates (ticket 80) ----------
-# Design: ~/.claude/orquestrador-plan/secondmate-por-grupo.md. A group (ORQ_HOME/groups/<name>.json) gathers the projects of one domain; the group's mate is
+# Design: secondmate-por-grupo.md in the plan. A group (ORQ_HOME/groups/<name>.json) gathers the projects of one domain; the group's mate is
 # a coordinator session with ORQ_MATE=<name> in the environment, which `orq mate open_page` brings up in a terminal (not via worker-start: without a dispatch, there is no
 # capability for Orca to revoke after the first worker_done). The channel is events.jsonl: the coordinator asks (`mate_pedido`, id pN, deadline), the mate
 # comes up (`entry` origin mate, with `corr` when answering a request), and the manager enforces the deadline (mate_lap).
@@ -5738,7 +5741,7 @@ def _mate_command(group_name, cfg, session, cwd=None, was_sleeping=False):
     mine = backlog_group(group_name, cfg)  # the group that already received tickets (`orq backlog mover`) reads and writes its own backlog, not the machine's
     environment = f"ORQ_MATE={shlex.quote(group_name)} " + (f"ORQ_BACKLOG={shlex.quote(mine)} " if mine and os.path.exists(mine) else "")
     command = environment + shlex.join([x for x in cmd if x is not None])
-    # Orca only creates a terminal in a worktree it knows, and the group's folder (~/.claude/orq) is not one: the terminal opens in the current checkout and cds into it.
+    # Orca only creates a terminal in a worktree it knows, and the group's folder (the orq clone) is not one: the terminal opens in the current checkout and cds into it.
     # `cd x; y` works in fish, zsh and bash; claude's resume only finds the session in the cwd where it was born
     return (f"cd {shlex.quote(cwd)}; {command}" if cwd else command), (" ".join(text_value.split()) if typed else None)  # the line break would submit in the middle
 
@@ -7291,7 +7294,7 @@ def doctor_backlog():
         for item_name in sorted(os.listdir(ISSUES)):
             if _FILE_NUM.match(item_name) and f"t{item_name.split('-')[0]}" not in ids and f"t{int(item_name.split('-')[0])}" not in ids:
                 problems.append({"ticket": item_name.split("-")[0].zfill(2), "problema": f"the file {item_name} has no item in any backlog",
-                                  "conserto": "python3 ~/.claude/orq/scripts/converte-backlog.py --completa"})
+                                  "conserto": f"python3 {shlex.quote(os.path.join(orqpaths.HERE, 'scripts', 'converte-backlog.py'))} --completa"})
     except FileNotFoundError:
         pass
     return {"tickets": len(tks), "tasks": sum(len(v) for v in by_run.values()), "problemas": problems, "avisos": notices}
@@ -8492,9 +8495,13 @@ def _check_start(dispatch, terminal, title, out):
 
 
 def _command_key(command):
-    """The command without the interpreter of an orq hook: `python3 x/orq.py hook stop` and `/opt/homebrew/bin/python3 x/orq.py hook stop` are the same hook (ticket 247)."""
-    first = hook_interpreter(command)
-    return command[len(first):].lstrip() if first else command
+    """What makes two hook commands the same hook. An orq hook is its call, with the pt hook name mapped: `python3 x/orq.py hook lugar` and
+    `/opt/homebrew/bin/python3 y/orq.py hook place` are one hook (tickets 247 and 124). Any other command counts with `~/` and `$HOME/` expanded."""
+    if m := HOOK_ORQ.search(command or ""):
+        head, _, last = m.group(0).rpartition(" ")
+        return f"orq {head} {HOOK_EN.get(last, last)}" if head else f"orq {last}"
+    home = os.path.expanduser("~")
+    return re.sub(r"(^|\s)(?:~|\$HOME)/", lambda x: f"{x.group(1)}{home}/", command or "")
 
 
 def merge_codex_hooks(current, example):
@@ -8513,27 +8520,127 @@ def merge_codex_hooks(current, example):
     return new, add
 
 
-def install_codex_hooks(example):
-    """Merges the example into CODEX_HOOKS (a missing file counts as empty) and returns the groups appended. JSON that cannot be read raises: nothing is written."""
+def install_hooks(example, target):
+    """Merges the example into the hooks file `target` (a missing file counts as empty) and returns the groups appended. The example's commands get this
+    clone's path and the 3.12+ interpreter. JSON that cannot be read raises: nothing is written."""
     try:
-        current = json.load(open(CODEX_HOOKS, encoding="utf-8"))
+        current = json.load(open(target, encoding="utf-8"))
     except FileNotFoundError:
         current = {}
     example_hooks = json.load(open(example, encoding="utf-8"))
-    if python := resolve_python():  # what is appended runs the 3.12+ interpreter, not whatever `python3` the PATH has
-        for group_map in _dict(example_hooks.get("hooks")).values():
-            for g in group_map:
-                for h in g.get("hooks", []):
-                    if first := hook_interpreter(h.get("command")):
-                        h["command"] = python + h["command"][len(first):]
+    python = resolve_python()  # what is appended runs the 3.12+ interpreter, not whatever `python3` the PATH has
+    for group_map in _dict(example_hooks.get("hooks")).values():
+        for g in group_map:
+            for h in g.get("hooks", []):
+                h["command"] = _repoint(h.get("command") or "")
+                if python and (first := hook_interpreter(h["command"])):
+                    h["command"] = python + h["command"][len(first):]
     new, add = merge_codex_hooks(current, example_hooks)
     if add:
-        tmp = f"{CODEX_HOOKS}.{os.getpid()}.tmp"
-        os.makedirs(os.path.dirname(CODEX_HOOKS) or ".", exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(new, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, CODEX_HOOKS)
+        _replace_config(target, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
     return add
+
+
+def _replace_config(file_name, text):
+    """Writes a harness config through tmp + rename: into the file a symlink points at (a dotfiles repo keeps its link) and with the old mode."""
+    real = os.path.realpath(file_name)
+    os.makedirs(os.path.dirname(real) or ".", exist_ok=True)
+    tmp = f"{real}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    with contextlib.suppress(OSError):
+        shutil.copymode(real, tmp)
+    os.replace(tmp, real)
+
+
+def install_codex_hooks(example):
+    return install_hooks(example, CODEX_HOOKS)
+
+
+ORQ_FILE_PATH = re.compile(r"[^\s\"';=]*/(orq\.py(?= hook )|precompact\.py(?= retomar\b|\s*$))")  # the script of an orq hook, not a log path that ends in .py
+STATUSLINE_PATH = re.compile(r"[^\s\"';=]*/orq/statusline\.sh\b")
+
+
+def _repoint(command):
+    """The command with the path of orq.py and precompact.py (in an orq hook) or of orq's statusline.sh swapped for this clone's (ticket 124)."""
+    if HOOK_ORQ.search(command):
+        return ORQ_FILE_PATH.sub(lambda m: os.path.join(orqpaths.CODE, m.group(1)), command, count=1)
+    return STATUSLINE_PATH.sub(lambda m: os.path.join(orqpaths.CODE, "statusline.sh"), command)
+
+
+def repoint_hooks(file_name):
+    """Rewrites in place, as a text edit, every orq command of a settings.json or hooks.json that runs another folder's orq.py, precompact.py or
+    statusline.sh: the rest of the file and the order of Codex's groups stay as they were. Returns how many commands changed; 0 without the file."""
+    try:
+        text = open(file_name, encoding="utf-8").read()
+    except FileNotFoundError:
+        return 0
+    changed = 0
+
+    def swap(m):
+        nonlocal changed
+        old = json.loads(f'"{m.group(2)}"')
+        if (new := _repoint(old)) == old:
+            return m.group(0)
+        changed += 1
+        return m.group(1) + json.dumps(new, ensure_ascii=False)[1:-1] + m.group(3)
+
+    new = re.sub(r'("command"\s*:\s*")((?:[^"\\]|\\.)*)(")', swap, text)
+    if changed:
+        json.loads(new)  # never leave a hooks file that does not parse
+        _replace_config(file_name, new)
+    return changed
+
+
+# (where the harness reads it, what it points at in the clone): what `orq install` links
+INSTALL_LINKS = (("~/.claude/hooks/worker-routing-guard.py", "hooks/worker-routing-guard.py"), ("~/.claude/hooks/limpar-mergeados-hook.py", "hooks/limpar-mergeados-hook.py"),
+                 ("~/.claude/scripts/limpar-mergeados.py", "scripts/limpar-mergeados.py"), ("~/.claude/scripts/limpar-mergeados.keep", "scripts/limpar-mergeados.keep"),
+                 ("~/.claude/scripts/orca-wait-runs.py", "scripts/orca-wait-runs.py"), ("~/.claude/scripts/trust-cwd.py", "scripts/trust-cwd.py"),
+                 ("~/.claude/skills/worker-routing", "skills/worker-routing"), ("~/.claude/commands/away.md", "commands/away.md"),
+                 ("~/.agents/skills/worker-routing", "skills/worker-routing"), ("~/.agents/skills/away", "skills/away"))
+
+
+def install_links():
+    """Points each INSTALL_LINKS link at this clone: creates it, or replaces a link that points anywhere else (a link through the old install path included).
+    A real file or folder in its place is left alone and reported. Returns one line per change."""
+    out = []
+    for link, target in INSTALL_LINKS:
+        link, target = os.path.expanduser(link), os.path.join(orqpaths.CODE, target)
+        if os.path.islink(link) and os.readlink(link) == target:
+            continue
+        if os.path.lexists(link) and not os.path.islink(link):
+            out.append(f"kept: {link} is not a link (move it away and run again)")
+            continue
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        tmp = f"{link}.{os.getpid()}.tmp"
+        os.symlink(target, tmp)
+        os.replace(tmp, link)
+        out.append(f"linked: {link} -> {target}")
+    return out
+
+
+def install():
+    """`orq install`: wires the harnesses to this clone (ticket 124). Repoints the orq commands already in ~/.claude/settings.json and ~/.codex/hooks.json,
+    appends the example groups still missing (never reordering Codex's), links the skills, hooks and scripts, writes the `orq` wrapper and says when the
+    launchd agent still points elsewhere. Idempotent: a second run changes nothing. Returns the lines to print."""
+    out = []
+    python = resolve_python()
+    for agent, target in HOOKS_FILES.items():
+        moved = repoint_hooks(target)
+        add = install_hooks(os.path.join(orqpaths.HERE, HOOKS_EXAMPLE[agent]), target)
+        out += [f"{agent}: {moved} command(s) repointed to {orqpaths.CODE}" + (": Codex trusts a hook by its text, review them in /hooks" if agent == "codex" else "")] if moved else []
+        out += [f"{agent}: added {ev} group {g}" for ev, g in add]
+    out += install_links()
+    if pin_orq_link(python):
+        out.append(f"wrote: {ORQ_LINK} -> {os.path.join(orqpaths.CODE, 'orq.py')}")
+    with contextlib.suppress(OSError, ValueError):
+        import plistlib
+        pl = plistlib.load(open(_plist_serve(), "rb"))
+        if pl.get("EnvironmentVariables", {}).get("ORQ_HOME") != HOME or os.path.join(orqpaths.CODE, "orq.py") not in pl.get("ProgramArguments", []):
+            out.append(f"launchd: {_plist_serve()} points at another folder: run `orq manager serve --install`")
+    if notice := codex_hooks_notice():
+        out.append(notice)
+    return out or ["nothing to do: hooks, links and the orq wrapper already point at " + orqpaths.CODE]
 
 
 def untrusted_codex_hooks():
@@ -8553,7 +8660,7 @@ def untrusted_codex_hooks():
     for ev, groups in event_list.items():
         for g, group_name in enumerate(groups):
             for h, x in enumerate(_dict(group_name).get("hooks", [])):
-                if not re.search(r"/orq/(?:orq|precompact)\.py", x.get("command") or ""):
+                if not HOOK_ORQ.search(x.get("command") or ""):  # any clone folder, not only one named orq
                     continue
                 key_name = f"{path}:{re.sub(r'(?<!^)(?=[A-Z])', '_', ev).lower()}:{g}:{h}"
                 reg = _dict(state_.get(key_name))
@@ -8938,10 +9045,11 @@ def orq_ticket(title, project=None):
 
 
 def orq_worktree_block(number=None):
-    """The block that tells the worker of an orq ticket to work in its own worktree: the live checkout `~/.claude/orq` receives only the integrator."""
+    """The block that tells the worker of an orq ticket to work in its own worktree: the live checkout (ORQ_INSTALL) receives only the integrator."""
     n = number or "<ticket>"
-    return (f"{ORQ_WT_TITLE}\n\nNever commit on `main` of the live checkout `~/.claude/orq`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
-            f"Create the worktree `~/.claude/orq-wt/{n}` from `origin/main` on a branch of its own (`git -C ~/.claude/orq worktree add -b <type>/<description> ~/.claude/orq-wt/{n} origin/main`) "
+    live, wt = ORQ_INSTALL, os.path.join(WT_ROOT, n)
+    return (f"{ORQ_WT_TITLE}\n\nNever commit on `main` of the live checkout `{live}`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
+            f"Create the worktree `{wt}` from `origin/main` on a branch of its own (`git -C {live} worktree add -b <type>/<description> {wt} origin/main`) "
             "and work and commit only in it.\n")
 
 
@@ -9439,7 +9547,7 @@ def pin_hooks_python(agent, python=None):
 def pin_orq_link(python=None):
     """The `orq` the manager loop calls becomes a two-line wrapper that runs orq.py with the resolved interpreter (a symlink would take whatever `python3` the PATH has). True if it wrote."""
     python = python or resolve_python()
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py")
+    script = os.path.join(orqpaths.CODE, "orq.py")
     wrapper = f"#!/bin/sh\nexec {shlex.quote(python or '')} {shlex.quote(script)} \"$@\"\n"
     if not python or (os.path.isfile(ORQ_LINK) and not os.path.islink(ORQ_LINK) and open(ORQ_LINK, encoding="utf-8").read() == wrapper):
         return False
@@ -11252,7 +11360,7 @@ def serve_install():
     os.makedirs(LAUNCH_AGENTS, exist_ok=True)
     os.makedirs(os.path.dirname(_path(SERVE_LOG)), exist_ok=True)
     import plistlib
-    pl = {"Label": LAUNCHD_LABEL, "ProgramArguments": [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py"), "gerente", "serve"],
+    pl = {"Label": LAUNCHD_LABEL, "ProgramArguments": [sys.executable, os.path.join(orqpaths.CODE, "orq.py"), "gerente", "serve"],
           "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ORQ_HOME": HOME}, "RunAtLoad": True, "KeepAlive": True,
           "ThrottleInterval": 30, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
     with open(_plist_serve(), "wb") as f:
@@ -11287,7 +11395,13 @@ def manager_tui(theme=None):
 
 # ---------- retro: the failure signal collector (ticket 78) ----------
 
-ORQ_INSTALL = os.path.realpath(os.environ.get("ORQ_INSTALL") or os.path.expanduser("~/.claude/orq"))  # the checkout that runs (hooks, panel): nobody works in it
+ORQ_INSTALL = os.path.realpath(os.environ.get("ORQ_INSTALL") or orqpaths.CODE)  # the checkout that runs (hooks, panel): nobody works in it
+
+
+def _in_live_checkout(path):
+    """Is `path` inside the live checkout, but not in the ticket worktrees that live in it (.worktrees/, ticket 124)?"""
+    real = os.path.realpath(path)
+    return real.startswith(ORQ_INSTALL + os.sep) and not real.startswith(os.path.realpath(WT_ROOT) + os.sep)
 RETRO_DIR = "retro"  # ORQ_HOME/retro/<YYYY-MM-DDTHHMM>.json: the metrics of each recorded round, to compare week by week
 RETRO_DAYS = 7
 RETRO_FIX_S = 1800  # the user's reaction to a delivery comes right after it
@@ -11332,7 +11446,7 @@ def _retro_violations(tool, text_value, cwd):
     `echo` is not a push. Only the trailer looks at the whole text (it lives in the commit message), and only when the `git commit` is really in the command.
     ponytail: regex, no shell parser. `bash -c "git push"` passes; `$(git push)` inside quotes too."""
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        return (["agents_global"] if "/.agents/" in text_value else []) + (["checkout_em_uso_do_orq"] if os.path.realpath(text_value).startswith(ORQ_INSTALL + os.sep) else [])
+        return (["agents_global"] if "/.agents/" in text_value else []) + (["checkout_em_uso_do_orq"] if _in_live_checkout(text_value) else [])
     v = RETRO_QUOTES.sub('""', RETRO_HEREDOC.sub("", text_value))
     rules = []
     if re.search(r"\bgit\s+(?:-C\s+\S+\s+)?push\b", v):
@@ -11431,7 +11545,8 @@ def retro_collection(events, since, until_at, turns=None, projects=None, pr_chec
     read_handles = {e.get("msg_id") for e in events if e.get("tipo") == "steer_fim" and e.get("motivo") == "lido"}
     ends = [(e.get("dispatch"), e["ts"]) for e in events if e.get("tipo") in ("worker_done", "fim_dispatch") and e.get("ts")]
     deliveries = sorted(_dt(e["ts"]).timestamp() for e in events if e.get("ts") and (e.get("tipo") == "worker_done" or e.get("origem") == "relatorio_worker"))
-    install = re.compile(re.escape(ORQ_INSTALL) + r"(?![\w-])")
+    inside = os.path.relpath(os.path.realpath(WT_ROOT), ORQ_INSTALL)  # .worktrees/ lives in the clone and is not the checkout in use
+    install = re.compile(re.escape(ORQ_INSTALL) + r"(?![\w-])" + ("" if inside.startswith("..") else f"(?!/{re.escape(inside)}(?![\\w-]))"))
 
     def add(item_name, e, detail, pointer=None):
         d = by_dispatch.get(e.get("dispatch")) or by_task.get(e.get("task")) or {}
@@ -11808,6 +11923,7 @@ def parser():
     hk = sub.add_parser("hook")
     hk.add_argument("kind", type=_value_from_pt(HOOK_EN), choices=list(HOOKS), metavar=_metavar(HOOK_EN, list(HOOKS)))
     hk.add_argument("harness", nargs="?", default="claude", choices=HARNESSES, help="which agent the hook comes from (the default is the one of the hooks installed in Claude)")
+    sub.add_parser("install", aliases=["instalar"], help="wires Claude Code and Codex to this clone: hooks, links, the orq wrapper (idempotent)")
     sub.add_parser("hooks-codex", help="appends the orq hooks to ~/.codex/hooks.json without reordering; then trust them in /hooks")
     i = sub.add_parser("intake")
     i.add_argument("entry")
@@ -12015,8 +12131,8 @@ def parser():
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
-    wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the orq-wt worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
-    wl.add_parser("clean", aliases=["limpar"], help="removes the orq-wt worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
+    wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the ORQ_WT worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
+    wl.add_parser("clean", aliases=["limpar"], help="removes the ORQ_WT worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: refuses a wrong author, trailer, forbidden term and code without a README before publishing main")
     au.add_argument("revs", nargs="+", help="git rev-list args; on a new branch: <head> --not --remotes (after --)")
     tk = sub.add_parser("ticket", help="tickets as files (ISSUES/NN-slug.md) with the task in Orca").add_subparsers(dest="op", required=True)
@@ -12261,6 +12377,8 @@ def main(argv=None):
             print("\n".join(clean_closed(dry=a.dry_run)) or "no task with all PRs closed without merge")
         elif a.cmd == "busy":
             print("\n".join(sorted(busy_worktrees())))
+        elif a.cmd == "install":
+            print("\n".join(install()))
         elif a.cmd == "hooks-codex":
             add = install_codex_hooks(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex.hooks.example.json"))
             print("\n".join([*(f"added: {ev} group {g}" for ev, g in add), codex_hooks_notice() or "orq hooks trusted in Codex"]))

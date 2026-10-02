@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Integrates orq branches in a worktree of its own; the live main (~/.claude/orq) only advances by fast-forward, with green tests.
+"""Integrates orq branches in a worktree of its own; the live main (the clone that runs) only advances by fast-forward, with green tests.
 
   integrar.py <branch>...     creates ORQ_WT_DIR/integra-<branches> from main, merges each branch, runs the tests and advances main
   integrar.py --avancar <wt>  after resolving a conflict (and committing) in the worktree: checks, runs the tests and advances main
 
 After the fast-forward it calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
 
-~/.claude/orq is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
+The live clone is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
 markers in orqlib.py and takes everything down. Here the conflict only exists in the worktree.
-Variables: ORQ_WT_DIR (default: ../orq-wt next to the installation), ORQ_TESTES (default: the README tests)."""
+Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests)."""
 import os
 import re
 import shlex
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True  # this runs inside the live main: no __pycache__ dirties the tree
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import orqpaths  # noqa: E402
 
 TESTS = "python3 test_orq.py && python3 test_precompact.py"
 
@@ -83,10 +87,10 @@ def advance(wt):
 
 
 def clean(viva):
-    """Start of the cycle: if the main push already went out, removes the orq-wt worktrees whose branches origin/main contains. A failure becomes a notice."""
+    """Start of the cycle: if the main push already went out, removes the ORQ_WT worktrees whose branches origin/main contains. A failure becomes a notice."""
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # orq.py runs inside the live main: no __pycache__ dirties the tree
     if os.environ.get("ORQ_WT_DIR"):
-        env["ORQ_WT_ROOT"] = os.environ["ORQ_WT_DIR"]  # the worktrees folder this cycle uses is the one that gets cleaned
+        env["ORQ_WT"] = env["ORQ_WT_ROOT"] = os.environ["ORQ_WT_DIR"]  # the worktrees folder this cycle uses is the one that gets cleaned
     r = subprocess.run([sys.executable, os.path.join(viva, "orq.py"), "worktrees", "clean"], capture_output=True, text=True, env=env)
     print(f"integrar: {r.stdout.splitlines()[0] if r.stdout else r.stderr.strip()}")
 
@@ -95,7 +99,7 @@ def integrate(branches):
     viva = alive()
     clean(viva)
     slug = re.sub(r"[^\w.-]+", "-", "-".join(branches))[:60]
-    wt = os.path.join(os.environ.get("ORQ_WT_DIR") or os.path.join(os.path.dirname(viva), "orq-wt"), f"integra-{slug}")
+    wt = os.path.join(os.environ.get("ORQ_WT_DIR") or orqpaths.WT, f"integra-{slug}")
     if os.path.exists(wt):
         die(f"{wt} already exists: finish with `integrar.py --avancar {wt}` or remove it with `git worktree remove --force {wt}`")
     base = git(viva, "symbolic-ref", "--short", "HEAD").stdout.strip()

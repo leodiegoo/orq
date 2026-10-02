@@ -1,0 +1,5 @@
+# Local files Orca copies into each new worktree of this repository (gitignore syntax).
+# The orq state, the plan and .worktrees/ are not listed on purpose: code run from a worktree reads them from the main checkout,
+# and a copy would fork the state.
+.env
+.env.*

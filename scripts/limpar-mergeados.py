@@ -21,9 +21,11 @@ KEEP_FILE = os.path.join(HOME, ".claude/scripts/limpar-mergeados.keep")
 LAST = os.path.join(HOME, ".claude/logs/limpar-mergeados.last.json")
 PROTECTED = set()  # the branches that are never deleted: main() fills this with the project's environments (`repo_flow`), the self-test with the example's
 ORPHAN_IDLE_H = 24  # an orphan worktree only goes after this long without activity
-ORQ = os.path.join(HOME, ".claude/orq/orq.py")
-ORQ_DIR = os.path.dirname(ORQ)
-REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(HOME, ".claude/orquestrador-plan/relatorios")
+ORQ_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # the clone this script belongs to (~/.claude/scripts/ links here)
+ORQ = os.path.join(ORQ_DIR, "orq.py")
+sys.path.insert(0, ORQ_DIR)
+import orqpaths  # noqa: E402 - stdlib only, like this script
+REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(orqpaths.PLAN, "relatorios")
 # Written by the worker itself at orq's request: not the worker's work (paths relative to the worktree root).
 ORQ_ARTIFACTS = ("PAUSE.md", "HANDOFF.md", "final-report*.md", ".scratch/*/final-report.md",
                  "PAUSA.md", "PASSAGEM.md", "relatorio*.md", ".scratch/*/relatorio-final.md")  # the pt names: worker that follows the old spec
@@ -382,7 +384,6 @@ def main():
                         v, r = "skip", f"could not save {', '.join(fa['artefatos'])}: {e}"
             if v == "remove" and not a.dry_run:
                 try:
-                    sys.path.insert(0, ORQ_DIR)
                     from orqlib import terminate_worktree_processes
                     terminate_worktree_processes(w["path"])
                 except Exception as e:  # without orq the cleanup carries on; Orca removes the worktree the same way
@@ -434,7 +435,6 @@ def main():
 def orq_event(task, branch, items):
     """Records in orq's log what the cleanup removed, kept and skipped. Orq missing or log inaccessible: carries on without the event."""
     try:
-        sys.path.insert(0, ORQ_DIR)
         from orqlib import append_event, cleaned_close
         ev = {"tipo": "pr", "op": "limpou", "task": task, "branch": branch,
                       "removidos": [f"{i['kind']}:{i['name']}" for i in items if i["action"] == "removed"],

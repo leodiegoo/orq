@@ -27,7 +27,7 @@ except Exception as e:  # noqa: BLE001 - orqlib quebrado: o hook sai mudo (ver f
 CAP_S = 20  # PreCompact: the hook has the settings timeout (30 s); the script stops collecting at 20 s
 RESUME_LINES = 60  # the build respects per-section budgets that fit in here (M12); past that, the resume notice says it cut
 OLD_S = 15 * 60  # ultimo.md older than this is not from the compact that just happened (B33)
-DESIGN_PATH = os.environ.get("ORQ_DESENHO") or os.path.expanduser("~/.claude/orquestrador-plan/desenho.md")
+DESIGN_PATH = os.environ.get("ORQ_DESENHO") or os.path.join(orq.PLAN, "desenho.md")
 CLI = shlex.split(os.environ.get("ORQ_CLI") or f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'orq.py')}")
 ENGRAM = os.environ.get("ORQ_ENGRAM") or "engram"
 GH = os.environ.get("ORQ_GH") or "gh"

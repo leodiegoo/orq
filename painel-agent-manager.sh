@@ -3,7 +3,7 @@
 # stays bound to this terminal: each round walks the manager's Runs, confirms the heartbeats and notifies the coordinator of the rest, one line per
 # Run. The `manager-alive` stamp is written before calling orq: the coordinator knows the panel stopped even with a broken orq.py.
 # With `orq manager serve` alive (ticket 128) absorb exits with 3 and does nothing: the panel only shows the serve log, and goes back to absorbing if it dies.
-h="${ORQ_HOME:-$HOME/.claude/orq}"
+h="${ORQ_HOME:-$(cd "$(dirname "$0")" && pwd -P)}"  # the state lives in the clone this panel belongs to (ticket 124)
 n=0
 while true; do
   touch "$h/manager-alive"

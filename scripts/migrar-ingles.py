@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrates the ORQ_HOME state to English (phase 2 of the migration; plan in ~/.claude/orquestrador-plan/orq-ingles-plano.md).
+"""Migrates the ORQ_HOME state to English (phase 2 of the migration; plan in orq-ingles-plano.md, in the plan).
 
 Refuses to run with a live worker in Orca (other than the calling terminal), with the manager running (`orq manager serve` or the agent manager panel) or
 with any orq lock stuck. First copies the files it will touch to ORQ_HOME/backup-pt-<date>/, rewrites events.jsonl line by line

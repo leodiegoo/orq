@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook guard",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook guard",
             "timeout": 5
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook external",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook external",
             "timeout": 3
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook place",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook place",
             "timeout": 3
           }
         ]
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook session",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook session",
             "timeout": 5
           }
         ]
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/precompact.py retomar",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/precompact.py retomar",
             "timeout": 5
           }
         ]
@@ -78,7 +78,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook prompt",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook prompt",
             "timeout": 5
           }
         ]
@@ -89,7 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook stop",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook stop",
             "timeout": 5
           }
         ]
@@ -101,7 +101,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook prlink",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook prlink",
             "timeout": 3
           }
         ]
@@ -111,7 +111,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/orq.py hook ask",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook ask",
             "timeout": 5
           }
         ]
@@ -123,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 ~/.claude/orq/precompact.py",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/precompact.py",
             "timeout": 30
           }
         ]
