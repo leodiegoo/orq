@@ -6065,7 +6065,7 @@ _EXT_GIT = r"^git((?:\s+-\S+(?:\s+\S+)?)*)\s+"  # the regexes run on one cmdnorm
 _EXT_GH = r"^gh(?:\s+-\S+(?:\s+\S+)?)*\s+"
 NIGHT_EXTERNAL = [  # (what is denied, a regex over a segment of the command)
     ("git push", re.compile(_EXT_GIT + r"push(?![-\w])")),
-    ("gh pr merge", re.compile(_EXT_GH + r"pr\s+merge(?![-\w])")),
+    ("gh pr merge", re.compile(_EXT_GH + r"pr(?:\s+(?:-R|--repo)(?:\s+|=)\S+)*\s+merge(?![-\w])")),  # `-R` also goes between `pr` and `merge`
     ("gh workflow run (deploy)", re.compile(_EXT_GH + r"workflow\s+run(?![-\w])")),
     ("git commit --no-verify", re.compile(_EXT_GIT + r"commit(?![-\w])[^;&|\n]*?\s(?:--no-verify|-[aeiopqsuvz]*n[a-zA-Z]*)(?=\s|$)")),
     ("orca worktree rm --force", re.compile(r"^orca\s+worktree\s+rm(?![-\w])[^;&|\n]*\s(?:--force|-f)(?![-\w])")),
@@ -6075,7 +6075,8 @@ _EXT_RESET = re.compile(_EXT_GIT + r"reset(?![-\w])[^;&|\n]*\s--hard(?![-\w])")
 
 _NIGHT_RX = dict(NIGHT_EXTERNAL)
 _EXT_PUSH = re.compile(_EXT_GIT + r"push(?![-\w])(.*)")
-_EXT_MERGE = re.compile(_EXT_GH + r"pr\s+merge(?![-\w])(.*)")
+_EXT_MERGE = re.compile(_EXT_GH + r"pr((?:\s+(?:-R|--repo)(?:\s+|=)\S+)*)\s+merge(?![-\w])(.*)")
+PR_BASE_TIMEOUT = 1  # seconds for `gh pr view`: the hook's alarm and the harness both stop it at 3 s, and a hook that times out lets the command through
 
 AWAY_EXTERNAL = {  # the away policy (ticket 214), one line per action and destination: what may go out while the user is away. Any other external action is denied
     "push-feature": ("allow", "git push of a branch that is none of the project's environments"),
@@ -6084,13 +6085,14 @@ AWAY_EXTERNAL = {  # the away policy (ticket 214), one line per action and desti
     "merge-env": ("allow", "gh pr merge into an environment before production (e.g. development, staging)"),
     "push-env": ("deny", "git push to one of the project's environment branches (e.g. development, staging, main)"),
     "push-force": ("deny", "git push --force, --force-with-lease or a +refspec"),
-    "push-other": ("deny", "git push with --delete, --all, --mirror, --tags, a :refspec, another option or a destination orq cannot tell"),
+    "push-other": ("deny", "git push with --delete, --all, --mirror, --tags, -c, a :refspec, a glob, a tag, another option or a destination orq cannot tell"),
     "merge-prod": ("deny", "gh pr merge into production (e.g. main) or into a branch that is none of the project's environments"),
-    "merge-unknown": ("deny", "gh pr merge whose base `gh pr view` did not give within 2 s"),
+    "merge-unknown": ("deny", "gh pr merge whose base `gh pr view` did not give within 1 s"),
     "workflow": ("deny", "gh workflow run (deploy)"),
     "no-verify": ("deny", "--no-verify on commit or push, or commit -n"),
     "worktree-rm": ("deny", "orca worktree rm --force"),
     "reset": ("deny", "git reset --hard outside a worker's linked worktree"),
+    "unjudged": ("deny", "an external action the guard could not judge (an error or the hook's time limit)"),
 }
 _PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress"}
 _MERGE_VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--subject", "-A", "--author-email", "--match-head-commit", "-R", "--repo", "-B", "--base"}
@@ -6121,10 +6123,11 @@ def _flow_at(d):
 
 
 def _away_push(ev, m):
-    """The AWAY_EXTERNAL line of a `git push`: each destination (refspec, or the current branch) is checked against the environments of the project at that folder."""
+    """The AWAY_EXTERNAL line of a `git push`: each destination (refspec, or the current branch) is checked against the environments of the project at that folder.
+    Whatever moves the destination out of sight (`-c`/`GIT_CONFIG_*`, a glob, a mirror remote, a push config, a source that is no local branch) is `push-other`."""
     d = _git_place(ev, m.group(1))
     try:
-        args = shlex.split(m.group(2))
+        args = shlex.split(m.group(2), comments=True)
     except ValueError:
         return "push-other"
     flags, pos = [a for a in args if a.startswith("-")], [a for a in args if not a.startswith("-")]
@@ -6132,15 +6135,20 @@ def _away_push(ev, m):
         return "no-verify"
     if any(f.startswith("--force") or re.fullmatch(r"-[a-z]*f[a-z]*", f) for f in flags) or any(r.startswith("+") for r in pos[1:]):
         return "push-force"
-    if not set(flags) <= _PUSH_FLAGS:
+    if not set(flags) <= _PUSH_FLAGS or re.search(r"(?:^|\s)(?:-c|--config-env)\b", m.group(1) or "") or "GIT_CONFIG" in ev["tool_input"]["command"]:
         return "push-other"
     remote, head = (pos[0] if pos else "origin"), (_git(d, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+    cfg = dict(line.split(" ", 1) for line in (_git(d, "config", "--get-regexp", r"^(remote\..*\.(push|mirror)|push\.default)$") or "").splitlines() if " " in line)
+    if cfg.get(f"remote.{remote}.mirror", "false") != "false" or not pos[1:] and (f"remote.{remote}.push" in cfg or cfg.get("push.default", "simple") not in ("simple", "current")):
+        return "push-other"
     flow, line = _flow_at(d), "push-feature"
     for spec in pos[1:] or ["HEAD"]:
-        src, _, dst = spec.partition(":")
-        src = head if src == "HEAD" else src.removeprefix("refs/heads/")
-        dst = dst.removeprefix("refs/heads/") or src
-        if not src or src == "HEAD" or (":" in spec and not spec.split(":", 1)[1]):
+        src, colon, dst = spec.partition(":")
+        if src == "HEAD" and ev.get("_head_moves"):
+            return "push-other"
+        src = head if src == "HEAD" else re.sub(r"^(?:refs/)?heads/", "", src)
+        dst = re.sub(r"^(?:refs/)?heads/", "", dst) if colon else src
+        if "*" in spec or not src or src == "HEAD" or not dst or dst.startswith("refs/") or _git(d, "show-ref", "--verify", "-q", f"refs/heads/{src}") is None:
             return "push-other"
         if dst not in flow["ambientes"]:
             continue
@@ -6148,7 +6156,7 @@ def _away_push(ev, m):
             return "push-env"
         try:
             clean = not audit_publication([f"{remote}/{dst}..{src}"], d)
-        except (subprocess.CalledProcessError, OSError):
+        except Exception:  # noqa: BLE001 - an audit that cannot run is not clean
             clean = False
         if not clean:
             return "push-env"
@@ -6157,10 +6165,11 @@ def _away_push(ev, m):
 
 
 def _pr_base(d, selector, repo):
-    """The base branch of the PR that `gh pr merge` would merge (the selector, or the branch of `d`), from `gh pr view`. None when gh fails or takes over 2 s: fail closed."""
+    """The base branch of the PR that `gh pr merge` would merge (the selector, or the branch of `d`), from `gh pr view`. None when gh fails or takes over
+    PR_BASE_TIMEOUT: fail closed, with room for the rest of the hook under its 3 s ceiling."""
     try:
         r = subprocess.run([GH, "pr", "view", *([selector] if selector else []), "--json", "baseRefName", *(["--repo", repo] if repo else [])],
-                           cwd=d, capture_output=True, text=True, timeout=2)
+                           cwd=d, capture_output=True, text=True, timeout=PR_BASE_TIMEOUT)
         return json.loads(r.stdout).get("baseRefName") if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
         return None
@@ -6170,7 +6179,7 @@ def _away_merge(ev, m):
     """The AWAY_EXTERNAL line of a `gh pr merge`: its base comes from `--base`, otherwise from `gh pr view`. Only an environment before production passes."""
     d = ev.get("cwd") or os.getcwd()
     try:
-        args = shlex.split(m.group(1))
+        args = shlex.split(f"{m.group(1)} {m.group(2)}", comments=True)
     except ValueError:
         return "merge-unknown"
     opts, selector, i = {}, None, 0
@@ -6204,19 +6213,37 @@ def _away_line(seg, ev):
     return "reset" if m and _reset_in_main_checkout(ev, m) else None
 
 
+def _asks_help(seg):
+    """Is the segment a `--help` read? Only a whole `--help` token before any `#` comment counts: `git push --force # --help` still pushes."""
+    toks = seg.split()
+    return "--help" in toks[:next((k for k, t in enumerate(toks) if t.startswith("#")), len(toks))]
+
+
 def _external_denied(ev, cur):
-    """(policy, what) for the first external action in the Bash of `ev` that the policy in force in `cur` denies, or None. Away on: the AWAY_EXTERNAL line (ticket 214).
-    Night on without away: the NIGHT_EXTERNAL name, everything denied (ticket 39). Neither: None, before any git or gh call. Reads the cursor, the local git, the
-    project files and, for a `gh pr merge` with no `--base`, `gh pr view`."""
+    """(policy, what) for the first external action in the Bash of `ev` that the policy in force in `cur` denies, or None. Away on: the AWAY_EXTERNAL line (ticket 214),
+    and any error or alarm while judging a segment denies it as `unjudged`. Night on without away: the NIGHT_EXTERNAL name, everything denied (ticket 39). Neither: None,
+    before any git or gh call. Reads the cursor, the local git, the project files and, for a `gh pr merge` with no `--base`, `gh pr view`."""
     cmd = ev.get("tool_input", {}).get("command") if ev.get("tool_name") == "Bash" and isinstance(ev.get("tool_input"), dict) else None
-    if not isinstance(cmd, str) or "--help" in cmd:
+    if not isinstance(cmd, str):
         return None
     away, night = bool(_dict(_dict(cur).get("ausente"))), night_active(cur)
     if not (away or night):
         return None
-    segs = cmdnorm.segments(cmd)
+    segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
     if away:
-        return next((("away", line) for line in (_away_line(seg, ev) for seg in segs) if line and AWAY_EXTERNAL[line][0] == "deny"), None)
+        for seg in segs:
+            if m := re.match(r"cd(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
+                ev = {**ev, "cwd": os.path.join(ev.get("cwd") or os.getcwd(), os.path.expanduser(m.group(1) or "~"))}
+                continue
+            if re.match(_EXT_GIT + r"(?:checkout|switch)(?![-\w])", seg):  # the hook runs before the command: HEAD still names the old branch
+                ev = {**ev, "_head_moves": True}
+            try:
+                line = _away_line(seg, ev)
+            except Exception:  # noqa: BLE001 - fail closed while away, the alarm's TimeoutError included
+                line = "unjudged"
+            if line and AWAY_EXTERNAL[line][0] == "deny":
+                return "away", line
+        return None
     found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
     if found_item:
         return "night", found_item

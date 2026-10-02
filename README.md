@@ -275,13 +275,14 @@ For a bounded unattended stretch, night mode adds a budget: `orq night on --unti
 | `merge-env` | allow | `gh pr merge` into an environment before production (e.g. `development`, `staging`) |
 | `push-env` | deny | `git push` to any other environment branch of the project |
 | `push-force` | deny | `git push --force`, `--force-with-lease` or a `+refspec` |
-| `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, a `:refspec`, another option, or a destination orq cannot tell |
+| `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, `-c`, a `:refspec`, a glob, a tag, another option, or a destination orq cannot tell |
 | `merge-prod` | deny | `gh pr merge` into production (e.g. `main`) or into a branch that is no environment |
-| `merge-unknown` | deny | `gh pr merge` with no `--base` whose base `gh pr view` did not give within 2 s |
+| `merge-unknown` | deny | `gh pr merge` with no `--base` whose base `gh pr view` did not give within 1 s |
 | `workflow` | deny | `gh workflow run` (deploy) |
 | `no-verify` | deny | `--no-verify` on commit or push, or `commit -n` |
 | `worktree-rm` | deny | `orca worktree rm --force` |
 | `reset` | deny | `git reset --hard` outside a worker's linked worktree |
+| `unjudged` | deny | an external action the guard could not judge (an error, or the hook's 3 s limit) |
 
 The environments come from the project file that holds the folder (`environments`); outside every project, the remote's default branch is the only one. The deny reason cites the line, and the command goes to the pending list once (id `externa-<hash>`, type `acao`, the command in `comando`), so the away report lists what was tried. The night budget (`away on` arms it, `night on --until` sets it) and this guard do not replace each other: the budget caps dispatches and failures and never lifts a line of the table; the table says what may go out and never depends on the budget. Neither mode on: nothing changes. See `docs/design.md`, "External-action guard".
 

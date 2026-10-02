@@ -10,7 +10,7 @@ _HEREDOC = re.compile(r"<<-?\s*([\'\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\
 _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 _SEPARATOR = re.compile(r"[;&|(){}\n]+")
 _KEYWORD = re.compile(r"(?:!|do|then|else|elif|if|while|until)\s+")  # a loop or an `if` runs the command that follows
-_PREFIX = re.compile(r"(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+-\S+)*|command|time|sudo|nohup|exec)\s+)+")
+_PREFIX = re.compile(r"^(?:(?:\w+=\S*|rtk(?:\s+proxy)?|env(?:\s+-\S+)*|command|time|sudo|nohup|exec)\s+)+")
 
 
 def no_text(cmd):
