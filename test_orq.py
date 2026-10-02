@@ -14957,6 +14957,43 @@ def test_ticket146_revisar_task_sem_despacho_recusa():
     assert r.returncode == 1 and "sem despacho" in r.stderr and not _log(a, "nm.log"), r
 
 
+def test_ticket165_entrega_devolvida_sai_do_stop_ate_o_worker_done_novo():
+    from datetime import datetime, timezone
+    agora = datetime.now(timezone.utc)
+    ev = [{"tipo": "despacho", "dispatch": "d1", "task": "t1", "ticket": "50"}, {"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m1"}]
+    ag = {"dispatch": "d1", "task": "t1", "estado": "entregue"}
+    prox = lambda ags, events: orq_mod.proximo_sem_usuario(tks=[_tk126("50", "claimed")], ags=ags, integracao={}, fila=[], events=events, cfg=orq_mod.maquina_cfg(), sem_push=0)
+    assert prox([ag], ev), "entregue: o Stop barra"
+    devolvido = ev + [{"tipo": "devolver", "dispatch": "d1", "task": "t1", "ts": "2026-10-01T12:00:00Z"}]
+    (r,) = orq_mod.reavalia([ag], devolvido, agora, integracao={})
+    assert r["estado"] == "devolvida" and prox([r], devolvido) is None, "devolvida: sai do Stop"
+    assert not orq_mod.linha_vivos(devolvido, {"agentes": [ag]}, agora).count("Entregues sem liberar"), "e do 'entregues sem liberar'"
+    novo = devolvido + [{"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m2"}]
+    (r2,) = orq_mod.reavalia([r], novo, agora, integracao={})
+    assert r2["estado"] == "entregue" and prox([r2], novo), "worker_done novo volta a ser entrega a integrar"
+
+
+def test_ticket165_steer_em_task_concluida_sugere_orq_devolver():
+    a = Amb()
+    _steer_env(a)
+    r = a.orq("steer", "task_feita", "oi")
+    assert r.returncode == 1 and "orq devolver task_feita" in r.stderr, r.stderr
+    assert not _enviados(a)
+
+
+def test_ticket165_devolver_manda_a_correcao_grava_o_evento_e_volta_a_task_para_dispatched():
+    a = Amb()
+    a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"}])
+    a.set("terminals.json", ["term_w0", "term_coord"])
+    _steer_env(a)
+    r = a.orq("devolver", "task_feita", "o padrão era decisão do usuário")
+    assert r.returncode == 0, r.stderr
+    (env,) = _enviados(a)
+    assert env[:5] == ["send", "--run", "run_a", "--to", "dispatch:ctx_0"] and "o padrão era decisão do usuário" in env[env.index("--body") + 1], env
+    (ev,) = [e for e in a.events() if e["tipo"] == "devolver"]
+    assert (ev["task"], ev["dispatch"], ev["run"]) == ("task_feita", "ctx_0", "run_a"), ev
+    assert a.orq("devolver", "task_fantasma", "x").returncode == 1
+
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""

@@ -86,7 +86,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "limite": 1, "sem_terminal": 2, "nao_comecou": 3, "parado": 4, "perguntando": 5, "rodando": 6, "aguardando_integracao": 7, "entregue": 8, "servico": 9, "hibernado": 10, "encerrado": 11, "liberado": 12}
+ORDEM_AGENTES = {"travado": 0, "limite": 1, "sem_terminal": 2, "nao_comecou": 3, "parado": 4, "perguntando": 5, "rodando": 6, "aguardando_integracao": 7, "entregue": 8, "devolvida": 8, "servico": 9, "hibernado": 10, "encerrado": 11, "liberado": 12}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -94,7 +94,7 @@ HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorv
 HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack devolve o próximo lote)
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
 RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do próprio `orq resumo`
-ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao")  # estados que aparecem em "Anda" do `orq resumo`
+ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao", "devolvida")  # estados que aparecem em "Anda" do `orq resumo`
 PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
 PAINEL_PARADO_S = 60  # carimbo mais velho que isto já vale um aviso de "painel lento"; parado é o limite de painel_limite_s
 PAINEL_LIMITE_MIN_S = 90  # o carimbo só vale como painel parado depois de tanto tempo (ou de PAINEL_VOLTAS_X voltas médias, o que for maior)
@@ -571,6 +571,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
             estado, idade = ("liberado" if w.get("terminalState") == "released" or _sem_terminal(w, liberados, vivos) else "entregue" if feito else "encerrado"), None
             estado = "servico" if estado == "entregue" and d in servicos else estado
+            estado = "devolvida" if estado == "entregue" and d in _devolvidas(events) else estado  # o coordenador mandou refazer: não é entrega a integrar até o worker_done novo
         ag = {"dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "titulo": det.get("titulo"), "modelo": det.get("modelo"),
               "effort": det.get("effort"), "terminal": w.get("agentTerminalHandle"), "estado": estado, "fase": sinal.get("fase"), "ultimo_heartbeat": _z(sinal.get("ts")),
               "desde": _z(det.get("desde")), "idade_s": idade, "agente": det.get("agente"), "turno": turno,
@@ -601,6 +602,19 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
 
 
+def _devolvidas(events):
+    """{dispatch: ts} das entregas devolvidas ao worker (`orq devolver`) que ainda não têm worker_done novo no log.
+    # ponytail: vale a ordem do log; um worker_done antigo ingerido depois da devolução a desfaz (o ingest costuma rodar antes)."""
+    out = {}
+    for e in events:
+        d = e.get("dispatch")
+        if e.get("tipo") == "devolver" and d:
+            out[d] = e.get("ts")
+        elif e.get("tipo") == "worker_done" and d:
+            out.pop(d, None)
+    return out
+
+
 def _marca_integracao_e_servico(ag, integracao, tickets_de, servicos):
     """Põe em `ag` (a linha de um agente) o que a fila do integrador e os despachos de serviço dizem dele: o estado `aguardando_integracao` no lugar de
     travado/nao_comecou/parado, e o `ciclo` do serviço. O motivo do travado sai: o worker não está travado, espera a main."""
@@ -624,13 +638,15 @@ def reavalia(agentes_, events, agora, turnos=None, integracao=None):
     integracao, tickets_de, servicos = integracao_fila() if integracao is None else integracao, _ticket_do_dispatch(events), _servicos(events)
     sinais = sinais_de_vida(events)
     liberados = _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}
-    pausas, out = interrompidos(events), []
+    pausas, out, devolvidas = interrompidos(events), [], _devolvidas(events)
     for ag in agentes_:
         ag = dict(ag)
-        if ag.get("estado") in ("entregue", "servico", "rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao") and ag.get("dispatch") in liberados:
+        if ag.get("estado") in ("entregue", "devolvida", "servico", "rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao") and ag.get("dispatch") in liberados:
             ag["estado"] = "liberado"  # o orq liberar depois do cache (M13); só existe liberar depois do worker_done, então vale mesmo com cache anterior a ele (B38)
         if ag.get("estado") in ("entregue", "servico") and ag.get("dispatch") in servicos:
             ag["estado"] = "servico"
+        if ag.get("estado") in ("entregue", "devolvida"):
+            ag["estado"] = "devolvida" if ag.get("dispatch") in devolvidas else "entregue"  # o worker_done novo volta a entrega para integrar
         if ag.get("estado") in ("rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao"):
             h = sinais.get(ag.get("dispatch")) or {}
             if _ts(h.get("ts")) and (not _ts(ag.get("ultimo_heartbeat")) or _ts(h["ts"]) > _ts(ag["ultimo_heartbeat"])):
@@ -1936,7 +1952,7 @@ def ingest_inbox():
     eventos = read_events()
     ja = {e.get("ref") for e in eventos if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in eventos if e.get("tipo") == "alerta"}
     feitos = {e.get("msg") for e in eventos if e.get("tipo") == "worker_done"}  # o digest lê daqui o que cada worker entregou
-    reservas = {e.get("dispatch") for e in eventos if e.get("origem") == "relatorio-final"}  # o relatorio-final.md já entregou: o worker_done tardio não repete
+    reservas = {e.get("dispatch") for e in eventos if e.get("origem") == "relatorio-final"} - set(_devolvidas(eventos))  # o relatorio-final.md já entregou: o worker_done tardio não repete
     msgs = sorted((m for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m.get("sequence"), int)),
                   key=lambda m: m["sequence"])
     if ultimo and msgs and msgs[0]["sequence"] > ultimo + 1:
@@ -1981,7 +1997,8 @@ def ingest_relatorios_finais():
     o de um dispatch anterior na mesma worktree não conta. O outcome é `succeeded` porque o worker só escreve o arquivo ao terminar. Roda depois do inbox,
     então um worker_done de verdade, se existe, ganha. Devolve o número de entradas novas."""
     eventos = read_events()
-    feitos = {e.get("dispatch") for e in eventos if e.get("tipo") == "worker_done"}
+    devolvidas = _devolvidas(eventos)
+    feitos = {e.get("dispatch") for e in eventos if e.get("tipo") == "worker_done"} - set(devolvidas)  # devolvida: o relatório mais novo vale como entrega nova
     runs = {e.get("dispatch"): e.get("run") for e in eventos if e.get("tipo") == "despacho"}
     desde, novos = _dt(_read_cursor()["ingest"]["desde"]), 0
     for dispatch, t in _turnos_ro().items():
@@ -1994,9 +2011,9 @@ def ingest_relatorios_finais():
             titulo = next((l.lstrip("# ").strip() for l in open(arq, encoding="utf-8", errors="replace").read().splitlines() if l.strip()), "")
         except OSError:
             continue
-        if mtime <= max(desde, _ts(t["inicio"])):
+        if mtime <= max(desde, _ts(t["inicio"]), _ts(devolvidas.get(dispatch)) or desde):
             continue
-        run, msg = runs.get(dispatch), f"relatorio-final:{dispatch}"
+        run, msg = runs.get(dispatch), f"relatorio-final:{dispatch}" + (f":{int(mtime.timestamp())}" if dispatch in devolvidas else "")
         subject = titulo or f"relatório final do worker {dispatch}"
         append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": arq, "ref": msg, "run": run,
@@ -5869,6 +5886,8 @@ def _steer(task, texto, alvo, entrada, pedido):
         if entrada:
             intake(entrada, "steer", task, run=alvo)
         return ev
+    if t.get("status") == "completed" and t.get("dispatch_id"):
+        raise ValueError(f"task {task} está completed: para mandar o worker refazer a entrega use `orq devolver {task} \"<motivo>\"`")
     if t.get("status") != "dispatched" or not t.get("dispatch_id"):
         raise ValueError(f"task {task} está {t.get('status')}, não dispatched: sem worker para receber o ajuste")
     try:
@@ -5891,6 +5910,54 @@ def _steer(task, texto, alvo, entrada, pedido):
     if entrada:
         intake(entrada, "steer", task, run=alvo)
     return ev
+
+
+def devolver(alvo, motivo, run=None):
+    """Devolve a entrega de uma task concluída ao worker com a correção `motivo`: digita no terminal dele (ou retoma a sessão se o terminal sumiu, ou acorda o
+    hibernado), grava `devolver` (a entrega sai do Stop do away e do "entregues sem liberar" até o worker_done novo) e volta a task para `dispatched`.
+    ValueError se `alvo` (task ou dispatch) não existe no Run ou o worker não tem como receber."""
+    run_ = run_padrao(run)
+    if not run_:
+        raise ValueError("sem Run ligado: passe --run e rode run-use --id <r>")
+    with _no_run(run_):
+        t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if alvo in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
+        if not t:
+            raise ValueError(f"{alvo} não é task nem dispatch do Run {run_}")
+        d, corpo = t["dispatch_id"], f"A entrega foi devolvida pelo coordenador; refaça e mande um worker_done novo. Motivo: {motivo}"
+        if d in _hibernados():
+            r = acordar(d, corpo)
+            if r["estado"] == "falhou":
+                raise ValueError(f"o worker está hibernado e não acordou: {r['aviso']}")
+            via = "acordado"
+        else:
+            handle = _terminal_do_dispatch(run_, d)
+            if handle and not _morto(handle):
+                try:
+                    orca("send", "--run", run_, "--to", f"dispatch:{d}", "--subject", "Entrega devolvida", "--body", corpo, "--priority", "high", timeout=10)
+                except RuntimeError as e:
+                    raise ValueError(str(e))
+                via = digita(handle, _aviso_ajuste(handle, motivo)) if _terminal_do_dispatch(run_, d) else "sem_terminal"
+            else:
+                tn = _dict(_turnos_ro().get(d))
+                cwd = tn.get("cwd") or _checkpoint(d).get("caminho")
+                if not (tn.get("sessao") and cwd and os.path.isdir(cwd)):
+                    raise ValueError(f"o terminal de {d} sumiu e não há sessão ou worktree gravada para retomar: `orq relancar {d} --nota '<motivo>'`")
+                try:
+                    cp = _checkpoint(d)
+                except (RuntimeError, subprocess.TimeoutExpired):
+                    cp = {"head": None, "sujo": None}
+                linha = {"dispatch": d, "task": t["id"], "run": run_, "titulo": d, "cwd": cwd, "terminal": handle}
+                r = _subir_sessao(linha, tn["sessao"], tn.get("modelo"), cp, f"suba outro worker com: orq relancar {d} --nota 'a sessão não pôde ser retomada'", corpo,
+                                  tn.get("harness") or "claude", None)
+                if r["estado"] == "falhou":
+                    raise ValueError(r["aviso"])
+                via = "retomado"
+        aviso = None
+        try:
+            orca("task-update", "--id", t["id"], "--status", "dispatched", "--run", run_, timeout=20)
+        except RuntimeError as e:
+            aviso = f"task {t['id']} segue {t.get('status')} ({e}): orca orchestration task-update --id {t['id']} --status dispatched"
+        return append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "run": run_, "texto": motivo, "via": via, **({"aviso": aviso} if aviso else {})})
 
 
 # ---------- tickets em arquivo ----------
@@ -10469,6 +10536,10 @@ def main(argv=None):
         pe.add_argument(f"--{k}")
     bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens")
     bl.add_argument("--json", action="store_true")
+    dv = sub.add_parser("devolver", help="orq devolver <task|dispatch> \"<motivo>\": manda a correção ao worker de uma entrega já concluída e tira a entrega do Stop até o worker_done novo")
+    dv.add_argument("alvo")
+    dv.add_argument("motivo")
+    dv.add_argument("--run")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("texto")
@@ -10802,6 +10873,8 @@ def main(argv=None):
                 print("\n".join(pr_lista(a.task)) or "nenhum PR ligado")
             else:
                 print("\n".join(pr_poll(forcar=a.forcar)) or "nenhuma mudança nos PRs")
+        elif a.cmd == "devolver":
+            print(json.dumps(devolver(a.alvo, a.motivo, a.run), ensure_ascii=False))
         elif a.cmd == "steer":
             print(json.dumps(steer(a.task, a.texto, a.run, a.entrada), ensure_ascii=False))
         elif a.cmd == "steers":

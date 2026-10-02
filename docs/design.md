@@ -39,6 +39,7 @@ Each entry gets a sequential id (`e1`, `e2`, ...). It stays open until an `intak
 |---|---|---|
 | `tarefa` | created or changed an Orca task | the task exists in the Run |
 | `steer` | adjusted a running task (`orq steer`) | the task exists |
+| `devolver` | a delivery was handed back to its worker (`orq devolver`); `_devolvidas` turns the dispatch into `devolvida` until the next `worker_done` | the task exists |
 | `pend` / `decisao` | became something only the user can do or decide | the pending id exists in the file or in a `pend add` event |
 | `conversa` | answered on the spot, nothing to track | none; refused for report items |
 | `descartado` | dropped on purpose | none; `--nota` gives the reason |
