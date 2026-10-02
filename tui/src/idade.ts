@@ -1,6 +1,7 @@
-// Idade de cada item de fila (ticket 345): o orq manda `desde`, a TUI calcula a idade e pinta na mesma escala do orq e do painel.
-// Abaixo do primeiro limite o texto fica neutro; dali em diante a cor sai de amarelo, passa por laranja e chega ao vermelho com interpolação.
-import type { Paleta } from "./tema"
+// Idade de cada item de fila (ticket 345): o orq manda `desde`, a TUI calcula a idade e a pinta na escala do orq e do painel.
+// A escala entra no modelo de trechos como mais uma cor semântica: neutro (secundario), amarelo, laranja e vermelho da paleta.
+import type { Trecho } from "./dados"
+import type { Cor } from "./tema"
 
 export type Nivel = "ok" | "warn" | "hot" | "crit"
 /** `limites`: os minutos de warn, hot e crit já multiplicados pelo fator do tipo (e pela metade em P1). */
@@ -9,6 +10,7 @@ export type Idade = { min: number; limites: number[] }
 export const ESCALA_PADRAO = [5, 15, 30]
 export const FATORES: Record<string, number> = { fila: 1, integracao: 1, worker: 1, entrega: 3, obrigacao: 3, pendencia: 12 }
 const NIVEIS: Nivel[] = ["warn", "hot", "crit"]
+const COR_NIVEL: Record<Nivel, Cor> = { ok: "secundario", warn: "amarelo", hot: "laranja", crit: "vermelho" }
 
 /** Minutos de espera desde um instante ISO (ou data AAAA-MM-DD); undefined quando não lê. */
 export function minutosDesde(iso: string | null | undefined, agora: number): number | undefined {
@@ -33,16 +35,10 @@ export const idadeTexto = (min: number): string => {
   return m < 60 ? `há ${m} min` : `há ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")}`
 }
 
-const rgb = (hex: string): number[] => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
-const mistura = (a: string, b: string, f: number): string =>
-  "#" + rgb(a).map((c, i) => Math.round(c + (rgb(b)[i] - c) * f).toString(16).padStart(2, "0")).join("")
+export const corDaIdade = (i: Idade): Cor => COR_NIVEL[nivelDe(i)]
 
-/** Neutro até o primeiro limite; depois gradiente contínuo warn → hot → crit, crit daí em diante. */
-export function corIdade({ min, limites }: Idade, p: Paleta): string {
-  const pontos = [p.idade.warn, p.idade.hot, p.idade.crit]
-  if (min < limites[0]) return p.secundario
-  for (let i = 0; i < pontos.length - 1; i++) {
-    if (min < limites[i + 1]) return mistura(pontos[i], pontos[i + 1], (min - limites[i]) / (limites[i + 1] - limites[i]))
-  }
-  return pontos[pontos.length - 1]
+/** O trecho da idade: o texto na cor da escala, e no crítico ▲ e negrito (a cor nunca é o único sinal). */
+export const idadeTrecho = (i: Idade, texto = idadeTexto(i.min)): Trecho => {
+  const crit = nivelDe(i) === "crit"
+  return { t: crit ? `${texto} ▲` : texto, c: corDaIdade(i), b: crit || undefined }
 }

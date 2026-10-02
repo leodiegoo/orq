@@ -1,14 +1,16 @@
 // Tema da TUI: OpenTUI pinta texto e borda de branco por padrão (ilegível em fundo claro), então cada cor sai da paleta do tema.
-// Nenhuma cor de fundo é fixada: o fundo é o do terminal, e a paleta só traz cores com contraste >= 4.5:1 contra o fundo típico do tema.
+// Nenhuma cor de fundo é fixada: o fundo é o do terminal, e a paleta (GitHub Dark/Light) só traz cores com contraste >= 4.5:1 contra o fundo do tema.
 import { spawnSync } from "node:child_process"
 
 export type Tema = "light" | "dark"
-export type Paleta = { fundo: string; texto: string; secundario: string; borda: string; idade: { warn: string; hot: string; crit: string } }
+export type Paleta = { fundo: string; texto: string; secundario: string; borda: string; verde: string; amarelo: string; laranja: string; vermelho: string; azul: string; roxo: string }
+/** Cor semântica de um trecho: verde = pronto, em dia ou feito; amarelo = esperando ou parado; laranja = esperando há tempo demais (escala de idade); vermelho = bloqueado, travado ou falhou; azul = em andamento; roxo = decisão com o usuário; secundario = cinza. */
+export type Cor = Exclude<keyof Paleta, "fundo" | "borda">
 
-// `fundo` só serve de referência para o teste de contraste; a TUI não o pinta.
+// GitHub Dark e GitHub Light, chave a chave. `fundo` só serve de referência para o teste de contraste; a TUI não o pinta.
 export const PALETAS: Record<Tema, Paleta> = {
-  dark: { fundo: "#1e1e1e", texto: "#e6e6e6", secundario: "#a0a0a0", borda: "#a0a0a0", idade: { warn: "#d29922", hot: "#db6d28", crit: "#f85149" } }, // paleta GitHub escura, a mesma do painel
-  light: { fundo: "#ffffff", texto: "#1f2328", secundario: "#57606a", borda: "#57606a", idade: { warn: "#9a6700", hot: "#bc4c00", crit: "#cf222e" } }, // paleta GitHub clara
+  dark: { fundo: "#0d1117", texto: "#c9d1d9", secundario: "#8b949e", borda: "#8b949e", verde: "#3fb950", amarelo: "#d29922", laranja: "#db6d28", vermelho: "#f85149", azul: "#58a6ff", roxo: "#bc8cff" },
+  light: { fundo: "#ffffff", texto: "#1f2328", secundario: "#656d76", borda: "#656d76", verde: "#1a7f37", amarelo: "#9a6700", laranja: "#bc4c00", vermelho: "#cf222e", azul: "#0969da", roxo: "#8250df" },
 }
 
 const luz = (hex: string): number => {

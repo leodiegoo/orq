@@ -5,4 +5,18 @@ if [ -z "$ORQ_INTEGRADOR" ] && [ "$(git rev-parse --git-dir)" = "$(git rev-parse
   echo "pre-commit: commit on main of the live checkout refused. Create a worktree: git worktree add -b <type>/<description> .worktrees/<ticket> origin/main" >&2
   exit 1
 fi
+# Author and committer must be the project's noreply: ORQ_AUTOR, else any <id>+<user>@users.noreply.github.com. audit-publication catches it too, but only at the end of the cycle.
+for who in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+  email=$(git var "$who" 2>/dev/null | sed -n 's/.*<\(.*\)>.*/\1/p')
+  ok=
+  if [ -n "$ORQ_AUTOR" ]; then
+    [ "$email" = "$ORQ_AUTOR" ] && ok=1
+  else
+    case "$email" in *@users.noreply.github.com) ok=1 ;; esac
+  fi
+  if [ -z "$ok" ]; then
+    echo "pre-commit: $who <$email> is not the project's noreply${ORQ_AUTOR:+ ($ORQ_AUTOR)}. Fix it in this worktree: git config user.name \"<name>\" && git config user.email \"<id>+<user>@users.noreply.github.com\" (and unset GIT_AUTHOR_*/GIT_COMMITTER_* in the environment)" >&2
+    exit 1
+  fi
+done
 exec python3 "$(git rev-parse --show-toplevel)/scripts/audiencia-check.py"

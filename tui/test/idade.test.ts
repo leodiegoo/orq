@@ -5,7 +5,7 @@ import { cpSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { lerEstado, montarBlocos } from "../src/dados"
-import { corIdade, idadeTexto, limitesDo, nivelDe } from "../src/idade"
+import { corDaIdade, idadeTexto, idadeTrecho, limitesDo, nivelDe } from "../src/idade"
 import { criarTela } from "../src/tela"
 import { PALETAS, contraste, type Tema } from "../src/tema"
 
@@ -25,17 +25,17 @@ test("it should be the age text in minutes and in hours", () => {
   expect([0, 14.9, 59, 125].map(idadeTexto)).toEqual(["há 0 min", "há 14 min", "há 59 min", "há 2 h 05"])
 })
 
+test("it should be the scale's color as a trecho: neutral, yellow, orange, red, and the ▲ only when critical", () => {
+  const cor = (min: number) => corDaIdade({ min, limites: limitesDo(escala, "fila") })
+  expect([3, 5, 20, 40].map(cor)).toEqual(["secundario", "amarelo", "laranja", "vermelho"])
+  expect(idadeTrecho({ min: 20, limites: [5, 15, 30] })).toEqual({ t: "há 20 min", c: "laranja", b: undefined })
+  expect(idadeTrecho({ min: 40, limites: [5, 15, 30] })).toEqual({ t: "há 40 min ▲", c: "vermelho", b: true })
+})
+
 for (const tema of ["light", "dark"] as Tema[]) {
-  test(`it should be a continuous gradient with contrast of 4.5:1 or more on the ${tema} background`, () => {
+  test(`it should be the four age colors with contrast of 4.5:1 or more on the ${tema} background`, () => {
     const p = PALETAS[tema]
-    const limites = limitesDo(escala, "fila")
-    expect(corIdade({ min: 3, limites }, p)).toBe(p.secundario)
-    expect(corIdade({ min: 5, limites }, p)).toBe(p.idade.warn)
-    expect(corIdade({ min: 15, limites }, p)).toBe(p.idade.hot)
-    expect(corIdade({ min: 30, limites }, p)).toBe(p.idade.crit)
-    expect(corIdade({ min: 600, limites }, p)).toBe(p.idade.crit)
-    expect(corIdade({ min: 10, limites }, p)).not.toBe(p.idade.warn) // entre os pontos, mistura em vez de degrau
-    for (let m = 0; m <= 40; m += 0.5) expect(contraste(corIdade({ min: m, limites }, p), p.fundo)).toBeGreaterThanOrEqual(4.5)
+    for (const c of ["secundario", "amarelo", "laranja", "vermelho"] as const) expect(contraste(p[c], p.fundo)).toBeGreaterThanOrEqual(4.5)
   })
 }
 
@@ -57,10 +57,10 @@ test("it should be the oldest age in the header and the colored lines on the scr
   const hex = (c: { r: number; g: number; b: number }) => "#" + [c.r, c.g, c.b].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")
   const t = await quadro(Date.parse("2026-10-01T12:00:30Z"), "dark") // 47 min no despacho, 2 min no integrador
   expect(t.texto).toContain("fila: 2 itens, o mais antigo há 47 min ▲")
-  expect(t.texto).toContain("despacho: conserto do cache do E2E  há 47 min")
-  expect(t.spans.some((s) => s.text.includes("há 47 min") && hex(s.fg) === PALETAS.dark.idade.crit)).toBe(true)
+  expect(t.texto).toContain("despacho: conserto do cache do E2E há 47 min")
+  expect(t.spans.some((s) => s.text.includes("há 47 min") && hex(s.fg) === PALETAS.dark.vermelho)).toBe(true)
   const antes = await quadro(Date.parse("2026-10-01T11:16:30Z"), "light") // 3 min: neutro, sem símbolo
   expect(antes.texto).toContain("o mais antigo há 3 min")
-  expect(antes.texto).not.toContain("▲")
+  expect(antes.texto).not.toContain("o mais antigo há 3 min ▲") // a pendência da fixture, de 59 h, é que está crítica
   expect(antes.spans.some((s) => s.text.includes("há 3 min") && hex(s.fg) === PALETAS.light.secundario)).toBe(true)
 })
