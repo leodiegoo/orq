@@ -11837,6 +11837,96 @@ def test_ticket95_enqueued_request_carries_project_and_worktree_for_manager_to_r
     assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
 
 
+# ---- ticket 315: the queue keeps the ticket's project; the service cwd never picks it ----
+
+def _two_projects315(a):
+    """Projects `a` and `b` on real repos; returns their folders."""
+    repo_a, repo_b = _repo95(a, "proj-a"), _repo95(a, "proj-b")
+    _project(a, "a", {"repo": "path:" + repo_a})
+    _project(a, "b", {"repo": "path:" + repo_b})
+    return repo_a, repo_b
+
+
+def _blocked315(a, header=""):
+    _tk105(a, "87", "Bloqueador", "claimed", task="task_87")
+    _tk105(a, "88", "Ticket do projeto", is_blocked="87", task="task_88", extra=MODEL105 + header)
+    _tasks105(a, ("task_87", "dispatched"), ("task_88", "blocked"))
+
+
+def test_ticket315_released_ticket_of_project_a_starts_in_a_with_the_service_cwd_in_b():
+    a = _panel79()
+    _manager(a)
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a, "Project: a\n")
+    r = a.orq("ticket", "fechar", "87", "--answer", "feito", cwd=repo_b)  # the coordinator is in B; the header says A
+    assert r.returncode == 0, r.stderr
+    (it,) = _queue79(a)
+    assert (it["projeto"], it["worktree"]) == ("a", "new-top-level") and it["nome"], it
+    r = a.orq("gerente", "absorver", cwd=repo_b)  # the service runs in B
+    assert r.returncode == 0 and "started" in r.stdout, r.stdout + r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a and arg[arg.index("--worktree") + 1] == "new-top-level", arg
+
+
+def test_ticket315_released_ticket_without_header_takes_the_project_of_the_coordinator_cwd():
+    a = _panel79()
+    _manager(a)
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a)
+    assert a.orq("ticket", "fechar", "87", "--answer", "feito", cwd=repo_a).returncode == 0
+    (it,) = _queue79(a)
+    assert it["projeto"] == "a", it
+    assert a.orq("gerente", "absorver", cwd=repo_b).returncode == 0
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a, arg
+
+
+def test_ticket315_dispatch_ticket_uses_the_project_of_its_header():
+    a = Env(run="run_a")
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a, "Project: a\n")
+    _tk105(a, "89", "Solto", task="task_89", extra=MODEL105 + "Project: a\n")
+    _tasks105(a, ("task_89", "pending"))
+    r = a.orq("despachar", "--run", "run_a", "--ticket", "89", "--modelo", "claude-sonnet-5-5", "--effort", "medium", cwd=repo_b)
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a, arg
+
+
+def test_ticket315_manager_refuses_an_item_without_project_instead_of_using_its_cwd():
+    a = _panel79()
+    _manager(a)
+    _, repo_b = _two_projects315(a)
+    _fleet79(a, live=[(f"Vivo {n}", SONNET) for n in range(4)])
+    out = json.loads(a.orq("despachar", "--run", "run_a", "--titulo", "Sem projeto", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium",
+                           cwd=a.tmp.name).stdout)  # the coordinator is outside every project
+    assert out["estado"] == "enfileirado", out
+    (it,) = _queue79(a)
+    assert not it.get("projeto"), it
+    _release79(a, "term_v0")
+    r = a.orq("gerente", "absorver", cwd=repo_b)  # the manager sits inside project b: it must not adopt it
+    assert not _log(a, "started.log"), "nothing starts in the manager's cwd"
+    assert "without a project" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert len(_queue79(a)) == 1 and _queue79(a)[0]["falhas"] == 1, "the item stays and counts the failure until the queue gives up and warns the coordinator"
+
+
+def test_ticket315_ticket_new_writes_the_project_of_the_cwd_and_project_overrides_it():
+    a = Env(run="run_a")
+    repo_a, repo_b = _two_projects315(a)
+    n1 = json.loads(_new(a, "Do cwd", cwd=repo_a).stdout)["ticket"]
+    n2 = json.loads(_new(a, "Declarado", "--project", "b", cwd=repo_a).stdout)["ticket"]
+    assert "\nProject: a\n" in _read_text(a, n1) and "\nProject: b\n" in _read_text(a, n2)
+    assert _ticket_project315(a, n1) == "a" and _ticket_project315(a, n2) == "b"
+    n3 = json.loads(_new(a, "Fora de projeto", cwd=a.tmp.name).stdout)["ticket"]
+    assert "Project:" not in _read_text(a, n3), "no project found: no line"
+    r = _new(a, "Projeto que nao existe", "--project", "zzz")
+    assert r.returncode == 1 and "zzz" in r.stderr, r
+
+
+def _ticket_project315(a, number):
+    return orq_mod.read_ticket(_ticket(a, number))["projeto"]
+
+
 # ---------- orq perguntar: decision through Lavish in both harnesses (ticket 75) ----------
 
 FALSE_LAVISH = """#!/usr/bin/env python3
@@ -13916,6 +14006,7 @@ def test_ticket128_serve_install_writes_launchd_and_uninstall_removes_it():
     assert pl["ProgramArguments"][-2:] == ["gerente", "serve"] and pl["ProgramArguments"][1].endswith("orq.py"), pl
     assert pl["KeepAlive"] and pl["RunAtLoad"] and pl["EnvironmentVariables"]["ORQ_HOME"] == a.home, pl
     assert pl["StandardErrorPath"] == os.path.join(a.home, "logs", "gerente.log"), pl
+    assert pl["WorkingDirectory"] == orq_mod.orqpaths.CODE, "the service runs in orq's clone, not wherever launchd starts it (ticket 315)"
     assert not [k for k in pl["EnvironmentVariables"] if k.startswith("ORCA_")], "o handle do coordenador não vai para o launchd"
     assert json.loads(a.orq("gerente", "serve", "--status", **env).stdout)["instalado"]
     assert a.orq("gerente", "serve", "--desinstalar", **env).returncode == 0
@@ -15903,12 +15994,7 @@ def test_ticket170_released_orq_ticket_raises_from_queue_with_worktree_current()
 
 
 def test_ticket170_released_project_ticket_raises_with_kebab_title_name_without_accents():
-    before = orq_mod.dispatch_project
-    orq_mod.dispatch_project = lambda item_name=None, run=None: "projeto-x"
-    try:
-        wt, item_name = orq_mod._released_worktree({"run": "run_a", "titulo": "Ação nº 3: relatório de variação muito longo para caber"})
-    finally:
-        orq_mod.dispatch_project = before
+    wt, item_name = orq_mod._released_worktree({"run": "run_a", "titulo": "Ação nº 3: relatório de variação muito longo para caber"}, "projeto-x")
     assert wt == "new-top-level" and item_name == "acao-no-3-relatorio-de-variacao-muito-lo" and len(item_name) <= 40, (wt, item_name)
 
 

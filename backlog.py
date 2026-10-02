@@ -16,7 +16,7 @@ TOML = '[markdown]\ndone_keep = 100000\n'  # the `.tasks.toml` of a backlog fold
 CLI_TIMEOUT_S = 20
 HOLD_KINDS = ("captain", "external", "load", "parked", "future")
 META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # `key_name: value` lines at the top of the pending item's body
-META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera", "scratch")  # same for the ticket; `orca: task_x run_y` is the bridge to Orca
+META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera", "scratch", "projeto")  # same for the ticket; `orca: task_x run_y` is the bridge to Orca
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 ID_RE = re.compile(rf"^{_ID}$")
@@ -210,7 +210,7 @@ def ticket_of_item(i, by_id, root):
     return {"num": m.group(1).zfill(2), "arquivo": os.path.join(root, meta["spec"]) if meta.get("spec") else None, "titulo": i["titulo"], "status": TICKET_STATE[i["estado"]],
             "blocked_by": [b[1:].zfill(2) for b in i["bloqueios"] if re.fullmatch(r"t\d+", b) and (i["estado"] == "done" or by_id.get(b, {}).get("estado") not in (None, "done"))],
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
-            "despacho": meta.get("despacho"), "espera": meta.get("espera"),  # the `Despacho:` and `Espera:` headers (ticket 142)
+            "despacho": meta.get("despacho"), "espera": meta.get("espera"), "projeto": meta.get("projeto"),  # the `Despacho:` and `Espera:` headers (ticket 142)
             "scratch": meta.get("scratch"),  # the `.scratch/<feature>/issues/NN-*.md` the ticket was born from (ticket 201)
             "fechado_em": i["closed"]}
 

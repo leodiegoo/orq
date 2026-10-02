@@ -7459,8 +7459,8 @@ def _write(path, txt):
 
 
 def read_ticket(path):
-    """{num, arquivo, titulo, status, blocked_by, run, task, modelo, effort} from the header of a `NN-slug.md` ticket (`Modelo:` and `Effort:` are optional: what orq
-    dispatches on its own when the ticket is released); raises OSError or ValueError if unreadable."""
+    """{num, arquivo, titulo, status, blocked_by, run, task, modelo, effort, projeto} from the header of a `NN-slug.md` ticket (`Modelo:`, `Effort:` and `Project:` are optional:
+    what orq dispatches on its own when the ticket is released, and the project it starts in); raises OSError or ValueError if unreadable."""
     with open(path, encoding="utf-8") as f:
         txt = f.read()
     cab = _header(txt)
@@ -7471,6 +7471,7 @@ def read_ticket(path):
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
             "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
+            "projeto": _campo(cab, "Project") or _campo(cab, "Projeto") or None,
             "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None}
 
 
@@ -7568,9 +7569,9 @@ def _waiting_ticket_line(t, integration, events, without_push):
     return ticket_line(t, dispatch_wait(t, integration, events, without_push) if t["status"] == STATUS_NEW and not t["blocked_by"] else None)
 
 
-def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None):
-    """The optional fields that say how the ticket is launched: Modelo, Effort, Despacho and Espera (ticket 142), in the order the header and the backlog store them."""
-    return {k: " ".join(v.split()) for k, v in (("modelo", model), ("effort", effort), ("despacho", dispatch_mode), ("espera", waiting)) if v}
+def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None, project=None):
+    """The optional fields that say how the ticket is launched: Modelo, Effort, Despacho, Espera (ticket 142) and Project (ticket 315), in the order the header and the backlog store them."""
+    return {k: " ".join(v.split()) for k, v in (("modelo", model), ("effort", effort), ("despacho", dispatch_mode), ("espera", waiting), ("projeto", project)) if v}
 
 
 def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
@@ -7582,7 +7583,7 @@ def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
                 *(x for b in blockers for x in ("--blocked-by", f"t{b}")), "--body", body_text)
 
 
-def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None):
+def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None, project=None):
     """Creates `ISSUES/NN-<slug>.md` from the title and the spec file, and the Orca task (`--task-title` equal to the title, a short `--spec` that
     points to the file, `--deps` with the tasks of the Blocked by still open). The `task_id` stays in the ticket, which is the only source of the content.
 
@@ -7591,7 +7592,8 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
 
     With tickets in the backlog (M5) the file is only the text (`# NN: título` and the sections, without Status, Blocked by, Run or Task) and the state goes to the backlog item `tNN`,
     written after the task: if the `add` fails, the file goes away and the task is completed with `desfeito` (undone). `model`, `effort`, `dispatch_mode` and `waiting` are the
-    optional header fields (or the item's meta).
+    optional header fields (or the item's meta). `project` (`Project:`) is where the released ticket starts: `--project`, otherwise the Run's, otherwise the one that contains the
+    coordinator's cwd; with none, no line (ticket 315).
     """
     title = " ".join((title or "").split())
     if not title:
@@ -7599,7 +7601,6 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     no_backlog = _tickets_in_backlog()
     if no_backlog and (p := backlog.problem_title(title)):
         raise ValueError(p)
-    meta = _meta_ticket(model, effort, dispatch_mode, waiting)
     try:
         with open(os.path.expanduser(spec_file), encoding="utf-8") as f:
             body_text = f.read().strip()
@@ -7614,6 +7615,7 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     existing = {t["num"]: t for t in tickets()}
     blockers = list(dict.fromkeys(n.zfill(2) for n in re.findall(r"\d+", blocked_by or "")))
     target = default_run(run)
+    meta = _meta_ticket(model, effort, dispatch_mode, waiting, dispatch_project(project, target))
     deps, notices = [], []
     for n in blockers:
         t = existing.get(n)
@@ -7634,7 +7636,7 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         with _lock("ticket.lock"):  # B25: two simultaneous `ticket new` do not pick the same number
             number = f"{_largest_ticket() + 1:02d}"
             path = os.path.join(ISSUES, f"{number}-{_slug(title)}.md")
-            cab = "" if no_backlog else f"\nStatus: {STATUS_NEW}\nBlocked by: {', '.join(blockers) or '(nenhum)'}\nRun: {target}\n" + "".join(f"{k.capitalize()}: {v}\n" for k, v in meta.items())
+            cab = "" if no_backlog else f"\nStatus: {STATUS_NEW}\nBlocked by: {', '.join(blockers) or '(nenhum)'}\nRun: {target}\n" + "".join(f"{'Project' if k == 'projeto' else k.capitalize()}: {v}\n" for k, v in meta.items())
             txt = f"# {number}: {title}\n{cab}\n{body_text}\n"
             with open(path, "x", encoding="utf-8") as f:
                 f.write(txt)
@@ -7743,11 +7745,11 @@ def ticket_edit(numero, **fields):
     return {"ticket": n, "campos": sorted(fresh)}
 
 
-def _released_worktree(t):
-    """(worktree, name) with which the released ticket goes up from the queue: `current` for an orq ticket (its worktree block already says where to work) and, for a
-    project one, a new worktree with `--name` from the title (kebab, no accents, up to 40 letters): Orca refuses new-top-level without a name. An invalid Run project raises ValueError."""
-    project = dispatch_project(None, t["run"])
-    if orq_ticket(t["titulo"], project):
+def _released_worktree(t, project):
+    """(worktree, name) with which the released ticket goes up from the queue: `current` for an orq ticket with no project (its worktree block already says where to work) and, for
+    a project one, a new worktree in the project's repo with `--name` from the title (kebab, no accents, up to 40 letters): Orca refuses new-top-level without a name. `current`
+    would be the manager terminal's worktree, which may be another project's (ticket 315)."""
+    if not project and orq_ticket(t["titulo"]):
         return "current", None
     return "new-top-level", _slug(t["titulo"])[:40].strip("-")
 
@@ -7789,8 +7791,10 @@ def _release_dependents(n, before=None):
             notices.append(f"ticket {t['num']} (P{priority}) released, outside the dispatch queue ({waiting}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
             try:
-                wt, item_name = _released_worktree(t)
-                item["fila"] = _enqueue_dispatch(f"ticket {n} resolved: released {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority, "claude")["fila"]
+                project = dispatch_project(t["projeto"], t["run"])  # resolved now, in the coordinator's process: the manager never guesses it from its own cwd
+                wt, item_name = _released_worktree(t, project)
+                item["fila"] = _enqueue_dispatch(f"ticket {n} resolved: released {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority,
+                                                 "claude", project)["fila"]
             except (OSError, ValueError) as e:
                 notices.append(f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3:
@@ -9479,8 +9483,9 @@ def run_store_project(run, item_name):
     return append_event({"tipo": "run_projeto", "run": run, "projeto": item_name})
 
 
-def dispatch_project(item_name=None, run=None):
-    """A dispatch's project: `--project`, otherwise the one the Run holds, otherwise the one that contains the cwd (or its main checkout), otherwise None.
+def dispatch_project(item_name=None, run=None, use_cwd=True):
+    """A dispatch's project: `--project`, otherwise the one the Run holds, otherwise the one that contains the cwd (or its main checkout), otherwise None. The manager passes
+    `use_cwd=False`: its cwd says nothing about the item it starts (ticket 315).
 
     A name requested or stored in the Run that no longer exists or is invalid is refused: falling back to the cwd would start the worker in the wrong repository."""
     ps = projects()
@@ -9492,6 +9497,8 @@ def dispatch_project(item_name=None, run=None):
         if ps[item_name]["erro"]:
             raise ValueError(f"{origin_name} points to project {item_name}, whose file is invalid: {ps[item_name]['erro']}")
         return item_name
+    if not use_cwd:
+        return None
     cwd = os.path.realpath(os.getcwd())
     return project_by_folder(ps, cwd) or (project_by_folder(ps, _repo_root(cwd) or cwd) if ps else None)
 
@@ -9780,6 +9787,12 @@ def _gate_backlog(tk):
         raise ValueError(f"ticket {tk['num']} is blocked by {', '.join(tk['blocked_by'])}: close the blockers first")
 
 
+def _ticket_project(number):
+    """The `Project:` of ticket `number`, or None (no such ticket, no line)."""
+    n = str(number).strip().zfill(2)
+    return next((t["projeto"] for t in tickets() if t["num"] == n), None)
+
+
 def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None):
     """worker-start (with --model and --effort, which the worker-routing-guard hook requires) + `dispatch_mode` event + entry intake.
 
@@ -9800,8 +9813,12 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
     """
     if priority_level is not None and priority_level not in (1, 2, 3):
         raise ValueError("--priority expects 1 (high), 2 or 3 (low)")
+    project = project or (_ticket_project(ticket) if ticket else None)  # --projeto, then the ticket's `Project:`
     explicit_project = bool(project or (run and run_project(run)))
-    project = dispatch_project(project, run)  # --projeto, the Run's, the cwd's; with none, the dispatch is the usual one
+    project = dispatch_project(project, run, use_cwd=not _draining)  # then the Run's, the cwd's; with none, the dispatch is the usual one
+    if _draining and not project and projects():
+        raise ValueError("queue item without a project: the manager does not guess one from its own cwd, "
+                         f"dispatch it by hand with {_abandoned_command({'run': run, 'ticket': ticket, 'titulo': title, 'modelo': model, 'effort': effort}).replace('orq dispatch', 'orq dispatch --project <name>', 1)}")
     repo = projects()[project]["repo"] if project else None
     if not agent:  # --agente wins; without it the project's harness holds, and without a project the usual claude
         agent = projects()[project]["harness"] if project else "claude"
@@ -12143,13 +12160,14 @@ def serve_stop(wait_s=15):
 
 
 def serve_install():
-    """Writes the launchd agent (starts at login, KeepAlive restarts it if it dies) and loads it. The environment is the current PATH and ORQ_HOME; no ORCA_*."""
+    """Writes the launchd agent (starts at login, KeepAlive restarts it if it dies) and loads it. The environment is the current PATH and ORQ_HOME; no ORCA_*. It runs in orq's
+    clone (`WorkingDirectory`): without it launchd starts in `/`, and nothing the manager starts may take its project from there (ticket 315)."""
     os.makedirs(LAUNCH_AGENTS, exist_ok=True)
     os.makedirs(os.path.dirname(_path(SERVE_LOG)), exist_ok=True)
     import plistlib
     pl = {"Label": LAUNCHD_LABEL, "ProgramArguments": [sys.executable, os.path.join(orqpaths.CODE, "orq.py"), "gerente", "serve"],
           "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ORQ_HOME": HOME}, "RunAtLoad": True, "KeepAlive": True,
-          "ThrottleInterval": 30, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
+          "ThrottleInterval": 30, "WorkingDirectory": orqpaths.CODE, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
     with open(_plist_serve(), "wb") as f:
         plistlib.dump(pl, f)
     target = f"gui/{os.getuid()}"
@@ -13068,6 +13086,7 @@ def parser():
     for k, h in (("modelo", "the model the released ticket starts with on its own"), ("despacho", "`manual[, reason]`: never starts on its own"), ("espera", "`integrador vazio`")):
         _arg(tn, k, help=h)
     tn.add_argument("--effort", help="its effort")
+    _arg(tn, "projeto", help="the project the released ticket starts in (`Project:`); without it the Run's or the coordinator's cwd project applies")
     tf = tk.add_parser("close", aliases=["fechar"], help="writes the Answer, sets resolved and completes the task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="text or the path of a file")
@@ -13488,7 +13507,7 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_tasks_text(r, a.dry_run))
         elif a.cmd == "ticket":
             if a.op == "new":
-                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting)
+                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting, a.project)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicit("tarefa", r["task"], r["run"])
             elif a.op == "edit":
