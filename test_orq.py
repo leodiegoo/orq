@@ -11934,6 +11934,155 @@ def test_mate_queue_drains_with_the_current_mate_terminal():
     assert seen_item["h"] == "term_mate_novo", seen_item
 
 
+# ---- ticket 323: the mate's Stop carries the group's obligations and open requests ----
+
+def _mate_stop(a, **env):
+    return a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}), ORQ_MATE="orq", **env)
+
+
+def _group_pr_env(**env):
+    """Env where task_feat1 was dispatched by the mate's Run: the PR it merges belongs to the group."""
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0", **env)
+    _group(a)
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"terminal": "term_mate", "runs": ["run_mate"], "turnos": []}}}, f)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "despacho", "task": "task_feat1", "run": "run_mate", "dispatch": "ctx_m1"}) + "\n")
+    return a
+
+
+def test_ticket323_group_pr_obligation_is_chased_in_the_mate_stop_and_fulfill_closes_it():
+    a = _group_pr_env()
+    e = _merge_main(a)
+    entry_event = next(x for x in a.events() if x.get("tipo") == "entrada" and x["id"] == e)
+    assert entry_event["grupo"] == "orq", entry_event
+    assert "decision" not in json.loads(_stop(a).stdout or "{}"), "the coordinator does not chase the group's obligation"
+    assert orq_mod.open_entries(a.events()) == [], "nor does it see the group's entry"
+    out = json.loads(_mate_stop(a).stdout)
+    assert out["decision"] == "block" and "Obligation open" in out["reason"] and f"{e} deploy" in out["reason"] and "orq fulfill" in out["reason"], out
+    for key_name in ("deploy", "comentario"):
+        assert a.orq("feito", e, key_name, "--prova", "v1", ORQ_MATE="orq").returncode == 0
+    assert a.orq("adiar", e, "limpeza", "--motivo", "depois", ORQ_MATE="orq").returncode == 0
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "closed by the mate: the Stop lets it through"
+
+
+def test_ticket323_group_obligation_shows_in_the_mate_prompt_and_not_in_the_coordinators():
+    a = _group_pr_env()
+    e = _merge_main(a)
+    notice = f"orq: PR #1282 entered main. Entry {e}."
+    assert f"To do by you: {e} →" in _ctx(a.prompt(notice, ORQ_MATE="orq"))
+    assert "To do by you" not in (a.prompt(notice).stdout or "")
+
+
+def _mate_requests(a, evs):
+    _mate_alive(a)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(x) + "\n" for x in evs))
+
+
+def test_ticket323_open_request_blocks_the_mate_stop_up_to_the_cap_and_then_releases_with_notice():
+    a = Env()
+    _group(a)
+    _mate_requests(a, _request())  # delivered long ago, no reply: the deadline is blown (state reenviar)
+    for _ in range(2):
+        out = json.loads(_mate_stop(a).stdout)
+        assert out["decision"] == "block" and "p1" in out["reason"] and "orq mate raise --corr p1" in out["reason"], out
+    out = json.loads(_mate_stop(a).stdout)
+    assert "decision" not in out and "p1" in out["systemMessage"], out
+    assert [x for x in a.events() if x["tipo"] == "gate_falhou"], "the spent budget leaves the event"
+
+
+def test_ticket323_answered_or_foreign_request_does_not_block_the_mate_stop():
+    a = Env()
+    _group(a)
+    answered = [*_request(), {"tipo": "entrada", "id": "e9", "origem": "mate", "mate": "orq", "corr": "p1", "ts": _z(15)}]
+    _mate_requests(a, answered)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}")
+    other_one = [{**x, "grupo": "dados"} for x in _request()]
+    _mate_requests(a, other_one)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "another group's request is not this mate's"
+    escalated = [*_request(), {"tipo": "mate_reenvio", "corr": "p1", "ts": _z(600)}, {"tipo": "mate_escalado", "corr": "p1", "ts": _z(900)}]
+    _mate_requests(a, escalated)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "already escalated: nothing left for the mate to do before stopping"
+
+
+def test_ticket323_mate_entry_without_effect_blocks_the_mate_stop():
+    a = Env()
+    _group(a)
+    a.prompt("trabalho do mate", ORQ_MATE="orq")
+    out = json.loads(_mate_stop(a).stdout)
+    assert out["decision"] == "block" and "without effect" in out["reason"] and "orq intake" in out["reason"], out
+    (entry_event,) = [e for e in a.events() if e.get("tipo") == "entrada"]
+    assert a.orq("intake", entry_event["id"], "conversation", ORQ_MATE="orq").returncode == 0
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}")
+
+
+def test_ticket323_night_externals_and_question_guard_hold_in_the_mate():
+    a = Env(run="run_a")
+    _group(a)
+    ev = {"session_id": "abcdef123456", "tool_name": "AskUserQuestion", "tool_input": {"questions": []}}
+    out = json.loads(a.orq("hook", "guard", stdin=json.dumps(ev), ORQ_MATE="orq").stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "orq mate raise --type decision" in out["permissionDecisionReason"], out
+    _night(a)
+    for cmd in ("git push origin main", "gh pr merge 12 --squash"):
+        ev = {"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": "abcdef123456", "cwd": a.tmp.name}
+        out = json.loads(a.orq("hook", "externas", stdin=json.dumps(ev), ORQ_MATE="orq").stdout)["hookSpecificOutput"]
+        assert out["permissionDecision"] == "deny", cmd
+
+
+def test_ticket323_doctor_hooks_warns_when_project_settings_of_the_group_turn_hooks_off():
+    a = Env()
+    _group(a)
+    os.makedirs(os.path.join(a.home, ".claude"), exist_ok=True)
+    with open(os.path.join(a.home, ".claude", "settings.local.json"), "w") as f:
+        json.dump({"disableAllHooks": True}, f)
+    r = a.orq("doctor", "hooks")
+    assert r.returncode == 1 and "mate orq" in r.stdout and "disableAllHooks" in r.stdout, r.stdout + r.stderr
+
+
+def test_ticket323_request_escalation_tells_the_coordinator_when_the_mate_recorded_no_turn():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    evs = [*_request(), {"tipo": "mate_reenvio", "corr": "p1", "ts": _z(600)}]
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(x) + "\n" for x in evs))
+    with InProcess(a):
+        assert any("p1 escalated" in x for x in orq_mod.mate_lap())
+    texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert "no turn" in texts[0] and "orq doctor hooks" in texts[0], texts
+
+
+def test_ticket323_mate_prompt_absorbs_heartbeat_batches_and_shows_worker_done_whole():
+    a = Env()
+    _group(a)
+    a.inbox(_hb("lendo"))
+    out = json.loads(a.prompt(NOTICE_A, ORQ_MATE="orq").stdout)
+    assert out["decision"] == "block" and "heartbeats absorbed" in out["reason"], out
+    b = Env()
+    _group(b)
+    _delivery141(b, body="sem texto", branch="fix/da-caixa")
+    b.inbox(_hb("lendo"), ("worker_done", {"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"}))
+    _body182(b, "msg_2", "entreguei o ticket. " + "x" * 2000)
+    ctx = _ctx182(b.prompt(NOTICE_A, ORQ_MATE="orq"))
+    assert "msg_2 worker_done" in ctx and "entreguei o ticket." in ctx and "x" * 1400 in ctx and "1 heartbeat" in ctx and "lendo" not in ctx, ctx
+
+
+def test_ticket323_group_pr_notice_is_typed_into_the_mate_and_not_the_coordinator():
+    a = _group_pr_env()
+    _merge_main(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.set("terminals.json", ["term_mate", "term_coord"])
+    with InProcess(a):
+        assert any("mate orq" in x for x in orq_mod.pr_notify())
+    targets = [c[c.index("--terminal") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert targets == ["term_mate"], targets
+
+
 # ---- ticket 94: project files (ORQ_HOME/projects/<name>.json) ----
 
 def _project(a, item_name, dado):

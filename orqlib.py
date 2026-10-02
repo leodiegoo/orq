@@ -4204,7 +4204,8 @@ def _apply_prs(d, seen, now_at):
         if i["url"] in already:
             i["avisado"] = True
             continue
-        entry_event = append_event({"tipo": "entrada", "origem": "pr", "texto": text_value, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"]}, new_id=True)
+        entry_event = append_event({"tipo": "entrada", "origem": "pr", "texto": text_value, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"],
+                                    **_run_group(_task_run(event_list, i["task"]))}, new_id=True)  # a Run of the group's mate: the PR and its obligations are the mate's (ticket 323)
         i.update(entrada=entry_event["id"], texto=text_value, avisado=False)
         if new == "mergeado":
             tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_CLOSED), None)
@@ -4245,7 +4246,7 @@ def pr_notify():
     g = _manager_cfg()
     if not g or not g.get("coordenador"):
         return []
-    line_list = []
+    line_list, owner = [], {e["id"]: e.get("grupo") for e in read_events() if e.get("tipo") == "entrada" and e.get("id")}
     for i in [x for x in _prs_ro()["itens"] if x["estado"] != "aberto" and not x.get("avisado") and x.get("entrada")]:
         def reserve(d, url=i["url"], value=True):
             """Sets/clears the notice under pr.lock; returns False if it was already set (another panel or a restart got there first)."""
@@ -4260,11 +4261,17 @@ def pr_notify():
         # reserve before typing: two panels (or a restart mid-round) do not type the same notice twice
         if not _mutate_prs(reserve):
             continue
-        if notify_coordinator(g["coordenador"], f"orq: {i['texto']}. Entry {i['entrada']}.", context=False) not in ("enviado", "adiado"):  # the "PR: …" in the summary already shows it
+        mate = owner.get(i["entrada"])  # a PR of the group's Run is the mate's: the notice is typed into its terminal, not the coordinator's (ticket 323)
+        notice, mate_terminal = f"orq: {i['texto']}. Entry {i['entrada']}.", mate and _dict(_mates().get(mate)).get("terminal")
+        if mate_terminal:
+            failed = type_text(mate_terminal, notice) != "enviado"
+        else:
+            failed = notify_coordinator(g["coordenador"], notice, context=False) not in ("enviado", "adiado")  # the "PR: …" in the summary already shows it
+        if failed:
             _mutate_prs(lambda d, f=reserve: f(d, value=False))  # nothing was typed: the next round tries
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
-        line_list.append(f"{i['task']}: PR #{i['numero']} notice typed in the coordinator")
+        line_list.append(f"{i['task']}: PR #{i['numero']} notice typed in the {'mate ' + mate if mate_terminal else 'coordinator'}")
     for i in [x for x in _prs_ro()["itens"] if x["estado"] == "aberto" and _blocked_by_base(x.get("ci")) and x.get("base_avisada") != ", ".join(x["ci"]["falhas"])]:
         key_name = ", ".join(i["ci"]["falhas"])
         since = i["ci"].get("base_vermelha_desde")
@@ -4309,6 +4316,14 @@ def open_obligations(events, entry=None):
             and entry in (None, e.get("entrada"))]
 
 
+def my_obligations(events):
+    """The open obligations of the reader: those of the entries of the mate's group (ORQ_MATE) or, in the coordinator, of the entries without a group (ticket 323).
+    The manager (deploy check, fulfill by id) uses `open_obligations`, which sees them all."""
+    owner = {e["id"]: e.get("grupo") for e in events if e.get("tipo") == "entrada" and e.get("id")}
+    g = os.environ.get("ORQ_MATE") or None
+    return [o for o in open_obligations(events) if owner.get(o["entrada"]) == g]
+
+
 def _by_entry(obligations_open):
     by = {}
     for o in obligations_open:
@@ -4317,9 +4332,9 @@ def _by_entry(obligations_open):
 
 
 def obligations_line(events):
-    """"A fazer por você: e484 → comentario (…), deploy (…)." from the coordinator's preamble, or empty. The mate does not carry the coordinator's.
+    """"A fazer por você: e484 → comentario (…), deploy (…)." from the reader's preamble (the coordinator's, or the mate's own group), or empty.
     ponytail: no cap of its own; dozens of open obligations make a long line, which is the sign they are being forgotten."""
-    obligations_open = [] if os.environ.get("ORQ_MATE") else open_obligations(events)
+    obligations_open = my_obligations(events)
     if not obligations_open:
         return ""
     return ("To do by you: " + "; ".join(f"{e} → " + ", ".join(f"{o['chave']} ({o['texto']}" + (f"; {m}" if o["chave"] == "limpeza" and (m := _cleanup_reason(events, o.get("task"))) else "") + ")" for o in os_) for e, os_ in _by_entry(obligations_open).items())
@@ -4442,9 +4457,9 @@ def defer_obligation(e, key_name, reason, run=None):
 
 
 def obligations_to_chase(events, now_at, minutes_elapsed=None):
-    """The obligations open for at least `minutes_elapsed` (OBLIGATION_MIN): the coordinator's Stop blocks them (`hook_stop`)."""
+    """The reader's obligations open for at least `minutes_elapsed` (OBLIGATION_MIN): the Stop of the coordinator, and of the mate for its group, blocks them (`hook_stop`)."""
     minutes_elapsed = OBLIGATION_MIN if minutes_elapsed is None else minutes_elapsed
-    return [o for o in open_obligations(events) if (now_at - _dt(o["ts"])).total_seconds() >= minutes_elapsed * 60]
+    return [o for o in my_obligations(events) if (now_at - _dt(o["ts"])).total_seconds() >= minutes_elapsed * 60]
 
 
 def _open_question(events):
@@ -6029,38 +6044,40 @@ def give_run_back_to_manager():
 
 def _hook_stop(ev, run):
     # an entry with no intake in the turn (same session) or open for more than INTAKE_OLD_MIN always blocks, via _gate_blocks; the others only with `stop_bloqueia`
-    if not os.environ.get("ORQ_MATE"):  # the mate's end of turn is not the coordinator's reply to the absent user
+    mate = os.environ.get("ORQ_MATE")
+    if not mate:  # the mate's end of turn is not the coordinator's reply to the absent user
         digest_no_stop(ev)
     events, now_at = read_events(), now_dt()
     without = open_entries(events)
-    old_entries = [] if os.environ.get("ORQ_MATE") else obligations_to_chase(events, now_at)
-    blocker = None if os.environ.get("ORQ_MATE") else away_blocker(events, now_at)
-    if not without and not old_entries and not blocker:
+    old_entries = obligations_to_chase(events, now_at)
+    asked = [p for p in mate_pending(events, _mates(), now_at) if p["grupo"] == mate and p["estado"] != "escalado"] if mate else []  # the mate answers before it stops (ticket 323)
+    blocker = None if mate else away_blocker(events, now_at)
+    if not without and not old_entries and not asked and not blocker:
         return None
-    msg = MARK
+    msg, session, gate_ids = MARK, (ev.get("session_id") or "")[:8], []
     if without:
         ids = [e["id"] for e in without]
-        append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
+        append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": session})
         rec = recovered_cursor(_cursor_ro(), now_at)
         quoted = ", ".join(f"{e['id']} ({_quote(e.get('texto'))!r})" for e in without[:3]) + (f" +{len(without) - 3}" if len(without) > 3 else "")
         msg += f" {len(ids)} entry(ies) without effect: {quoted}. Use: orq intake <e> task|steer|pend|decision|conversation|discarded [ref]" + (f" [notice] {recovered_notice(rec)}" if rec else "")
-        session = (ev.get("session_id") or "")[:8]
-        if not os.environ.get("ORQ_MATE"):
-            if not machine_cfg()["stop_bloqueia"]:  # only what the user said in this turn, or what has been open for a long time
-                ids = [e["id"] for e in without if e.get("origem", "usuario") == "usuario" and (
-                    (session and e.get("sessao") == session) or ((t := _ts(e.get("ts"))) and (now_at - t).total_seconds() > INTAKE_OLD_MIN * 60))]
-            if ids:
-                if _gate_blocks(session, ids):
-                    return {"decision": "block", "reason": msg}
-                append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": session})
+        if not mate and not machine_cfg()["stop_bloqueia"]:  # only what the user said in this turn, or what has been open for a long time; the mate has no absent user: every entry of the group
+            ids = [e["id"] for e in without if e.get("origem", "usuario") == "usuario" and (
+                (session and e.get("sessao") == session) or ((t := _ts(e.get("ts"))) and (now_at - t).total_seconds() > INTAKE_OLD_MIN * 60))]
+        gate_ids += ids
     if old_entries:
         msg += (f" Obligation open for more than {OBLIGATION_MIN:g} min: " + ", ".join(f"{o['entrada']} {o['chave']} ({o['texto']})" for o in old_entries[:4])
                 + (f" +{len(old_entries) - 4}" if len(old_entries) > 4 else "") + ': orq fulfill <e> <obligation> --proof "…" or orq defer <e> <obligation> --reason "…" (a deploy that is still building can be deferred).')
-        ids, session = [f"{o['entrada']}:{o['chave']}" for o in old_entries], (ev.get("session_id") or "")[:8]
-        if _gate_blocks(session, ids):
+        gate_ids += [f"{o['entrada']}:{o['chave']}" for o in old_entries]
+    if asked:
+        msg += (" Request from the coordinator without a reply: " + ", ".join(f"{p['corr']} ({_quote(p['texto'])!r})" for p in asked[:3]) + (f" +{len(asked) - 3}" if len(asked) > 3 else "")
+                + f". Answer each with `orq mate raise --corr {asked[0]['corr']} --type answer --text \"…\"` before you stop.")
+        gate_ids += [p["corr"] for p in asked]
+    if gate_ids:
+        if _gate_blocks(session, gate_ids):
             return {"decision": "block", "reason": msg}
-        append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": session})
-    return {**({"systemMessage": msg} if without or old_entries else {}), **({"decision": "block", "reason": blocker} if blocker else {})}
+        append_event({"tipo": "gate_falhou", "abertas": gate_ids, "sessao": session})
+    return {**({"systemMessage": msg} if without or old_entries or asked else {}), **({"decision": "block", "reason": blocker} if blocker else {})}
 
 
 def _ask_data(ev):
@@ -6618,6 +6635,11 @@ def _run_group(run):
     return next(({"grupo": g} for g, m in _mates().items() if run in (_dict(m).get("runs") or [])), {})
 
 
+def _task_run(events, task):
+    """The Run that dispatched `task`, or None."""
+    return next((e.get("run") for e in reversed(events) if e.get("tipo") == "despacho" and e.get("task") == task), None)
+
+
 def mate_pending(event_list, mates, now_at):
     """Requests to the mate without a correlated answer, with the state: a_entregar (to deliver), aguardando (waiting), reenviar (resend), escalar (escalate) or escalado (escalated). Pure.
 
@@ -6778,6 +6800,11 @@ def mate_open(group_name):
     return {"grupo": group_name, "terminal": new, "retomado": bool(m.get("sessao"))}
 
 
+def _mate_turn_since(mate, since):
+    """Did the mate's hooks record a turn that started at or after `since`? A mate that answers nothing and has none is not loading them (ticket 323)."""
+    return any(isinstance(t, list) and t and _ts(t[0]) and _ts(t[0]) >= (_ts(since) or _ts(t[0])) for t in _dict(mate).get("turnos") or [])
+
+
 def mate_lap():
     """One round of the manager over the mates: delivers the request that was waiting for the mate to be free, resends once what blew the deadline, escalates once what blew
     it again, notifies the coordinator of each new startup and of the mate that went down (once per terminal). Returns one line per action."""
@@ -6795,7 +6822,8 @@ def mate_lap():
             append_event({"tipo": "mate_reenvio", "corr": p["corr"], "ts": before})
             line_list.append(f"mate {p['grupo']}: {p['corr']} resent")
         elif p["estado"] == "escalar" and coord_handle and notify_coordinator(coord_handle, f"orq ▸ mate {p['grupo']} did not answer request {p['corr']} ({_quote(p['texto'])!r}) "
-                                                                               f"even after the repost. See terminal {terminal}.") in DELIVERED:
+                                                                               f"even after the repost. See terminal {terminal}." + (" (no turn recorded: orq doctor hooks)"
+                                                                                if not _mate_turn_since(mates.get(p["grupo"]), p.get("ts")) else "")) in DELIVERED:
             append_event({"tipo": "mate_escalado", "corr": p["corr"]})
             line_list.append(f"mate {p['grupo']}: {p['corr']} escalated to the coordinator")
     until_at = _cursor_ro().get("mate_avisada_ate")
@@ -8833,6 +8861,14 @@ def doctor_old_text(r, release_=False):
     return "\n".join(ls) or "no old dispatch left unreleased"
 
 
+def mate_hooks_problems():
+    """A project of a group whose settings turn every hook off (`disableAllHooks`) leaves its mate with no turn, no Stop and no guard (ticket 323). Settings that only add hooks do not remove the global ones."""
+    return [f"mate {g}: {f} sets disableAllHooks, so the mate's hooks (prompt, stop, guard) do not run"
+            for g, cfg in groups().items() for project in cfg.get("projetos") or []
+            for f in (os.path.join(os.path.expanduser(project), ".claude", n) for n in ("settings.json", "settings.local.json"))
+            if _dict(_read_json(f)).get("disableAllHooks") is True]
+
+
 def doctor_hooks(pin=False):
     """`orq doctor hooks`: per harness hooks file that exists, the problems with the interpreter of orq's hooks; with `pin`, writes the absolute Python first. Exit 1 while there is a problem."""
     broken = 0
@@ -8845,6 +8881,10 @@ def doctor_hooks(pin=False):
         problems = hooks_python_problems(agent)
         broken += len(problems)
         print("\n".join(f"{agent}: {x}" for x in problems) or f"{agent}: hooks ok")
+    mate_problems = mate_hooks_problems()
+    broken += len(mate_problems)
+    if mate_problems:
+        print("\n".join(mate_problems))
     if pin:
         print("orq link: " + ("wrapper written" if pin_orq_link() else "unchanged"))
     return 1 if broken else 0
