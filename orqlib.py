@@ -1929,6 +1929,32 @@ def _branch_do_texto(texto):
     return next((b for b in dict.fromkeys(BRANCH_RE.findall(texto)) if any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)), None)
 
 
+BRANCHES_DE_AMBIENTE = ("main", "development", "staging")
+
+
+def _branch_do_orq(b):
+    """`b` se é branch de trabalho do orq (existe num repositório de ORQ_REPOS e não é main/development/staging), senão None: a worktree de um produto não entra na fila."""
+    repos = [r for r in os.environ.get("ORQ_REPOS", os.path.expanduser("~/.claude/orq")).split(":") if r]
+    ok = b and b not in BRANCHES_DE_AMBIENTE and any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)
+    return b if ok else None
+
+
+def _branch_do_payload(b):
+    """A branch que o worker declarou no worker_done vale sem conferir o repositório, menos main/development/staging."""
+    return b if b and b not in BRANCHES_DE_AMBIENTE else None
+
+
+def _branch_da_orq_wt(num):
+    """A branch da worktree da convenção `~/.claude/orq-wt/<ticket>` (ou `t<ticket>`; ORQ_WT_ROOT troca a raiz), ou None. Ticket do orq é despachado com `--worktree
+    current`: a worktree do dispatch é a do produto, e quem tem a branch da entrega é esta."""
+    raiz = os.environ.get("ORQ_WT_ROOT", os.path.expanduser("~/.claude/orq-wt"))
+    for nome in dict.fromkeys((num, num.lstrip("0"), f"t{num}", f"t{num.lstrip('0')}")):
+        d = os.path.join(raiz, nome)
+        if os.path.isdir(d) and (b := _branch_do_orq((_git(d, "branch", "--show-current") or "").strip())):
+            return b
+    return None
+
+
 def _despacho_do_integrador(events):
     """O evento `despacho` do serviço que se chama integrador (o último que não foi liberado), ou None."""
     servicos, liberados = _servicos(events), _liberados(events)
@@ -1944,8 +1970,8 @@ def _terminal_do_integrador(events):
 
 def _entrega_do_orq(m, p):
     """worker_done `succeeded` de ticket do orq (a task é a `Task:` de um ticket de ISSUES; os do produto não entram) com branch no payload ou no texto ->
-    `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). A branch vem do payload, da branch atual da worktree do dispatch e só
-    por último do texto, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
+    `integrar fila add` e um aviso curto digitado no integrador (branch, worktree e commit). A branch vem do payload, da worktree `orq-wt/<ticket>`, da branch atual da worktree do dispatch e só
+    por último do texto; main/development/staging e branch fora de ORQ_REPOS nunca entram, se existir no repositório do orq. Sem branch: log e evento `entrega` com aviso, o coordenador adiciona à mão.
     O aviso é digitado uma vez (ocupado: tenta enfileirar no turno; ainda assim não, fica só a fila, que o integrador lê no ciclo). Devolve o ticket ou None."""
     if p.get("outcome") != "succeeded" or not p.get("taskId") or _ja_tem_evento("entrega_orq", m["id"]):
         return None
@@ -1954,7 +1980,8 @@ def _entrega_do_orq(m, p):
         return None
     texto = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
     wt = _worktree_do_dispatch(m.get("run_id"), p.get("dispatchId"))
-    branch = p.get("branch") or (wt and (_git(wt, "branch", "--show-current") or "").strip()) or _branch_do_texto(texto)
+    branch = (_branch_do_payload(p.get("branch")) or _branch_da_orq_wt(t["num"]) or (wt and _branch_do_orq((_git(wt, "branch", "--show-current") or "").strip()))
+              or _branch_do_texto(texto))
     if not branch:
         log(f"entrega do orq: ticket {t['num']} sem branch no worker_done {m['id']}; fica fora da fila do integrador")
         append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
@@ -8936,10 +8963,15 @@ def _sobe_da_fila(it):
     return f"fila: {it['titulo']} retomado: {r['estado']}" + (f" ({r['aviso']})" if r.get("aviso") else "")
 
 
+def _comando_ticket(run, ticket, modelo, effort):
+    """`orq despachar --run <run> --ticket <n> --modelo <m> --effort <e>`: o que falta no cabeçalho do ticket fica de fora."""
+    return " ".join(["orq despachar"] + [f"{f} {v}" for f, v in (("--run", run), ("--ticket", ticket), ("--modelo", modelo), ("--effort", effort)) if v])
+
+
 def _comando_desistido(it):
     """O comando para despachar à mão o item que a fila largou."""
     if it.get("ticket"):
-        return f"orq despachar --ticket {it['ticket']}"
+        return _comando_ticket(it["run"], it["ticket"], it.get("modelo"), it.get("effort"))
     return f"orq despachar --run {it.get('run')} --titulo {shlex.quote(it.get('titulo') or '')} --spec-arquivo <spec>"
 
 
@@ -8949,11 +8981,11 @@ def _avisa_desistiu(it, falhas, erro, cmd):
     coord = it.get("coord") or _gerente_cfg().get("coordenador")
     if coord:
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, ValueError, OSError):
-            avisa_coordenador(coord, f"orq: a fila desistiu de {_cita(it.get('titulo'), 40)} ({falhas} erros). Despache à mão: {cmd}. Erro: {_cita(str(erro), 100)}")
+            avisa_coordenador(coord, f"orq: a fila desistiu ({falhas} erros). Despache à mão: {cmd}. {_cita(it.get('titulo'), 40)}: {_cita(str(erro), 100)}")
 
 
 def away_desistidos(tks, events):
-    """Motivo (ou None) para o Stop do away: item que a fila de despacho largou (`desistiu`) e ninguém despachou depois. Ticket que saiu de ready ou foi
+    """Motivo (ou None) para o Stop do away: item que a fila de despacho largou (`desistiu`) e ninguém despachou depois. Ticket que saiu de ready, ficou bloqueado ou foi
     despachado (evento `despacho` com o ticket) sai; item sem ticket sai com um `despacho` do mesmo Run e título."""
     abertos, por_num = {}, {t["num"]: t for t in tks}
     for e in events:
@@ -8962,9 +8994,11 @@ def away_desistidos(tks, events):
         elif e.get("tipo") == "despacho":
             abertos.pop(e.get("ticket") or (e.get("run"), e.get("titulo")), None)
     for k, e in abertos.items():
-        if e.get("ticket") and (por_num.get(k) or {}).get("status") != STATUS_NOVO:
+        t = por_num.get(k) or {}
+        if e.get("ticket") and (t.get("status") != STATUS_NOVO or any((por_num.get(b) or {}).get("status") != STATUS_FECHADO for b in t.get("blocked_by") or [])):
             continue
-        return f"a fila de despacho desistiu de {_cita(e.get('titulo'), 60)} ({_cita(str(e.get('erro')), 120)}): `{e.get('comando')}`"
+        cmd = e.get("comando") or (_comando_ticket(e.get("run"), e["ticket"], e.get("modelo") or t.get("modelo"), e.get("effort") or t.get("effort")) if e.get("ticket") else _comando_desistido(e))
+        return f"a fila de despacho desistiu de {_cita(e.get('titulo'), 60)} ({_cita(str(e.get('erro')), 120)}): `{cmd}`"
     return None
 
 
@@ -9002,7 +9036,7 @@ def despacho_drenar(cfg=None, agora=None, so_isentos=False):
             falhas = it.get("falhas", 0) + (0 if segurado else 1)
             if falhas >= FALHAS_FILA:
                 cmd = _comando_desistido(it)
-                fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), run=it.get("run"), comando=cmd)
+                fila_despacho_rm(it["id"], "desistiu", erro=str(e), ticket=it.get("ticket"), run=it.get("run"), modelo=it.get("modelo"), effort=it.get("effort"), comando=cmd)
                 _avisa_desistiu(it, falhas, e, cmd)
                 linhas.append(f"fila: {it['titulo']} saiu da fila depois de {falhas} erros ({e}); despache de novo à mão")
                 continue

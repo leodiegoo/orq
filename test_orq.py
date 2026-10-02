@@ -438,7 +438,7 @@ class Amb:
         os.chmod(self.bin, 0o755)
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
-                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
+                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
                     "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.maquina()
@@ -15276,6 +15276,68 @@ def test_ticket169_branch_da_worktree_vence_o_texto_que_cita_um_arquivo():
     assert [(i["ticket"], i["branch"]) for i in fila] == [("141", "feat/x")], fila
 
 
+def test_ticket172_entrega_de_ticket_do_orq_usa_a_branch_da_orq_wt_e_nunca_main():
+    tmp = tempfile.mkdtemp()
+    repo = _repo_com_branch(tmp)
+    raiz = os.path.join(tmp, "orq-wt")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "fix/orq-x", os.path.join(raiz, "141")], check=True)
+    produto = os.path.join(tmp, "produto")  # o dispatch em `current`: a worktree do produto, em main
+    subprocess.run(["git", "init", "-q", "-b", "main", produto], check=True)
+    a = Amb(run="run_a", ORQ_REPOS=repo, ORQ_WT_ROOT=raiz)
+    _entrega141(a, body="entregue, commit abc1234def")
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
+                           {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": repo}])
+    a.orq("ingest")
+    fila = json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in fila] == [("141", "fix/orq-x")], fila
+
+
+def test_ticket172_main_nunca_entra_na_fila_nem_pelo_payload_nem_pela_worktree_do_dispatch():
+    tmp = tempfile.mkdtemp()
+    repo = _repo_com_branch(tmp)
+    a = Amb(run="run_a", ORQ_REPOS=repo, ORQ_WT_ROOT=os.path.join(tmp, "vazio"))
+    _entrega141(a, body="entregue, commit abc1234def", branch="main")
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
+                           {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": repo}])
+    a.orq("ingest")
+    assert not os.path.exists(os.path.join(a.home, "integrar-fila.json")) or not json.load(open(os.path.join(a.home, "integrar-fila.json")))["itens"]
+
+
+def _desistiu172(a, ticket="88", blocked=""):
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], f"{ticket}-x.md"), "w") as f:
+        f.write(f"# {ticket}: x\n\nStatus: ready-for-agent\nBlocked by: {blocked or '(nenhum)'}\nRun: run_a\nModelo: m\nEffort: medium\n\n## What to build\n\nx\n")
+    return [{"tipo": "despacho_fila", "op": "desistiu", "ticket": ticket, "run": "run_a", "titulo": "x", "erro": "boom"}]  # evento antigo: sem `comando`
+
+
+def _desistidos172(a, evs):
+    """away_desistidos no processo do teste, com ORQ_ISSUES do ambiente `a`."""
+    antes = orq_mod.ISSUES
+    orq_mod.ISSUES = a.env["ORQ_ISSUES"]
+    try:
+        return orq_mod.away_desistidos(orq_mod.tickets(), evs)
+    finally:
+        orq_mod.ISSUES = antes
+
+
+def test_ticket172_desistencia_sem_comando_no_evento_cita_o_comando_real():
+    a = Amb(run="run_a")
+    evs = _desistiu172(a)
+    msg = _desistidos172(a, evs)
+    assert "orq despachar --run run_a --ticket 88 --modelo m --effort medium" in msg and "None" not in msg, msg
+
+
+def test_ticket172_desistencia_seguida_de_despacho_manual_ou_com_ticket_bloqueado_nao_barra_o_stop():
+    a = Amb(run="run_a")
+    evs = _desistiu172(a)
+    assert _desistidos172(a, evs)
+    assert _desistidos172(a, evs + [{"tipo": "despacho", "ticket": "88", "run": "run_a", "task": "t", "dispatch": "d"}]) is None
+    b = Amb(run="run_a")
+    evs = _desistiu172(b, "89", blocked="102")
+    _desistiu172(b, "102")  # o 102 segue aberto: o 89 está bloqueado
+    assert _desistidos172(b, evs) is None
+
+
 def test_ticket169_nome_que_nao_e_branch_nao_entra_e_avisa_que_faltou_a_branch():
     tmp = tempfile.mkdtemp()
     a = Amb(run="run_a", ORQ_REPOS=_repo_com_branch(tmp))
@@ -15425,10 +15487,12 @@ def test_ticket170_erro_do_worker_start_avisa_o_coordenador_uma_vez_e_o_stop_do_
         a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL="claude-sonnet-5-5")
     assert not _fila79(a) and [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu"
     (aviso,) = [e[e.index("--text") + 1] for e in _avisos_enviados(a) if "desistiu" in e[e.index("--text") + 1]]
-    assert "desistiu" in aviso and "orq despachar --ticket 88" in aviso and "model not available" in aviso, aviso
+    if "… completo em " in aviso:  # o aviso passa do AVISO_MAX: o digitado leva o começo e o caminho do texto inteiro
+        aviso = open(aviso.split("… completo em ")[1]).read()
+    assert "desistiu" in aviso and "orq despachar --run run_a --ticket 88 --modelo claude-sonnet-5-5 --effort medium" in aviso and "model not available" in aviso, aviso
     a.orq("away", "on")
     out = _stop126(a)
-    assert out["decision"] == "block" and "desistiu" in out["reason"] and "orq despachar --ticket 88" in out["reason"], out
+    assert out["decision"] == "block" and "desistiu" in out["reason"] and "orq despachar --run run_a --ticket 88 --modelo claude-sonnet-5-5 --effort medium" in out["reason"] and "None" not in out["reason"], out
     assert a.orq("despachar", "--run", "run_a", "--ticket", "88", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--worktree", "current").returncode == 0
     assert orq_mod.away_desistidos(orq_mod.tickets(), a.events()) is None
 
