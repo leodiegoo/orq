@@ -22,6 +22,7 @@ if "ORQ_BACKLOG" not in os.environ:
     orq_mod.BACKLOG = None  # o backlog.path da máquina (ticket 167) não liga o backlog nos testes em processo
 if "ORQ_BACKLOG_TICKETS" not in os.environ:
     orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
+os.environ["ORQ_SEM_PUSH"] = "0"  # nenhum teste lê o git do orq de verdade (ticket 180)
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # a segunda leitura da caixa não espera nos testes
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # o digest e o status dos testes não leem a fila real da máquina
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
@@ -13010,7 +13011,7 @@ def test_ticket126_proximo_sem_usuario_entrega_sem_integrar_e_ciclo_sem_push():
     ciclo = ev + [{"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"}]
     assert prox(ags=[], events=ciclo, sem_push=2) and "abc1234" in prox(ags=[], events=ciclo, sem_push=2) and "push" in prox(ags=[], events=ciclo, sem_push=2)
     assert prox(ags=[], events=ciclo, sem_push=0) is None and prox(ags=[], events=ciclo, sem_push=None) is None, "sem commit a enviar, ou sem saber: deixa parar"
-    assert prox(ags=[], events=ev, sem_push=2) is None, "sem ciclo do integrador não há o que auditar"
+    assert "2 commit(s) sem push" in prox(ags=[], events=ev, sem_push=2) and "abc1234" not in prox(ags=[], events=ev, sem_push=2), "o integrador não grava o ciclo (ticket 180): os commits sem push bastam"
 
 
 def test_ticket126_proximo_sem_usuario_ticket_ready_pede_prioridade_modelo_e_vaga():
@@ -16104,7 +16105,7 @@ def test_ticket173_guarda_recusa_def_test_depois_do_main():
 
 # ---------- ticket 174: o gerente acorda o coordenador parado quando há trabalho sem o usuário ----------
 
-def _acorda174(away=True, sem_push=2):
+def _acorda174(away=True, sem_push=2, ciclo=True):
     """Home isolada com gerente.json, um ciclo do integrador e `digita` trocado: devolve (home, enviados, restaura)."""
     home = tempfile.mkdtemp()
     antes = (orq_mod.HOME, orq_mod.digita, orq_mod._sem_push, orq_mod.CICLOS_LOG)
@@ -16114,7 +16115,8 @@ def _acorda174(away=True, sem_push=2):
     json.dump({"coordenador": "term_c", "gerente": "term_g", "runs": []}, open(os.path.join(home, "gerente.json"), "w"))
     if away:
         _away_ligado(home)
-    orq_mod.append_event({"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"})
+    if ciclo:
+        orq_mod.append_event({"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"})
 
     def restaura():
         orq_mod.HOME, orq_mod.digita, orq_mod._sem_push, orq_mod.CICLOS_LOG = antes
@@ -16183,6 +16185,27 @@ def test_ticket174_motivo_que_some_zera_a_contagem_dos_5_min():
 
 def test_ticket174_o_aviso_digitado_conta_como_aviso_do_orq_e_nao_como_prompt_do_usuario():
     assert orq_mod.origem("orq: coordenador parado há 5 min: o ciclo do integrador deixou 2 commit(s) sem push") == "aviso_orq"
+
+
+def test_ticket180_ff_do_integrador_sem_evento_ciclo_e_coordenador_parado_digita_o_aviso():
+    """O caso real de 02/10: o integrador faz o FF à mão (`git merge --ff-only` + `orq integrar fila rm`), nunca grava `ciclo`, e a main fica com commits sem push."""
+    _, enviados, restaura = _acorda174(ciclo=False)
+    try:
+        orq_mod.append_event({"tipo": "integrar_fila", "op": "rm", "ticket": "129"})
+        assert orq_mod.acorda_parado(_em174(0)) == [] and enviados == [], "viu agora: ainda não passou o prazo"
+        assert len(orq_mod.acorda_parado(_em174(6))) == 1 and len(enviados) == 1, enviados
+        h, texto = enviados[0]
+        assert h == "term_c" and "2 commit(s) sem push" in texto, enviados
+    finally:
+        restaura()
+
+
+def test_ticket180_sem_ciclo_e_sem_commits_sem_push_nao_acorda():
+    _, enviados, restaura = _acorda174(ciclo=False, sem_push=0)
+    try:
+        assert orq_mod.acorda_parado(_em174(0)) == [] and orq_mod.acorda_parado(_em174(10)) == [] and enviados == []
+    finally:
+        restaura()
 
 
 def _g176(repo, *a):

@@ -4691,7 +4691,10 @@ AWAY_BLOQUEIO_MIN = 30
 
 
 def _sem_push():
-    """Commits da instalação do orq que o upstream ainda não tem; None se o git não responde. Só é chamado depois de um ciclo do integrador."""
+    """Commits da instalação do orq que o upstream ainda não tem; None se o git não responde. Vale sempre, sem depender de um evento `ciclo`: o integrador avança
+    a main à mão (`git merge --ff-only` + `orq integrar fila rm`) e nunca o grava (ticket 180). `ORQ_SEM_PUSH` fixa o número (os testes)."""
+    if os.environ.get("ORQ_SEM_PUSH"):
+        return int(os.environ["ORQ_SEM_PUSH"])
     try:
         r = subprocess.run(["git", "-C", os.path.dirname(os.path.realpath(__file__)), "rev-list", "--count", "@{u}..HEAD"], capture_output=True, text=True, timeout=2)
         return int(r.stdout) if r.returncode == 0 else None
@@ -4741,9 +4744,10 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
     desistido = away_desistidos(tks, events)
     if desistido:
         return desistido
-    ciclo = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
-    if ciclo and sem_push:
-        return f"o ciclo do integrador ({str(ciclo.get('hash'))[:8]}) deixou {sem_push} commit(s) sem push: audite o diff e dê o push"
+    if sem_push:
+        ciclo = next((e for e in reversed(events) if e.get("tipo") == "ciclo"), None)
+        hash_ = f" ({str(ciclo.get('hash'))[:8]})" if ciclo else ""
+        return f"o ciclo do integrador{hash_} deixou {sem_push} commit(s) sem push: audite o diff e dê o push"
     ocup = {"vivos": {a["dispatch"]: a.get("modelo") for a in ags if a.get("estado") in ANDA}}
     na_fila = {i.get("ticket") for i in fila}
     for t in sorted(tks, key=lambda t: (prioridade_de(events, t["task"], None, t["titulo"]), t["num"])):
@@ -4760,7 +4764,7 @@ def _trabalho_sem_usuario(events, agora):
     """(próximo passo que não depende do usuário, pendência do integrador) lidos só dos arquivos do orq; (None, None) se algo falha (o Stop falha aberto, o gerente tenta na volta seguinte)."""
     try:
         ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
-        sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+        sem_push = _sem_push()
         pend = _pendente_do_integrador(events)
         return proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push, pend and pend["motivo"]), pend
     except Exception as e:  # noqa: BLE001 - hook falha aberto
@@ -6549,7 +6553,7 @@ def _slug(titulo):
 
 def espera_despacho(t, integracao, events, sem_push):
     """Por que o ticket não entra sozinho na fila de despacho, ou None. `Despacho: manual[, motivo]` nunca entra; `Espera: integrador vazio` só com a fila do
-    integrador vazia e sem ciclo dele com commits sem push (`sem_push`, lido só depois de um ciclo)."""
+    integrador vazia e sem commits sem push na main (`sem_push`, lido sempre: o integrador não grava o `ciclo`)."""
     d = (t.get("despacho") or "").strip()
     if d.lower().startswith("manual"):
         return f"Despacho: {d}"
@@ -6557,7 +6561,7 @@ def espera_despacho(t, integracao, events, sem_push):
         return None
     if integracao:
         return f"espera o integrador esvaziar ({len(integracao)} na fila)"
-    if sem_push and any(e.get("tipo") == "ciclo" for e in events):
+    if sem_push:
         return f"espera o ciclo do integrador ({sem_push} commit(s) sem push)"
     return None
 
@@ -6761,7 +6765,7 @@ def _libera_dependentes(n, antes=None):
     status = {t["num"]: t["status"] for t in ts}
     liberados, avisos, livres = [], [], []
     events, integracao = read_events(), integracao_fila()
-    sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+    sem_push = _sem_push()
     no_backlog = _tickets_no_backlog()
     dependiam = {x["num"] for x in (antes or ts) if n in x["blocked_by"]}
     for t in ts:
@@ -6810,7 +6814,7 @@ def _libera_dependentes(n, antes=None):
 def linha_espera_despacho(ts, events):
     """'fora da fila de despacho: 88 (Despacho: manual, ...)': os tickets ready sem bloqueio que um cabeçalho Despacho/Espera segura; '' se não há."""
     integracao = integracao_fila()
-    sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+    sem_push = _sem_push()
     seg = [(t["num"], m) for t in ts if t["status"] == STATUS_NOVO and not t["blocked_by"] and (m := espera_despacho(t, integracao, events, sem_push))]
     return f"fora da fila de despacho: {'; '.join(f'{n} ({m})' for n, m in seg)}" if seg else ""
 
@@ -11957,7 +11961,7 @@ def main(argv=None):
             else:
                 ts = [t for t in tickets() if a.todos or t["status"] != STATUS_FECHADO]
                 integracao, evs = integracao_fila(), read_events()
-                sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in evs) else None
+                sem_push = _sem_push()
                 if a.json:
                     print(json.dumps([{**t, "espera_motivo": espera_despacho(t, integracao, evs, sem_push) if t["status"] == STATUS_NOVO and not t["blocked_by"] else None} for t in ts], ensure_ascii=False))
                 else:
