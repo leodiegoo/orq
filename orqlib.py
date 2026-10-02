@@ -4319,19 +4319,87 @@ def _away_marker(hora):
         pass
 
 
+PREFLIGHT_DISK_MIN_GB = 10  # below this much free disk in the orq clone, the night starts with a warning
+PREFLIGHT_WT_MAX = 20  # integration/worker folders in the orq worktree root before the count is worth a warning
+PREFLIGHT_E2E_STUCK_MIN = 120  # an E2E queue owner stopped for more than this many minutes is reported
+
+
+def away_preflight():
+    """`orq doctor away` and what `away on` runs first (ticket 217): what would keep the night from running, with no LLM and no Orca call beyond the worker/terminal lists.
+    Returns {duros, avisos}: hard failures (the manager is not alive or not bound to this coordinator, the harness has no orq hooks), each one ending in the command that fixes it,
+    and warnings (dirty or unpushed live checkout, old dispatches, stuck worktree folders, low disk, stopped E2E queue). Git runs with a 2 s timeout, like `_no_push`."""
+    hard, warn = [], []
+    mine = os.environ.get("ORCA_TERMINAL_HANDLE")
+    g = _manager_cfg()
+    cur = _cursor_ro()
+    if not g:
+        hard.append("no agent manager is bound: `orq start --objective \"<assunto>\"`")
+    elif mine and g.get("coordenador") != mine:
+        hard.append(f"the agent manager is bound to {g.get('coordenador')}, not to this coordinator ({mine}): `orq start --take-over`")
+    else:
+        try:
+            ages = [time.time() - os.path.getmtime(_path(PANEL_ALIVE))]
+        except OSError:
+            ages = []
+        if cur.get("gerente_volta"):
+            ages.append((datetime.now(timezone.utc) - _dt(cur["gerente_volta"])).total_seconds())
+        if not ages or min(ages) > panel_limit_s(g):
+            hard.append("the agent manager shows no recent round (`gerente-vivo` and `gerente_volta` are old or missing): `orq manager spawn`")
+    harness = _this_terminal_harness()
+    if harness and not _hook_commands(HOOKS_FILES[harness]):
+        hard.append(f"{harness} has no orq hooks in {HOOKS_FILES[harness]}: `python3 orq.py install`")
+    try:
+        dirty = subprocess.run(["git", "-C", ORQ_INSTALL, "status", "--short"], capture_output=True, text=True, timeout=2).stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        dirty = []
+    if dirty:
+        warn.append(f"the live checkout of orq is dirty, the integrator will stop on it: {'; '.join(dirty[:5])}" + (f" (+{len(dirty) - 5})" if len(dirty) > 5 else ""))
+    ahead = _no_push()
+    if ahead:
+        warn.append(f"the live checkout of orq has {ahead} commit(s) ahead of upstream that nobody pushed")
+    try:
+        old = len(doctor_old()["antigos"])
+    except Exception as e:  # noqa: BLE001  # a broken Orca read must not stop the night from starting
+        old = 0
+        log(f"away_preflight: doctor_old: {type(e).__name__}: {e}")
+    if old:
+        warn.append(f"{old} old dispatch(es) with no terminal still hold worktrees: `orq doctor old --release`")
+    try:
+        folders = len([d for d in os.listdir(WT_ROOT) if d != "integracao" and os.path.isdir(os.path.join(WT_ROOT, d))])
+    except OSError:
+        folders = 0
+    if folders > PREFLIGHT_WT_MAX:
+        warn.append(f"{folders} folders in {WT_ROOT} (more than {PREFLIGHT_WT_MAX}): `orq worktrees clean`")
+    try:
+        free_gb = shutil.disk_usage(HOME).free / 1e9
+    except OSError:
+        free_gb = None
+    if free_gb is not None and free_gb < PREFLIGHT_DISK_MIN_GB:
+        warn.append(f"only {free_gb:.1f} GB free on the orq disk (less than {PREFLIGHT_DISK_MIN_GB} GB)")
+    q = e2e_queue()
+    if q and q.get("presa") and (q.get("min") or 0) > PREFLIGHT_E2E_STUCK_MIN:
+        warn.append(f"the E2E queue has a stuck owner for {int(q['min'])} min ({q.get('worktree') or q.get('ticket')}): `scripts/e2e-infra.sh lock-status`")
+    return {"duros": hard, "avisos": warn}
+
+
+def away_preflight_lines(r):
+    """The preflight result as text lines (empty when everything is clean)."""
+    return [*[f"refused: {x}" for x in r["duros"]], *[f"warning: {x}" for x in r["avisos"]]]
+
+
 NIGHT_FAILURES = 3  # consecutive failures that close the dispatch (night and away)
 AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:00 local
 
 
-def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES):
+def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None):
     """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
     marked `via: away` so `orq hook external` stays inert): the end time, the dispatch cap and the failure breaker. Already on, it keeps the original
-    `ligada_em` and only re-arms the budget. Returns the stored state."""
+    `ligada_em` and only re-arms the budget. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
     _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
     was = _dict(_cursor_ro().get("ausente"))
     state_ = was or {"ligada_em": now()}
     if not was:
-        _cursor_mut(lambda c: c.__setitem__("ausente", state_))
+        _cursor_mut(lambda c: (c.__setitem__("ausente", state_), preflight is not None and c.__setitem__("preflight", {"ts": state_["ligada_em"], **preflight})))
         _away_marker(_hora_local(state_["ligada_em"]))
         append_event({"tipo": "ausente_ligar"})
     night_on(until_at, max_dispatches, max_failures, via="away")
@@ -4341,7 +4409,7 @@ def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURE
 def away_off():
     """Turns off away mode; returns whether it was on."""
     bound = bool(_dict(_cursor_ro().get("ausente")))
-    _cursor_mut(lambda c: c.pop("ausente", None))
+    _cursor_mut(lambda c: (c.pop("ausente", None), c.pop("preflight", None)))
     _away_marker(None)
     if bound:
         append_event({"tipo": "ausente_desligar"})
@@ -4383,7 +4451,7 @@ def coordinator_stops(evs, end_ts):
     return [x for x in out if (_dt(x[1]) - _dt(x[0])).total_seconds() > LACUNA_S]
 
 
-def away_report(since, live=None, now_at=None):
+def away_report(since, live=None, now_at=None, preflight=None):
     """The absence report in pt-BR lines, only from what orq stores (events.jsonl and the pending item list), no LLM, only with what was born after
     `since`. Sections in order: decisions, problems, coordinator stopped, summaries, deliveries, PRs, tickets, then the morning card's (dispatch stops, dirty
     worktrees, not pushed, manager, log gap, commands to paste); an empty section does not appear. `live` is `_live_states` for the dispatches still running."""
@@ -4399,6 +4467,7 @@ def away_report(since, live=None, now_at=None):
     decisions = [pending_line(i) for i in open_entries if i.get("tipo") == "decisao"]
     ok = lambda e: e.get("outcome") == "succeeded"  # noqa: E731
     sections = [
+        ("Crooked when the night began", [*[f"refused, forced: {x}" for x in _dict(preflight).get("duros", [])], *_dict(preflight).get("avisos", [])]),
         ("Decisions left for you", decisions),
         ("Other open pending items", [f"{i.get('tipo')} {pending_line(i)}" for i in open_entries if i.get("tipo") != "decisao"]),
         ("Problems", [f"worker failed: {_quote(e.get('subject'), 100)}" for e in evs if e.get("tipo") == "worker_done" and not ok(e)]
@@ -4438,24 +4507,35 @@ def write_away_report(line_list):
     return path
 
 
-def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES):
+def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES, force=False):
     """`orq away` / `/away`: turns away mode on, off or shows it; without op it toggles. Returns the lines to print.
     On, the flags set the night budget (`--until` default 08:00, `--max-dispatches` default none, `--max-failures` default 3); on again with no flag keeps the budget as it is.
+    Turning on runs `away_preflight` first (`ORQ_AWAY_PREFLIGHT=off` skips it): a hard failure refuses and names the fix, `force` turns on anyway and logs `away_preflight_forcado`;
+    warnings go in the text and in cursor.json for the report.
     On turning off it shows the link to the 8765 panel, the count and the absence report (written to a file; the path goes last); it does not open a tab."""
     cur = _dict(_cursor_ro().get("ausente"))
     op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
     if op == "status":
         return away_lines(_cursor_ro())[:1]
     if op == "on":
+        pre, notes = None, []
+        if not cur and os.environ.get("ORQ_AWAY_PREFLIGHT") != "off":
+            pre = away_preflight()
+            notes = away_preflight_lines(pre)
+            if pre["duros"] and not force:
+                return [*notes, "away mode stays off; fix the above or pass --force"]
         if not cur or not night_active(_cursor_ro()) or until_at or max_dispatches is not None or max_failures != NIGHT_FAILURES:
-            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures)
+            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures, pre)
+        if pre and pre["duros"]:
+            append_event({"tipo": "away_preflight_forcado", "duros": pre["duros"]})
         since = _hora_local(_dict(_cursor_ro().get("ausente")).get("ligada_em"))
-        return [f"away mode on since {since}; the digest records each reply", *night_lines(_cursor_ro(), read_events())[1:]]
+        return [f"away mode on since {since}; the digest records each reply", *notes, *night_lines(_cursor_ro(), read_events())[1:]]
     n = len(digest_generate()[0]["linha"]) if cur else 0
+    pre = _dict(_cursor_ro().get("preflight"))
     away_off()
     if not cur:
         return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}"]
-    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]))
+    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]), preflight=pre)
     file_path = write_away_report(rel)
     digest_generate()  # atual.json already carries the report
     return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}", "", *rel, "", f"Report saved to {file_path}; hand it to the user in the first reply."]
@@ -12932,6 +13012,7 @@ def parser():
     _arg(aw, "ate", help="on: end of the budget, next HH:MM local (default 08:00)")
     _arg(aw, "max-despachos", type=int, help="on: dispatch cap (default none)")
     _arg(aw, "max-falhas", type=int, default=NIGHT_FAILURES, help="on: consecutive worker failures that stop dispatching (default 3)")
+    _arg(aw, "forcar", action="store_true", help="with on, turns it on even when the preflight refuses (logs away_preflight_forcado)")
     sub.add_parser("steers", help="redelivers the notice of the adjustments the stopped worker did not read and records the alert on the third failure (the manager panel already does it)")
     rp = sub.add_parser("reply", aliases=["responder"], help="answers a worker's question through the manager, binding the message's Run first")
     rp.add_argument("msg_id")
@@ -13080,6 +13161,7 @@ def parser():
     _arg(da, "horas", type=float, default=24, help="minimum age of the dispatch (default 24)")
     da.add_argument("--ticket", action="append", default=[], help="only this ticket (repeatable)")
     da.add_argument("--json", action="store_true")
+    dc.add_parser("away", help="the away-mode preflight (what `away on` checks first): hard failures exit 1, warnings only print; it turns nothing on")
     dh = dc.add_parser("hooks", help="checks the interpreter of each orq hook (it must import orqlib: Python 3.12+); --pin writes the absolute path into the hook commands and the `orq` link")
     dh.add_argument("--pin", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
@@ -13379,7 +13461,7 @@ def main(argv=None):
                 away_off()
             print("\n".join(away_lines(_cursor_ro())))
         elif a.cmd == "away":
-            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures)))
+            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures, a.force)))
         elif a.cmd == "remind":
             words = a.op_or_text
             if words[0] in ("list", "lista"):
@@ -13478,6 +13560,10 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"phase {c['fase']} of {c['plano']}: " + (f"missing {', '.join(c['faltando'])}" if c["faltando"] else "complete")
                                                                          for c in r) or "no plan with tickets of the cited phase")
             return 1 if phase_refusal(r) else 0
+        elif a.cmd == "doctor" and a.op == "away":
+            r = away_preflight()
+            print("\n".join(away_preflight_lines(r)) or "away preflight clean")
+            return 1 if r["duros"] else 0
         elif a.cmd == "doctor" and a.op == "hooks":
             return doctor_hooks(a.pin)
         elif a.cmd == "doctor" and a.op == "old":

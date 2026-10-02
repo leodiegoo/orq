@@ -28,6 +28,7 @@ os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` 
 os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
 os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
 os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
+os.environ["ORQ_AWAY_PREFLIGHT"] = "off"  # `away on` does not check the real machine in the older tests (ticket 217); the preflight tests turn it on
 os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
 os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
@@ -8359,6 +8360,70 @@ def test_away_on_and_off_store_the_state_and_the_log():
     assert "away mode on" in r.stdout and "away mode off" not in r.stdout
     assert "away mode off" in a.orq("ausente", "desligar").stdout and "ausente" not in _cursor(a)
     assert [e["tipo"] for e in a.events() if e["tipo"].startswith("ausente")] == ["ausente_ligar", "ausente_desligar"]
+
+
+def _away_is_on(a):
+    """Is away on? A refused `away on` writes no cursor.json at all."""
+    return os.path.exists(os.path.join(a.home, "cursor.json")) and bool(_cursor(a).get("ausente"))
+
+
+def _preflight_env(manager=True, hooks=True, dirty=False, **env):
+    """An Env where the away preflight is clean: manager bound to term_coord with a fresh stamp, orq hooks in the Claude settings, a clean git checkout as ORQ_INSTALL."""
+    t = tempfile.mkdtemp()
+    live = os.path.join(t, "live")
+    subprocess.run(["git", "init", "-q", live], check=True)
+    subprocess.run(["git", "-C", live, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    if dirty:
+        open(os.path.join(live, "sujo.txt"), "w").write("x")
+    settings = os.path.join(t, "settings.json")
+    json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 /x/orq.py hook stop"}]}]}} if hooks else {}, open(settings, "w"))
+    a = Env(ORQ_AWAY_PREFLIGHT="on", ORQ_INSTALL=live, ORQ_CLAUDE_SETTINGS=settings, CLAUDECODE="1", ORQ_PYTHON=sys.executable, **env)
+    if manager:
+        os.makedirs(a.home, exist_ok=True)
+        _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]})
+        open(os.path.join(a.home, "gerente-vivo"), "w").close()
+    return a
+
+
+def test_away_preflight_clean_turns_on_without_a_warning_and_doctor_away_turns_nothing_on():
+    a = _preflight_env()
+    r = a.orq("doctor", "away")
+    assert r.returncode == 0 and "away preflight clean" in r.stdout and not _away_is_on(a), r
+    r = a.orq("away", "on")
+    assert r.returncode == 0 and "away mode on" in r.stdout and "warning" not in r.stdout and "refused" not in r.stdout, r
+    assert _cursor(a)["preflight"]["duros"] == [] and _cursor(a)["preflight"]["avisos"] == []
+
+
+def test_away_preflight_dirty_live_checkout_warns_naming_the_file():
+    a = _preflight_env(dirty=True)
+    r = a.orq("away", "on")
+    assert r.returncode == 0 and "away mode on" in r.stdout and "warning" in r.stdout and "sujo.txt" in r.stdout, r
+    assert "sujo.txt" in json.dumps(_cursor(a)["preflight"]["avisos"])
+
+
+def test_away_preflight_dead_manager_refuses_and_force_turns_on_and_logs_the_event():
+    a = _preflight_env()
+    os.utime(os.path.join(a.home, "gerente-vivo"), (1, 1))
+    r = a.orq("away", "on")
+    assert "refused" in r.stdout and "orq manager spawn" in r.stdout and not _away_is_on(a), r
+    r = a.orq("away", "on", "--force")
+    assert r.returncode == 0 and "refused" in r.stdout and _cursor(a)["ausente"]["ligada_em"], r
+    assert [e["tipo"] for e in a.events() if e["tipo"] == "away_preflight_forcado"] == ["away_preflight_forcado"]
+    off = a.orq("away", "off").stdout
+    assert "Crooked when the night began" in off and "refused, forced" in off
+
+
+def test_away_preflight_manager_bound_to_another_coordinator_refuses():
+    a = _preflight_env()
+    _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_other", "gerente": "term_ger", "runs": ["run_a"]})
+    r = a.orq("away", "on")
+    assert "term_other" in r.stdout and "--take-over" in r.stdout and not _away_is_on(a), r
+
+
+def test_away_preflight_missing_hooks_refuses():
+    a = _preflight_env(hooks=False)
+    r = a.orq("away", "on")
+    assert "no orq hooks" in r.stdout and "orq.py install" in r.stdout and not _away_is_on(a), r
 
 
 def test_away_toggles_and_accepts_on_off_status_without_removing_away_mode():

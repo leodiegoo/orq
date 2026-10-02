@@ -244,9 +244,12 @@ Away mode is for when you leave the keyboard. It changes what the coordinator do
 ```
 /away on        # Claude Code slash command (commands/away.md)
 $away on        # Codex skill (skills/away): Codex has no user slash commands
-orq away on [--until HH:MM] [--max-dispatches N] [--max-failures 3]     # the same thing from a shell
+orq away on [--until HH:MM] [--max-dispatches N] [--max-failures 3] [--force]     # the same thing from a shell
 orq away off|status
+orq doctor away            # the preflight alone: turns nothing on, exits 1 on a hard failure
 ```
+
+`away on` runs that preflight first, with no LLM (git with a 2 s timeout). Hard failures refuse and print the fixing command: no agent manager alive and bound to this coordinator (`orq manager spawn`, `orq start --take-over`), or no orq hooks in the harness you are running (`python3 orq.py install`). `--force` turns it on anyway and logs `away_preflight_forcado`. Warnings only go in the output: dirty or unpushed live checkout (naming the files), old dispatches with no terminal, more than 20 folders in the worktree root, under 10 GB free, an E2E queue owner stuck for over 2 h. The result is kept in `cursor.json` (`preflight`), and the report from `away off` opens with it under "Crooked when the night began". `ORQ_AWAY_PREFLIGHT=off` skips it.
 
 With it on: the Stop hook logs each reply and refreshes the digest; the AskUserQuestion guard denies the box and points to `orq pend add --type decision` (park the decision, keep going on what does not depend on it); `orq ask` builds the decision page but returns at once; the manager types notices into the coordinator whenever it is stopped (with it off, only when its prompt box is empty, ticket 182); and the Stop hook blocks the end of a turn (at most 3 times in 30 minutes) while there is work that needs no user. The Stop that ends a turn records `coordenador_parou` (motive `trabalho_esperando`, `esperando_usuario` or `sem_trabalho`, computed from orq's files); the user's next prompt or a notice typed by the manager closes the interval. `orq away off` prints the away report (decisions first; then the coordinator's stops longer than 10 minutes with their motive, and the morning card's dispatch stop reasons, dirty worktrees, unpushed branches and commands to paste) and saves it to `digest/ausencia.md` and `$ORQ_RESUMOS/<date>-ausencia.md` (default `./.scratch/resumos`; the file names keep their Portuguese spelling). A bare `/away` toggles. `statusline.sh` adds `away since HH:MM` to the first HUD line while it is on. See `docs/design.md`, "Digest and away mode".
 
