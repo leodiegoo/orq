@@ -9303,6 +9303,8 @@ def encerrar_processos_da_worktree(wt, espera_s=None):
     raiz = os.path.realpath(wt) if wt else ""
     if raiz in ("", "/", os.path.realpath(HOME)):
         return None
+    if not os.path.isfile(os.path.join(raiz, ".git")):  # só worktree ligada: o checkout principal (.git pasta) roda coordenador, gerente e workers de --worktree current
+        return None
     procs = _processos(todos=True)
     if procs is None:
         return None

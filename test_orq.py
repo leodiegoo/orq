@@ -14752,6 +14752,7 @@ def test_ticket147_liberar_encerra_so_os_processos_com_cwd_dentro_da_worktree():
     a = Amb(run="run_a")
     wt = os.path.join(a.tmp.name, "wt147")
     os.makedirs(wt)
+    open(os.path.join(wt, ".git"), "w").write("gitdir: /tmp/x/.git/worktrees/wt147\n")
     _lib_env(a)
     a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "active", "release": "released", "worktree": wt}])
     arq = _procs147(a, wt)
@@ -14767,6 +14768,7 @@ def test_ticket147_liberar_com_terminal_mantido_nao_encerra_processo_nenhum():
     a = Amb(run="run_a")
     wt = os.path.join(a.tmp.name, "wt147")
     os.makedirs(wt)
+    open(os.path.join(wt, ".git"), "w").write("gitdir: /tmp/x/.git/worktrees/wt147\n")
     a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "active", "release": "retained",
                             "release_reason": "user_takeover", "worktree": wt}])
     a.set("terminals.json", ["term_w1", "term_coord"])
@@ -14781,6 +14783,7 @@ def test_ticket147_encerrar_poupa_o_proprio_orq_e_quem_o_chamou():
     a = Amb(run="run_a")
     wt = os.path.join(a.tmp.name, "wt147")
     os.makedirs(wt)
+    open(os.path.join(wt, ".git"), "w").write("gitdir: /tmp/x/.git/worktrees/wt147\n")
     eu, pai = os.getpid(), os.getppid()
     arq = os.path.join(a.tmp.name, "p.json")
     json.dump([{"pid": 400, "ppid": 1, "args": "node", "cwd": wt}, {"pid": pai, "ppid": 1, "args": "coordenador", "cwd": wt},
@@ -14793,6 +14796,24 @@ def test_ticket147_encerrar_poupa_o_proprio_orq_e_quem_o_chamou():
         for k, v in antes.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
     assert res["encerrados"] == 1 and {p["pid"] for p in json.load(open(arq))} == {pai, eu}, res
+
+
+def test_hotfix147_checkout_principal_nunca_tem_processo_encerrado():
+    """01/10 23h08: o liberar de um worker com --worktree current encerrou 103 processos do checkout principal (gerente, integrador, workers, MCPs)."""
+    import orqlib
+    a = Amb(run="run_a")
+    wt = os.path.join(a.tmp.name, "checkout")
+    os.makedirs(os.path.join(wt, ".git"))
+    arq = os.path.join(a.tmp.name, "p.json")
+    json.dump([{"pid": 401, "ppid": 1, "args": "claude worker", "cwd": wt}, {"pid": 402, "ppid": 1, "args": "gerente", "cwd": wt}], open(arq, "w"))
+    antes = {k: os.environ.get(k) for k in ("ORQ_PROCESSOS", "ORQ_HOME")}
+    os.environ.update(ORQ_PROCESSOS=arq, ORQ_HOME=a.home)
+    try:
+        res = orqlib.encerrar_processos_da_worktree(wt, espera_s=0.2)
+    finally:
+        for k, v in antes.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    assert res is None and len(json.load(open(arq))) == 2, res
 
 
 # ---------- ticket 146: orq revisar (só o review do no-mistakes) ----------
