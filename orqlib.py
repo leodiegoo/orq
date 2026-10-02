@@ -11267,51 +11267,126 @@ def _implicito(efeito, ref=None, run=None):
         print(linha, file=sys.stderr)
 
 
-def main(argv=None):
+FLAG_EN = {  # --pt -> --en (fase 1 da migração para inglês); o dest continua o nome em pt, que o resto do código lê
+    "titulo": "title", "spec-arquivo": "spec-file", "detalhe": "detail", "frente": "stream", "comando": "command", "espera": "waiting", "ate": "until",
+    "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "motivo": "reason",
+    "tipo": "type", "forcar": "force", "abrir": "open", "passo": "step", "nome": "name", "por": "why", "agente": "agent", "objetivo": "objective",
+    "assumir": "take-over", "noite": "night", "parada": "stopped-by", "modelo": "model", "para": "to", "max-despachos": "max-dispatches",
+    "max-falhas": "max-failures", "projeto": "project", "prioridade": "priority", "servico": "service", "pergunta": "question", "opcao": "option",
+    "recomendada": "recommended", "espera-min": "wait-min", "sem-poll": "no-poll", "sessao": "session", "pausados": "paused", "texto": "text",
+    "ate-prioridade": "up-to-priority", "grupo": "group", "prazo": "deadline", "responde": "answers", "sem-gh": "no-gh",
+    "sem-transcritos": "no-transcripts", "gravar": "save", "corpo": "body", "ambientes": "environments", "ultimos": "last", "fechados": "closed",
+    "destino": "dest", "substituir-orca-yaml": "replace-orca-yaml", "despacho": "dispatch", "parar": "stop", "instalar": "install",
+    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state"}
+FLAG_APELIDOS = {f"--{pt}": f"--{en}" for pt, en in FLAG_EN.items()}
+APELIDOS = {  # pt -> en. "" são os comandos; a chave de cada outra tabela é o comando em inglês (op) ou "<comando> <op>" (acao)
+    "": {"feito": "fulfill", "adiar": "defer", "fila": "queue", "ausente": "away", "responder": "reply", "iniciar": "start", "ocupadas": "busy",
+         "resumo": "summary", "alerta": "alert", "agentes": "agents", "liberar": "release", "interromper": "interrupt", "responder-tela": "answer-screen",
+         "encerrar": "end", "relancar": "relaunch", "passagem": "handoff", "passar": "switch", "noite": "night", "despachar": "dispatch",
+         "projetos": "projects", "projeto": "project", "fluxo": "flow", "ciclo": "cycle", "integrar": "integrate", "lavish-resposta": "lavish-answer",
+         "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
+         "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
+         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
+         "transcrito": "transcript", "servico": "service"},
+    "pend": {"lista": "list"},
+    "backlog": {"mover": "move"},
+    "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink"},
+    "queue": {"feito": "done", "lista": "list"},
+    "away": {"ligar": "on", "desligar": "off"},
+    "alert": {"visto": "seen"},
+    "night": {"ligar": "on", "desligar": "off"},
+    "run": {"projeto": "project"},
+    "project": {"confiar": "trust"},
+    "service": {"marcar": "mark"},
+    "cycle": {"feito": "done"},
+    "integrate": {"fila": "queue", "concluir": "conclude"},
+    "integrate queue": {"lista": "list"},
+    "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
+    "manager": {"ligar": "bind", "desligar": "unbind", "checar": "check", "subir": "spawn", "absorver": "absorb", "intervalo": "interval"},
+    "dispatch-queue": {"lista": "list", "descartar": "discard"},
+       "worktrees": {"limpar": "clean"},
+    "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
+}
+# os valores de `choices` (pt -> en): a CLI aceita os dois e entrega o pt, que é o que o código grava hoje
+PEND_EN = {"acao": "action", "decisao": "decision", "avisar": "notify"}
+SUBIDA_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqueio": "blocker", "resumo": "summary"}
+PARADA_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
+EFEITO_EN = {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded"}
+HOOK_EN = {"lugar": "place", "externas": "external", "prligar": "prlink"}  # os hooks instalados chamam o nome em pt e ele vale para sempre: sem log
+
+
+def _arg(p, pt, **kw):
+    """`--<en>` e `--<pt>` no mesmo argumento; o dest continua o nome em pt."""
+    return p.add_argument(f"--{FLAG_EN[pt]}", f"--{pt}", dest=pt.replace("-", "_"), **kw)
+
+
+def _valor_pt(pt_en, rotulo=None):
+    """`type=` de um argumento com choices: aceita o valor em inglês ou em pt e entrega o pt. Com `rotulo`, o uso do pt vai para o log."""
+    en_pt = {en: pt for pt, en in pt_en.items()}
+
+    def converte(v):
+        if v in en_pt:
+            return en_pt[v]
+        if rotulo and v in pt_en:
+            log(f"apelido pt: {rotulo} {v} -> {pt_en[v]}")
+        return v
+    return converte
+
+
+def _metavar(pt_en, todos=None):
+    """O `{a,b,c}` do --help com os nomes em inglês (`todos`: a lista inteira, quando só alguns valores têm tradução)."""
+    return "{" + ",".join(pt_en.get(v, v) for v in (todos or pt_en)) + "}"
+
+
+def parser():
+    """O ArgumentParser do orq. Comandos, subcomandos, flags e valores têm nome em inglês e o nome em pt vale como apelido (APELIDOS, FLAG_EN)."""
     ap = argparse.ArgumentParser(prog="orq")
     sub = ap.add_subparsers(dest="cmd", required=True)
     hk = sub.add_parser("hook")
-    hk.add_argument("kind", choices=list(HOOKS))
+    hk.add_argument("kind", type=_valor_pt(HOOK_EN), choices=list(HOOKS), metavar=_metavar(HOOK_EN, list(HOOKS)))
     hk.add_argument("harness", nargs="?", default="claude", choices=HARNESSES, help="de que agente vem o hook (o padrão é o dos hooks instalados no Claude)")
     sub.add_parser("hooks-codex", help="acrescenta os hooks do orq ao ~/.codex/hooks.json sem reordenar; depois confie em /hooks")
     i = sub.add_parser("intake")
     i.add_argument("entrada")
-    i.add_argument("efeito")
+    i.add_argument("efeito", type=_valor_pt(EFEITO_EN, "efeito"))
     i.add_argument("ref", nargs="?")
     i.add_argument("--run")
-    i.add_argument("--nota")
-    fe = sub.add_parser("feito", help='orq feito <e> <obrigação> --prova "<url, versão, hash>": fecha uma obrigação do aviso')
+    _arg(i, "nota")
+    fe = sub.add_parser("fulfill", aliases=["feito"], help='orq fulfill <e> <obrigação> --proof "<url, versão, hash>": fecha uma obrigação do aviso')
     fe.add_argument("entrada")
     fe.add_argument("obrigacao")
-    fe.add_argument("--prova", required=True)
-    ad = sub.add_parser("adiar", help='orq adiar <e> <obrigação> --motivo "…": adia a obrigação com um ticket "a fazer depois"')
+    _arg(fe, "prova", required=True)
+    ad = sub.add_parser("defer", aliases=["adiar"], help='orq defer <e> <obrigação> --reason "…": adia a obrigação com um ticket "a fazer depois"')
     ad.add_argument("entrada")
     ad.add_argument("obrigacao")
-    ad.add_argument("--motivo", required=True)
+    _arg(ad, "motivo", required=True)
     ad.add_argument("--run")
     p = sub.add_parser("pend").add_subparsers(dest="op", required=True)
     pa = p.add_parser("add")
     pa.add_argument("--id", required=True)
-    pa.add_argument("--tipo", required=True, choices=TIPOS_PEND)
-    pa.add_argument("--titulo", required=True)
-    for k in ("detalhe", "frente", "link", "comando", "espera", "task", "ate"):
-        pa.add_argument(f"--{k}")
+    _arg(pa, "tipo", required=True, type=_valor_pt(PEND_EN, "tipo"), choices=TIPOS_PEND, metavar=_metavar(PEND_EN))
+    _arg(pa, "titulo", required=True)
+    for k in ("detalhe", "frente", "comando", "espera", "ate"):
+        _arg(pa, k)
+    pa.add_argument("--link")
+    pa.add_argument("--task")
     pa.add_argument("--run", help="o Run da task do gate (obrigatório com o agent manager em mais de um Run)")
-    pl = p.add_parser("lista", help="as pendências vivas; --todas inclui as de Depois")
-    pl.add_argument("--todas", action="store_true")
+    pl = p.add_parser("list", aliases=["lista"], help="as pendências vivas; --all inclui as de Depois")
+    _arg(pl, "todas", action="store_true")
     pd = p.add_parser("done")
     pd.add_argument("id")
-    pd.add_argument("--resposta")
-    pe = p.add_parser("edit", help='orq pend edit <id> [--titulo T] [--detalhe D] [--frente F] [--link L] [--comando C] [--espera E] [--ate AAAA-MM-DD]; "" apaga o campo')
+    _arg(pd, "resposta")
+    pe = p.add_parser("edit", help='orq pend edit <id> [--title T] [--detail D] [--stream F] [--link L] [--command C] [--waiting E] [--until AAAA-MM-DD]; "" apaga o campo')
     pe.add_argument("id")
-    for k in ("titulo", "detalhe", "frente", "link", "comando", "espera", "ate"):
-        pe.add_argument(f"--{k}")
-    bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens; `mover NN... --grupo G` leva tickets ao backlog de um grupo")
-    bl.add_argument("op", nargs="?", choices=["mover"])
-    bl.add_argument("numeros", nargs="*", help="os tickets que saem (mover)")
-    bl.add_argument("--grupo", help="o grupo que recebe os tickets (mover)")
+    for k in ("titulo", "detalhe", "frente", "comando", "espera", "ate"):
+        _arg(pe, k)
+    pe.add_argument("--link")
+    bl = sub.add_parser("backlog", help="o backlog do tasks-axi (ORQ_BACKLOG): caminho, versão da CLI e contagens; `move NN... --group G` leva tickets ao backlog de um grupo")
+    bl.add_argument("op", nargs="?", choices=["move", "mover"])
+    bl.add_argument("numeros", nargs="*", help="os tickets que saem (move)")
+    _arg(bl, "grupo", help="o grupo que recebe os tickets (move)")
     bl.add_argument("--json", action="store_true")
-    dv = sub.add_parser("devolver", help="orq devolver <task|dispatch> \"<motivo>\": manda a correção ao worker de uma entrega já concluída e tira a entrega do Stop até o worker_done novo")
+    dv = sub.add_parser("send-back", aliases=["devolver"], help="orq send-back <task|dispatch> \"<motivo>\": manda a correção ao worker de uma entrega já concluída e tira a entrega do Stop até o worker_done novo")
     dv.add_argument("alvo")
     dv.add_argument("motivo")
     dv.add_argument("--run")
@@ -11319,179 +11394,178 @@ def main(argv=None):
     st.add_argument("task")
     st.add_argument("texto")
     st.add_argument("--run")
-    st.add_argument("--entrada")
-    pr = sub.add_parser("pr", help="PRs de cada feature ligados à task: ligar, lista, desligar, poll (o poll roda fora dos hooks)").add_subparsers(dest="op", required=True)
-    pl2 = pr.add_parser("ligar", help="orq pr ligar <task> <url> [--issue N]: registra o PR da feature (um por ambiente do projeto, ou merge/<feature>-<ambiente>)")
+    _arg(st, "entrada")
+    pr = sub.add_parser("pr", help="PRs de cada feature ligados à task: link, list, unlink, poll (o poll roda fora dos hooks)").add_subparsers(dest="op", required=True)
+    pl2 = pr.add_parser("link", aliases=["ligar"], help="orq pr link <task> <url> [--issue N]: registra o PR da feature (um por ambiente do projeto, ou merge/<feature>-<ambiente>)")
     pl2.add_argument("task")
     pl2.add_argument("url")
     pl2.add_argument("--issue", type=int, help="número da issue do GitHub, quando houver")
-    pa = pr.add_parser("auto", help="orq pr auto <url> [--head B] [--wt DIR]: liga o PR à task dona da branch; sem dona, vai para 'PR sem tarefa' (o hook prligar chama)")
+    pa = pr.add_parser("auto", help="orq pr auto <url> [--head B] [--wt DIR]: liga o PR à task dona da branch; sem dona, vai para 'PR sem tarefa' (o hook prlink chama)")
     pa.add_argument("url")
     pa.add_argument("--head")
     pa.add_argument("--wt")
     pa.add_argument("--cwd", help="onde achar a worktree da branch quando o --head não veio (a branch sai do gh pr view)")
     pl2.add_argument("--tag", help="a etiqueta da feature no digest (segurança, failover, …)")
-    pl2.add_argument("--nota", help="o que o PR faz, em uma ou duas frases, para o digest")
-    po = pr.add_parser("abrir", help="orq pr abrir <dispatch|branch> --titulo T --corpo ARQ [--ambientes a,b]: tira o prefixo da branch, confere merge-tree, empurra e abre um PR por ambiente ligado à task")
+    _arg(pl2, "nota", help="o que o PR faz, em uma ou duas frases, para o digest")
+    po = pr.add_parser("open", aliases=["abrir"], help="orq pr open <dispatch|branch> --title T --body ARQ [--environments a,b]: tira o prefixo da branch, confere merge-tree, empurra e abre um PR por ambiente ligado à task")
     po.add_argument("alvo")
-    po.add_argument("--titulo", required=True)
-    po.add_argument("--corpo", required=True, help="arquivo com o corpo do PR (seções da skill /pr)")
-    po.add_argument("--ambientes", help="branches separadas por vírgula; padrão: os ambientes do projeto antes da produção")
+    _arg(po, "titulo", required=True)
+    _arg(po, "corpo", required=True, help="arquivo com o corpo do PR (seções da skill /pr)")
+    _arg(po, "ambientes", help="branches separadas por vírgula; padrão: os ambientes do projeto antes da produção")
     po.add_argument("--cwd", help="onde achar a worktree quando o alvo é uma branch")
-    pr.add_parser("lista").add_argument("--task")
-    pd2 = pr.add_parser("desligar")
+    pr.add_parser("list", aliases=["lista"], help="os PRs ligados (de uma task, com --task)").add_argument("--task")
+    pd2 = pr.add_parser("unlink", aliases=["desligar"], help="orq pr unlink <task> <url>: tira o PR da task")
     pd2.add_argument("task")
     pd2.add_argument("url")
-    pr.add_parser("poll", help="pergunta ao gh pelos PRs abertos; merge ou fechamento vira uma entrada, uma vez").add_argument("--forcar", action="store_true", help="ignora o intervalo mínimo")
-    lf = sub.add_parser("limpar", help="orq limpar --fechados [--dry-run]: limpa na hora a worktree e as branches das tasks com todos os PRs fechados sem merge")
-    lf.add_argument("--fechados", action="store_true", required=True)
+    _arg(pr.add_parser("poll", help="pergunta ao gh pelos PRs abertos; merge ou fechamento vira uma entrada, uma vez"), "forcar", action="store_true", help="ignora o intervalo mínimo")
+    lf = sub.add_parser("clean", aliases=["limpar"], help="orq clean --closed [--dry-run]: limpa na hora a worktree e as branches das tasks com todos os PRs fechados sem merge")
+    _arg(lf, "fechados", action="store_true", required=True)
     lf.add_argument("--dry-run", action="store_true", help="só mostra o que apagaria")
     dg = sub.add_parser("digest", help="grava digest/atual.json (o contrato do painel): fila de merge, features, pendências, o que aconteceu e workers vivos")
-    dg.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez do momento em que o modo ausente ligou ou da última mensagem do usuário")
+    _arg(dg, "desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez do momento em que o modo ausente ligou ou da última mensagem do usuário")
     dg.add_argument("--html", action="store_true", help="grava também a página digest/<data>.html")
-    dg.add_argument("--abrir", action="store_true", help="grava a página e a abre numa aba do Orca")
-    fi = sub.add_parser("fila", help="a ordem de merge que o coordenador declara: add, feito, rm, lista").add_subparsers(dest="op", required=True)
-    fa = fi.add_parser("add", help="orq fila add --passo N --nome <nome> --por <por quê> <PR>…: declara (ou troca) o passo; os PRs já precisam estar ligados")
-    fa.add_argument("--passo", type=int, required=True)
-    fa.add_argument("--nome", required=True)
-    fa.add_argument("--por", required=True)
+    _arg(dg, "abrir", action="store_true", help="grava a página e a abre numa aba do Orca")
+    fi = sub.add_parser("queue", aliases=["fila"], help="a ordem de merge que o coordenador declara: add, done, rm, list").add_subparsers(dest="op", required=True)
+    fa = fi.add_parser("add", help="orq queue add --step N --name <nome> --why <por quê> <PR>…: declara (ou troca) o passo; os PRs já precisam estar ligados")
+    _arg(fa, "passo", type=int, required=True)
+    _arg(fa, "nome", required=True)
+    _arg(fa, "por", required=True)
     fa.add_argument("prs", nargs="+", type=int, help="números dos PRs do passo")
-    fi.add_parser("feito", help="marca o passo como feito à mão").add_argument("passo", type=int)
+    fi.add_parser("done", aliases=["feito"], help="marca o passo como feito à mão").add_argument("passo", type=int)
     fi.add_parser("rm", help="tira o passo da fila").add_argument("passo", type=int)
-    fi.add_parser("lista")
-    au = sub.add_parser("ausente", help="modo ausente: orq ausente ligar | desligar | (sem op: estado); o Stop de cada resposta atualiza o digest")
-    au.add_argument("op", nargs="?", choices=["ligar", "desligar"])
-    aw = sub.add_parser("away", help="alias em inglês do modo ausente: orq away [on|off|status]; sem op alterna; ao desligar mostra o link do painel")
+    fi.add_parser("list", aliases=["lista"], help="os passos declarados")
+    aw = sub.add_parser("away", aliases=["ausente"], help="modo ausente: orq away [on|off|status]; sem op alterna; ao desligar mostra o link do painel (o apelido `ausente` mantém o jeito de antes: sem op mostra o estado)")
     aw.add_argument("op", nargs="?", choices=["on", "off", "status", "ligar", "desligar"])
     sub.add_parser("steers", help="reentrega o aviso dos ajustes que o worker parado não leu e grava o alerta na terceira falha (o painel do gerente já faz)")
-    rp = sub.add_parser("responder", help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
+    rp = sub.add_parser("reply", aliases=["responder"], help="responde a pergunta de um worker pelo gerente, ligando o Run da mensagem antes")
     rp.add_argument("msg_id")
     rp.add_argument("texto")
     sub.add_parser("status")
-    ini = sub.add_parser("iniciar", help="no coordenador já aberto (Claude ou Codex): confere os hooks, liga o Run, sobe ou assume o agent manager e imprime o status")
-    ini.add_argument("--agente", choices=HARNESSES, help="o harness deste coordenador; sem ele, o dos processos acima")
+    ini = sub.add_parser("start", aliases=["iniciar"], help="no coordenador já aberto (Claude ou Codex): confere os hooks, liga o Run, sobe ou assume o agent manager e imprime o status")
+    _arg(ini, "agente", choices=HARNESSES, help="o harness deste coordenador; sem ele, o dos processos acima")
     ini.add_argument("--run", help="liga este Run (run-use) em vez de criar um")
-    ini.add_argument("--objetivo", help="cria um Run novo com este objetivo (um Run por frente)")
-    ini.add_argument("--assumir", action="store_true", help="toma o agent manager de outro coordenador que ainda aparece no Orca, com os Runs dele")
-    sub.add_parser("ocupadas", help="os caminhos das worktrees com worker vivo, um por linha (o limpar-mergeados não apaga essas)")
-    rs = sub.add_parser("resumo", help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
-    rs.add_argument("--desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
-    rs.add_argument("--noite", action="store_true", help="o cartão da manhã da última noite (até 40 linhas)")
+    _arg(ini, "objetivo", help="cria um Run novo com este objetivo (um Run por frente)")
+    _arg(ini, "assumir", action="store_true", help="toma o agent manager de outro coordenador que ainda aparece no Orca, com os Runs dele")
+    sub.add_parser("busy", aliases=["ocupadas"], help="os caminhos das worktrees com worker vivo, um por linha (o limpar-mergeados não apaga essas)")
+    rs = sub.add_parser("summary", aliases=["resumo"], help="as quatro partes (com você, entrou, anda, vem) e as decisões desde a última mensagem do usuário")
+    _arg(rs, "desde", help="carimbo ISO (AAAA-MM-DDTHH:MM:SSZ) em vez da última mensagem do usuário")
+    _arg(rs, "noite", action="store_true", help="o cartão da manhã da última noite (até 40 linhas)")
     rs.add_argument("op", nargs="?", choices=["add"], help="add \"<texto>\": grava o resumo em .scratch/resumos/<data>.md do projeto, com a hora local real")
     rs.add_argument("texto", nargs="?")
-    rs.add_argument("--projeto", help="com add: o arquivo de ORQ_HOME/projects; sem ele vale o projeto que contém o cwd")
-    al = sub.add_parser("alerta", help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
-    al.add_parser("visto").add_argument("task")
-    ag = sub.add_parser("agentes", help="o estado de cada dispatch em todos os Runs")
+    _arg(rs, "projeto", help="com add: o arquivo de ORQ_HOME/projects; sem ele vale o projeto que contém o cwd")
+    al = sub.add_parser("alert", aliases=["alerta"], help="trata um alerta de scout sem reportPath").add_subparsers(dest="op", required=True)
+    al.add_parser("seen", aliases=["visto"], help="marca o alerta da task como visto").add_argument("task")
+    ag = sub.add_parser("agents", aliases=["agentes"], help="o estado de cada dispatch em todos os Runs")
     ag.add_argument("--json", action="store_true")
     ag.add_argument("--run", help="só os dispatches deste Run (obrigatório se o worker-list vier escopado)")
-    ag.add_argument("--todos", action="store_true", help="inclui os liberados e os retidos pelo Orca (user_takeover…)")
-    li = sub.add_parser("liberar", help="ack pendente, worker-release e terminal close se vier retained")
+    _arg(ag, "todos", action="store_true", help="inclui os liberados e os retidos pelo Orca (user_takeover…)")
+    li = sub.add_parser("release", aliases=["liberar"], help="ack pendente, worker-release e terminal close se vier retained")
     li.add_argument("dispatch")
     li.add_argument("--run")
-    it = sub.add_parser("interromper", help="manda o interrupt ao terminal do worker que roda (o worker segue vivo)")
+    it = sub.add_parser("interrupt", aliases=["interromper"], help="manda o interrupt ao terminal do worker que roda (o worker segue vivo)")
     it.add_argument("dispatch")
     it.add_argument("--run")
-    rt = sub.add_parser("responder-tela", help="digita a opção de um menu preso na tela do worker (permissão, AskUserQuestion, trust)")
+    rt = sub.add_parser("answer-screen", aliases=["responder-tela"], help="digita a opção de um menu preso na tela do worker (permissão, AskUserQuestion, trust)")
     rt.add_argument("task")
     rt.add_argument("opcao", help="o número da opção ou o começo do rótulo")
     rt.add_argument("--run")
-    en = sub.add_parser("encerrar", help="worker-stop (se ainda roda) e release, com o motivo no log")
+    en = sub.add_parser("end", aliases=["encerrar"], help="worker-stop (se ainda roda) e release, com o motivo no log")
     en.add_argument("dispatch")
-    en.add_argument("--motivo", required=True)
-    en.add_argument("--parada", choices=list(PARADAS), help="nomeia a parada no cartão da manhã (parou: orçamento|decisão pendente|limite de uso)")
+    _arg(en, "motivo", required=True)
+    _arg(en, "parada", type=_valor_pt(PARADA_EN, "parada"), choices=list(PARADAS), metavar=_metavar(PARADA_EN), help="nomeia a parada no cartão da manhã (parou: orçamento|decisão pendente|limite de uso)")
     en.add_argument("--run")
-    rl = sub.add_parser("relancar", help="para o worker e sobe outro na mesma worktree e task (--retry-of), com a nota do que mudou")
+    rl = sub.add_parser("relaunch", aliases=["relancar"], help="para o worker e sobe outro na mesma worktree e task (--retry-of), com a nota do que mudou")
     rl.add_argument("dispatch")
-    rl.add_argument("--nota", required=True)
-    rl.add_argument("--modelo", help="troca o modelo (vai junto com --effort); sem ele, o do worker antigo")
+    _arg(rl, "nota", required=True)
+    _arg(rl, "modelo", help="troca o modelo (vai junto com --effort); sem ele, o do worker antigo")
     rl.add_argument("--effort")
     rl.add_argument("--run")
-    tc = sub.add_parser("transcrito", help="lê o fim do transcrito de um worker (Claude ou Codex): mensagens e chamadas de ferramenta, sem raciocínio nem registros meta, e a lista do que cortou")
+    tc = sub.add_parser("transcript", aliases=["transcrito"], help="lê o fim do transcrito de um worker (Claude ou Codex): mensagens e chamadas de ferramenta, sem raciocínio nem registros meta, e a lista do que cortou")
     tc.add_argument("dispatch")
-    tc.add_argument("--ultimos", type=int, default=20, help="só os N últimos eventos (padrão 20)")
+    _arg(tc, "ultimos", type=int, default=20, help="só os N últimos eventos (padrão 20)")
     tc.add_argument("--json", action="store_true")
-    pg = sub.add_parser("passagem", help="escreve o PASSAGEM.md de um worker sem turno (limite do plano), só com fatos e em até 20 s; não para nem sobe worker")
+    pg = sub.add_parser("handoff", aliases=["passagem"], help="escreve o PASSAGEM.md de um worker sem turno (limite do plano), só com fatos e em até 20 s; não para nem sobe worker")
     pg.add_argument("dispatch", help="o dispatch do worker, ou `coordenador` para gravar o snapshot desta sessão (o hook session do outro harness o injeta)")
-    pg.add_argument("--para", choices=list(HARNESSES), help="o harness que vai ler (padrão: o outro)")
+    _arg(pg, "para", choices=list(HARNESSES), help="o harness que vai ler (padrão: o outro)")
     pg.add_argument("--run")
-    ps = sub.add_parser("passar", help="continua o worker em outro harness (claude|codex) na mesma worktree e task: PASSAGEM.md, worker-start --retry-of --agent")
+    ps = sub.add_parser("switch", aliases=["passar"], help="continua o worker em outro harness (claude|codex) na mesma worktree e task: PASSAGEM.md, worker-start --retry-of --agent")
     ps.add_argument("dispatch")
-    ps.add_argument("--para", required=True, choices=list(HARNESSES))
-    ps.add_argument("--modelo", help="o modelo no outro harness (vai junto com --effort); sem ele vale a tabela de equivalência do worker-routing")
+    _arg(ps, "para", required=True, choices=list(HARNESSES))
+    _arg(ps, "modelo", help="o modelo no outro harness (vai junto com --effort); sem ele vale a tabela de equivalência do worker-routing")
     ps.add_argument("--effort")
     ps.add_argument("--run")
-    nt = sub.add_parser("noite", help="modo noite: orq noite ligar --ate HH:MM [--max-despachos N] [--max-falhas 3] | desligar | (sem op: estado)")
-    nt.add_argument("op", nargs="?", choices=["ligar", "desligar"])
-    nt.add_argument("--ate")
-    nt.add_argument("--max-despachos", type=int)
-    nt.add_argument("--max-falhas", type=int, default=NOITE_FALHAS)
-    de = sub.add_parser("despachar", help="worker-start com modelo e effort, evento e intake")
+    nt = sub.add_parser("night", aliases=["noite"], help="modo noite: orq night on --until HH:MM [--max-dispatches N] [--max-failures 3] | off | (sem op: estado)")
+    nt.add_argument("op", nargs="?", choices=["on", "off", "ligar", "desligar"])
+    _arg(nt, "ate")
+    _arg(nt, "max-despachos", type=int)
+    _arg(nt, "max-falhas", type=int, default=NOITE_FALHAS)
+    de = sub.add_parser("dispatch", aliases=["despachar"], help="worker-start com modelo e effort, evento e intake")
     de.add_argument("--run", required=True)
-    de.add_argument("--titulo")
-    de.add_argument("--spec-arquivo")
-    de.add_argument("--ticket", help="número de um ticket criado por orq ticket novo: o worker sobe na task dele (no lugar de --titulo e --spec-arquivo)")
-    de.add_argument("--agente", help=f"o harness do worker ({', '.join(HARNESSES)}); sem ele vale o do projeto e, sem projeto, claude")
-    de.add_argument("--projeto", help="um arquivo de ORQ_HOME/projects (orq projetos); sem ele vale o projeto cujo repo contém o cwd")
-    de.add_argument("--modelo", required=True)
+    _arg(de, "titulo")
+    _arg(de, "spec-arquivo")
+    de.add_argument("--ticket", help="número de um ticket criado por orq ticket new: o worker sobe na task dele (no lugar de --title e --spec-file)")
+    _arg(de, "agente", help=f"o harness do worker ({', '.join(HARNESSES)}); sem ele vale o do projeto e, sem projeto, claude")
+    _arg(de, "projeto", help="um arquivo de ORQ_HOME/projects (orq projects); sem ele vale o projeto cujo repo contém o cwd")
+    _arg(de, "modelo", required=True)
     de.add_argument("--effort", required=True)
     de.add_argument("--worktree", choices=["current", "new-top-level"])
     de.add_argument("--name")
     de.add_argument("--base-branch")
-    de.add_argument("--entrada")
-    de.add_argument("--prioridade", type=int, choices=[1, 2, 3], help="1 alta a 3 baixa; sem ela vale a da frente do título (segurança e produção 1, failover, diagnóstico e painel 3)")
-    rp = sub.add_parser("run", help="o que o orq guarda de um Run").add_subparsers(dest="op", required=True).add_parser("projeto", help="liga o Run a um projeto de ORQ_HOME/projects: os despachos dele sobem no repo do projeto")
+    _arg(de, "entrada")
+    _arg(de, "prioridade", type=int, choices=[1, 2, 3], help="1 alta a 3 baixa; sem ela vale a da frente do título (segurança e produção 1, failover, diagnóstico e painel 3)")
+    rp = sub.add_parser("run", help="o que o orq guarda de um Run").add_subparsers(dest="op", required=True).add_parser("project", aliases=["projeto"], help="liga o Run a um projeto de ORQ_HOME/projects: os despachos dele sobem no repo do projeto")
     rp.add_argument("nome")
     rp.add_argument("--run")
-    pj = sub.add_parser("projetos", help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo, ambientes)")
+    pj = sub.add_parser("projects", aliases=["projetos"], help="os projetos de ORQ_HOME/projects/<nome>.json (repo, harness dos workers, grupo, ambientes)")
     pj.add_argument("--json", action="store_true")
-    pa = sub.add_parser("projeto", help="projeto novo: registra no Orca e gera o orca.yaml (add), ou confia a pasta no Codex (confiar)").add_subparsers(dest="op", required=True)
-    paa = pa.add_parser("add", help="orq projeto add <caminho|url>: grava projects/<nome>.json, registra o repo no Orca se faltar e escreve o orca.yaml")
+    pa = sub.add_parser("project", aliases=["projeto"], help="projeto novo: registra no Orca e gera o orca.yaml (add), ou confia a pasta no Codex (trust)").add_subparsers(dest="op", required=True)
+    paa = pa.add_parser("add", help="orq project add <caminho|url>: grava projects/<nome>.json, registra o repo no Orca se faltar e escreve o orca.yaml")
     paa.add_argument("alvo")
-    paa.add_argument("--nome")
+    _arg(paa, "nome")
     paa.add_argument("--harness", choices=sorted(TRUST_DO_HARNESS))
-    paa.add_argument("--grupo")
-    paa.add_argument("--destino", help="url: a pasta do clone (padrão ~/Developer/<nome>)")
+    _arg(paa, "grupo")
+    _arg(paa, "destino", help="url: a pasta do clone (padrão ~/Developer/<nome>)")
     paa.add_argument("--orca-yaml", dest="orca_yaml", help="o orca.yaml que o agente propôs: troca os blocos detectados (a parte fixa entra sempre)")
-    paa.add_argument("--substituir-orca-yaml", action="store_true", help="troca o orca.yaml que o repositório já tem (sem a flag ele só mostra o diff)")
+    _arg(paa, "substituir-orca-yaml", action="store_true", help="troca o orca.yaml que o repositório já tem (sem a flag ele só mostra o diff)")
     paa.add_argument("--dry-run", action="store_true", help="mostra o orca.yaml e o que faria, sem gravar nem registrar")
     paa.add_argument("--json", action="store_true")
-    pa.add_parser("confiar", help="marca o cwd (e a raiz do repo dele) como confiável no Codex: a linha fixa do setup do orca.yaml de um projeto Codex")
-    fl = sub.add_parser("fluxo", help="os ambientes e a produção do projeto que contém --repo (o limpar-mergeados.py lê daqui)")
+    pa.add_parser("trust", aliases=["confiar"], help="marca o cwd (e a raiz do repo dele) como confiável no Codex: a linha fixa do setup do orca.yaml de um projeto Codex")
+    fl = sub.add_parser("flow", aliases=["fluxo"], help="os ambientes e a produção do projeto que contém --repo (o limpar-mergeados.py lê daqui)")
     fl.add_argument("--repo", default=".")
     fl.add_argument("--json", action="store_true")
-    de.add_argument("--servico", action="store_true", help="worker de serviço (integrador, secondmate): segue vivo depois do worker_done e reporta cada ciclo com orq ciclo feito")
-    cc = sub.add_parser("ciclo", help="worker de serviço: reporta um ciclo terminado (sem capability do Orca)").add_subparsers(dest="op", required=True)
-    sv = sub.add_parser("servico", help="marca como serviço um dispatch que já existe").add_subparsers(dest="op", required=True).add_parser("marcar", help="orq servico marcar <dispatch>: o mesmo efeito do --servico no despacho")
+    _arg(de, "servico", action="store_true", help="worker de serviço (integrador, secondmate): segue vivo depois do worker_done e reporta cada ciclo com orq cycle done")
+    cc = sub.add_parser("cycle", aliases=["ciclo"], help="worker de serviço: reporta um ciclo terminado (sem capability do Orca)").add_subparsers(dest="op", required=True)
+    sv = sub.add_parser("service", aliases=["servico"], help="marca como serviço um dispatch que já existe").add_subparsers(dest="op", required=True).add_parser("mark", aliases=["marcar"], help="orq service mark <dispatch>: o mesmo efeito do --service no despacho")
     sv.add_argument("dispatch")
-    cf = cc.add_parser("feito", help="orq ciclo feito --dispatch <id> --hash <commit> [--nota <texto>]")
+    cf = cc.add_parser("done", aliases=["feito"], help="orq cycle done --dispatch <id> --hash <commit> [--note <texto>]")
     cf.add_argument("--dispatch", required=True)
     cf.add_argument("--hash", required=True)
-    cf.add_argument("--nota")
-    ig = sub.add_parser("integrar", help="a fila do integrador").add_subparsers(dest="op", required=True)
-    igf = ig.add_parser("fila", help="as branches que esperam o integrador: add, rm, lista").add_subparsers(dest="acao", required=True)
-    iga = igf.add_parser("add", help="orq integrar fila add <branch> <ticket>: o worker do ticket fica aguardando integração, não parado")
+    _arg(cf, "nota")
+    ig = sub.add_parser("integrate", aliases=["integrar"], help="a fila do integrador").add_subparsers(dest="op", required=True)
+    igf = ig.add_parser("queue", aliases=["fila"], help="as branches que esperam o integrador: add, rm, list").add_subparsers(dest="acao", required=True)
+    iga = igf.add_parser("add", help="orq integrate queue add <branch> <ticket>: o worker do ticket fica aguardando integração, não parado")
     iga.add_argument("branch")
     iga.add_argument("ticket")
     igf.add_parser("rm", help="tira o ticket da fila").add_argument("ticket")
-    igf.add_parser("lista").add_argument("--json", action="store_true")
-    igc = ig.add_parser("concluir", help="orq integrar concluir --hash <main nova> <branch>...: o que o integrar.py chama depois do fast-forward; fecha fila, ticket e worker e grava o ciclo")
+    igf.add_parser("list", aliases=["lista"], help="as branches na fila").add_argument("--json", action="store_true")
+    igc = ig.add_parser("conclude", aliases=["concluir"], help="orq integrate conclude --hash <main nova> <branch>...: o que o integrar.py chama depois do fast-forward; fecha fila, ticket e worker e grava o ciclo")
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="o dispatch do integrador (padrão: o serviço de título integrador ainda não liberado)")
     igc.add_argument("branches", nargs="+")
     wl = sub.add_parser("worktrees", help="orq worktrees limpar [--dry-run]: remove as worktrees do orq-wt já contidas na origin/main").add_subparsers(dest="op", required=True)
-    wl.add_parser("limpar").add_argument("--dry-run", action="store_true")
-    au = sub.add_parser("auditar-publicacao", help="orq auditar-publicacao <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
+    wl.add_parser("clean", aliases=["limpar"]).add_argument("--dry-run", action="store_true")
+    au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
     au.add_argument("revs", nargs="+", help="args do git rev-list; em branch nova: <head> --not --remotes (depois de --)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
-    tn = tk.add_parser("novo", help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
-    tn.add_argument("--titulo", required=True)
-    tn.add_argument("--spec-arquivo", required=True)
+    tn = tk.add_parser("new", aliases=["novo"], help="cria o arquivo e a task a partir de um título e de um arquivo de spec")
+    _arg(tn, "titulo", required=True)
+    _arg(tn, "spec-arquivo", required=True)
     tn.add_argument("--blocked-by", help="números dos tickets que bloqueiam este, separados por vírgula")
     tn.add_argument("--run", help="Run da task (o ligado ao coordenador, por padrão)")
-    for k, h in (("modelo", "o modelo com que o ticket liberado sobe sozinho"), ("effort", "o effort dele"), ("despacho", "`manual[, motivo]`: nunca sobe sozinho"), ("espera", "`integrador vazio`")):
-        tn.add_argument(f"--{k}", help=h)
-    tf = tk.add_parser("fechar", help="grava o Answer, põe resolved e completa a task")
+    for k, h in (("modelo", "o modelo com que o ticket liberado sobe sozinho"), ("despacho", "`manual[, motivo]`: nunca sobe sozinho"), ("espera", "`integrador vazio`")):
+        _arg(tn, k, help=h)
+    tn.add_argument("--effort", help="o effort dele")
+    tf = tk.add_parser("close", aliases=["fechar"], help="grava o Answer, põe resolved e completa a task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="texto ou caminho de um arquivo")
     dc = sub.add_parser("doctor", help="confere o estado do orq contra o Orca e corrige o que dá").add_subparsers(dest="op", required=True)
@@ -11505,120 +11579,145 @@ def main(argv=None):
     da.add_argument("--json", action="store_true")
     dbk = dc.add_parser("backlog", help="cruza os tickets dos backlogs com as tasks do Orca e imprime o conserto de cada diferença (não escreve nada)")
     dbk.add_argument("--json", action="store_true")
-    te = tk.add_parser("editar", help="troca o modelo, o effort, o despacho ou a espera de um ticket (valor vazio tira o campo)")
+    te = tk.add_parser("edit", aliases=["editar"], help="troca o modelo, o effort, o despacho ou a espera de um ticket (valor vazio tira o campo)")
     te.add_argument("numero")
-    for k in ("modelo", "effort", "despacho", "espera"):
-        te.add_argument(f"--{k}")
-    tl = tk.add_parser("lista", help="os tickets abertos (--todos inclui os resolvidos)")
-    tl.add_argument("--todos", action="store_true")
+    for k in ("modelo", "despacho", "espera"):
+        _arg(te, k)
+    te.add_argument("--effort")
+    tl = tk.add_parser("list", aliases=["lista"], help="os tickets abertos (--all inclui os resolvidos)")
+    _arg(tl, "todos", action="store_true")
     tl.add_argument("--json", action="store_true")
-    sub.add_parser("lavish-resposta").add_argument("arquivo", help="saída do `lavish-axi poll` (crua, ou o JSON dela); `-` lê a entrada padrão")
-    pg = sub.add_parser("perguntar", help="decisão pelo Lavish (vale no Claude e no Codex): página com as opções, espera a resposta e fecha a pendência")
+    sub.add_parser("lavish-answer", aliases=["lavish-resposta"], help="grava a resposta de uma decisão pelo Lavish").add_argument("arquivo", help="saída do `lavish-axi poll` (crua, ou o JSON dela); `-` lê a entrada padrão")
+    pg = sub.add_parser("ask", aliases=["perguntar"], help="decisão pelo Lavish (vale no Claude e no Codex): página com as opções, espera a resposta e fecha a pendência")
     pg.add_argument("--id", required=True, help="id da pendência de decisão (até 12 caracteres; nasce se não existir)")
-    pg.add_argument("--pergunta", required=True)
-    pg.add_argument("--opcao", action="append", default=[], help="uma opção; repita (mínimo 2)")
-    pg.add_argument("--recomendada", type=int, default=1, help="número (1..N) da opção recomendada; só marca, não pré-seleciona")
-    pg.add_argument("--detalhe")
-    pg.add_argument("--espera-min", type=float, help=f"minutos até desistir (padrão {PERGUNTAR_MIN:g}); a pendência fica aberta")
-    pg.add_argument("--sem-poll", action="store_true", help="só monta e abre a página; grave o poll depois com orq lavish-resposta")
-    sub.add_parser("auditar-respostas").add_argument("--sessao", help="id (ou prefixo) da sessão; sem ele, a última sessão de coordenador do cursor.json")
-    ge = sub.add_parser("gerente", help="agent manager em terminal próprio: os avisos do Orca vão para ele, não para o coordenador").add_subparsers(dest="op", required=True)
-    gl = ge.add_parser("ligar", help="no coordenador: liga Runs ao terminal do agent manager (soma aos que ele já tem)")
+    _arg(pg, "pergunta", required=True)
+    _arg(pg, "opcao", action="append", default=[], help="uma opção; repita (mínimo 2)")
+    _arg(pg, "recomendada", type=int, default=1, help="número (1..N) da opção recomendada; só marca, não pré-seleciona")
+    _arg(pg, "detalhe")
+    _arg(pg, "espera-min", type=float, help=f"minutos até desistir (padrão {PERGUNTAR_MIN:g}); a pendência fica aberta")
+    _arg(pg, "sem-poll", action="store_true", help="só monta e abre a página; grave o poll depois com orq lavish-answer")
+    _arg(sub.add_parser("audit-answers", aliases=["auditar-respostas"], help="audita as respostas do coordenador de uma sessão"), "sessao", help="id (ou prefixo) da sessão; sem ele, a última sessão de coordenador do cursor.json")
+    ge = sub.add_parser("manager", aliases=["gerente"], help="agent manager em terminal próprio: os avisos do Orca vão para ele, não para o coordenador").add_subparsers(dest="op", required=True)
+    gl = ge.add_parser("bind", aliases=["ligar"], help="no coordenador: liga Runs ao terminal do agent manager (soma aos que ele já tem)")
     gl.add_argument("--terminal", required=True)
     gl.add_argument("--run", action="append", help="repita para ligar vários; sem --run entra o Run ligado ao coordenador")
-    gl.add_argument("--assumir", action="store_true", help="toma o gerente.json de outro coordenador que ainda aparece no Orca, com os Runs dele")
-    gd = ge.add_parser("desligar", help="no coordenador: devolve um Run (--run) ou todos a este terminal")
+    _arg(gl, "assumir", action="store_true", help="toma o gerente.json de outro coordenador que ainda aparece no Orca, com os Runs dele")
+    gd = ge.add_parser("unbind", aliases=["desligar"], help="no coordenador: devolve um Run (--run) ou todos a este terminal")
     gd.add_argument("--run")
-    gd.add_argument("--assumir", action="store_true", help="desliga também o gerente.json de outro coordenador que ainda aparece no Orca")
-    ge.add_parser("checar", help="confere no Orca se o terminal do agent manager ainda existe (o prompt do coordenador chama, em segundo plano)")
-    gs = ge.add_parser("subir", help="no coordenador: o terminal do agent manager sumiu; cria outro com o painel e religa todos os Runs do gerente.json")
-    gs.add_argument("--forcar", action="store_true", help="sobe mesmo com o terminal antigo ainda no Orca")
-    ge.add_parser("intervalo", help="quantos segundos o painel dorme antes da próxima volta (o shell do painel chama)")
-    ga = ge.add_parser("absorver", help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
-    ga.add_argument("--estado", action="store_true", help=argparse.SUPPRESS)  # o serve: grava o gerente-estado.json depois da volta
+    _arg(gd, "assumir", action="store_true", help="desliga também o gerente.json de outro coordenador que ainda aparece no Orca")
+    ge.add_parser("check", aliases=["checar"], help="confere no Orca se o terminal do agent manager ainda existe (o prompt do coordenador chama, em segundo plano)")
+    gs = ge.add_parser("spawn", aliases=["subir"], help="no coordenador: o terminal do agent manager sumiu; cria outro com o painel e religa todos os Runs do gerente.json")
+    _arg(gs, "forcar", action="store_true", help="sobe mesmo com o terminal antigo ainda no Orca")
+    ge.add_parser("interval", aliases=["intervalo"], help="quantos segundos o painel dorme antes da próxima volta (o shell do painel chama)")
+    ga = ge.add_parser("absorb", aliases=["absorver"], help="no terminal do agent manager: confirma heartbeat e avisa o coordenador do resto, Run por Run")
+    _arg(ga, "estado", action="store_true", help=argparse.SUPPRESS)  # o serve: grava o gerente-estado.json depois da volta
     gv = ge.add_parser("serve", help="o agent manager sem terminal: absorve em laço fora do Orca, com log em logs/gerente.log")
-    gv.add_argument("--voltas", type=int, help=argparse.SUPPRESS)
+    _arg(gv, "voltas", type=int, help=argparse.SUPPRESS)
     gvo = gv.add_mutually_exclusive_group()
-    for op, ajuda in (("status", "se roda, o pid, o launchd e a última volta"), ("parar", "para o serve (e o launchd até o próximo login)"),
+    gvo.add_argument("--status", action="store_true", help="se roda, o pid, o launchd e a última volta")
+    for op, ajuda in (("parar", "para o serve (e o launchd até o próximo login)"),
                       ("instalar", "grava e carrega o launchd agent: sobe no login e reinicia se cair"), ("desinstalar", "tira o launchd agent")):
-        gvo.add_argument(f"--{op}", action="store_true", help=ajuda)
+        _arg(gvo, op, action="store_true", help=ajuda)
     ge.add_parser("tui", help="abre a TUI (OpenTUI, pede Bun) que acompanha o gerente, os workers e as filas; só leitura")
-    rt = sub.add_parser("retomar", help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
+    rt = sub.add_parser("resume", aliases=["retomar"], help="depois de uma queda: sobe o agent manager e retoma, com claude --resume, os workers sem worker_done que perderam o terminal")
     rt.add_argument("--dry-run", action="store_true", help="só lista")
     rt.add_argument("--run", help="só os dispatches deste Run")
     rt.add_argument("--json", action="store_true")
-    rt.add_argument("--pausados", action="store_true", help="sobe os workers que o orq pausar parou (em vez dos que caíram); recusa com o uso ainda alto")
-    rt.add_argument("--forcar", action="store_true", help="com --pausados, sobe mesmo com o uso acima do limiar")
-    hb = sub.add_parser("hibernar", help="fecha o terminal de um worker ocioso e guarda a sessão (o gerente faz sozinho, com o critério do README); o steer, o responder e o orq acordar o trazem de volta")
+    _arg(rt, "pausados", action="store_true", help="sobe os workers que o orq pause parou (em vez dos que caíram); recusa com o uso ainda alto")
+    _arg(rt, "forcar", action="store_true", help="com --paused, sobe mesmo com o uso acima do limiar")
+    hb = sub.add_parser("hibernate", aliases=["hibernar"], help="fecha o terminal de um worker ocioso e guarda a sessão (o gerente faz sozinho, com o critério do README); o steer, o reply e o orq wake o trazem de volta")
     hb.add_argument("alvo", help="id da task ou do dispatch")
     hb.add_argument("--run")
-    hb.add_argument("--forcar", action="store_true", help="passa a falta de prova de processo filho (ps/lsof sem achar o agente); nunca passa processo filho vivo, tela ocupada nem coordenador")
+    _arg(hb, "forcar", action="store_true", help="passa a falta de prova de processo filho (ps/lsof sem achar o agente); nunca passa processo filho vivo, tela ocupada nem coordenador")
     hb.add_argument("--json", action="store_true")
-    ac = sub.add_parser("acordar", help="sobe de volta, com o resume do harness, o worker hibernado (task ou dispatch)")
+    ac = sub.add_parser("wake", aliases=["acordar"], help="sobe de volta, com o resume do harness, o worker hibernado (task ou dispatch)")
     ac.add_argument("alvo")
-    ac.add_argument("--texto", help="o que o worker recebe ao acordar (o padrão é 'acordado à mão')")
+    _arg(ac, "texto", help="o que o worker recebe ao acordar (o padrão é 'acordado à mão')")
     ac.add_argument("--json", action="store_true")
-    pz = sub.add_parser("pausar", help="pausa workers para abrir folga no plano: PAUSA.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
+    pz = sub.add_parser("pause", aliases=["pausar"], help="pausa workers para abrir folga no plano: PAUSA.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
     pz.add_argument("tasks", nargs="*", help="ids de task ou de dispatch; sem eles vale o critério de prioridade")
-    pz.add_argument("--ate-prioridade", type=int, choices=[1, 2, 3], help="pausa as de prioridade N e mais baixas (3 = só as baixas)")
+    _arg(pz, "ate-prioridade", type=int, choices=[1, 2, 3], help="pausa as de prioridade N e mais baixas (3 = só as baixas)")
     pz.add_argument("--run")
     pz.add_argument("--dry-run", action="store_true", help="só lista")
     pz.add_argument("--json", action="store_true")
-    pr_ = sub.add_parser("prioridade", help="troca a prioridade (1 alta a 3 baixa) de uma task; o orq agentes, o digest, o orq pausar e a recusa por orçamento usam essa ordem")
+    pr_ = sub.add_parser("priority", aliases=["prioridade"], help="troca a prioridade (1 alta a 3 baixa) de uma task; o orq agents, o digest, o orq pause e a recusa por orçamento usam essa ordem")
     pr_.add_argument("task")
     pr_.add_argument("valor", type=int, choices=[1, 2, 3])
-    uz = sub.add_parser("uso", help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
+    uz = sub.add_parser("usage", aliases=["uso"], help="o uso do plano (semana e janela de 5 h) lido do HUD, o nível e a decisão sobre novos despachos")
     uz.add_argument("--json", action="store_true")
-    uz.add_argument("--agente", default="claude", choices=HARNESSES, help="de que plano (as cotas do Claude e do Codex são separadas)")
-    rv = sub.add_parser("revisar", help="só o review do no-mistakes na worktree da task (ticket 146), com o modelo barato do NM_HOME do orq; recusa em pausa/segura do uso e sem slot caro")
+    _arg(uz, "agente", default="claude", choices=HARNESSES, help="de que plano (as cotas do Claude e do Codex são separadas)")
+    rv = sub.add_parser("review", aliases=["revisar"], help="só o review do no-mistakes na worktree da task (ticket 146), com o modelo barato do NM_HOME do orq; recusa em pausa/segura do uso e sem slot caro")
     rv.add_argument("task", help="o id da task ou o número do ticket")
     rv.add_argument("--json", action="store_true")
-    mq = sub.add_parser("maquina", help="o orçamento da máquina (ticket 79): o que ela tem agora, o que o orq decide e as vagas. `orq maquina set <chave> <valor>` ajusta o maquina.json")
+    mq = sub.add_parser("machine", aliases=["maquina"], help="o orçamento da máquina (ticket 79): o que ela tem agora, o que o orq decide e as vagas. `orq machine set <chave> <valor>` ajusta o maquina.json")
     mq.add_argument("op", nargs="?", choices=["set"])
     mq.add_argument("chave", nargs="?")
     mq.add_argument("valor", nargs="?", help="em JSON: 4, true, [\"claude-opus-*\"]")
     mq.add_argument("--json", action="store_true")
-    fd = sub.add_parser("fila-despacho", help="os despachos e retomadas que esperam vaga na máquina: lista | rm <id>").add_subparsers(dest="op", required=True)
-    fd.add_parser("lista").add_argument("--json", action="store_true")
+    fd = sub.add_parser("dispatch-queue", aliases=["fila-despacho"], help="os despachos e retomadas que esperam vaga na máquina: list | rm <id>").add_subparsers(dest="op", required=True)
+    fd.add_parser("list", aliases=["lista"], help="os despachos na fila").add_argument("--json", action="store_true")
     fd.add_parser("rm").add_argument("id")
-    dc = fd.add_parser("descartar", help="dá a desistência `desistiu` por resolvida: tira o item do Stop do away")
+    dc = fd.add_parser("discard", aliases=["descartar"], help="dá a desistência `desistiu` por resolvida: tira o item do Stop do away")
     dc.add_argument("id")
-    dc.add_argument("--motivo", required=True)
-    cx = sub.add_parser("caixa", help="lê a caixa do Orca (check) e com --ack a confirma na mesma geração; volta o vínculo ao Run anterior")
+    _arg(dc, "motivo", required=True)
+    cx = sub.add_parser("inbox", aliases=["caixa"], help="lê a caixa do Orca (check) e com --ack a confirma na mesma geração; volta o vínculo ao Run anterior")
     cx.add_argument("run", nargs="?")
     cx.add_argument("--ack", action="store_true")
-    cx.add_argument("--todas", action="store_true", help="percorre os Runs com mensagem não lida")
-    ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--todos: o arquivo e os de teste)")
-    ru.add_argument("--todos", action="store_true")
+    _arg(cx, "todas", action="store_true", help="percorre os Runs com mensagem não lida")
+    ru = sub.add_parser("runs", help="os Runs com trabalho aberto ou recentes (--all: o arquivo e os de teste)")
+    _arg(ru, "todos", action="store_true")
     ru.add_argument("--json", action="store_true")
-    gp = sub.add_parser("grupos", help="os grupos (ORQ_HOME/groups/*.json) e os mates; com --titulo/--cwd/--grupo diz para qual grupo o pedido vai")
-    gp.add_argument("--titulo")
+    gp = sub.add_parser("groups", aliases=["grupos"], help="os grupos (ORQ_HOME/groups/*.json) e os mates; com --title/--cwd/--group diz para qual grupo o pedido vai")
+    _arg(gp, "titulo")
     gp.add_argument("--cwd")
-    gp.add_argument("--grupo")
-    mt = sub.add_parser("mate", help="o secondmate de um grupo: abrir | dormir | pedir | subir | pedidos").add_subparsers(dest="op", required=True)
-    mt.add_parser("abrir").add_argument("grupo")
-    mt.add_parser("dormir", help="hiberna o mate do grupo (o gerente faz sozinho depois de ORQ_MATE_DORMIR_MIN min ocioso); orq mate pedir o acorda").add_argument("grupo")
-    mp = mt.add_parser("pedir")
+    _arg(gp, "grupo")
+    mt = sub.add_parser("mate", help="o secondmate de um grupo: open | sleep | request | raise | requests").add_subparsers(dest="op", required=True)
+    mt.add_parser("open", aliases=["abrir"], help="abre o mate do grupo").add_argument("grupo")
+    mt.add_parser("sleep", aliases=["dormir"], help="hiberna o mate do grupo (o gerente faz sozinho depois de ORQ_MATE_DORMIR_MIN min ocioso); orq mate request o acorda").add_argument("grupo")
+    mp = mt.add_parser("request", aliases=["pedir"], help="pede algo ao mate do grupo")
     mp.add_argument("grupo")
-    mp.add_argument("--texto", required=True)
-    mp.add_argument("--prazo", type=int, default=PRAZO_PEDIDO_S, help="segundos do fim do turno do mate até a repostagem; 0: não espera resposta")
-    mp.add_argument("--responde", help="a entrada que o mate subiu e este pedido responde: fecha com o efeito mate")
-    ms = mt.add_parser("subir")
-    ms.add_argument("--tipo", required=True, choices=TIPOS_SUBIDA)
-    ms.add_argument("--texto", required=True)
+    _arg(mp, "texto", required=True)
+    _arg(mp, "prazo", type=int, default=PRAZO_PEDIDO_S, help="segundos do fim do turno do mate até a repostagem; 0: não espera resposta")
+    _arg(mp, "responde", help="a entrada que o mate subiu e este pedido responde: fecha com o efeito mate")
+    ms = mt.add_parser("raise", aliases=["subir"], help="o mate sobe uma resposta, decisão, PR, bloqueio ou resumo ao coordenador")
+    _arg(ms, "tipo", required=True, type=_valor_pt(SUBIDA_EN, "tipo"), choices=TIPOS_SUBIDA, metavar=_metavar(SUBIDA_EN))
+    _arg(ms, "texto", required=True)
     ms.add_argument("--corr")
     ms.add_argument("--link")
-    ms.add_argument("--grupo")
-    mt.add_parser("pedidos").add_argument("--grupo")
+    _arg(ms, "grupo")
+    _arg(mt.add_parser("requests", aliases=["pedidos"], help="os pedidos ao mate ainda sem resposta"), "grupo")
     sub.add_parser("ingest").add_argument("--refresh", action="store_true", help="depois do ingest, refaz o aberto.json")
     rr = sub.add_parser("retro", help="os sinais de falha dos eventos, transcritos e PRs de uma janela (padrão 7 dias), sem LLM: quantos, quais casos, em que modelo")
-    rr.add_argument("--desde", help="início da janela (data ou ISO)")
-    rr.add_argument("--ate", help="fim da janela (padrão: agora)")
-    rr.add_argument("--projeto", help="só os casos cujo caminho, título ou task contém o trecho")
+    _arg(rr, "desde", help="início da janela (data ou ISO)")
+    _arg(rr, "ate", help="fim da janela (padrão: agora)")
+    _arg(rr, "projeto", help="só os casos cujo caminho, título ou task contém o trecho")
     rr.add_argument("--json", action="store_true")
-    rr.add_argument("--sem-gh", action="store_true", help="não pergunta ao gh pelo CI e pelo review dos PRs")
-    rr.add_argument("--sem-transcritos", action="store_true", help="não lê os transcritos dos workers (regras violadas)")
-    rr.add_argument("--gravar", action="store_true", help="guarda as métricas em ORQ_HOME/retro para a próxima rodada comparar")
+    _arg(rr, "sem-gh", action="store_true", help="não pergunta ao gh pelo CI e pelo review dos PRs")
+    _arg(rr, "sem-transcritos", action="store_true", help="não lê os transcritos dos workers (regras violadas)")
+    _arg(rr, "gravar", action="store_true", help="guarda as métricas em ORQ_HOME/retro para a próxima rodada comparar")
+    return ap
+
+
+def normalizar(a, args):
+    """Troca os apelidos pt de `a.cmd`, `a.op` e `a.acao` pelo nome em inglês (o despacho compara com ele) e devolve os apelidos pt usados, comandos e flags."""
+    usados = []
+
+    def troca(chave, valor):
+        en = APELIDOS.get(chave, {}).get(valor)
+        if en:
+            usados.append(f"{valor} -> {en}")
+        return en or valor
+    a.cmd = troca("", a.cmd)
+    if isinstance(getattr(a, "op", None), str):
+        a.op = troca(a.cmd, a.op)
+    if isinstance(getattr(a, "acao", None), str):
+        a.acao = troca(f"{a.cmd} {a.op}", a.acao)
+    usados += [f"{f} -> {FLAG_APELIDOS[f]}" for f in (t.split("=")[0] for t in args) if f in FLAG_APELIDOS]
+    return usados
+
+
+def main(argv=None):
+    ap = parser()
     args = sys.argv[1:] if argv is None else argv
     if args[:1] == ["hook"]:
         try:
@@ -11631,18 +11730,21 @@ def main(argv=None):
         a = ap.parse_args(args)
     if a.cmd == "hook":
         return run_hook(a.kind, a.harness)
+    ausente = a.cmd == "ausente"  # o apelido mantém o jeito de antes: sem op mostra o estado e ligar/desligar imprime o estado
+    for u in normalizar(a, args):
+        log(f"apelido pt: {u}")
     try:
         if a.cmd == "intake":
             print(json.dumps(intake(a.entrada, a.efeito, a.ref, a.run, a.nota), ensure_ascii=False))
-        elif a.cmd == "feito":
+        elif a.cmd == "fulfill":
             print(json.dumps(obrigacao_feito(a.entrada, a.obrigacao, a.prova), ensure_ascii=False))
-        elif a.cmd == "adiar":
+        elif a.cmd == "defer":
             print(json.dumps(obrigacao_adiar(a.entrada, a.obrigacao, a.motivo, a.run), ensure_ascii=False))
         elif a.cmd == "pend":
             if a.op == "add":
                 print(json.dumps(pend_add(a.id, a.tipo, a.titulo, a.detalhe, a.frente, a.link, a.comando, a.espera, a.task, a.ate, a.run), ensure_ascii=False))
                 _implicito("decisao" if a.tipo == "decisao" else "pend", a.id)
-            elif a.op == "lista":
+            elif a.op == "list":
                 print("\n".join(pend_lista(a.todas)) or "nenhuma pendência")
             elif a.op == "edit":
                 print(json.dumps(pend_edit(a.id, titulo=a.titulo, detalhe=a.detalhe, frente=a.frente, link=a.link, comando=a.comando, espera=a.espera, ate=a.ate), ensure_ascii=False))
@@ -11651,32 +11753,32 @@ def main(argv=None):
                 print(json.dumps(feito, ensure_ascii=False))
                 if feito.get("aviso"):
                     print(f"aviso: {feito['aviso']}", file=sys.stderr)
-        elif a.cmd == "backlog" and a.op == "mover":
+        elif a.cmd == "backlog" and a.op == "move":
             if not (a.numeros and a.grupo):
-                print("backlog mover: passe os números dos tickets e --grupo", file=sys.stderr)
+                print("backlog move: passe os números dos tickets e --grupo", file=sys.stderr)
                 return 2
             print(json.dumps(backlog_mover(a.numeros, a.grupo), ensure_ascii=False))
         elif a.cmd == "backlog":
             r = backlog_estado()
             print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"{k}: {v}" for k, v in r.items()))
         elif a.cmd == "pr":
-            if a.op == "ligar":
+            if a.op == "link":
                 print(json.dumps(pr_ligar(a.task, a.url, a.issue, a.tag, a.nota), ensure_ascii=False))
             elif a.op == "auto":
                 print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
-            elif a.op == "abrir":
+            elif a.op == "open":
                 urls, avisos = pr_abrir(a.alvo, a.titulo, a.corpo, [x for x in (a.ambientes or "").split(",") if x] or None, a.cwd)
                 for av in avisos:
                     print(f"aviso: {av}", file=sys.stderr)
                 print("\n".join(urls))
-            elif a.op == "desligar":
+            elif a.op == "unlink":
                 pr_desligar(a.task, a.url)
                 print(f"PR desligado de {a.task}")
-            elif a.op == "lista":
+            elif a.op == "list":
                 print("\n".join(pr_lista(a.task)) or "nenhum PR ligado")
             else:
                 print("\n".join(pr_poll(forcar=a.forcar)) or "nenhuma mudança nos PRs")
-        elif a.cmd == "devolver":
+        elif a.cmd == "send-back":
             print(json.dumps(devolver(a.alvo, a.motivo, a.run), ensure_ascii=False))
         elif a.cmd == "steer":
             ev = steer(a.task, a.texto, a.run, a.entrada)
@@ -11685,52 +11787,52 @@ def main(argv=None):
                 _implicito("steer", a.task, ev.get("run"))
         elif a.cmd == "steers":
             print("\n".join(reentrega_steers()) or "nenhum ajuste a reentregar")
-        elif a.cmd == "responder":
+        elif a.cmd == "reply":
             print(json.dumps(responder(a.msg_id, a.texto), ensure_ascii=False))
-        elif a.cmd == "alerta":
+        elif a.cmd == "alert":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
-        elif a.cmd == "limpar":
+        elif a.cmd == "clean":
             print("\n".join(limpar_fechados(dry=a.dry_run)) or "nenhuma task com todos os PRs fechados sem merge")
-        elif a.cmd == "ocupadas":
+        elif a.cmd == "busy":
             print("\n".join(sorted(worktrees_ocupadas())))
         elif a.cmd == "hooks-codex":
             add = instalar_hooks_codex(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex.hooks.example.json"))
             print("\n".join([*(f"acrescentado: {ev} grupo {g}" for ev, g in add), aviso_hooks_codex() or "hooks do orq confiados no Codex"]))
         elif a.cmd == "status":
             print(texto_status())
-        elif a.cmd == "iniciar":
+        elif a.cmd == "start":
             print(iniciar(a.agente, a.run, a.objetivo, a.assumir))
-        elif a.cmd == "resumo" and a.op == "add":
+        elif a.cmd == "summary" and a.op == "add":
             print(resumo_add(a.texto, a.projeto))
-        elif a.cmd == "resumo" and a.noite:
+        elif a.cmd == "summary" and a.noite:
             print(cartao_manha())
-        elif a.cmd == "resumo":
+        elif a.cmd == "summary":
             if a.desde:
                 _dt(a.desde)  # ValueError vira exit 1
             print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _pend_ro(), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
-        elif a.cmd == "agentes":
+        elif a.cmd == "agents":
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]
             print(json.dumps(ags, ensure_ascii=False) if a.json else "\n".join([*filter(None, [aviso_hooks_codex()]), texto_agentes(ags), *linhas_hibernacao(), *parada]))
-        elif a.cmd == "transcrito":
+        elif a.cmd == "transcript":
             r = transcrito(a.dispatch, a.ultimos)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_transcrito(r))
-        elif a.cmd == "caixa":
+        elif a.cmd == "inbox":
             print("\n".join(caixa(a.run, a.ack, a.todas)))
         elif a.cmd == "runs":
             rs = runs_lista(a.todos)
             print(json.dumps(rs, ensure_ascii=False) if a.json else texto_runs(rs))
-        elif a.cmd == "liberar":
+        elif a.cmd == "release":
             r = liberar(a.dispatch, a.run)
             print(json.dumps(r, ensure_ascii=False))
             if r["aviso"]:
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
-        elif a.cmd == "responder-tela":
+        elif a.cmd == "answer-screen":
             print(json.dumps(responder_tela(a.task, a.opcao, a.run), ensure_ascii=False))
-        elif a.cmd in ("interromper", "encerrar", "relancar", "passar", "passagem"):
-            r = interromper(a.dispatch, a.run) if a.cmd == "interromper" else encerrar(a.dispatch, a.motivo, a.run, a.parada) if a.cmd == "encerrar" \
-                else passar(a.dispatch, a.para, a.modelo, a.effort, a.run) if a.cmd == "passar" else passagem_coordenador(a.para) if (a.cmd, a.dispatch) == ("passagem", "coordenador") \
-                else passagem(a.dispatch, a.para, a.run) if a.cmd == "passagem" else relancar(a.dispatch, a.nota, a.modelo, a.effort, a.run)
+        elif a.cmd in ("interrupt", "end", "relaunch", "switch", "handoff"):
+            r = interromper(a.dispatch, a.run) if a.cmd == "interrupt" else encerrar(a.dispatch, a.motivo, a.run, a.parada) if a.cmd == "end" \
+                else passar(a.dispatch, a.para, a.modelo, a.effort, a.run) if a.cmd == "switch" else passagem_coordenador(a.para) if (a.cmd, a.dispatch) == ("handoff", "coordenador") \
+                else passagem(a.dispatch, a.para, a.run) if a.cmd == "handoff" else relancar(a.dispatch, a.nota, a.modelo, a.effort, a.run)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
                 print(f"aviso: {r['aviso']}", file=sys.stderr)
@@ -11744,30 +11846,30 @@ def main(argv=None):
                     digest_abrir(pagina)
                 except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
                     print(f"aviso: a aba não abriu ({e}); abra {pagina}", file=sys.stderr)
-        elif a.cmd == "fila":
+        elif a.cmd == "queue":
             if a.op == "add":
                 print(json.dumps(fila_add(a.passo, a.nome, a.por, a.prs), ensure_ascii=False))
-            elif a.op in ("feito", "rm"):
-                fila_marca(a.passo, a.op)
-                print(f"passo {a.passo}: {'marcado feito' if a.op == 'feito' else 'tirado da fila'}")
+            elif a.op in ("done", "rm"):
+                fila_marca(a.passo, "feito" if a.op == "done" else a.op)
+                print(f"passo {a.passo}: {'marcado feito' if a.op == 'done' else 'tirado da fila'}")
             else:
                 print("\n".join(fila_lista()) or "nenhum passo declarado")
-        elif a.cmd == "ausente":
-            if a.op == "ligar":
+        elif a.cmd == "away" and ausente:
+            if a.op == "on":
                 ausente_ligar()
-            elif a.op == "desligar":
+            elif a.op == "off":
                 ausente_desligar()
             print("\n".join(linhas_ausente(_cursor_ro())))
         elif a.cmd == "away":
             print("\n".join(away(a.op)))
-        elif a.cmd == "noite":
-            if a.op == "ligar":
+        elif a.cmd == "night":
+            if a.op == "on":
                 noite_ligar(a.ate, a.max_despachos, a.max_falhas)
-            elif a.op == "desligar":
+            elif a.op == "off":
                 print("modo noite desligado" if noite_desligar() else "modo noite já estava desligado")
                 return 0
             print("\n".join(linhas_noite(_cursor_ro(), read_events())) or "modo noite desligado")
-        elif a.cmd == "despachar":
+        elif a.cmd == "dispatch":
             r = despachar(a.run, a.titulo, a.spec_arquivo, a.modelo, a.effort, a.worktree, a.name, a.base_branch, a.entrada, a.ticket, a.prioridade, a.agente, a.projeto, servico=a.servico)
             print(json.dumps(r, ensure_ascii=False))
             if r.get("aviso"):
@@ -11779,13 +11881,13 @@ def main(argv=None):
             if not run:
                 raise ValueError("sem Run ligado: passe --run")
             print(json.dumps(run_guardar_projeto(run, a.nome), ensure_ascii=False))
-        elif a.cmd == "fluxo":
+        elif a.cmd == "flow":
             fx = fluxo_do_repo(a.repo)
             print(json.dumps(fx, ensure_ascii=False) if a.json else f"produção {fx['producao']}; ambientes {', '.join(fx['ambientes'])}; fluxo {fx['fluxo']}" + ("" if fx["declarado"] else " (padrão: sem bloco ambientes)"))
-        elif a.cmd == "projeto" and a.op == "confiar":
+        elif a.cmd == "project" and a.op == "trust":
             cwd = os.path.realpath(os.getcwd())
             print("\n".join(f"codex: pasta confiável {p}" for p in confiar_codex(_raiz_do_repo(cwd), cwd)))
-        elif a.cmd == "projeto":
+        elif a.cmd == "project":
             r = projeto_add(a.alvo, a.nome, a.harness, a.grupo, a.orca_yaml, a.destino, a.substituir_orca_yaml, a.dry_run)
             if a.json:
                 print(json.dumps(r, ensure_ascii=False))
@@ -11797,7 +11899,7 @@ def main(argv=None):
                     print(f"diferença para o orca.yaml que o repositório tem:\n{r['diff']}")
                 if r["orca_yaml_estado"] == "mantido":
                     print("o orca.yaml existente não foi trocado: pergunte ao usuário e, se ele aceitar, rode de novo com --substituir-orca-yaml")
-        elif a.cmd == "projetos":
+        elif a.cmd == "projects":
             ps = projetos()
             if a.json:
                 print(json.dumps([{"nome": n, **d} for n, d in ps.items()], ensure_ascii=False))
@@ -11806,27 +11908,27 @@ def main(argv=None):
                                 (f"  ambientes {' > '.join(d['ambientes'])} ({d['fluxo']}, produção {d['producao']})" if d["ambientes"] else "") +
                                 (f"  fila do E2E {d['fila_e2e']}" if d["fila_e2e"] else "") +
                                 (f"  inválido: {d['erro']}" if d["erro"] else "") for n, d in ps.items()) or f"nenhum projeto em {_path('projects')}")
-        elif a.cmd == "servico":
+        elif a.cmd == "service":
             print(json.dumps(servico_marcar(a.dispatch), ensure_ascii=False))
-        elif a.cmd == "ciclo":
+        elif a.cmd == "cycle":
             print(json.dumps(ciclo_feito(a.dispatch, a.hash, a.nota), ensure_ascii=False))
-        elif a.cmd == "integrar" and a.op == "concluir":
+        elif a.cmd == "integrate" and a.op == "conclude":
             r = integrar_concluir(a.hash, a.branches, a.dispatch)
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"aviso: {x}", file=sys.stderr)
-        elif a.cmd == "integrar" and a.acao == "add":
+        elif a.cmd == "integrate" and a.acao == "add":
             print(json.dumps(integrar_fila_add(a.branch, a.ticket), ensure_ascii=False))
-        elif a.cmd == "integrar" and a.acao == "rm":
+        elif a.cmd == "integrate" and a.acao == "rm":
             print(json.dumps(integrar_fila_rm(a.ticket), ensure_ascii=False))
-        elif a.cmd == "integrar":
+        elif a.cmd == "integrate":
             itens = list(integracao_fila().values())
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (desde {_hora_local(i['ts'])})" for i in itens) or "fila do integrador vazia")
         elif a.cmd == "worktrees":
             r = limpar_worktrees_orq(dry_run=a.dry_run)
             print(f"{'sairiam' if a.dry_run else 'removidas'}: {len(r['removidas'])}; ficaram: {len(r['ficaram'])}" + (f"; bundle {r['bundle']}" if r["bundle"] else ""))
             print("\n".join([f"  sai {x['pasta']} ({x['branch']})" for x in r["removidas"]] + [f"  fica {x['pasta']}: {x['motivo']}" for x in r["ficaram"]]))
-        elif a.cmd == "auditar-publicacao":
+        elif a.cmd == "audit-publication":
             motivos = auditar_publicacao(a.revs)
             print("\n".join(f"auditar-publicacao: {m}" for m in motivos), file=sys.stderr)
             return 1 if motivos else 0
@@ -11841,13 +11943,13 @@ def main(argv=None):
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_doctor_tasks(r, a.dry_run))
         elif a.cmd == "ticket":
-            if a.op == "novo":
+            if a.op == "new":
                 r = ticket_novo(a.titulo, a.spec_arquivo, a.blocked_by, a.run, a.modelo, a.effort, a.despacho, a.espera)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicito("tarefa", r["task"], r["run"])
-            elif a.op == "editar":
+            elif a.op == "edit":
                 print(json.dumps(ticket_editar(a.numero, modelo=a.modelo, effort=a.effort, despacho=a.despacho, espera=a.espera), ensure_ascii=False))
-            elif a.op == "fechar":
+            elif a.op == "close":
                 r = ticket_fechar(a.numero, a.answer)
                 print(json.dumps(r, ensure_ascii=False))
                 if r["aviso"]:
@@ -11860,27 +11962,27 @@ def main(argv=None):
                     print(json.dumps([{**t, "espera_motivo": espera_despacho(t, integracao, evs, sem_push) if t["status"] == STATUS_NOVO and not t["blocked_by"] else None} for t in ts], ensure_ascii=False))
                 else:
                     print("\n".join(_linha_ticket_espera(t, integracao, evs, sem_push) for t in ts) or "nenhum ticket aberto")
-        elif a.cmd == "perguntar":
+        elif a.cmd == "ask":
             r = perguntar(a.id, a.pergunta, a.opcao, a.recomendada, a.detalhe, a.espera_min, not a.sem_poll)
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"aviso: {x}", file=sys.stderr)
             _implicito("decisao", a.id)
-        elif a.cmd == "lavish-resposta":
+        elif a.cmd == "lavish-answer":
             r = lavish_resposta(a.arquivo)
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"aviso: {x}", file=sys.stderr)
-        elif a.cmd == "gerente":
-            if a.op == "ligar":
+        elif a.cmd == "manager":
+            if a.op == "bind":
                 print(json.dumps(gerente_ligar(a.terminal, a.run, a.assumir), ensure_ascii=False))
-            elif a.op == "desligar":
+            elif a.op == "unbind":
                 print(json.dumps(gerente_desligar(a.run, a.assumir), ensure_ascii=False))
-            elif a.op == "checar":
+            elif a.op == "check":
                 print(json.dumps(gerente_checar(), ensure_ascii=False))
-            elif a.op == "subir":
+            elif a.op == "spawn":
                 print(json.dumps(gerente_subir(a.forcar), ensure_ascii=False))
-            elif a.op == "intervalo":
+            elif a.op == "interval":
                 print(painel_intervalo_s(_read_json(_path(GERENTE))))
             elif a.op == "serve":
                 acao = serve_status if a.status else serve_parar if a.parar else serve_instalar if a.instalar else serve_desinstalar if a.desinstalar else None
@@ -11899,78 +12001,78 @@ def main(argv=None):
                 print(linha)
                 if a.estado:
                     gerente_estado_gravar(linha)
-        elif a.cmd == "retomar" and a.pausados:
+        elif a.cmd == "resume" and a.pausados:
             r = {"gerente": None, "workers": retomar_pausados(a.run, a.forcar)}
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
-        elif a.cmd == "retomar":
+        elif a.cmd == "resume":
             r = retomar(a.dry_run, a.run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar(r))
-        elif a.cmd == "hibernar":
+        elif a.cmd == "hibernate":
             r = hibernar(a.alvo, a.run, a.forcar)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_hibernado(r))
-        elif a.cmd == "acordar":
+        elif a.cmd == "wake":
             r = acordar(a.alvo, a.texto)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_retomar({"gerente": None, "workers": [r]}))
             if r["estado"] in ("falhou", "sem_worktree"):
                 return 1
-        elif a.cmd == "pausar":
+        elif a.cmd == "pause":
             r = pausar(a.tasks, a.ate_prioridade, a.run, a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else texto_pausar(r))
-        elif a.cmd == "prioridade":
+        elif a.cmd == "priority":
             print(json.dumps(prioridade_definir(a.task, a.valor), ensure_ascii=False))
-        elif a.cmd == "grupos" and (a.titulo or a.cwd or a.grupo):
+        elif a.cmd == "groups" and (a.titulo or a.cwd or a.grupo):
             nome, motivo = grupo_de(grupos(), a.titulo, a.cwd, a.grupo)
             t = nome and _dict(_mates().get(nome)).get("terminal")
             vivos = _terminais_vivos() if t else None
             print(json.dumps({"grupo": nome, "motivo": motivo, "mate": t if t and (vivos is None or t in vivos) else None}, ensure_ascii=False))
-        elif a.cmd == "grupos":
+        elif a.cmd == "groups":
             print(texto_grupos(grupos(), _mates(), _terminais_vivos() if _mates() else None, read_events(), datetime.now(timezone.utc)))
-        elif a.cmd == "mate" and a.op == "abrir":
+        elif a.cmd == "mate" and a.op == "open":
             print(json.dumps(mate_abrir(a.grupo), ensure_ascii=False))
-        elif a.cmd == "mate" and a.op == "dormir":
+        elif a.cmd == "mate" and a.op == "sleep":
             print(json.dumps(mate_dormir(a.grupo), ensure_ascii=False))
-        elif a.cmd == "mate" and a.op == "pedir":
+        elif a.cmd == "mate" and a.op == "request":
             r = mate_pedir(a.grupo, a.texto, a.prazo, a.responde)
             print(json.dumps(r, ensure_ascii=False))
             if not a.responde:
                 _implicito("mate", r["corr"])
-        elif a.cmd == "mate" and a.op == "subir":
+        elif a.cmd == "mate" and a.op == "raise":
             print(json.dumps(mate_subir(a.tipo, a.texto, a.corr, a.link, a.grupo), ensure_ascii=False))
         elif a.cmd == "mate":
             ps = [p for p in mate_pendentes(read_events(), _mates(), datetime.now(timezone.utc)) if not a.grupo or p["grupo"] == a.grupo]
             print("\n".join(f"{p['corr']} {p['grupo']} {p['estado']}: {_cita(p['texto'])}" for p in ps) or "nenhum pedido sem resposta")
-        elif a.cmd == "revisar":
+        elif a.cmd == "review":
             r = revisar(a.task)
             print(json.dumps(r, ensure_ascii=False) if a.json else revisao_texto(r))
-        elif a.cmd == "maquina" and a.op == "set":
+        elif a.cmd == "machine" and a.op == "set":
             if not a.chave or a.valor is None:
-                raise ValueError("orq maquina set <chave> <valor>")
+                raise ValueError("orq machine set <chave> <valor>")
             print(json.dumps(maquina_definir(a.chave, a.valor), ensure_ascii=False))
-        elif a.cmd == "maquina":
+        elif a.cmd == "machine":
             cfg, leitura = maquina_cfg(), maquina_ler()
             nivel, motivo = maquina_nivel(leitura, cfg)
             ocup = maquina_ocupacao()
             print(json.dumps({"config": cfg, "leitura": leitura, "nivel": nivel, "motivo": motivo, "vivos": ocup["vivos"], "fila": fila_despacho_itens()}, ensure_ascii=False)
                   if a.json else "\n".join(texto_maquina(cfg, leitura, ocup)))
-        elif a.cmd == "fila-despacho" and a.op == "rm":
+        elif a.cmd == "dispatch-queue" and a.op == "rm":
             if not fila_despacho_rm(a.id):
                 raise ValueError(f"{a.id} não está na fila de despacho")
             print(f"{a.id} saiu da fila de despacho")
-        elif a.cmd == "fila-despacho" and a.op == "descartar":
+        elif a.cmd == "dispatch-queue" and a.op == "discard":
             if not any(e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu" and e.get("id") == a.id for e in read_events()):
                 raise ValueError(f"{a.id} não tem desistência registrada")
             append_event({"tipo": "despacho_fila", "op": "descartado", "id": a.id, "motivo": a.motivo})
             print(f"{a.id} descartado do Stop do away")
-        elif a.cmd == "fila-despacho":
+        elif a.cmd == "dispatch-queue":
             itens = fila_despacho_itens()
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(
                 f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}) desde {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(itens, 1)) or "fila de despacho vazia")
-        elif a.cmd == "uso":
+        elif a.cmd == "usage":
             u = uso_plano(agente=a.agente)
             nivel, motivo, _ = uso_nivel(u)
             print(json.dumps({"uso": u, "nivel": nivel, "motivo": motivo}, ensure_ascii=False) if a.json else
                   f"{nivel}" + (f": {motivo}" if motivo else "") + (f" (semana {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (sem quadro fresco do HUD)"))
-        elif a.cmd == "auditar-respostas":
+        elif a.cmd == "audit-answers":
             print(auditar_respostas(a.sessao), end="")
         elif a.cmd == "retro":
             print(cmd_retro(a))

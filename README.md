@@ -187,6 +187,8 @@ An obligation of the coordinator or a worker that depends on someone remembering
 
 ## Usage
 
+Commands, subcommands, flags and choice values have English names (`orq release`, `orq pend list --all`, `orq ticket new --title`). The Portuguese names (`orq liberar`, `pend lista --todas`) still work as aliases until phase 4 of the English migration, and each use is logged to `orq.log` as `apelido pt:`. The examples below keep the Portuguese names until phase 3 rewrites the text.
+
 Start the manager in a plain shell terminal inside Orca, then bind your Run to it from the coordinator:
 
 ```sh

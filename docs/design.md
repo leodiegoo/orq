@@ -817,6 +817,18 @@ The user opens Claude or Codex in the orq's folder and that session is the coord
 
 Differences from the sketch in `firstmate-licoes-2.md`: there is no `--projeto` (the `projects/<name>.json` layer of ticket 94 is not in this branch's base, and `run_projeto` belongs to the next slice), and the Codex trust check warns instead of refusing. Limit: the harness is read from `ps`, so a harness wrapped by another launcher whose executable is not named `claude` or `codex` needs `--agente`.
 
+## English names with Portuguese aliases (ticket 129, phase 1)
+
+`parser()` builds the one `ArgumentParser`; `main` calls it. Every command and subcommand is registered under its English name with the Portuguese one as an argparse alias (`add_parser("release", aliases=["liberar"])`), so `--help` lists `release (liberar)`. argparse stores the name that was typed, so `normalizar(a, args)` runs right after `parse_args` and rewrites `a.cmd`, `a.op` and `a.acao` to English with the `APELIDOS` table; the dispatch in `main` compares only English. `APELIDOS[""]` holds the commands and each other key holds the subcommands of one English command (`"integrate queue"` holds the `acao` level).
+
+Flags are added by `_arg(parser, "<pt>", ...)`, which reads the English name from `FLAG_EN` and registers both (`--title`, `--titulo`) with the `dest` still in Portuguese, because the code reads `a.titulo`. Values of `choices` go through `_valor_pt(...)`: both spellings are accepted and the Portuguese value comes out, since that is what the state files record until phase 2. Positional `op` choices (`away on|off`, `night on|off`, `backlog move`) are normalized to English like the subcommands.
+
+Every use of a Portuguese alias writes one `apelido pt: <pt> -> <en>` line to `orq.log` (commands, subcommands, flags, and the `--type`, `--stopped-by` and intake effect values). Phase 4 counts those lines for seven days before it removes the aliases. The hook names `lugar`, `externas` and `prligar` are not logged and stay valid forever; the installed hooks call them.
+
+`orq ausente` keeps its old output, because the old command printed the state where `orq away` toggles: the main loop remembers the typed name (`ausente`) before normalizing and takes the old branch. The alias goes away in phase 4.
+
+Names not in the glossary of the plan, chosen here: `devolver` is `send-back`, `revisar` is `review`, `caixa` is `inbox`, `transcrito` is `transcript`, `auditar-publicacao` is `audit-publication`, `limpar` is `clean`, `servico marcar` is `service mark`, `integrar concluir` is `integrate conclude`, `projeto` is `project` (`confiar` is `trust`), `backlog mover` is `backlog move`, `ticket editar` is `ticket edit`, `gerente intervalo` is `manager interval`, `mate dormir` is `mate sleep`, `pr abrir` is `pr open`. Flags: `--corpo` is `--body`, `--ambientes` is `--environments`, `--ultimos` is `--last`, `--fechados` is `--closed`, `--destino` is `--dest`, `--despacho` is `--dispatch`, `--parar`, `--instalar` and `--desinstalar` are `--stop`, `--install` and `--uninstall`.
+
 ## Design decisions
 
 Orca stays the source of truth for tasks. It already stores backlog, dependencies, gates, dispatches and a durable mailbox. A separate `tasks.json` would be a second truth that drifts. orq stores only what Orca lacks: the link from a request to what it became, and the user's own to-do items.

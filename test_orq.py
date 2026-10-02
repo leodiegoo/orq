@@ -968,7 +968,7 @@ def test_ask_ja_fez_fecha_as_marcadas_pelo_id_da_descricao():
     assert res["resposta"] == resp and sorted(res["fechou"]) == ["alice", "dana"]
     # id que já saiu não derruba o hook
     a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Alice: schemaVersion"}))
-    assert a.log() == ""
+    assert [l for l in a.log().splitlines() if "apelido pt" not in l] == []  # o uso de --tipo e --titulo grava a linha do apelido (ticket 129)
 
 
 def test_marcadas_prefere_o_label_mais_longo():
@@ -2259,7 +2259,7 @@ def test_auditar_respostas_lista_so_a_recomendada_a_ate_2s_de_uma_entrega_ao_coo
     assert len(linhas) == 1 and "Princípio" in linhas[0] and "msg_1" in linhas[0] and "run_b" in linhas[0], r.stdout
     assert not any(h in r.stdout for h in ("Super admin", "Permissão", "Livre", "Longe")), r.stdout
     assert linhas[0].startswith("| 25/09/2026")
-    assert sorted(os.listdir(a.tmp.name)) == antes and not os.path.exists(a.home), "só leitura: nada foi gravado"
+    assert sorted(f for f in os.listdir(a.tmp.name) if f != "orq.log") == antes and not os.path.exists(a.home), "só leitura: nada foi gravado (fora a linha do apelido no orq.log, ticket 129)"
     assert a.orq("auditar-respostas", "--sessao", "inexistente").returncode == 1
     assert "coordenador" in a.orq("auditar-respostas").stderr, "sem --sessao e sem cursor.json pede o id"
 
@@ -16289,6 +16289,230 @@ def test_ticket176_dispatch_vivo_e_worktree_recente_ficam_mesmo_integradas():
     repo, raiz, k = _reescrita176(agora=time.time())
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
     assert _fica176(r, "1") == "criada há menos de 24 h" and os.path.isdir(os.path.join(raiz, "1"))
+
+
+# --- ticket 129: comandos, flags e valores em inglês, os nomes em pt como apelido ---
+
+PARES129 = [  # (argv em pt, argv em inglês): um par de cada comando, subcomando, flag e valor de choices
+    ("feito e1 o1 --prova p", "fulfill e1 o1 --proof p"),
+    ("adiar e1 o1 --motivo m", "defer e1 o1 --reason m"),
+    ("pend add --id x --tipo acao --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend add --id x --type action --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
+    ("pend add --id x --tipo decisao --titulo T", "pend add --id x --type decision --title T"),
+    ("pend add --id x --tipo avisar --titulo T", "pend add --id x --type notify --title T"),
+    ("pend lista --todas", "pend list --all"),
+    ("pend done x --resposta r", "pend done x --answer r"),
+    ("pend edit x --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend edit x --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
+    ("backlog mover 1 2 --grupo g", "backlog move 1 2 --group g"),
+    ("devolver t m", "send-back t m"),
+    ("steer t txt --entrada e1", "steer t txt --entry e1"),
+    ("pr ligar t http://u --nota n", "pr link t http://u --note n"),
+    ("pr abrir d --titulo T --corpo c.md --ambientes a,b", "pr open d --title T --body c.md --environments a,b"),
+    ("pr lista --task t", "pr list --task t"),
+    ("pr desligar t http://u", "pr unlink t http://u"),
+    ("pr poll --forcar", "pr poll --force"),
+    ("limpar --fechados", "clean --closed"),
+    ("digest --desde 2026-10-01T00:00:00Z --abrir", "digest --since 2026-10-01T00:00:00Z --open"),
+    ("fila add --passo 1 --nome n --por p 5 6", "queue add --step 1 --name n --why p 5 6"),
+    ("fila feito 1", "queue done 1"),
+    ("fila rm 1", "queue rm 1"),
+    ("fila lista", "queue list"),
+    ("ausente ligar", "away on"),
+    ("ausente desligar", "away off"),
+    ("responder m t", "reply m t"),
+    ("iniciar --agente codex --objetivo o --assumir", "start --agent codex --objective o --take-over"),
+    ("ocupadas", "busy"),
+    ("resumo --desde 2026-10-01T00:00:00Z --noite", "summary --since 2026-10-01T00:00:00Z --night"),
+    ("resumo add txt --projeto p", "summary add txt --project p"),
+    ("alerta visto t", "alert seen t"),
+    ("agentes --todos", "agents --all"),
+    ("liberar d", "release d"),
+    ("interromper d", "interrupt d"),
+    ("responder-tela t 1", "answer-screen t 1"),
+    ("encerrar d --motivo m --parada orcamento", "end d --reason m --stopped-by budget"),
+    ("encerrar d --motivo m --parada decisao", "end d --reason m --stopped-by decision"),
+    ("encerrar d --motivo m --parada limite", "end d --reason m --stopped-by limit"),
+    ("relancar d --nota n --modelo m", "relaunch d --note n --model m"),
+    ("transcrito d --ultimos 5", "transcript d --last 5"),
+    ("passagem d --para codex", "handoff d --to codex"),
+    ("passar d --para codex --modelo m", "switch d --to codex --model m"),
+    ("noite ligar --ate 06:00 --max-despachos 3 --max-falhas 2", "night on --until 06:00 --max-dispatches 3 --max-failures 2"),
+    ("noite desligar", "night off"),
+    ("despachar --run r --titulo T --spec-arquivo s.md --agente claude --projeto p --modelo m --effort high --entrada e1 --prioridade 2 --servico",
+     "dispatch --run r --title T --spec-file s.md --agent claude --project p --model m --effort high --entry e1 --priority 2 --service"),
+    ("run projeto meu-app", "run project meu-app"),
+    ("projetos", "projects"),
+    ("projeto add /tmp/x --nome n --grupo g --destino d --substituir-orca-yaml", "project add /tmp/x --name n --group g --dest d --replace-orca-yaml"),
+    ("projeto confiar", "project trust"),
+    ("fluxo", "flow"),
+    ("ciclo feito --dispatch d --hash h --nota n", "cycle done --dispatch d --hash h --note n"),
+    ("servico marcar d", "service mark d"),
+    ("integrar fila add b 1", "integrate queue add b 1"),
+    ("integrar fila rm 1", "integrate queue rm 1"),
+    ("integrar fila lista", "integrate queue list"),
+    ("integrar concluir --hash h b1 b2", "integrate conclude --hash h b1 b2"),
+    ("auditar-publicacao a..b", "audit-publication a..b"),
+    ("ticket novo --titulo T --spec-arquivo s.md --modelo m --despacho manual --espera e", "ticket new --title T --spec-file s.md --model m --dispatch manual --waiting e"),
+    ("ticket fechar 1 --answer a", "ticket close 1 --answer a"),
+    ("ticket editar 1 --modelo m --despacho d --espera e", "ticket edit 1 --model m --dispatch d --waiting e"),
+    ("ticket lista --todos", "ticket list --all"),
+    ("lavish-resposta f", "lavish-answer f"),
+    ("perguntar --id i --pergunta P --opcao a --opcao b --recomendada 2 --detalhe D --espera-min 3 --sem-poll",
+     "ask --id i --question P --option a --option b --recommended 2 --detail D --wait-min 3 --no-poll"),
+    ("auditar-respostas --sessao s", "audit-answers --session s"),
+    ("gerente ligar --terminal t --assumir", "manager bind --terminal t --take-over"),
+    ("gerente desligar --assumir", "manager unbind --take-over"),
+    ("gerente checar", "manager check"),
+    ("gerente subir --forcar", "manager spawn --force"),
+    ("gerente intervalo", "manager interval"),
+    ("gerente absorver --estado", "manager absorb --state"),
+    ("gerente serve --voltas 3", "manager serve --rounds 3"),
+    ("gerente serve --parar", "manager serve --stop"),
+    ("gerente serve --instalar", "manager serve --install"),
+    ("gerente serve --desinstalar", "manager serve --uninstall"),
+    ("retomar --pausados --forcar", "resume --paused --force"),
+    ("hibernar t --forcar", "hibernate t --force"),
+    ("acordar t --texto x", "wake t --text x"),
+    ("pausar --ate-prioridade 2", "pause --up-to-priority 2"),
+    ("prioridade t 1", "priority t 1"),
+    ("uso --agente codex", "usage --agent codex"),
+    ("revisar t", "review t"),
+    ("maquina set k 1", "machine set k 1"),
+    ("fila-despacho lista", "dispatch-queue list"),
+    ("fila-despacho rm i", "dispatch-queue rm i"),
+    ("caixa --todas", "inbox --all"),
+    ("runs --todos", "runs --all"),
+    ("grupos --titulo T --grupo g", "groups --title T --group g"),
+    ("mate abrir g", "mate open g"),
+    ("mate dormir g", "mate sleep g"),
+    ("mate pedir g --texto t --prazo 1 --responde r", "mate request g --text t --deadline 1 --answers r"),
+    ("mate subir --tipo resposta --texto t --grupo g", "mate raise --type answer --text t --group g"),
+    ("mate subir --tipo decisao --texto t", "mate raise --type decision --text t"),
+    ("mate subir --tipo pr --texto t", "mate raise --type pr --text t"),
+    ("mate subir --tipo bloqueio --texto t", "mate raise --type blocker --text t"),
+    ("mate subir --tipo resumo --texto t", "mate raise --type summary --text t"),
+    ("mate pedidos --grupo g", "mate requests --group g"),
+    ("retro --desde 2026-10-01 --ate 2026-10-02 --projeto p --sem-gh --sem-transcritos --gravar", "retro --since 2026-10-01 --until 2026-10-02 --project p --no-gh --no-transcripts --save"),
+    ("intake e1 tarefa", "intake e1 task"),
+    ("intake e1 decisao", "intake e1 decision"),
+    ("intake e1 conversa --nota n", "intake e1 conversation --note n"),
+    ("intake e1 descartado", "intake e1 discarded"),
+    ("hook lugar", "hook place"),
+    ("hook externas", "hook external"),
+    ("hook prligar", "hook prlink"),
+]
+
+
+def _ns129(argv, pt):
+    p = orq_mod.parser()
+    a = p.parse_args(argv.split())
+    return a, orq_mod.normalizar(a, argv.split()) if pt else []
+
+
+def test_ticket129_cada_par_pt_en_da_o_mesmo_namespace_depois_de_normalizar():
+    ant, orq_mod.LOG = orq_mod.LOG, os.path.join(tempfile.mkdtemp(), "orq.log")
+    try:
+        vistos = set()
+        for pt, en in PARES129:
+            a_pt, usados = _ns129(pt, True)
+            a_en, _ = _ns129(en, False)
+            orq_mod.normalizar(a_en, en.split())
+            assert vars(a_pt) == vars(a_en), (pt, en, vars(a_pt), vars(a_en))
+            vistos.update(usados)
+    finally:
+        orq_mod.LOG = ant
+    esperados = {f"{pt} -> {en}" for tab in orq_mod.APELIDOS.values() for pt, en in tab.items()} | {f"{f} -> {e}" for f, e in orq_mod.FLAG_APELIDOS.items()}
+    assert esperados - vistos == set(), f"apelidos sem par na tabela: {sorted(esperados - vistos)}"
+
+
+def _parser_de(caminho):
+    """O parser do subcomando `caminho` (nomes em inglês), ou None se o último nível é só choices."""
+    p = orq_mod.parser()
+    for nome in caminho:
+        acao = next((x for x in p._actions if isinstance(x, orq_mod.argparse._SubParsersAction)), None)
+        if acao is None or nome not in acao.choices:
+            return None
+        p = acao.choices[nome]
+    return p
+
+
+def test_ticket129_o_help_de_cada_comando_mostra_en_entre_parenteses_o_pt():
+    ant, os.environ["COLUMNS"] = os.environ.get("COLUMNS"), "300"
+    try:
+        for chave, tab in orq_mod.APELIDOS.items():
+            pai = _parser_de(chave.split())
+            assert pai is not None, chave
+            if not any(isinstance(x, orq_mod.argparse._SubParsersAction) for x in pai._actions):
+                continue  # away, night, backlog: o op é um choices posicional, sem linha de help por valor
+            ajuda = pai.format_help()
+            for pt, en in tab.items():
+                assert f"{en} ({pt})" in ajuda, (chave, pt, en)
+    finally:
+        os.environ.pop("COLUMNS") if ant is None else os.environ.__setitem__("COLUMNS", ant)
+
+
+def test_ticket129_flag_em_ingles_sai_no_help_ao_lado_da_em_pt():
+    ajuda = _parser_de(["pend", "add"]).format_help()
+    assert "--title, --titulo TITULO" in ajuda, ajuda
+
+
+def test_ticket129_valor_de_choices_invalido_continua_recusado():
+    for argv in ("pend add --id x --type nada --title T", "pend add --id x --tipo nada --titulo T", "mate raise --type nada --text t", "end d --reason m --stopped-by nada"):
+        try:
+            orq_mod.parser().parse_args(argv.split())
+        except SystemExit as e:
+            assert e.code == 2, argv
+        else:
+            raise AssertionError(f"aceitou {argv}")
+
+
+def test_ticket129_release_e_liberar_fazem_a_mesma_coisa_e_o_log_registra_so_o_pt():
+    saidas, logs = [], []
+    for cmd in ("liberar", "release"):
+        a = Amb(run="run_a")
+        _lib_env(a)
+        r = a.orq(cmd, "ctx_term_w1")
+        assert r.returncode == 0, r.stderr
+        saidas.append((json.loads(r.stdout), a.estados(), _ordem(a), [e["estado"] for e in a.events() if e["tipo"] == "liberar"]))
+        logs.append(a.log())
+    assert saidas[0] == saidas[1], saidas
+    assert "apelido pt: liberar -> release" in logs[0], logs[0]
+    assert "apelido pt" not in logs[1], logs[1]
+
+
+def test_ticket129_flag_e_subcomando_em_pt_vao_para_o_log_uma_linha_cada():
+    a = Amb(run="run_a")
+    assert a.orq("pend", "lista", "--todas").returncode == 0
+    assert a.orq("pend", "list", "--all").returncode == 0
+    linhas = [l for l in a.log().splitlines() if "apelido pt" in l]
+    assert [l.split("apelido pt: ")[1] for l in linhas] == ["lista -> list", "--todas -> --all"], linhas
+
+
+def test_ticket129_valor_de_choices_em_pt_vai_para_o_log_e_o_hook_pt_nao():
+    ant, orq_mod.LOG = orq_mod.LOG, os.path.join(tempfile.mkdtemp(), "orq.log")
+    try:
+        orq_mod.parser().parse_args("pend add --id x --type acao --title T".split())
+        orq_mod.parser().parse_args("pend add --id x --type action --title T".split())
+        orq_mod.parser().parse_args("hook lugar".split())
+        log_ = open(orq_mod.LOG).read()
+    finally:
+        orq_mod.LOG = ant
+    assert [l.split("apelido pt: ")[1] for l in log_.splitlines()] == ["tipo acao -> action"], log_
+
+
+def test_ticket129_ausente_sem_op_mostra_o_estado_e_away_sem_op_alterna():
+    a = Amb(run="run_a")
+    assert "modo ausente desligado" in a.orq("ausente").stdout
+    assert "away mode ligado" in a.orq("away").stdout
+    assert "modo ausente ligado" in a.orq("ausente").stdout
+    assert "away mode desligado" in a.orq("away").stdout
+
+
+def test_ticket129_hooks_instalados_com_nome_pt_seguem_funcionando():
+    a = Amb(run="run_a")
+    for kind in ("lugar", "externas", "prligar", "place", "external", "prlink"):
+        r = a.orq("hook", kind, stdin="{}")
+        assert r.returncode == 0, (kind, r.stderr)
+    assert "apelido pt" not in a.log()
 
 
 if __name__ == "__main__":
