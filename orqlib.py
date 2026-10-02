@@ -35,6 +35,7 @@ def ThreadPoolExecutor(n):  # import tardio: concurrent.futures custa ~11 ms e s
 HOME = os.environ.get("ORQ_HOME") or os.path.expanduser("~/.claude/orq")
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
+GIT = os.environ.get("ORQ_GIT") or "git"
 LIMPAR = os.environ.get("ORQ_LIMPAR") or os.path.expanduser("~/.claude/scripts/limpar-mergeados.py")
 LIMPAR_ATRASO_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # o mesmo atraso do hook "merged"
 FECHADO_DIAS = float(os.environ.get("ORQ_FECHADO_DIAS") or 1)  # dias entre o último PR fechado sem merge da task e a limpeza automática da branch
@@ -2517,6 +2518,87 @@ def pr_desligar(task, url):
         raise ValueError(f"o PR {url} não está ligado à task {task}")
 
     return _mutar_prs(rm)
+
+
+TIPOS_COMMIT = "feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+TITULO_COMMIT_RE = re.compile(rf"(?:{TIPOS_COMMIT})(?:\([^)]+\))?!?: \S.*")
+RODAPE_GERADOR_RE = re.compile(r"Generated with|Co-Authored-By|claude\.com/claude-code|\U0001F916", re.I)
+SECOES_PR = ("Summary", "Evidence", "Merge Danger")
+
+
+def _sem_prefixo_de_usuario(branch):
+    """`leodiegoo/feat/x` vira `feat/x`: o Orca prefixa o usuário, e a regra do git flow é `<tipo>/<descrição>`. Só tira o 1º trecho quando o 2º é um tipo."""
+    topo, _, resto = branch.partition("/")
+    return resto if resto and re.match(rf"(?:{TIPOS_COMMIT})/", resto) and not re.fullmatch(TIPOS_COMMIT, topo) else branch
+
+
+def _git_wt(wt, *args, timeout=60):
+    return subprocess.run([GIT, "-C", wt, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def pr_abrir(alvo, titulo, corpo, ambientes=None, cwd=None):
+    """Publica a entrega: tira o prefixo de usuário da branch, confere `git merge-tree` contra cada ambiente (conflito para antes do push), empurra, abre um
+    PR por ambiente na ordem do projeto e liga cada um à task. `alvo` é o dispatch (ctx_…) ou a branch. Devolve (urls, avisos); ValueError antes de tocar em algo."""
+    texto = open(corpo).read() if os.path.isfile(corpo) else None
+    if not (texto or "").strip():
+        raise ValueError(f"corpo vazio ou inexistente: {corpo}")
+    for nome, t in (("título", titulo), ("corpo", texto)):
+        if m := RODAPE_GERADOR_RE.search(t):
+            raise ValueError(f"{nome} com rodapé de gerador ou trailer ({m.group(0)!r}): tire antes de publicar")
+    if not TITULO_COMMIT_RE.fullmatch(titulo.strip()):
+        raise ValueError(f"título fora do Conventional Commits: {titulo!r} (<tipo>(<escopo>): <descrição em inglês>)")
+    avisos = [f"corpo sem a seção {sec} (skill /pr)" for sec in SECOES_PR if not re.search(rf"^#+\s*{sec}\b", texto, re.M | re.I)]
+    eventos = read_events()
+    if alvo.startswith("ctx_"):
+        desp = next((e for e in reversed(eventos) if e.get("tipo") == "despacho" and e.get("dispatch") == alvo), None)
+        if not desp:
+            raise ValueError(f"dispatch desconhecido: {alvo}")
+        task, wt = desp.get("task"), _caminho_do_worker(orca("worker-show", "--dispatch", alvo, timeout=10))
+        if not wt:
+            raise ValueError(f"o Orca não diz a worktree de {alvo}")
+        branch = _git_wt(wt, "branch", "--show-current").stdout.strip()
+    else:
+        branch, wt = alvo, _worktrees_por_ramo(cwd or os.getcwd()).get(alvo)
+        if not wt:
+            raise ValueError(f"nenhuma worktree com a branch {alvo} a partir de {cwd or os.getcwd()}")
+        task = task_do_ramo(branch, wt, eventos)
+    if not branch:
+        raise ValueError(f"sem branch na worktree {wt}")
+    fx = fluxo_da_task(task, eventos) if task else fluxo_do_repo(wt)
+    envs = ambientes or ([a for a in fx["ambientes"] if a != fx["producao"]] or [fx["producao"]] if fx["fluxo"] == "promocao" else [fx["producao"]])
+    envs = sorted(dict.fromkeys(envs), key=lambda a: fx["ambientes"].index(a) if a in fx["ambientes"] else len(fx["ambientes"]))
+    if fx["producao"] in envs:
+        entrados = {i["base"] for i in _prs_ro()["itens"] if i.get("task") == task and i["estado"] != "aberto"}
+        faltam = [a for a in fx["ambientes"][: fx["ambientes"].index(fx["producao"])] if a not in entrados]
+        if faltam:
+            raise ValueError(f"{fx['producao']} só depois de {' e '.join(faltam)} entrar(em): nenhum PR mergeado de {task} lá")
+    novo = _sem_prefixo_de_usuario(branch)
+    for a in envs:
+        subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+        r = _git_wt(wt, "merge-tree", "--write-tree", "--name-only", "--no-messages", f"origin/{a}", branch)
+        if r.returncode != 0:
+            raise ValueError(f"conflito com {a}" + (f" em: {', '.join(x for x in r.stdout.splitlines()[1:] if x.strip())}" if r.returncode == 1 else f" (merge-tree falhou: {r.stderr.strip()[-200:]})") +
+                             f". Nada foi empurrado: crie merge/{novo.split('/', 1)[-1]}-{a} a partir de {a}")
+    if novo != branch:
+        r = _git_wt(wt, "branch", "-m", branch, novo)
+        if r.returncode:
+            raise ValueError(f"não renomeei {branch} para {novo}: {r.stderr.strip()[-200:]}")
+    r = _git_wt(wt, "push", "-u", "origin", novo)
+    if r.returncode:
+        raise ValueError(f"push falhou: {r.stderr.strip()[-300:]}")
+    urls = []
+    for a in envs:
+        r = subprocess.run([GH, "pr", "create", "--base", a, "--head", novo, "--title", titulo, "--body-file", corpo], cwd=wt, capture_output=True, text=True, timeout=120)
+        achada = PR_RE.findall(r.stdout)
+        if r.returncode or not achada:
+            raise ValueError(f"gh pr create para {a} falhou ({'; '.join(urls) or 'nenhum PR aberto antes'}): {(r.stderr or r.stdout).strip()[-300:]}")
+        urls.append(achada[-1])
+        ja = any(i["url"] == achada[-1] for i in _prs_ro()["itens"])
+        if task and not ja:
+            fila_auto(pr_ligar(task, achada[-1]))
+        elif not task:
+            pr_auto(achada[-1], head=novo, wt=wt)
+    return urls, avisos
 
 
 def pr_lista(task=None):
@@ -9975,6 +10057,12 @@ def main(argv=None):
     pa.add_argument("--cwd", help="onde achar a worktree da branch quando o --head não veio (a branch sai do gh pr view)")
     pl2.add_argument("--tag", help="a etiqueta da feature no digest (segurança, failover, …)")
     pl2.add_argument("--nota", help="o que o PR faz, em uma ou duas frases, para o digest")
+    po = pr.add_parser("abrir", help="orq pr abrir <dispatch|branch> --titulo T --corpo ARQ [--ambientes a,b]: tira o prefixo da branch, confere merge-tree, empurra e abre um PR por ambiente ligado à task")
+    po.add_argument("alvo")
+    po.add_argument("--titulo", required=True)
+    po.add_argument("--corpo", required=True, help="arquivo com o corpo do PR (seções da skill /pr)")
+    po.add_argument("--ambientes", help="branches separadas por vírgula; padrão: os ambientes do projeto antes da produção")
+    po.add_argument("--cwd", help="onde achar a worktree quando o alvo é uma branch")
     pr.add_parser("lista").add_argument("--task")
     pd2 = pr.add_parser("desligar")
     pd2.add_argument("task")
@@ -10263,6 +10351,11 @@ def main(argv=None):
                 print(json.dumps(pr_ligar(a.task, a.url, a.issue, a.tag, a.nota), ensure_ascii=False))
             elif a.op == "auto":
                 print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
+            elif a.op == "abrir":
+                urls, avisos = pr_abrir(a.alvo, a.titulo, a.corpo, [x for x in (a.ambientes or "").split(",") if x] or None, a.cwd)
+                for av in avisos:
+                    print(f"aviso: {av}", file=sys.stderr)
+                print("\n".join(urls))
             elif a.op == "desligar":
                 pr_desligar(a.task, a.url)
                 print(f"PR desligado de {a.task}")

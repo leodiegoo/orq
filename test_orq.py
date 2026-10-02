@@ -14367,6 +14367,112 @@ def test_it_should_be_that_the_pre_push_hook_refuses_a_bad_push_and_lets_a_clean
         assert r.returncode == 0, r.stderr
 
 
+# ---------- ticket 143: orq pr abrir ----------
+
+FAKE_GIT143 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+a = sys.argv[3:] if sys.argv[1] == "-C" else sys.argv[1:]
+open(os.path.join(d, "git.log"), "a").write(json.dumps(a) + "\\n")
+if a[:2] == ["branch", "--show-current"]:
+    print(os.environ["FAKE_BRANCH"])
+elif a[0] == "merge-tree" and os.environ.get("FAKE_CONFLITO") in a:
+    print("treeoid\\nsrc/a.js"); sys.exit(1)
+"""
+FAKE_GH143 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+open(os.path.join(d, "gh.log"), "a").write(json.dumps(sys.argv[1:]) + "\\n")
+arq = os.path.join(d, "gh.json")
+dados = json.load(open(arq)) if os.path.exists(arq) else {}
+if sys.argv[2] == "create":
+    url = "https://github.com/acme/app/pull/%d" % (300 + len(dados))
+    dados[url] = {"state": "OPEN", "mergedAt": None, "baseRefName": sys.argv[sys.argv.index("--base") + 1], "title": sys.argv[sys.argv.index("--title") + 1]}
+    json.dump(dados, open(arq, "w")); print(url)
+elif sys.argv[2] == "view" and sys.argv[3] in dados:
+    print(json.dumps(dados[sys.argv[3]]))
+else:
+    sys.exit(1)
+"""
+CORPO143 = "## Summary\nx\n\n## Evidence\ny\n\n## Merge Danger\nz\n"
+
+
+def _abrir143(branch="leodiegoo/feat/algo", conflito=None):
+    a = Amb(run="run_a", FAKE_BRANCH=branch, **({"FAKE_CONFLITO": conflito} if conflito else {}))
+    _neo(a)
+    for nome, src, var in (("git", FAKE_GIT143, "ORQ_GIT"), ("gh", FAKE_GH143, "ORQ_GH")):
+        caminho = os.path.join(a.tmp.name, nome + "143")
+        with open(caminho, "w") as f:
+            f.write(src)
+        os.chmod(caminho, 0o755)
+        a.env[var] = caminho
+    wt = os.path.join(a.tmp.name, "wt")
+    os.makedirs(wt)
+    a.set("workers.json", [{"handle": "term_w", "run": "run_a", "worktree": wt}])
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_feat", "dispatch": "ctx_term_w", "titulo": "Algo"}) + "\n")
+    corpo = os.path.join(a.tmp.name, "corpo.md")
+    open(corpo, "w").write(CORPO143)
+    a.corpo = corpo
+    return a
+
+
+def _abrir(a, *extra, corpo=None):
+    return a.orq("pr", "abrir", "ctx_term_w", "--titulo", "feat: add algo", "--corpo", corpo or a.corpo, *extra)
+
+
+def _log143(a, nome):
+    return [json.loads(l) for l in open(os.path.join(a.fake, nome)).read().splitlines()] if os.path.exists(os.path.join(a.fake, nome)) else []
+
+
+def test_ticket143_pr_abrir_tira_o_prefixo_empurra_abre_um_pr_por_ambiente_e_liga_a_task():
+    a = _abrir143()
+    r = _abrir(a)
+    assert r.returncode == 0, r.stderr
+    git = _log143(a, "git.log")
+    assert ["branch", "-m", "leodiegoo/feat/algo", "feat/algo"] in git, git
+    assert git.index(["branch", "-m", "leodiegoo/feat/algo", "feat/algo"]) < next(n for n, c in enumerate(git) if c[0] == "push"), "renomeia antes do push"
+    assert [c for c in git if c[0] == "push"] == [["push", "-u", "origin", "feat/algo"]]
+    criados = [c for c in _log143(a, "gh.log") if c[:2] == ["pr", "create"]]
+    assert [c[c.index("--base") + 1] for c in criados] == ["development", "staging"], criados
+    assert all(c[c.index("--head") + 1] == "feat/algo" and c[c.index("--body-file") + 1] == a.corpo for c in criados)
+    assert "https://github.com/acme/app/pull/300" in r.stdout and "https://github.com/acme/app/pull/301" in r.stdout, r.stdout
+    itens = json.load(open(os.path.join(a.home, "prs.json")))["itens"]
+    assert [(i["task"], i["base"]) for i in itens] == [("task_feat", "development"), ("task_feat", "staging")], itens
+
+
+def test_ticket143_pr_abrir_para_no_conflito_antes_do_push():
+    a = _abrir143(conflito="origin/staging")
+    r = _abrir(a)
+    assert r.returncode == 1 and "staging" in r.stderr and "src/a.js" in r.stderr, r
+    assert not [c for c in _log143(a, "git.log") if c[0] == "push"] and not _log143(a, "gh.log"), "nada sobe com conflito"
+
+
+def test_ticket143_pr_abrir_recusa_rodape_de_gerador_trailer_e_corpo_vazio():
+    a = _abrir143()
+    for ruim in ("## Summary\nx\n\n\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)\n", "x\n\nCo-Authored-By: Claude <n@a.com>\n", "  \n"):
+        open(a.corpo, "w").write(ruim)
+        r = _abrir(a)
+        assert r.returncode == 1 and not _log143(a, "gh.log") and not _log143(a, "git.log"), (ruim, r.stderr)
+    open(a.corpo, "w").write(CORPO143)
+    r = a.orq("pr", "abrir", "ctx_term_w", "--titulo", "Add algo", "--corpo", a.corpo)
+    assert r.returncode == 1 and "Conventional" in r.stderr, r
+
+
+def test_ticket143_pr_abrir_avisa_secoes_faltando_mas_abre():
+    a = _abrir143()
+    open(a.corpo, "w").write("## Summary\nso isto\n")
+    r = _abrir(a, "--ambientes", "development")
+    assert r.returncode == 0 and "Evidence" in r.stderr and "Merge Danger" in r.stderr, r
+    assert len([c for c in _log143(a, "gh.log") if c[:2] == ["pr", "create"]]) == 1
+
+
+def test_ticket143_pr_abrir_main_so_depois_do_staging_entrar():
+    a = _abrir143()
+    r = _abrir(a, "--ambientes", "development,staging,main")
+    assert r.returncode == 1 and "staging" in r.stderr and not _log143(a, "gh.log"), r
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
