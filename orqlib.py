@@ -465,15 +465,17 @@ def integrate_queue_add(branch, ticket):
     return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": new["branch"]})
 
 
-def audit_publication(revs, repo=None):
+def audit_publication(revs, repo=None, authorship_only=False):
     """Reasons why `revs` (args of `git rev-list`, e.g. `base..head`) cannot go to the public main: author or committer outside the configured noreply
     (`ORQ_AUTOR` or `git config user.email`), Co-Authored-By trailer or generator footer, forbidden term in the diff or message, `orqlib.py`/`orq.py` without `README.md` in the range.
-    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check."""
-    git = lambda *x: subprocess.run(["git", *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
+    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check. `authorship_only` keeps just the author and trailer checks (a PR of another project's branch, ticket 338)."""
+    git = lambda *x: subprocess.run([GIT, *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
     expected = os.environ.get("ORQ_AUTOR") or git("config", "user.email").strip()
     terms = []
     listing = os.environ.get("ORQ_TERMOS") or os.path.join(PLAN, "termos-proibidos.txt")
-    if os.path.exists(listing):
+    if authorship_only:
+        pass
+    elif os.path.exists(listing):
         spec = importlib.util.spec_from_file_location("audiencia_check", os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "audiencia-check.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -494,7 +496,7 @@ def audit_publication(revs, repo=None):
             first_code = sha
         files_set |= changed_files
         reasons += [f"{sha[:7]} {msg.splitlines()[0] if msg.strip() else ''}: {m}" for m in findings]
-    if first_code and "README.md" not in files_set:
+    if first_code and "README.md" not in files_set and not authorship_only:
         reasons.append(f"{first_code[:7]}: changes orqlib.py/orq.py and no commit in the range touches README.md (document the change)")
     return reasons
 
@@ -3163,18 +3165,53 @@ def _git_wt(wt, *args, timeout=60):
     return subprocess.run([GIT, "-C", wt, *args], capture_output=True, text=True, timeout=timeout)
 
 
-def pr_open(target, title, body_text, environments=None, cwd=None):
+REPORT_SECTIONS = (("Summary", r"summary|resumo"), ("Evidence", r"evidence|evid[eê]ncia|conformance"), ("Merge Danger", r"merge danger|risco|risk"))
+
+
+def pr_body_from_report(report):
+    """The PR body (sections of the /pr skill) filled from a `final-report.md`: Summary is the section named summary/resumo, else the text before the first heading;
+    Evidence the evidence/evidência section, else `## Conformance` (the proof of each item); Merge Danger the merge danger/risco section. A section the report does not
+    have is left out, and `pr_open` warns about it. The text stays as the report wrote it."""
+    parts = re.split(r"^##\s+(.+?)\s*$", report, flags=re.M)
+    by_heading = {parts[i].strip().lower(): parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+    out = []
+    for name, pattern in REPORT_SECTIONS:
+        text_value = next((t for h, t in by_heading.items() if t and re.fullmatch(pattern, h)), "")
+        if name == "Summary" and not text_value:
+            text_value = re.sub(r"^#\s.*$", "", parts[0], flags=re.M).strip()
+        if text_value:
+            out.append(f"## {name}\n\n{text_value}")
+    return "\n\n".join(out) + "\n" if out else ""
+
+
+def _branch_ref(repo, branch):
+    """`branch` when it exists locally, else `origin/<branch>` after a fetch (a branch with no worktree that only the remote has). ValueError if neither exists."""
+    if _git_wt(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
+        return branch
+    _git_wt(repo, "fetch", "origin", branch)
+    if _git_wt(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}").returncode == 0:
+        return f"origin/{branch}"
+    raise ValueError(f"no branch {branch} here or on origin (from {repo})")
+
+
+def pr_open(target, title, body_text=None, environments=None, cwd=None, rename=None, report=None, task=None):
     """Publishes the delivery: strips the user prefix from the branch, checks `git merge-tree` against each environment (a conflict stops before the push), pushes, opens one
-    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Returns (urls, notices); ValueError before touching anything."""
-    text_value = open(body_text).read() if os.path.isfile(body_text) else None
-    if not (text_value or "").strip():
-        raise ValueError(f"empty or missing body: {body_text}")
-    for item_name, t in (("title", title), ("body", text_value)):
+    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. A branch with no worktree (local or only on
+    origin, ticket 338) is read from the repo at `cwd`, its commits must carry the configured noreply author and no trailer, and it keeps its name unless `rename` asks
+    for another (`""` = without the user prefix); with no `body_text` the body comes from `report` or from the `final-report.md` committed on the branch. Returns (urls, notices); ValueError before touching anything."""
+    def check_body(t):
+        if not (t or "").strip():
+            raise ValueError(f"empty or missing body: {body_text or report or 'final-report.md'}")
         if m := GENERATOR_FOOTER_RE.search(t):
-            raise ValueError(f"{item_name} with generator footer or trailer ({m.group(0)!r}): remove it before publishing")
+            raise ValueError(f"body with generator footer or trailer ({m.group(0)!r}): remove it before publishing")
+        return [f"body without the {sec} section (skill /pr)" for sec in PR_SECTIONS if not re.search(rf"^#+\s*{sec}\b", t, re.M | re.I)]
+
+    if m := GENERATOR_FOOTER_RE.search(title):
+        raise ValueError(f"title with generator footer or trailer ({m.group(0)!r}): remove it before publishing")
     if not COMMIT_TITLE_RE.fullmatch(title.strip()):
         raise ValueError(f"title is not Conventional Commits: {title!r} (<type>(<scope>): <description in English>)")
-    notices = [f"body without the {sec} section (skill /pr)" for sec in PR_SECTIONS if not re.search(rf"^#+\s*{sec}\b", text_value, re.M | re.I)]
+    text_value = open(body_text).read() if body_text and os.path.isfile(body_text) else None
+    notices = check_body(text_value) if body_text else []
     event_list = read_events()
     if target.startswith("ctx_"):
         dispatch_events = next((e for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("dispatch") == target), None)
@@ -3189,15 +3226,29 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         branch = _git_wt(wt, "branch", "--show-current").stdout.strip()
     else:
         branch, wt = target, _worktrees_by_branch(cwd or os.getcwd()).get(target)
-        if not wt:
-            raise ValueError(f"no worktree with branch {target} from {cwd or os.getcwd()}")
-        task = branch_task(branch, wt, event_list)
+        task = task or branch_task(branch, wt, event_list)
     if not branch:
         raise ValueError(f"no branch in worktree {wt}")
-    phases = phase_check(f"{title}\n{text_value}", scratch_roots([wt]), event_list)  # ticket 201: a PR that says "phase N" carries all of it
+    repo = wt or cwd or os.getcwd()  # a branch with no worktree is read from the repo itself
+    ref = branch if wt else _branch_ref(repo, branch)
+    if not body_text:
+        if report:
+            if not os.path.isfile(report):
+                raise ValueError(f"no report at {report}")
+            report_text = open(report).read()
+        else:
+            r = _git_wt(repo, "show", f"{ref}:{FINAL_REPORT}")
+            report_text = r.stdout if r.returncode == 0 else ""
+            if not report_text.strip() and wt and os.path.isfile(os.path.join(wt, FINAL_REPORT)):
+                report_text = open(os.path.join(wt, FINAL_REPORT)).read()
+            if not report_text.strip():
+                raise ValueError(f"no --body and no {FINAL_REPORT} on {ref}: pass --body FILE or --report FILE")
+        text_value = pr_body_from_report(report_text)
+        notices = check_body(text_value)
+    phases = phase_check(f"{title}\n{text_value}", scratch_roots([wt] if wt else []), event_list)  # ticket 201: a PR that says "phase N" carries all of it
     if refusal := phase_refusal(phases):
         raise ValueError(f"{refusal}. Nothing was pushed: finish them, or name the tickets the PR carries without calling it the phase")
-    flow_info = task_flow(task, event_list) if task else repo_flow(wt)
+    flow_info = task_flow(task, event_list) if task else repo_flow(repo)
     envs = environments or ([a for a in flow_info["ambientes"] if a != flow_info["producao"]] or [flow_info["producao"]] if flow_info["fluxo"] == "promocao" else [flow_info["producao"]])
     envs = sorted(dict.fromkeys(envs), key=lambda a: flow_info["ambientes"].index(a) if a in flow_info["ambientes"] else len(flow_info["ambientes"]))
     if flow_info["producao"] in envs:
@@ -3205,23 +3256,28 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         still_missing = [a for a in flow_info["ambientes"][: flow_info["ambientes"].index(flow_info["producao"])] if a not in entered]
         if still_missing:
             raise ValueError(f"{flow_info['producao']} only after {' and '.join(still_missing)} enter(s): no merged PR of {task} there")
-    new = _no_user_prefix(branch)
+    new = (rename or _no_user_prefix(branch)) if wt or rename is not None else branch
     for a in envs:
-        subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
-        r = _git_wt(wt, "merge-tree", "--write-tree", "--name-only", "--no-messages", f"origin/{a}", branch)
+        subprocess.run([GIT, "-C", repo, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+        r = _git_wt(repo, "merge-tree", "--write-tree", "--name-only", "--no-messages", f"origin/{a}", ref)
         if r.returncode != 0:
             raise ValueError(f"conflict with {a}" + (f" in: {', '.join(x for x in r.stdout.splitlines()[1:] if x.strip())}" if r.returncode == 1 else f" (merge-tree failed: {r.stderr.strip()[-200:]})") +
                              f". Nothing was pushed: create merge/{new.split('/', 1)[-1]}-{a} from {a}")
-    if new != branch:
-        r = _git_wt(wt, "branch", "-m", branch, new)
-        if r.returncode:
-            raise ValueError(f"did not rename {branch} to {new}: {r.stderr.strip()[-200:]}")
-    r = _git_wt(wt, "push", "-u", "origin", new)
+        if reasons := audit_publication([f"origin/{a}..{ref}"], repo, authorship_only=True):
+            raise ValueError(f"commits of {branch} not publishable against {a}: " + "; ".join(reasons) + ". Nothing was pushed")
+    if not wt:  # no local checkout to rename: the push carries the new name
+        r = _git_wt(repo, "push", "origin", f"{ref}:refs/heads/{new}")
+    else:
+        if new != branch:
+            r = _git_wt(wt, "branch", "-m", branch, new)
+            if r.returncode:
+                raise ValueError(f"did not rename {branch} to {new}: {r.stderr.strip()[-200:]}")
+        r = _git_wt(wt, "push", "-u", "origin", new)
     if r.returncode:
         raise ValueError(f"push failed: {r.stderr.strip()[-300:]}")
     urls = []
     for a in envs:
-        r = subprocess.run([GH, "pr", "create", "--base", a, "--head", new, "--title", title, "--body-file", body_text], cwd=wt, capture_output=True, text=True, timeout=120)
+        r = subprocess.run([GH, "pr", "create", "--base", a, "--head", new, "--title", title, "--body-file", body_text or "-"], input=None if body_text else text_value, cwd=repo, capture_output=True, text=True, timeout=120)
         found_matches = PR_RE.findall(r.stdout)
         if r.returncode or not found_matches:
             raise ValueError(f"gh pr create for {a} failed ({'; '.join(urls) or 'no PR opened before'}): {(r.stderr or r.stdout).strip()[-300:]}")
@@ -3230,7 +3286,7 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         if task and not already:
             queue_auto(pr_link(task, found_matches[-1]))
         elif not task:
-            pr_auto(found_matches[-1], head=new, wt=wt)
+            pr_auto(found_matches[-1], head=new, wt=wt, cwd=repo)
     if phases:
         append_event({"tipo": "fase_declarada", "texto": f"{title}\n{text_value}"[:2000], "urls": urls, "task": task})
     return urls, notices
@@ -12900,10 +12956,14 @@ def parser():
     pa.add_argument("--cwd", help="where to find the branch's worktree when --head did not come (the branch comes from gh pr view)")
     pl2.add_argument("--tag", help="the feature's label in the digest (security, failover, …)")
     _arg(pl2, "nota", help="what the PR does, in one or two sentences, for the digest")
-    po = pr.add_parser("open", aliases=["abrir"], help="orq pr open <dispatch|branch> --title T --body FILE [--environments a,b]: strips the branch prefix, checks merge-tree, pushes and opens one PR per environment linked to the task")
-    po.add_argument("target")
+    po = pr.add_parser("open", aliases=["abrir"], help="orq pr open <dispatch|branch> | --head BRANCH --title T [--body FILE | --report FILE] [--environments a,b] [--rename [NAME]]: checks author, trailer and merge-tree, pushes and opens one PR per environment linked to the task")
+    po.add_argument("target", nargs="?")
+    po.add_argument("--head", help="the branch to publish, with or without a local worktree (local, or only on origin)")
     _arg(po, "titulo", required=True)
-    _arg(po, "corpo", required=True, help="file with the PR body (sections of the /pr skill)")
+    _arg(po, "corpo", help="file with the PR body (sections of the /pr skill); without it the body is built from --report or the branch's final-report.md")
+    po.add_argument("--report", help="final-report.md to fill the body from (default: the one committed on the branch)")
+    po.add_argument("--rename", nargs="?", const="", help="branch name to publish under; bare, drops the user prefix Orca adds (a branch with a worktree always does)")
+    po.add_argument("--task", help="the task the PRs link to (default: the one that owns the branch)")
     _arg(po, "ambientes", help="comma-separated branches; default: the project environments before production")
     po.add_argument("--cwd", help="where to find the worktree when the target is a branch")
     pr.add_parser("list", aliases=["lista"], help="the linked PRs (of one task, with --task)").add_argument("--task")
@@ -13283,7 +13343,10 @@ def main(argv=None):
             elif a.op == "auto":
                 print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
             elif a.op == "open":
-                urls, notices = pr_open(a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd)
+                if not (a.head or a.target):
+                    print("pr open: pass the dispatch or branch, or --head BRANCH", file=sys.stderr)
+                    return 2
+                urls, notices = pr_open(a.head or a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd, a.rename, a.report, a.task)
                 for av in notices:
                     print(f"warning: {av}", file=sys.stderr)
                 print("\n".join(urls))
