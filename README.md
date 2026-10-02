@@ -272,10 +272,11 @@ For a bounded unattended stretch, night mode adds a budget: `orq night on --unti
 | `push-feature` | allow | `git push` of a branch that is none of the project's environments |
 | `push-orq-main` | allow | `git push` of orq's production branch (`main`) when `orq audit-publication origin/main..main` is clean |
 | `pr-create` | allow | `gh pr create` |
-| `merge-env` | allow | `gh pr merge` into an environment before production (e.g. `development`, `staging`) |
+| `merge-env-flag` | allow | `gh pr merge` into an environment before production whose `merge_allowed` flag is `true` in the project file |
 | `push-env` | deny | `git push` to any other environment branch of the project |
 | `push-force` | deny | `git push --force`, `--force-with-lease` or a `+refspec` |
 | `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, `-c`, `--git-dir`, a `:refspec`, a glob, a tag, another option, or a destination orq cannot tell (after `popd`, a subshell `cd`, or a `HEAD` push after a command that may switch branch) |
+| `merge-env` | deny | `gh pr merge` into an environment before production (e.g. `development`, `staging`) when the project's `merge_allowed` for that base is not `true`: the default |
 | `merge-prod` | deny | `gh pr merge` into production (e.g. `main`) or into a branch that is no environment |
 | `merge-unknown` | deny | `gh pr merge` with no `--base` whose base `gh pr view` did not give within 1 s |
 | `workflow` | deny | `gh workflow run` (deploy) |
@@ -284,7 +285,7 @@ For a bounded unattended stretch, night mode adds a budget: `orq night on --unti
 | `reset` | deny | `git reset --hard` outside a worker's linked worktree |
 | `unjudged` | deny | an external action the guard could not judge (an error, or the hook's 3 s limit) |
 
-The environments come from the project file that holds the folder (`environments`); outside every project, the remote's default branch is the only one. The deny reason cites the line, and the command goes to the pending list once (id `externa-<hash>`, type `acao`, the command in `comando`), so the away report lists what was tried. The night budget (`away on` arms it, `night on --until` sets it) and this guard do not replace each other: the budget caps dispatches and failures and never lifts a line of the table; the table says what may go out and never depends on the budget. Neither mode on: nothing changes. See `docs/design.md`, "External-action guard".
+The environments come from the project file that holds the folder (`environments`). Merging into one is the user's: the project file's `merge_allowed` (`{"development": false, "staging": false}`) frees `gh pr merge` per base, only a literal `true` counts, and a project without the key (every existing one) frees none. Production never merges, flag or not; outside every project, the remote's default branch is the only one. The deny reason cites the line, and the command goes to the pending list once (id `externa-<hash>`, type `acao`, the command in `comando`), so the away report lists what was tried. The night budget (`away on` arms it, `night on --until` sets it) and this guard do not replace each other: the budget caps dispatches and failures and never lifts a line of the table; the table says what may go out and never depends on the budget. Neither mode on: nothing changes. See `docs/design.md`, "External-action guard".
 
 ### Reminders (`orq remind`)
 

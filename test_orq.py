@@ -7263,11 +7263,12 @@ def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
 
 # ---- orq hook externas (away mode, ticket 214) ----
 
-def _away_project(a):
-    """Away mode on and a promotion project (development, staging, main as production) holding the test folder."""
+def _away_project(a, merge_allowed=None):
+    """Away mode on and a promotion project (development, staging, main as production) holding the test folder, with the `merge_allowed` flag when given."""
     os.makedirs(a.home, exist_ok=True)
     _away_on(a.home)
-    _project(a, "app", {"repo": "path:" + a.tmp.name, "environments": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "production": True}], "flow": "promocao"})
+    _project(a, "app", {"repo": "path:" + a.tmp.name, "environments": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "production": True}], "flow": "promocao",
+                        **({"merge_allowed": merge_allowed} if merge_allowed is not None else {})})
 
 
 def _pend_ids(a):
@@ -7288,7 +7289,7 @@ def _away_repo(a):
 
 def test_away_external_denies_merge_into_production_and_force_push_and_allows_the_table():
     a = Env(run="run_a")
-    _away_project(a)
+    _away_project(a, {"development": True, "staging": True})
     r = _away_repo(a)
     for cmd, line in (("gh pr merge 12 --base main", "merge-prod"), ("gh pr merge 12 --base feat/y", "merge-prod"), ("gh pr -R acme/app merge 12 --base main", "merge-prod"),
                       ("git push --force origin feat/x", "push-force"), ("rtk git push --force-with-lease", "push-force"), ("git push origin +feat/x", "push-force"),
@@ -7329,6 +7330,33 @@ def test_away_external_denies_merge_into_production_and_force_push_and_allows_th
     assert _external(a, "gh pr merge 12 --base development", cwd=r) is None, "away on top of night: the table rules"
 
 
+def test_away_external_merge_into_an_environment_is_denied_unless_the_project_flag_allows_that_base():
+    for flag, cmd, line in ((None, "gh pr merge 12 --base development", "merge-env"), (None, "gh pr merge 12 --base staging --squash", "merge-env"),
+                            ({"development": False, "staging": False}, "gh pr merge 12 --base development", "merge-env"),
+                            ({"development": True, "staging": False}, "gh pr merge 12 --base staging", "merge-env"),
+                            ({"development": "true", "staging": 1}, "gh pr merge 12 --base development", "merge-env"),
+                            ({"development": "true", "staging": 1}, "gh pr merge 12 --base staging", "merge-env"),
+                            ({"main": True}, "gh pr merge 12 --base main", "merge-prod"), ({"development": True, "staging": True, "main": True}, "gh pr merge 12 --base main", "merge-prod"),
+                            ({"feat/y": True}, "gh pr merge 12 --base feat/y", "merge-prod"), (["development"], "gh pr merge 12 --base development", "merge-env")):
+        a = Env(run="run_a")
+        _away_project(a, flag)
+        out = _external(a, cmd)
+        assert out and out["permissionDecision"] == "deny", (flag, cmd)
+        assert f"line `{line}`" in out["permissionDecisionReason"], (flag, cmd, out["permissionDecisionReason"])
+    for flag, cmd in (({"development": True}, "gh pr merge 12 --base development --squash"), ({"development": False, "staging": True}, "gh pr merge 12 --base=staging")):
+        a = Env(run="run_a")
+        _away_project(a, flag)
+        assert _external(a, cmd) is None, (flag, cmd)
+    a = Env(run="run_a")  # without --base the base comes from gh, and the flag is read for that base
+    _away_project(a, {"staging": True})
+    _gh(a)
+    _pr(a, PR1, base="staging")
+    _pr(a, PR2, base="development")
+    assert _external(a, f"gh pr merge {PR1} --squash") is None
+    out = _external(a, f"gh pr merge {PR2} --squash")
+    assert out and "line `merge-env`" in out["permissionDecisionReason"]
+
+
 def test_away_external_quoted_text_and_heredoc_do_not_trigger():
     a = Env(run="run_a")
     _away_project(a)
@@ -7338,7 +7366,7 @@ def test_away_external_quoted_text_and_heredoc_do_not_trigger():
 
 def test_away_external_merge_without_base_asks_gh_and_denies_when_it_fails():
     a = Env(run="run_a")
-    _away_project(a)
+    _away_project(a, {"staging": True})
     _gh(a)
     _pr(a, PR1, base="staging")
     _pr(a, PR2, base="main")

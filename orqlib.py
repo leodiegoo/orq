@@ -6082,10 +6082,11 @@ AWAY_EXTERNAL = {  # the away policy (ticket 214), one line per action and desti
     "push-feature": ("allow", "git push of a branch that is none of the project's environments"),
     "push-orq-main": ("allow", "git push of orq's production branch (main) with `orq audit-publication origin/main..main` clean"),
     "pr-create": ("allow", "gh pr create"),
-    "merge-env": ("allow", "gh pr merge into an environment before production (e.g. development, staging)"),
+    "merge-env-flag": ("allow", "gh pr merge into an environment before production (e.g. development, staging) whose `merge_allowed` flag is true in the project file"),
     "push-env": ("deny", "git push to one of the project's environment branches (e.g. development, staging, main)"),
     "push-force": ("deny", "git push --force, --force-with-lease or a +refspec"),
     "push-other": ("deny", "git push with --delete, --all, --mirror, --tags, -c, a :refspec, a glob, a tag, another option or a destination orq cannot tell"),
+    "merge-env": ("deny", "gh pr merge into an environment before production (e.g. development, staging) unless the project's `merge_allowed` flag for that base is true"),
     "merge-prod": ("deny", "gh pr merge into production (e.g. main) or into a branch that is none of the project's environments"),
     "merge-unknown": ("deny", "gh pr merge whose base `gh pr view` did not give within 1 s"),
     "workflow": ("deny", "gh workflow run (deploy)"),
@@ -6193,7 +6194,7 @@ def _pr_base(d, selector, repo):
 
 
 def _away_merge(ev, m):
-    """The AWAY_EXTERNAL line of a `gh pr merge`: its base comes from `--base`, otherwise from `gh pr view`. Only an environment before production passes."""
+    """The AWAY_EXTERNAL line of a `gh pr merge`: its base comes from `--base`, otherwise from `gh pr view`. Only an environment before production whose `merge_allowed` flag is true passes; production never does."""
     d = ev.get("cwd") or os.getcwd()
     args = f"{m.group(1)} {m.group(2)}".split()  # cmdnorm already blanked quotes to `""`, so a token with `"`, `$` or a backtick is the shell's to decide
     args = args[:next((k for k, a in enumerate(args) if a.startswith("#")), len(args))]
@@ -6216,7 +6217,9 @@ def _away_merge(ev, m):
     if not base:
         return "merge-unknown"
     flow = _flow_at(d)
-    return "merge-env" if base in flow["ambientes"] and base != flow["producao"] else "merge-prod"
+    if base not in flow["ambientes"] or base == flow["producao"]:
+        return "merge-prod"
+    return "merge-env-flag" if flow.get("merge_allowed", {}).get(base) is True else "merge-env"
 
 
 def _away_line(seg, ev):
@@ -11208,10 +11211,10 @@ def _file_tests(v):
 
 
 def projects():
-    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "erro"}}.
+    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "merge_allowed", "erro"}}.
 
     Only `repo` is required; a missing `harness` counts as claude and `group_name` only groups the listing. `environments` is the project's ordered list `[{"branch", "production"?}]`
-    (the production one is the one marked, otherwise the last) and `flow` is `promocao` or `direto`; without the `environments` block it comes as None and the remote's default applies
+    (the production one is the one marked, otherwise the last), `merge_allowed` is the away flag `{branch: true}` that lets `gh pr merge` into that environment pass (ticket 322; only a literal `true` counts, default none) and `flow` is `promocao` or `direto`; without the `environments` block it comes as None and the remote's default applies
     (`project_flow`). `e2e_queue` is the folder of the project's E2E queue (`e2e_queue()`; without it the project shows no queue) and `transcritos` the folder of the
     coordinator's transcripts (`transcript_dirs()`; without it the one Claude Code names from `repo: path:` applies). A file that is unreadable, has no `repo`, has a harness orq does not dispatch or has malformed environments stays in the list with `error`
     (`orq projects` shows the reason) and is never chosen on its own."""
@@ -11235,6 +11238,7 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
+                         "merge_allowed": {b: v for b, v in d["merge_allowed"].items() if v is True} if isinstance(d.get("merge_allowed"), dict) else {},
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
                          "tests": _file_tests(d.get("tests")),
@@ -11301,7 +11305,8 @@ def project_flow(item_name):
     environment, the default branch of the repo's remote (the project folder, or the cwd), with a direct flow; `declarado` says which of the two."""
     d = projects().get(item_name) or {}
     if d.get("ambientes") and not d.get("erro"):
-        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False)}
+        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False),
+                "merge_allowed": d["merge_allowed"]}
     default = default_branch((d.get("repo") and repo_folder(d["repo"])) or os.getcwd())
     return {"ambientes": [default], "producao": default, "fluxo": "direto", "declarado": False}
 
