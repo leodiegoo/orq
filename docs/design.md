@@ -964,7 +964,19 @@ The rule scan looks only at the command that runs: heredoc bodies and quoted tex
 
 Week over week. `--save` writes only the numbers to `ORQ_HOME/retro/<end>.json`. The next run prints them in an `antes` column, and `orq digest` adds a `retro` key to `atual.json` (the last 4 rounds: `ate`, `falhas`, `metricas`) plus a line per round on the HTML page. The key is additive and absent until a round is saved, so a v1 reader keeps working. `falhas` is the plain sum of all signals, a thermometer: compare signal by signal.
 
-Limits: `pr_ci_vermelho` is the state of the checks now, not at delivery time. `liberado_sujo` counts the dirt the main checkout already had; the analysis step discounts a constant baseline. Windows start where `events.jsonl` does, so the first saved round is a baseline. `intake_descartado` and `entrada_sem_tratamento` measure the coordinator's habits, not bugs. The collector never writes anything besides the saved round.
+Gap ledger (ticket 210). `--save` also folds every case into `ORQ_HOME/retro/gaps.json` (`{lacunas: [...]}`, one entry per gap), because the rounds keep only numbers and a gap seen once a week for a month never added up. The identity of a gap is the signal, or the rule id for `regra_violada`; an LLM proposal (the navigability automation) cites an existing `id` from `orq retro gaps --json` instead of inventing one. An entry holds `id`, `classe` (a default by signal family, `texto` or `checagem`; the skill's reading of the cases wins), `sessoes` (distinct ids: the dispatch, else the task, else the event's session, else the day), `ponteiros` (the latest 20), `primeira_vez`, `ultima_vez` and `estado`:
+
+| `estado` | meaning | next |
+|---|---|---|
+| `aberta` | under 2 sessions | 2 sessions: `proposta` |
+| `proposta` | 2 or more distinct sessions, in any weeks: the skill proposes it (the exception stays: one case that lost work or broke orq) | `accept`: `aceita`; `reject`: `rejeitada` |
+| `rejeitada` | `orq retro reject <id> --reason T` stores the session count of that moment; there is no defer button, rejecting is remembered | more sessions than at the rejection: `proposta` |
+| `aceita` | `orq retro accept <id> --ticket N` | ticket `N` closed (`ticket close` event): `coberta` |
+| `coberta` | the ticket that answered it closed | a session not yet counted: starts over as `aberta` |
+
+A gap with no sighting for 90 days leaves the file, rejection included (`GAP_MAX_AGE_DAYS`). The same session twice, or the same window twice, changes nothing. `orq retro gaps` settles the ledger as of now in memory; only `--save`, `reject` and `accept` write. The `retro` output and the saved round are unchanged. Not built: the backpass model call that merges duplicate gaps (`src/consolidate.js`); look at it only if duplicates show up.
+
+Limits: `pr_ci_vermelho` is the state of the checks now, not at delivery time. `liberado_sujo` counts the dirt the main checkout already had; the analysis step discounts a constant baseline. Windows start where `events.jsonl` does, so the first saved round is a baseline. `intake_descartado` and `entrada_sem_tratamento` measure the coordinator's habits, not bugs. The collector writes nothing besides the saved round and the gap ledger.
 
 ### Weekly trigger (proposed, not created)
 

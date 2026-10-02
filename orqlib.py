@@ -11949,7 +11949,8 @@ def retro_collection(events, since, until_at, turns=None, projects=None, pr_chec
         where = next((x for x in (e.get("caminho"), e.get("worktree"), d.get("worktree")) if x and x != "current"), None)
         cases[item_name].append({"ts": e.get("ts"), "task": e.get("task") or d.get("task"), "dispatch": e.get("dispatch") or d.get("dispatch"), "titulo": d.get("titulo"),
                             "modelo": d.get("modelo"), "effort": d.get("effort"), "onde": where, "detalhe": detail,
-                            "ponteiro": pointer or (f"events.jsonl:{e['_l']}" if e.get("_l") else f"events.jsonl@{e.get('ts')}")})
+                            "ponteiro": pointer or (f"events.jsonl:{e['_l']}" if e.get("_l") else f"events.jsonl@{e.get('ts')}"),
+                            **({"sessao": e["sessao"]} if e.get("sessao") else {})})  # the gap ledger counts sessions: the dispatch, else the task, else this
 
     gate_notices, prs = {}, {}
     for e in ev:
@@ -12067,6 +12068,127 @@ def write_retro(r):
     return path
 
 
+# ---------- retro: the gap ledger, what the retro remembers between weeks (ticket 210) ----------
+
+RETRO_GAPS = os.path.join(RETRO_DIR, "gaps.json")  # ORQ_HOME/retro/gaps.json: {lacunas: [one entry per gap]}
+GAP_MIN_SESSIONS = 2  # distinct sessions before a gap becomes a proposal (the skill's exception: one case that lost work or broke orq)
+GAP_MAX_AGE_DAYS = 90  # a gap with no new sighting for this long is forgotten, rejection included
+GAP_POINTERS = 20  # the pointers kept per gap: the latest ones
+GAP_OPEN = ("aberta", "proposta")
+RETRO_TEXT_SIGNALS = ("correcao_do_usuario", "pr_pediu_mudanca", "intake_descartado", "entrada_sem_tratamento")  # judgement errors; the rest of the signals is mechanical
+
+
+def _gap_stamp(ts, default=""):
+    """A stamp in the `AAAA-MM-DDTHH:MM:SSZ` form (transcripts carry milliseconds), or `default` when it is not a date."""
+    try:
+        return _dt(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (AttributeError, ValueError):
+        return default
+
+
+def _gaps_sight(gaps, signal, case, ref_at):
+    """Folds one case into the ledger. The gap id is the broken rule (`regra_violada`) or the signal; the session is the dispatch, else the task, else the event's session, else the day.
+
+    The same session never counts twice, but each new pointer is kept. A covered gap that comes back in a new session starts over.
+    ponytail: the class is the signal's family (text or check), not a reading of the case: calibration is the skill's call, and its reading wins in the proposal."""
+    gid = case.get("regra") or signal
+    seen_at = _gap_stamp(case.get("ts"), ref_at)
+    g = next((x for x in gaps if x["id"] == gid), None)
+    if not g:
+        g = {"id": gid, "classe": "texto" if signal in RETRO_TEXT_SIGNALS else "checagem",
+             "sessoes": [], "ponteiros": [], "primeira_vez": seen_at, "ultima_vez": seen_at, "estado": "aberta"}
+        gaps.append(g)
+    session = case.get("dispatch") or case.get("task") or case.get("sessao") or f"dia:{seen_at[:10]}"
+    if session not in g["sessoes"]:
+        if g["estado"] == "coberta":
+            g.update(sessoes=[], estado="aberta", primeira_vez=seen_at)
+            g.pop("ticket", None)
+        g["sessoes"].append(session)
+    if case.get("ponteiro") and case["ponteiro"] not in g["ponteiros"]:
+        g["ponteiros"] = [*g["ponteiros"], case["ponteiro"]][-GAP_POINTERS:]
+    g["primeira_vez"], g["ultima_vez"] = min(g["primeira_vez"], seen_at), max(g["ultima_vez"], seen_at)
+
+
+def _gaps_settle(gaps, ref_at, events):
+    """The ledger as of `ref_at`: forgets what went 90 days without a sighting, covers the accepted gap whose ticket closed, lets a rejected one back
+    once it has more sessions than at the rejection, and graduates the open one that reached two sessions. Returns the surviving gaps."""
+    cutoff = (_dt(ref_at) - timedelta(days=GAP_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    closed = {str(e.get("ticket")).zfill(2) for e in events if e.get("tipo") == "ticket" and e.get("op") == "fechar"}
+    out = []
+    for g in gaps:
+        if (g.get("ultima_vez") or "") <= cutoff:
+            continue
+        if g["estado"] == "aceita" and str(g.get("ticket")) in closed:
+            g["estado"] = "coberta"
+        elif g["estado"] == "rejeitada" and len(g["sessoes"]) > _dict(g.get("rejeicao")).get("sessoes", 0):
+            g["estado"] = "proposta"
+            g.pop("rejeicao", None)
+        if g["estado"] == "aberta" and len(g["sessoes"]) >= GAP_MIN_SESSIONS:
+            g["estado"] = "proposta"
+        out.append(g)
+    return out
+
+
+def _gaps_read():
+    return [g for g in _dict(_read_json(_path(RETRO_GAPS))).get("lacunas") or [] if isinstance(g, dict) and g.get("id")
+            and isinstance(g.get("sessoes"), list) and isinstance(g.get("ponteiros"), list)]
+
+
+def gaps_record(r, ref_at, events):
+    """`orq retro --gravar`: adds each case of the round to ORQ_HOME/retro/gaps.json. Running the same window again changes nothing."""
+    with _lock("retro.lock"):
+        gaps = _gaps_read()
+        for signal, s in r["sinais"].items():
+            for case in s["casos"]:
+                _gaps_sight(gaps, signal, case, ref_at)
+        _write_json(_path(RETRO_GAPS), {"lacunas": _gaps_settle(gaps, ref_at, events)}, indent=2)
+
+
+def gaps_edit(gid, events, edit=None):
+    """The settled ledger and, with `edit(gap)`, the change to one gap written back. Raises ValueError for an id the ledger does not know."""
+    with _lock("retro.lock"):
+        gaps = _gaps_settle(_gaps_read(), now(), events)
+        if edit:
+            g = next((x for x in gaps if x["id"] == gid), None)
+            if not g:
+                raise ValueError(f"no gap {gid!r} in the ledger (known: {', '.join(x['id'] for x in gaps) or 'none'})")
+            edit(g)
+            _write_json(_path(RETRO_GAPS), {"lacunas": gaps}, indent=2)
+        return gaps
+
+
+def gaps_text(gaps):
+    """`orq retro gaps`: the number of open gaps and one line per gap, the ones ready to propose first."""
+    ls = [f"open gaps: {sum(g['estado'] in GAP_OPEN for g in gaps)}"]
+    for g in sorted(gaps, key=lambda g: (g["estado"] != "proposta", g["estado"] != "aberta", g["id"])):
+        extra = (f"  ticket {g['ticket']}" if g.get("ticket") else "") + (f"  rejected at {g['rejeicao']['sessoes']} session(s): {g['rejeicao']['motivo']}" if g.get("rejeicao") else "")
+        ls.append(f"{g['id']:<26}{g['estado']:<10}{len(g['sessoes']):>3} session(s)  {g['classe']:<11} {g['primeira_vez'][:10]} to {g['ultima_vez'][:10]}{extra}")
+    return "\n".join(ls)
+
+
+def gaps_cmd(a):
+    """`orq retro gaps | reject <id> --reason T | accept <id> --ticket N`."""
+    events = _retro_events()
+    if a.op == "reject":
+        if not a.ref or not (a.reason or "").strip():
+            raise ValueError("orq retro reject <id> --reason <text>")
+
+        def reject(g):
+            g["estado"], g["rejeicao"] = "rejeitada", {"motivo": a.reason.strip(), "sessoes": len(g["sessoes"]), "ts": now()}
+        n = next(g for g in gaps_edit(a.ref, events, reject) if g["id"] == a.ref)["rejeicao"]["sessoes"]
+        return f"gap {a.ref} rejected at {n} session(s): it only comes back with more than that"
+    if a.op == "accept":
+        number = str(a.ticket or "").strip().zfill(2)
+        if not a.ref or not a.ticket:
+            raise ValueError("orq retro accept <id> --ticket <number>")
+        if not any(t["num"] == number for t in tickets()):
+            raise ValueError(f"ticket {number} does not exist in {ISSUES}")
+        gaps_edit(a.ref, events, lambda g: (g.update(estado="aceita", ticket=number), g.pop("rejeicao", None)))
+        return f"gap {a.ref} accepted as ticket {number}: it becomes covered when the ticket closes"
+    gaps = gaps_edit(None, events)
+    return json.dumps({"abertas": sum(g["estado"] in GAP_OPEN for g in gaps), "lacunas": gaps}, ensure_ascii=False) if a.json else gaps_text(gaps)
+
+
 def retro_text(r, anterior=None, by_case=5):
     """The round as short text: the signals table (with the stored round beside it), the cases with a pointer and the table by model and effort."""
     ant = _dict(_dict(anterior).get("metricas"))
@@ -12089,11 +12211,15 @@ def retro_cmd(a):
     """`orq retro`: collects the window (default: the last 7 days), prints it and, with --gravar, saves the metrics for the next round to compare."""
     until_at = _dt(a.until_at).strftime("%Y-%m-%dT%H:%M:%SZ") if a.until_at else now()
     since = _dt(a.since).strftime("%Y-%m-%dT%H:%M:%SZ") if a.since else (_dt(until_at) - timedelta(days=RETRO_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    r = retro_collection(_retro_events(), since, until_at, None if a.without_transcripts else _turns_ro(), None if a.without_transcripts else PROJECTS,
+    if a.op in ("reject", "accept", "gaps"):
+        return gaps_cmd(a)
+    events = _retro_events()
+    r = retro_collection(events, since, until_at, None if a.without_transcripts else _turns_ro(), None if a.without_transcripts else PROJECTS,
                      None if a.without_gh else _retro_pr_checks, a.project)
     anterior = next((x for x in reversed(_retro_rounds()) if x["ate"] < until_at), None)
     if a.write_out:
         write_retro(r)
+        gaps_record(r, until_at, events)
     return json.dumps(r, ensure_ascii=False) if a.json else retro_text(r, anterior)
 
 
@@ -12282,6 +12408,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "dispatch-queue": {"lista": "list", "descartar": "discard"},
        "worktrees": {"limpar": "clean"},
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
+    "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept"},
 }
 # the `choices` values (pt -> en): the CLI accepts both and delivers the pt one, which is what the code records today
 STOP_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
@@ -12679,7 +12806,12 @@ def parser():
     _arg(rr, "desde", help="start of the window (date or ISO)")
     _arg(rr, "ate", help="end of the window (default: now)")
     _arg(rr, "projeto", help="only the cases whose path, title or task contains the snippet")
+    rr.add_argument("op", nargs="?", choices=["gaps", "lacunas", "reject", "rejeitar", "accept", "aceitar"], metavar="{gaps,reject,accept}",
+                    help="gaps: the ledger of gaps kept between rounds; reject <id> --reason T: the proposal only comes back with more sessions; accept <id> --ticket N: the gap is covered when the ticket closes")
+    rr.add_argument("ref", nargs="?", help="the gap id (reject, accept)")
+    rr.add_argument("--ticket", help="accept: the ticket that answers the gap")
     rr.add_argument("--json", action="store_true")
+    _arg(rr, "motivo", help="reject: why the proposal was turned down")
     _arg(rr, "sem-gh", action="store_true", help="does not ask gh for the CI and review of the PRs")
     _arg(rr, "sem-transcritos", action="store_true", help="does not read the workers' transcripts (violated rules)")
     _arg(rr, "gravar", action="store_true", help="keeps the metrics in ORQ_HOME/retro for the next round to compare")
