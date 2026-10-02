@@ -209,6 +209,7 @@ def ticket_de_item(i, por_id, raiz):
     return {"num": m.group(1).zfill(2), "arquivo": os.path.join(raiz, meta["spec"]) if meta.get("spec") else None, "titulo": i["titulo"], "status": ESTADO_TICKET[i["estado"]],
             "blocked_by": [b[1:].zfill(2) for b in i["bloqueios"] if re.fullmatch(r"t\d+", b) and por_id.get(b, {}).get("estado") not in (None, "done")],
             "run": run.strip() or None, "task": task or None, "modelo": meta.get("modelo"), "effort": meta.get("effort"), "issue": int(issue) if issue.isdigit() else None,
+            "despacho": None, "espera": None,  # os cabeçalhos `Despacho:` e `Espera:` (ticket 142) ainda não têm lugar no backlog: o ticket do backlog não os segura
             "fechado_em": i["closed"]}
 
 
