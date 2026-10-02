@@ -4890,7 +4890,7 @@ def _full_suite(cmd):
             toks = shlex.split(seg)
         except ValueError:
             continue
-        i = next((k for k, t in enumerate(toks) if t.endswith("test_orq.py")), None)
+        i = next((k for k, t in enumerate(toks) if t.endswith("test_orq.py") and (k == 0 or os.path.basename(toks[k - 1]).startswith("python"))), None)
         rest = toks[i + 1:] if i is not None else None
         if rest is not None and not [t for k, t in enumerate(rest) if not t.startswith("-") and not (k and rest[k - 1] in ("-j", "--jobs", "--map"))]:
             return True
@@ -9853,9 +9853,11 @@ def affected_tests(root, base, test_map):
 
     A changed def or class of a .py reaches the tests that ran it (the map: {tests: {test: ["file:function"]}}); a module-level name reaches it through the
     defs that use it; a test changed or new in test_orq.py always runs. A file the map does not know (a script run without coverage, a non-.py) reaches the
-    tests whose source mentions its name. Full suite: no map, a failed diff, a loose module-level line (import, `if`), or a .py the map does not know
-    that no test mentions. Limit: a module-level name used only through another module name (A = B + 1) is followed one level."""
+    tests whose source mentions its name; an untracked file counts as new. Full suite: no map, a failed diff, a loose module-level line (import, `if`),
+    a .py the map does not know that no test mentions, or a changed def that already existed and that no test in the map ran (untested, run only at
+    import like orqpaths, or newer than the map). Limit: a module-level name used only through another module name (A = B + 1) is followed one level."""
     diff = _git(root, "diff", "-U0", "--no-color", "--no-renames", base, "--")
+    untracked = (_git(root, "ls-files", "--others", "--exclude-standard") or "").split("\n")
     by_fn = {}
     for t, fns in _dict(_dict(test_map).get("tests")).items():
         for f in fns:
@@ -9878,8 +9880,9 @@ def affected_tests(root, base, test_map):
         return via_tests_file({st.name for _, st in hits if type(st).__name__ in TOP_DEF}, _touched(tests_src, [(f, st.end_lineno) for f, st in hits])[1])
 
     picked, reasons, precompact = set(), [], False
-    for path, (new, old) in sorted(_diff_ranges(diff).items()):
-        precompact |= path in ("precompact.py", "test_precompact.py")
+    changed = {**_diff_ranges(diff), **{u: ([(1, 10 ** 9)], []) for u in untracked if u}}  # an untracked file is new from its first line
+    for path, (new, old) in sorted(changed.items()):
+        precompact |= path in ("precompact.py", "test_precompact.py", "fail_safe.py")
         if not path.endswith(".py"):
             hits = mentioning(os.path.basename(path))
             picked |= hits
@@ -9900,9 +9903,12 @@ def affected_tests(root, base, test_map):
             hits |= mentioning(os.path.basename(path))
             if not hits and path not in ("precompact.py", "test_precompact.py"):
                 return {"tests": None, "reasons": reasons + [f"{path}: not in the test map and no test mentions it: full suite"], "precompact": precompact}
-        uncovered = sorted(d for d in defs if not by_fn.get(f"{path}:{d}") and d not in all_tests)
+        prev_defs = {st.name for _, st in _top(prev) if type(st).__name__ in TOP_DEF}
+        uncovered = [] if path in ("precompact.py", "test_precompact.py") else sorted(d for d in defs if d in prev_defs and not by_fn.get(f"{path}:{d}") and d not in all_tests)  # precompact has its own suite
+        if uncovered:  # no test ran it, or it runs only at import (orqpaths, fail_safe), or the map is older than it: only the full suite proves it
+            return {"tests": None, "reasons": reasons + [f"{path}: no test in the map ran {', '.join(uncovered)}: full suite"], "precompact": precompact}
         picked |= hits
-        reasons.append(f"{path}: {', '.join(sorted(defs | names)) or 'no code'} -> {len(hits)} tests" + (f" (no test ran {', '.join(uncovered)})" if uncovered else ""))
+        reasons.append(f"{path}: {', '.join(sorted(defs | names)) or 'no code'} -> {len(hits)} tests")
     return {"tests": picked & all_tests, "reasons": reasons, "precompact": precompact}
 
 
@@ -9930,7 +9936,7 @@ def run_tests(affected=False, base=None, jobs=None, names=(), test_map=None, dry
     if dry_run:
         print("\n".join(shlex.join(c[1:]) for c in runs))
         return 0
-    return max([subprocess.run(c, cwd=root).returncode for c in runs] or [0])
+    return next((rc for rc in (subprocess.run(c, cwd=root).returncode for c in runs) if rc), 0)  # a suite killed by a signal is negative: still a failure
 
 
 def orq_ticket(title, project=None):

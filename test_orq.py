@@ -7107,7 +7107,8 @@ def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
     for cmd in ("python3 test_orq.py", "cd wt && rtk python3 test_orq.py -j 4", "python3 /x/test_orq.py --map m.json && python3 test_precompact.py"):
         out = _external(a, cmd)
         assert out and "orq test --affected" in out["additionalContext"] and "permissionDecision" not in out, cmd
-    for cmd in ("python3 test_orq.py test_x", "python3 test_orq.py -j 2 ticket328", "orq test --affected", "python3 test_precompact.py", "git commit -m 'python3 test_orq.py'"):
+    for cmd in ("python3 test_orq.py test_x", "python3 test_orq.py -j 2 ticket328", "orq test --affected", "python3 test_precompact.py", "git commit -m 'python3 test_orq.py'",
+                "cat test_orq.py", "git diff test_orq.py", "wc -l test_orq.py"):
         assert _external(a, cmd) is None, cmd
     _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {}})
     assert _external(a, "python3 test_orq.py") is None, "the coordinator and the integrator's script are not warned"
@@ -18540,11 +18541,11 @@ def _cpu():
 
 def _run_child(name, fn, out, cover):
     """In the forked child: runs one test with its output in `out`.log and writes {ok, err, cpu, cover} to `out`.json. `cover`: also the repo functions it ran (ORQ_COVER for its subprocesses)."""
-    fd = os.open(out + ".log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    os.dup2(fd, 1)
-    os.dup2(fd, 2)
     res = {"ok": True, "err": ""}
     try:
+        fd = os.open(out + ".log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)  # inside the try: a child that raises here never returns into the scheduler
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
         _private_paths()
         if cover:
             os.environ["ORQ_COVER"] = out + ".cover"
@@ -18553,7 +18554,7 @@ def _run_child(name, fn, out, cover):
     except BaseException as e:  # noqa: BLE001 - the report shows all failures at once
         res = {"ok": False, "err": f"{type(e).__name__}: {str(e)[-400:]!r}"}
     try:
-        hits = set(orq_mod.COVER_HITS)
+        hits = set(orq_mod.COVER_HITS) if res["ok"] else set()
         if cover and os.path.exists(out + ".cover"):
             hits |= set(open(out + ".cover").read().split())
         res.update(cpu=_cpu(), cover=sorted(hits))
@@ -18645,9 +18646,11 @@ def _leaks(before):
 
 
 def _write_map(path, results, full):
-    """The test map of `orq test --affected`: {tests: {name: ["file:function", ...]}}. A full run replaces it; a partial one updates its tests."""
-    old = {} if full else _dict_file(path).get("tests", {})
-    data = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": {**old, **{n: r["cover"] for n, r in results.items()}}}
+    """The test map of `orq test --affected`: {tests: {name: ["file:function", ...]}}. A full green run replaces it; otherwise only the tests that passed
+    update their entry, so a test that failed or died early keeps the coverage it had instead of a short one."""
+    ok = {n: r["cover"] for n, r in results.items() if r["ok"]}
+    old = {} if full and len(ok) == len(results) else _dict_file(path).get("tests", {})
+    data = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": {**old, **ok}}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path + ".tmp", "w") as f:
         json.dump(data, f)
@@ -18715,8 +18718,10 @@ def test_ticket328_runner_records_the_functions_a_test_runs_in_process_and_in_su
     assert {"orqlib.py:origin_name", "test_orq.py:Env", "orqlib.py:main", "orqlib.py:state"} <= set(res["cover"]), res["cover"][:20]
     t = tempfile.mkdtemp()
     _write_map(os.path.join(t, "m.json"), {"t": res}, full=True)
-    _write_map(os.path.join(t, "m.json"), {"u": {"cover": ["x.py:f"]}}, full=False)
+    _write_map(os.path.join(t, "m.json"), {"u": {"ok": True, "cover": ["x.py:f"]}}, full=False)
     assert set(_dict_file(os.path.join(t, "m.json"))["tests"]) == {"t", "u"}, "a partial run updates its tests and keeps the rest"
+    _write_map(os.path.join(t, "m.json"), {"t": {"ok": False, "cover": []}, "u": {"ok": True, "cover": ["x.py:g"]}}, full=True)
+    assert _dict_file(os.path.join(t, "m.json"))["tests"] == {"t": res["cover"], "u": ["x.py:g"]}, "a red full run keeps the failed test's old coverage"
 
 
 def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead_one():
@@ -18802,6 +18807,14 @@ def test_ticket328_affected_falls_back_to_the_full_suite_when_it_cannot_tell():
     r = orq_mod.affected_tests(root, "main", MAP328)
     assert r["tests"] is None and "tool.py: not in the test map" in r["reasons"][-1], r
     subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    r = orq_mod.affected_tests(root, "main", {"tests": {"test_a": ["orqlib.py:a"]}})
+    assert r["tests"] is None and "no test in the map ran Env" in r["reasons"][-1], "a def the map has no test for (untested, import-time, newer than the map) runs everything"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    with open(os.path.join(root, "novo.md"), "w") as f:
+        f.write("x\n")
+    assert orq_mod.affected_tests(root, "main", MAP328)["reasons"] == ["novo.md: 0 tests mention it"], "an untracked file is part of the diff"
+    os.remove(os.path.join(root, "novo.md"))
     _edit328(root, "orqlib.py", '"""doc"""', '"""the doc"""')
     assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == set(), "the module docstring reaches nothing"
 
@@ -18862,6 +18875,9 @@ if __name__ == "__main__":
         w0, c0 = time.time(), _cpu()
         results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
         wall, cpu = time.time() - w0, _cpu() - c0
+    if opts.names and not tests:
+        print(f"FALHOU  no test matches {' '.join(opts.names)}")
+        failures.append("no test")
     if opts.map:
         _write_map(opts.map, results, full=not opts.names)
     failures += [n for n, r in results.items() if not r["ok"]]
@@ -18871,5 +18887,5 @@ if __name__ == "__main__":
     shutil.rmtree(SUITE_TMP, ignore_errors=True)
     slow = sorted(results.items(), key=lambda x: -x[1]["s"])[:15]
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
-    print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
+    print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
