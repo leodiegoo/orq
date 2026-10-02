@@ -16148,13 +16148,18 @@ def _cenario176():
     return repo, raiz
 
 
+def _k176(repo, **kw):
+    """Dois dias à frente (nada é recente), nenhum ticket resolvido nem dispatch vivo, bundle ao lado do repo."""
+    return {"agora": time.time() + 172800, "resolvidos": set(), "vivos": set(), "backups": os.path.join(os.path.dirname(repo), "backups"), **kw}
+
+
 def test_ticket176_limpa_so_a_worktree_cuja_branch_esta_na_origin_main():
     repo, raiz = _cenario176()
     os.remove(os.path.join(raiz, "3", "novo.txt"))  # a suja do cenário vira limpa: sai
     open(os.path.join(raiz, "2", "novo.txt"), "w").write("x")
-    r = orq_mod.limpar_worktrees_orq(repo, raiz, dry_run=True)
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, dry_run=True, **_k176(repo))
     assert sorted(os.path.basename(x["pasta"]) for x in r["removidas"]) == ["1", "3"] and os.path.isdir(os.path.join(raiz, "1")), r
-    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
     assert sorted(os.path.basename(x["pasta"]) for x in r["removidas"]) == ["1", "3"], r
     assert not os.path.exists(os.path.join(raiz, "1")) and os.path.isdir(os.path.join(raiz, "2"))
     branches = subprocess.run(["git", "-C", repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
@@ -16163,23 +16168,65 @@ def test_ticket176_limpa_so_a_worktree_cuja_branch_esta_na_origin_main():
 
 def test_ticket176_branch_com_commit_fora_da_main_fica_com_o_motivo():
     repo, raiz = _cenario176()
-    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
     fica = {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}
     assert "commit fora de origin/main" in fica["2"] and os.path.isdir(os.path.join(raiz, "2")), fica
 
 
 def test_ticket176_worktree_suja_fica_mesmo_com_a_branch_integrada():
     repo, raiz = _cenario176()
-    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
     assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["3"] == "mudança não commitada"
     assert os.path.exists(os.path.join(raiz, "3", "novo.txt"))
 
 
 def test_ticket176_worktree_do_integrador_fica():
     repo, raiz = _cenario176()
-    r = orq_mod.limpar_worktrees_orq(repo, raiz)
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
     assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["integracao"] == "worktree do integrador"
     assert os.path.isdir(os.path.join(raiz, "integracao"))
+
+
+def _reescrita176(**kw):
+    """cenário + worktree 4 (feat/reescrita) com um commit de assunto "a" que a origin/main tem com outro hash."""
+    repo, raiz = _cenario176()
+    _g176(repo, "worktree", "add", "-q", "-b", "feat/reescrita", os.path.join(raiz, "4"), "main~2")
+    _g176(os.path.join(raiz, "4"), "commit", "-q", "--allow-empty", "--date=2000-01-01T00:00:00", "-m", "a")  # outra data: hash diferente, mesmo assunto
+    return repo, raiz, _k176(repo, resolvidos={"04"}, **kw)
+
+
+def _fica176(r, nome):
+    return {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}.get(nome)
+
+
+def test_ticket176_hash_reescrito_com_ticket_resolvido_sai_com_bundle_antes():
+    repo, raiz, k = _reescrita176()
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
+    assert "4" in [os.path.basename(x["pasta"]) for x in r["removidas"]] and not os.path.exists(os.path.join(raiz, "4")), r
+    assert r["bundle"] and os.path.basename(r["bundle"]).startswith("orq-wt-") and r["bundle"].endswith(".bundle")
+    heads = subprocess.run(["git", "bundle", "list-heads", r["bundle"]], capture_output=True, text=True, cwd=repo).stdout
+    assert "refs/heads/feat/reescrita" in heads, heads
+    assert "feat/reescrita" not in subprocess.run(["git", "-C", repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+
+
+def test_ticket176_hash_reescrito_com_ticket_aberto_ou_assunto_sem_par_fica():
+    repo, raiz, k = _reescrita176()
+    k["resolvidos"] = set()
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
+    assert "não está resolvido" in _fica176(r, "4") and os.path.isdir(os.path.join(raiz, "4")) and r["bundle"] is None
+    repo, raiz, k = _reescrita176()
+    k["resolvidos"] = {"04", "02"}  # a 2 (feat/fora) tem o assunto "b", que a origin/main não tem
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
+    assert "sem assunto igual" in _fica176(r, "2") and os.path.isdir(os.path.join(raiz, "2"))
+
+
+def test_ticket176_dispatch_vivo_e_worktree_recente_ficam_mesmo_integradas():
+    repo, raiz, k = _reescrita176(vivos={"01", "04"})
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
+    assert _fica176(r, "1") == _fica176(r, "4") == "dispatch vivo do ticket" and os.path.isdir(os.path.join(raiz, "1"))
+    repo, raiz, k = _reescrita176(agora=time.time())
+    r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
+    assert _fica176(r, "1") == "criada há menos de 24 h" and os.path.isdir(os.path.join(raiz, "1"))
 
 
 if __name__ == "__main__":

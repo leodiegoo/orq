@@ -552,38 +552,80 @@ def _cwds_abertos():
     return [l[1:] for l in r.stdout.splitlines() if l.startswith("n")]
 
 
-def limpar_worktrees_orq(repo=None, raiz=None, ref="origin/main", dry_run=False):
-    """Remove as worktrees `<raiz>/<ticket>` do orq cuja branch já está contida em `ref` (ticket 176): o integrador faz fast-forward na main e o push é manual,
-    então ninguém mais as removia. Fica a worktree do integrador (`integra/*`, a pasta `integracao`), a de branch solta, a com mudança não commitada
-    (inclusive arquivo novo), a com processo dentro e a de branch fora de `ref`. Só `git worktree remove` e `git branch -d`, nunca `--force`/`-D`/`rm -rf`.
-    Devolve {removidas: [{pasta, branch}], ficaram: [{pasta, motivo}]}; com `dry_run` nada é removido (`removidas` é o que sairia)."""
+def _nascimento(pasta):
+    """Quando a worktree nasceu (o `.git` dela; birthtime onde o sistema tem, senão mtime)."""
+    st = os.stat(os.path.join(pasta, ".git"))
+    return getattr(st, "st_birthtime", st.st_mtime)
+
+
+def limpar_worktrees_orq(repo=None, raiz=None, ref="origin/main", dry_run=False, agora=None, resolvidos=None, vivos=None, backups=None):
+    """Remove as worktrees `<raiz>/<ticket>` do orq já publicadas em `ref` (tickets 176 e a decisão que o seguiu). O integrador faz fast-forward na main e o push é
+    manual, então ninguém mais as removia. Fica, com o motivo: a worktree do integrador (`integra/*`, `integracao`), a de branch solta, a de ticket com dispatch
+    vivo (não liberado: rodando, entregue ou devolvido), a criada há menos de 24 h, a com mudança não commitada (arquivo novo incluso) e a com processo dentro.
+    Branch contida em `ref` (`merge-base --is-ancestor`): `git worktree remove` + `git branch -d`. Branch de hash reescrito: só se o ticket está resolvido E todo commit
+    dela tem um de mesmo assunto em `ref`; antes, as refs vão para um bundle datado em `backups` (verificado), e então `worktree remove` + `branch -D`.
+    Nunca `--force` nem `rm -rf`. `resolvidos` e `vivos` são conjuntos de número de ticket (padrão: os tickets em Status resolved; os dispatches não liberados).
+    Devolve {removidas: [{pasta, branch, via}], ficaram: [{pasta, motivo}], bundle}; com `dry_run` nada é removido nem gravado."""
     repo = repo or HOME
     raiz = raiz or os.environ.get("ORQ_WT_ROOT", os.path.expanduser("~/.claude/orq-wt"))
-    out, cwds = {"removidas": [], "ficaram": []}, None
+    backups = backups or os.path.expanduser("~/.claude/orquestrador-plan/backups")
+    agora = agora if agora is not None else time.time()
+    if resolvidos is None:
+        resolvidos = {t["num"] for t in tickets() if t["status"] == STATUS_FECHADO}
+    if vivos is None:
+        ev = read_events()
+        lib = _liberados(ev)
+        vivos = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}
+    assuntos = set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
+    out, cwds, reescritas = {"removidas": [], "ficaram": [], "bundle": None}, None, []
     for nome in sorted(os.listdir(raiz)) if os.path.isdir(raiz) else []:
         d = os.path.join(raiz, nome)
         if not os.path.exists(os.path.join(d, ".git")):
             continue
+        num = (nome[1:] if nome.startswith("t") else nome).zfill(2)
         branch = (_git(d, "branch", "--show-current") or "").strip()
         motivo = ("branch solta (HEAD destacado)" if not branch else "worktree do integrador" if nome == "integracao" or branch.startswith("integra/")
-                  else "branch principal" if branch == "main" else None)
-        if not motivo and _git(repo, "merge-base", "--is-ancestor", branch, ref) is None:
-            motivo = f"{branch} tem commit fora de {ref}"
+                  else "branch principal" if branch == "main" else "dispatch vivo do ticket" if num in vivos
+                  else "criada há menos de 24 h" if agora - _nascimento(d) < 86400 else None)
+        contida = not motivo and _git(repo, "merge-base", "--is-ancestor", branch, ref) is not None
+        if not motivo and not contida:
+            subs = (_git(repo, "log", "--format=%s", f"{ref}..{branch}") or "?").splitlines()
+            if num not in resolvidos:
+                motivo = f"{branch} tem commit fora de {ref} e o ticket não está resolvido"
+            elif not all(x in assuntos for x in subs):
+                motivo = f"{branch} tem commit sem assunto igual em {ref}"
         if not motivo and ((st := _git(d, "status", "--porcelain")) is None or st.strip()):
             motivo = "mudança não commitada"
         if not motivo:
             cwds = _cwds_abertos() if cwds is None else cwds
             real = os.path.realpath(d)
             motivo = "processo dentro da pasta" if any(c == real or c.startswith(real + os.sep) for c in cwds) else None
-        if not motivo and not dry_run:
-            if _git(repo, "worktree", "remove", d) is None:
-                motivo = "git worktree remove recusou"
-            elif _git(repo, "branch", "-d", branch) is None:
-                motivo = f"pasta removida, mas git branch -d recusou {branch}"
         if motivo:
             out["ficaram"].append({"pasta": d, "motivo": motivo})
         else:
-            out["removidas"].append({"pasta": d, "branch": branch})
+            out["removidas"].append({"pasta": d, "branch": branch, "via": "contida" if contida else "assunto"})
+    if dry_run:
+        return out
+    reescritas = [x for x in out["removidas"] if x["via"] == "assunto"]
+    if reescritas:
+        os.makedirs(backups, exist_ok=True)
+        bundle = os.path.join(backups, f"orq-wt-{time.strftime('%Y-%m-%d', time.localtime(agora))}.bundle")
+        if os.path.exists(bundle):
+            bundle = bundle[:-7] + time.strftime("-%H%M%S", time.localtime(agora)) + ".bundle"
+        ok = subprocess.run(["git", "-C", repo, "bundle", "create", bundle, *[x["branch"] for x in reescritas]], capture_output=True).returncode == 0 \
+            and subprocess.run(["git", "-C", repo, "bundle", "verify", bundle], capture_output=True).returncode == 0
+        out["bundle"] = bundle if ok else None
+    for x in list(out["removidas"]):
+        if x["via"] == "assunto" and not out["bundle"]:
+            motivo = "bundle de backup falhou: nada removido"
+        elif _git(repo, "worktree", "remove", x["pasta"]) is None:
+            motivo = "git worktree remove recusou"
+        elif _git(repo, "branch", "-D" if x["via"] == "assunto" else "-d", x["branch"]) is None:
+            motivo = f"pasta removida, mas git branch recusou {x['branch']}"
+        else:
+            continue
+        out["removidas"].remove(x)
+        out["ficaram"].append({"pasta": x["pasta"], "motivo": motivo})
     return out
 
 
@@ -11717,7 +11759,7 @@ def main(argv=None):
             print(json.dumps(itens, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (desde {_hora_local(i['ts'])})" for i in itens) or "fila do integrador vazia")
         elif a.cmd == "worktrees":
             r = limpar_worktrees_orq(dry_run=a.dry_run)
-            print(f"{'sairiam' if a.dry_run else 'removidas'}: {len(r['removidas'])}; ficaram: {len(r['ficaram'])}")
+            print(f"{'sairiam' if a.dry_run else 'removidas'}: {len(r['removidas'])}; ficaram: {len(r['ficaram'])}" + (f"; bundle {r['bundle']}" if r["bundle"] else ""))
             print("\n".join([f"  sai {x['pasta']} ({x['branch']})" for x in r["removidas"]] + [f"  fica {x['pasta']}: {x['motivo']}" for x in r["ficaram"]]))
         elif a.cmd == "auditar-publicacao":
             motivos = auditar_publicacao(a.revs)
