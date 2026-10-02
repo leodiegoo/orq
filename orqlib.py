@@ -10633,6 +10633,26 @@ def dispatch_queue_rm(id_, op="removido", **extra):
     return found_item
 
 
+def dispatch_queue_priority(id_, value):
+    """`orq dispatch-queue priority <id> <1-3>`: changes the priority of a queue item, keeping its `ts` (the order is priority, then oldest). The coordinator or the mate that
+    owns the item; the event carries the author. The P1 rules (ahead of the queue and the worker ceiling, not the memory floor or the expensive ceiling) are the ones of `machine_bar_item`."""
+    if value not in (1, 2, 3):
+        raise ValueError("the priority is 1 (high), 2 or 3 (low)")
+    author = os.environ.get("ORQ_MATE") or "coordinator"
+
+    def muda(item_list):
+        it = next((i for i in item_list if i.get("id") == id_), None)
+        if not it:
+            raise ValueError(f"{id_} is not in the dispatch queue (ids: {', '.join(i.get('id') for i in item_list) or 'none'})")
+        if author != "coordinator" and it.get("mate") != author:
+            raise ValueError(f"{id_} belongs to {it.get('mate') or 'the coordinator'}: only it (or the coordinator) changes its priority")
+        before, it["prioridade"] = it.get("prioridade") or 2, value
+        return it, before
+    it, before = _dispatch_queue_mut(muda)
+    order = [i["id"] for i in dispatch_queue_items()]
+    return append_event({"tipo": "dispatch_queue_priority", "id": id_, "valor": value, "de": before, "autor": author, "posicao": order.index(id_) + 1})
+
+
 def _enqueue_dispatch(reason, run, title, spec, model, effort, worktree, name, base_branch, entry, tk, priority, agent, project=None, service=False):
     """The dispatch that did not fit: stores the request (the spec in a copy under ORQ_HOME) and returns the `orq dispatch_worker` response in place of the worker ids."""
     import uuid
@@ -12796,7 +12816,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
     "manager": {"ligar": "bind", "desligar": "unbind", "checar": "check", "subir": "spawn", "absorver": "absorb", "intervalo": "interval"},
     "doctor": {"antigos": "old"},
-    "dispatch-queue": {"lista": "list", "descartar": "discard"},
+    "dispatch-queue": {"lista": "list", "descartar": "discard", "prioridade": "priority"},
        "worktrees": {"limpar": "clean"},
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
     "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept"},
@@ -13165,9 +13185,12 @@ def parser():
     mq.add_argument("key_name", nargs="?")
     mq.add_argument("value", nargs="?", help="as JSON: 4, true, [\"claude-opus-*\"]")
     mq.add_argument("--json", action="store_true")
-    fd = sub.add_parser("dispatch-queue", aliases=["fila-despacho"], help="the dispatches and resumes waiting for a slot on the machine: list | rm <id>").add_subparsers(dest="op", required=True)
+    fd = sub.add_parser("dispatch-queue", aliases=["fila-despacho"], help="the dispatches and resumes waiting for a slot on the machine: list | rm <id> | priority <id> <1|2|3>").add_subparsers(dest="op", required=True)
     fd.add_parser("list", aliases=["lista"], help="the dispatches in the queue").add_argument("--json", action="store_true")
     fd.add_parser("rm").add_argument("id")
+    fp = fd.add_parser("priority", aliases=["prioridade"], help="changes the priority (1 high to 3 low) of a queue item (fdXXXXXX), keeping its place by entry date")
+    fp.add_argument("id")
+    fp.add_argument("value", type=int, choices=[1, 2, 3])
     dc = fd.add_parser("discard", aliases=["descartar"], help="marks the `desistiu` give-up as resolved: takes the item off the away Stop")
     dc.add_argument("id")
     _arg(dc, "motivo", required=True)
@@ -13563,7 +13586,7 @@ def main(argv=None):
             r = pause_workers(a.tasks, a.up_to_priority, a.run, a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else pause_text(r))
         elif a.cmd == "priority":
-            print(json.dumps(set_priority(a.task, a.value), ensure_ascii=False))
+            print(json.dumps(dispatch_queue_priority(a.task, a.value) if re.fullmatch(r"fd[0-9a-f]{6}", a.task) else set_priority(a.task, a.value), ensure_ascii=False))
         elif a.cmd == "groups" and (a.title or a.cwd or a.group_name):
             item_name, reason = group_of(groups(), a.title, a.cwd, a.group_name)
             t = item_name and _dict(_mates().get(item_name)).get("terminal")
@@ -13602,6 +13625,8 @@ def main(argv=None):
             if not dispatch_queue_rm(a.id):
                 raise ValueError(f"{a.id} is not in the dispatch queue")
             print(f"{a.id} left the dispatch queue")
+        elif a.cmd == "dispatch-queue" and a.op == "priority":
+            print(json.dumps(dispatch_queue_priority(a.id, a.value), ensure_ascii=False))
         elif a.cmd == "dispatch-queue" and a.op == "discard":
             if not any(e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu" and e.get("id") == a.id for e in read_events()):
                 raise ValueError(f"{a.id} has no recorded give-up")
@@ -13610,7 +13635,8 @@ def main(argv=None):
         elif a.cmd == "dispatch-queue":
             item_list = dispatch_queue_items()
             print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(
-                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}) since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
+                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')})"
+                f"{''.join(f' {k} {i[k]}' for k in ('task', 'ticket', 'mate') if i.get(k))} since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
         elif a.cmd == "usage":
             u = plan_usage(agent=a.agent)
             level, reason, _ = usage_level(u)

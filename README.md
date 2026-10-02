@@ -156,7 +156,7 @@ orq machine set max_workers 3
 orq machine set expensive_models '["claude-opus-*"]'   # values are JSON
 ```
 
-What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|discard <id> --reason "..."` manages it.
+What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|priority <id> <1|2|3>|discard <id> --reason "..."` manages it. `list` shows the task, ticket and owning mate when there are any; `priority` (also `orq priority fdXXXXXX <1|2|3>`) moves the item without losing its entry date, for the coordinator and the mate that owns it.
 
 ### 2. `projects/<name>.json`: one file per project
 
