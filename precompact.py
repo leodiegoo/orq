@@ -40,35 +40,35 @@ def rodar(cmd, timeout=5, cwd=None):
     """Saída de um comando, ou '' se falhou: uma seção que falha não derruba as outras. O que passa do teto de TETO_S do hook fica sem rodar (B33)."""
     resta = TETO_S - (time.monotonic() - T0)
     if resta <= 0.5:
-        orq.log(f"precompact: {cmd[0]} pulado, orçamento de {TETO_S} s esgotado")
+        orq.log(f"precompact: {cmd[0]} skipped, {TETO_S} s budget exhausted")
         return ""
     timeout = min(timeout, resta)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         return p.stdout.strip() if p.returncode == 0 else ""
     except Exception as e:
-        orq.log(f"precompact: {cmd[0]} falhou: {e}")
+        orq.log(f"precompact: {cmd[0]} failed: {e}")
         return ""
 
 
 def secao_agentes():
-    txt = rodar(CLI + ["agentes", "--json"])
+    txt = rodar(CLI + ["agents", "--json"])
     try:
         ags = json.loads(txt)
     except ValueError:
-        return "(orq agentes indisponível)"
+        return "(orq agents unavailable)"
     vivos = [a for a in ags if a.get("estado") not in ("liberado", "entregue")]
     entregues = [a for a in ags if a.get("estado") == "entregue" and not a.get("retido")]
-    linhas = [f"- {a.get('estado')} {a.get('task')} {a.get('titulo')} ({a.get('modelo')}, {a.get('terminal')}, fase: {a.get('fase') or '-'})"
-              for a in vivos[:MAX_VIVOS]] or ["Nenhum agente rodando, travado ou perguntando."]
+    linhas = [f"- {a.get('estado')} {a.get('task')} {a.get('titulo')} ({a.get('modelo')}, {a.get('terminal')}, phase: {a.get('fase') or '-'})"
+              for a in vivos[:MAX_VIVOS]] or ["No agent running, stuck or asking."]
     if len(vivos) > MAX_VIVOS:
-        linhas.append(f"+{len(vivos) - MAX_VIVOS} (orq agentes)")
+        linhas.append(f"+{len(vivos) - MAX_VIVOS} (orq agents)")
     if vivos:
         runs = sorted({a["run"] for a in vivos if a.get("run")})
         linhas.append(f"Waiter: `python3 {WAITER} {' '.join(runs)}`")
-    linhas += [f"- entregue {a.get('task')} {a.get('titulo')}: orq liberar {a.get('dispatch')}" for a in entregues[:MAX_ENTREGUES]]  # B32
+    linhas += [f"- delivered {a.get('task')} {a.get('titulo')}: orq release {a.get('dispatch')}" for a in entregues[:MAX_ENTREGUES]]  # B32
     if len(entregues) > MAX_ENTREGUES:
-        linhas.append(f"+{len(entregues) - MAX_ENTREGUES} entregues (orq agentes)")
+        linhas.append(f"+{len(entregues) - MAX_ENTREGUES} delivered (orq agents)")
     return "\n".join(linhas)
 
 
@@ -76,10 +76,10 @@ def secao_pendencias():
     try:
         itens = orq._pend_ro()["itens"]  # o pendencias.json, ou o backlog com ORQ_BACKLOG
     except Exception:
-        return "(pendencias.json ilegível)"
+        return "(pendencias.json unreadable)"
     if not itens:
-        return "Nenhuma."
-    linhas = [f"- {i.get('id')} [{i.get('tipo')}] {i.get('titulo')} (desde {i.get('desde') or '?'}, espera: {i.get('espera') or '-'})" for i in itens[:MAX_PEND]]
+        return "None."
+    linhas = [f"- {i.get('id')} [{i.get('tipo')}] {i.get('titulo')} (since {i.get('desde') or '?'}, waiting: {i.get('espera') or '-'})" for i in itens[:MAX_PEND]]
     return "\n".join(linhas + ([f"+{len(itens) - MAX_PEND} (orq pend)"] if len(itens) > MAX_PEND else []))
 
 
@@ -91,40 +91,40 @@ def cortar(txt, n=MAX_LISTA):
 
 def secao_prs(cwd):
     if not rodar(["git", "rev-parse", "--git-dir"], cwd=cwd):
-        return "(cwd fora de repo git)"
+        return "(cwd outside a git repo)"
     txt = rodar([GH, "pr", "list", "--author", "@me", "--state", "open", "--json", "number,title,url"], timeout=8, cwd=cwd)
     try:
         prs = json.loads(txt)
     except ValueError:
-        return "(gh indisponível)"
-    return cortar("\n".join(f"- #{p['number']} {p['title']} {p['url']}" for p in prs)) or "Nenhum."
+        return "(gh unavailable)"
+    return cortar("\n".join(f"- #{p['number']} {p['title']} {p['url']}" for p in prs)) or "None."
 
 
 def secao_entradas():
     try:
         ev = orq.read_events()
     except Exception:
-        return "(events.jsonl ilegível)"
+        return "(events.jsonl unreadable)"
     efeito = {e.get("entrada"): e for e in ev if e.get("tipo") == "intake"}
     us = [e for e in ev if e.get("tipo") == "entrada" and e.get("origem") == "usuario"][-10:]
     out = []
     for e in us:
         i = efeito.get(e.get("id")) or {}
-        out.append(f"- {e.get('id')} {e.get('ts')}: {(e.get('texto') or '')[:120]!r} -> {i.get('efeito') or 'sem efeito'}" + (f" {i['ref']}" if i.get("ref") else ""))
-    return "\n".join(out) or "Nenhuma."
+        out.append(f"- {e.get('id')} {e.get('ts')}: {(e.get('texto') or '')[:120]!r} -> {i.get('efeito') or 'no effect'}" + (f" {i['ref']}" if i.get("ref") else ""))
+    return "\n".join(out) or "None."
 
 
 def montar(run, cwd):
     """O snapshot em markdown; cada seção é independente."""
     # o que mais importa vem primeiro: a retomada corta o fim (M12). Sem "orq status": o `orq hook session` injeta um mais novo no compact (B29)
     secoes = [
-        ("Run ligado", run["id"]),
-        ("Últimas 10 entradas do usuário", secao_entradas()),
-        ("Mapa", DESENHO),
-        ("Agentes", secao_agentes()),
-        ("Pendências do usuário", secao_pendencias()),
-        ("Tickets abertos", cortar(rodar(CLI + ["ticket", "lista"])) or "Nenhum (ou orq indisponível)."),
-        ("PRs abertos do usuário", secao_prs(cwd)),
+        ("Bound Run", run["id"]),
+        ("Last 10 user entries", secao_entradas()),
+        ("Map", DESENHO),
+        ("Agents", secao_agentes()),
+        ("User pending items", secao_pendencias()),
+        ("Open tickets", cortar(rodar(CLI + ["ticket", "list"])) or "None (or orq unavailable)."),
+        ("User's open PRs", secao_prs(cwd)),
     ]
     return "\n\n".join(f"## {t}\n{c}" for t, c in secoes)
 
@@ -157,7 +157,7 @@ def precompact(ev):
     agora = datetime.now()
     md = montar(run, cwd)
     if time.monotonic() - T0 > TETO_S:
-        orq.log("precompact: passou do teto; snapshot gravado mesmo assim")
+        orq.log("precompact: over the limit; snapshot written anyway")
     gravar(md, agora)
     engram(md, agora, cwd)
 
@@ -170,9 +170,9 @@ def retomar(ev):
         todas, idade = open(arq).read().splitlines(), time.time() - os.path.getmtime(arq)
     except OSError:
         return
-    linhas = todas[:LINHAS_RETOMADA] + ([f"(… {len(todas) - LINHAS_RETOMADA} linhas cortadas; leia handoff/ultimo.md)"] if len(todas) > LINHAS_RETOMADA else [])
-    titulo = ("Handoff salvo antes do compact (handoff/ultimo.md):" if idade < VELHO_S else
-              f"Handoff VELHO de {datetime.fromtimestamp(os.path.getmtime(arq)):%Y-%m-%d %H:%M}: o PreCompact não gravou um novo (handoff/ultimo.md):")  # B33
+    linhas = todas[:LINHAS_RETOMADA] + ([f"(… {len(todas) - LINHAS_RETOMADA} lines cut; read handoff/ultimo.md)"] if len(todas) > LINHAS_RETOMADA else [])
+    titulo = ("Handoff saved before the compact (handoff/ultimo.md):" if idade < VELHO_S else
+              f"STALE handoff from {datetime.fromtimestamp(os.path.getmtime(arq)):%Y-%m-%d %H:%M}: PreCompact did not write a new one (handoff/ultimo.md):")  # B33
     ctx = titulo + "\n" + "\n".join(linhas)
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
@@ -182,7 +182,7 @@ def passagem(de, para):
     do outro lado confere: ele só injeta se o `ts` tem menos de 15 min e o `de` não é o harness dele. Sem Engram: o servidor é o mesmo nos dois harnesses."""
     run = orq.orca("run-current")["run"]
     if not run:
-        print("orq: sem Run ligado a este terminal: não há estado de coordenador para passar (`orca orchestration run-use --id <run>`)", file=sys.stderr)
+        print("orq: no Run bound to this terminal: there is no coordinator state to hand off (`orca orchestration run-use --id <run>`)", file=sys.stderr)
         return 1
     agora = datetime.now()
     nome = gravar(montar(run, os.getcwd()), agora)
@@ -203,7 +203,7 @@ def main(argv):
         try:
             return passagem(a.de, a.para)
         except Exception as e:  # noqa: BLE001 - comando, não hook: a causa vai para o stderr em vez de sumir no log
-            print(f"orq: passagem do coordenador falhou: {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"orq: coordinator handoff failed: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
     try:
         raw = sys.stdin.read()

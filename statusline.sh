@@ -10,7 +10,7 @@ desde=
 if [ -z "$desde" ]; then
   exec sh "$HUD" "$@"
 fi
-seg=$(printf ' \033[33maway desde %s\033[0m' "$desde")
+seg=$(printf ' \033[33maway since %s\033[0m' "$desde")
 out=$(sh "$HUD" "$@")
 nl='
 '

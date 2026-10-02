@@ -48,5 +48,5 @@ subprocess.Popen(["sh", "-c", f'sleep 20; exec python3 "{home}/.claude/scripts/l
                  cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "UserPromptSubmit",
-    "additionalContext": "Limpeza de branches mergeadas começou em segundo plano (em ~20 s); resumo em ~/.claude/logs/limpar-mergeados.last.json.",
+    "additionalContext": "Cleanup of merged branches started in the background (in ~20 s); summary in ~/.claude/logs/limpar-mergeados.last.json.",
 }}))

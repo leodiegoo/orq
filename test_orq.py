@@ -544,7 +544,7 @@ def test_so_usuario_vira_entrada_e_injeta():
     assert a.events() == []
     r = a.prompt("cria a task do ticket 03")
     out = json.loads(r.stdout)["hookSpecificOutput"]
-    assert out["hookEventName"] == "UserPromptSubmit" and "entrada e1 (usuário)" in out["additionalContext"]
+    assert out["hookEventName"] == "UserPromptSubmit" and "entry e1 (user)" in out["additionalContext"]
     (e,) = a.events()
     assert e["tipo"] == "entrada" and e["origem"] == "usuario" and e["sessao"] == "abcdef12" and e["id"] == "e1"
 
@@ -566,7 +566,7 @@ def test_binding_perdido_avisa_em_vez_de_calar():
     a.set("run.json", None)  # hibernação ou resume: o Run sumiu
     r = a.prompt("segunda")
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "binding perdido: rode run-use --id run_a" in ctx
+    assert "binding lost: run run-use --id run_a" in ctx
     assert [e["tipo"] for e in a.events()] == ["entrada", "binding_perdido"] and a.events()[-1]["run"] == "run_a"
     assert Amb(run=None).prompt("worker").stdout == "", "sessão que nunca teve Run segue worker"
 
@@ -600,7 +600,7 @@ def test_intake_recusa_ref_inexistente():
     r = a.orq("intake", "e1", "steer", "task_inexistente")
     assert r.returncode == 1
     r = a.orq("intake", "e1", "tarefa")
-    assert r.returncode == 1 and "pede o id" in r.stderr
+    assert r.returncode == 1 and "needs the" in r.stderr
     r = a.orq("intake", "e1", "pend", "nao-existe")
     assert r.returncode == 1 and "pendencias.json" in r.stderr
     r = a.orq("intake", "e1", "decisao", "nao-existe")
@@ -648,7 +648,7 @@ def test_contagem_de_entradas_sem_efeito():
         r = a.orq("hook", "stop", stdin=json.dumps({"stop_hook_active": ativo, "session_id": "s"}))
         out = json.loads(r.stdout)
         assert r.returncode == 0 and "decision" not in out and "continue" not in out
-        assert "2 entrada(s) sem efeito: e1 ('um'), e3 ('três')" in out["systemMessage"]
+        assert "2 entry(ies) without effect: e1 ('um'), e3 ('três')" in out["systemMessage"]
     avisos = [e for e in a.events() if e["tipo"] == "gate_aviso"]
     assert len(avisos) == 2 and avisos[0]["abertas"] == ["e1", "e3"]
     for e in ("e1", "e3"):
@@ -672,7 +672,7 @@ def test_stop_barra_entrada_sem_intake_e_libera_com_intake():
     a.prompt("faça isso")
     out = _stop_gate(a, sessao="abcdef123456")
     assert out["decision"] == "block" and "e1 ('faça isso')" in out["reason"]
-    assert "tarefa|steer|pend|decisao|conversa|descartado" in out["reason"]
+    assert "task|steer|pend|decision|conversation|discarded" in out["reason"]
     a.orq("intake", "e1", "conversa")
     assert _stop_gate(a, sessao="abcdef123456") == {}
 
@@ -718,7 +718,7 @@ def test_sem_efeito_do_hook_so_traz_24h_e_o_status_traz_as_velhas():
     ctx = json.loads(a.prompt("terceira").stdout)["hookSpecificOutput"]["additionalContext"]
     assert "e1" not in ctx and "e2 ('nova')" in ctx
     st = a.orq("status").stdout
-    assert "Há mais de 24 h: e1 ('velha')" in st
+    assert "Over 24 h old: e1 ('velha')" in st
 
 
 def test_stop_com_orcamento_barra_no_maximo_2_vezes_o_mesmo_conjunto():
@@ -764,9 +764,9 @@ def test_resumo_no_maximo_5_linhas():
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     linhas = ctx.splitlines()
     assert 1 <= len(linhas) <= 5, ctx
-    assert "entrada e13 (usuário)" in linhas[0] and "+9" in linhas[0]
-    assert "backlog 1 (task_4bda… 'Ticket 01 com quebra de linha'," in linhas[1] and "rodando 1, bloqueado 1, gates 0" in linhas[1]
-    assert "Com você: 2 (1 decisões)" in linhas[2]
+    assert "entry e13 (user)" in linhas[0] and "+9" in linhas[0]
+    assert "backlog 1 (task_4bda… 'Ticket 01 com quebra de linha'," in linhas[1] and "running 1, blocked 1, gates 0" in linhas[1]
+    assert "With you: 2 (1 decisions)" in linhas[2]
     assert len(a.orq("status").stdout.strip().splitlines()) <= 5
     # sem cache, sem pendências, sem entradas: ainda cabe
     assert len(orq_mod.resumo([], None, None).splitlines()) <= 5
@@ -800,7 +800,7 @@ def test_hook_prompt_dispara_refresh_em_segundo_plano():
     a.set("runs.json", [{"id": "run_a"}])
     a.set("tasks_run_a.json", [{"id": "t1", "status": "ready", "spec": "x", "created_at": "2026-09-27T00:00:00Z"}])
     r = a.prompt("oi")
-    assert "cache ainda não existe" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "cache does not exist yet" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     for _ in range(50):
         if _existe_estado(os.path.join(a.home, "aberto.json")):
             break
@@ -842,8 +842,8 @@ def test_limpeza_nao_dispara_com_notificacao_nem_pergunta():
     assert _limpar("o 1163 já foi merged?  \n") == ""
     assert _limpar("bom dia") == ""
     # controle positivo: sem ele os "" acima não provariam nada
-    assert "Limpeza de branches mergeadas" in _limpar("1163 merged")
-    assert "Limpeza de branches mergeadas" in _limpar("pode seguir, está merged.")
+    assert "Cleanup of merged branches" in _limpar("1163 merged")
+    assert "Cleanup of merged branches" in _limpar("pode seguir, está merged.")
 
 
 def test_monta_aberto_de_todos_os_runs_com_deps_e_cancelada():
@@ -920,7 +920,7 @@ def test_pend_recusas():
     assert a.orq("pend", "add", "--id", "doze-chars-1", "--tipo", "decisao", "--titulo", "X").returncode == 0, "12 cabe"
     assert a.orq("pend", "add", "--id", "id-longo-mas-acao-ok", "--tipo", "acao", "--titulo", "X").returncode == 0, "limite só vale para decisão"
     r = a.orq("pend", "add", "--id", "freio-prod", "--tipo", "acao", "--titulo", "duplicado")
-    assert r.returncode == 1 and "já existe" in r.stderr
+    assert r.returncode == 1 and "already exists" in r.stderr
     assert a.orq("pend", "add", "--id", "x", "--tipo", "inventado", "--titulo", "X").returncode == 2
     assert a.orq("pend", "add", "--id", " ", "--tipo", "acao", "--titulo", "X").returncode == 1
     r = a.orq("pend", "done", "nao-existe")
@@ -962,7 +962,7 @@ def test_ask_texto_livre_guarda_o_texto_e_nao_fecha_a_decisao_answers_em_tool_in
     (res,) = [e for e in a.events() if e["tipo"] == "resposta"]
     assert res["resposta"] == texto and res["livre"] is True and "fechou" not in res
     assert not [e for e in a.events() if e["tipo"] == "pend"]
-    assert 'resposta livre em freio-prod: se decidiu, feche com orq pend done freio-prod --resposta "<o que foi decidido>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert 'free-text answer in freio-prod: if decided, close it with orq pend done freio-prod --answer "<what was decided>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_ask_header_desconhecido_so_registra_e_sem_answers_loga():
@@ -1006,13 +1006,13 @@ def test_resposta_suspeita_colada_a_notificacao_do_orca_nao_fecha():
     a.prompt("You have 1 orchestration message. Run `orca orchestration check`")  # chega e o hook do prompt marca
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Teto por pod (Recomendado)"}))
     assert r.returncode == 0
-    assert "resposta suspeita em freio-prod: confirme" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "suspect answer in freio-prod: confirm" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     assert [i["id"] for i in _pend(a)["itens"]] == ["freio-prod", "avisar-x"], "suspeita não fecha"
     tipos = [e["tipo"] for e in a.events()]
     assert "resposta_suspeita" in tipos and "resposta" not in tipos
     assert not [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "done"]
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "resposta suspeita em freio-prod: confirme" in ctx and len(ctx.splitlines()) <= 5
+    assert "suspect answer in freio-prod: confirm" in ctx and len(ctx.splitlines()) <= 5
     # a pergunta refeita e respondida de verdade (chegada já velha) fecha e limpa o aviso
     cur = _ler_estado(os.path.join(a.home, "cursor.json"))
     cur["chegada"]["t"] -= 60
@@ -1027,13 +1027,13 @@ def test_resposta_suspeita_task_notification_e_texto_de_notificacao():
     q = [_pergunta("freio-prod", [("A", "x")])]
     a.prompt("<task-notification><task-id>x</task-id></task-notification>")
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "A"}))
-    assert "suspeita" in r.stdout and len(_pend(a)["itens"]) == 2
+    assert "suspect answer" in r.stdout and len(_pend(a)["itens"]) == 2
     # resposta velha (>= 3 s) não é suspeita; e o texto digitado que é o próprio aviso do Orca é suspeito sem precisar de timing
     cur = _ler_estado(os.path.join(a.home, "cursor.json"))
     cur["chegada"]["t"] -= 10
     json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "You have 2 orchestration messages. Run `orca orchestration check`"}))
-    assert "suspeita" in r.stdout and len(_pend(a)["itens"]) == 2
+    assert "suspect answer" in r.stdout and len(_pend(a)["itens"]) == 2
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "A"}))
     assert (r.returncode, r.stdout) == (0, "") and [i["id"] for i in _pend(a)["itens"]] == ["avisar-x"]
 
@@ -1168,8 +1168,8 @@ def test_ingest_relatorio_sem_a_secao_ou_sem_caminho_vira_item_ler():
     rel = _entradas(a, "relatorio")
     assert len(rel) == 2
     por_ref = {e["ref"]: e for e in rel}
-    assert por_ref[ok[0]["id"]]["texto"].endswith("ler solto.md") and por_ref[ok[0]["id"]]["caminho"] == sem_secao
-    assert "ler" in por_ref[ok[1]["id"]]["texto"] and not por_ref[ok[1]["id"]].get("caminho")
+    assert por_ref[ok[0]["id"]]["texto"].endswith("read solto.md") and por_ref[ok[0]["id"]]["caminho"] == sem_secao
+    assert "read" in por_ref[ok[1]["id"]]["texto"] and not por_ref[ok[1]["id"]].get("caminho")
 
 
 def test_ingest_run_em_andamento_espera_e_entra_quando_completa():
@@ -1196,7 +1196,7 @@ def test_ingest_inbox_so_worker_done_com_reportpath_vira_entrada():
     assert por["run_44769cae0dc5"]["caminho"] == "docs/research/2026-09-29-escritas-no-secundario.md"
     assert por["run_44769cae0dc5"]["texto"].startswith("Escritas no banco secundário") and por["run_44769cae0dc5"]["task"] == "task_d23305d9dca3"
     assert por["run_0927b30c9065"]["caminho"].endswith(".md")
-    assert "sem reportPath" in a.log() and "task_10c7b0acb36e" in a.log(), "os outros só no log"
+    assert "without reportPath" in a.log() and "task_10c7b0acb36e" in a.log(), "os outros só no log"
     ing = _ler_estado(os.path.join(a.home, "cursor.json"))["ingest"]
     assert ing["inbox_seq"] == 933
     n = len(a.events())
@@ -1235,7 +1235,7 @@ def test_scout_sem_reportpath_vira_alerta_no_resumo():
     assert not [e for e in a.events() if e["tipo"] == "alerta" and e["task"] == "task_d23305d9dca3"], "scout com reportPath não alerta"
     assert not [e for e in a.events() if e["tipo"] == "alerta" and e["task"] == "task_10c7b0acb36e"], "ship sem reportPath é normal"
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Alerta: scout 'Diagnosticar failover'" in ctx and len(ctx.splitlines()) <= 5, ctx
+    assert "Alert: scout 'Diagnosticar failover'" in ctx and len(ctx.splitlines()) <= 5, ctx
     n = len(a.events())
     a.orq("ingest")
     assert len(a.events()) == n
@@ -1250,8 +1250,8 @@ def test_scout_sem_reportpath_vira_alerta_no_resumo():
 def test_alerta_de_scout_expira_em_24h():
     from datetime import datetime, timezone
     ev = [{"ts": "2026-09-28T10:00:00Z", "tipo": "alerta", "alerta": "scout_sem_relatorio", "task": "t", "titulo": "[scout] velho"}]
-    assert "Alerta" not in orq_mod.resumo(ev, None, None, agora=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc))
-    assert "Alerta" in orq_mod.resumo(ev, None, None, agora=datetime(2026, 9, 28, 20, 0, tzinfo=timezone.utc))
+    assert "Alert:" not in orq_mod.resumo(ev, None, None, agora=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc))
+    assert "Alert:" in orq_mod.resumo(ev, None, None, agora=datetime(2026, 9, 28, 20, 0, tzinfo=timezone.utc))
 
 
 def test_resumo_com_relatorios_alerta_e_suspeita_cabe_em_5_linhas():
@@ -1269,14 +1269,14 @@ def test_resumo_com_relatorios_alerta_e_suspeita_cabe_em_5_linhas():
     ctx = orq_mod.resumo(ev, None, {"itens": []}, {"id": "e12"}, agora=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc))
     linhas = ctx.splitlines()
     assert len(linhas) <= 5 and all(len(l) <= 500 for l in linhas), ctx
-    extra = [l for l in linhas if "Relatório" in l]
-    assert extra and "resposta suspeita em freio-prod" in extra[0] and "Alerta: scout" in extra[0], ctx
+    extra = [l for l in linhas if "Reports not triaged" in l]
+    assert extra and "suspect answer in freio-prod" in extra[0] and "Alert: scout" in extra[0], ctx
     assert "Auditoria diária" in extra[0] and "×4" in extra[0] and "e13-e16" in extra[0], extra
-    assert "worker_done com relatório ×1 [e21] research/x.md" in extra[0], extra
-    assert "Sem efeito:" in linhas[0] and "e13" not in linhas[0], "l1 é só das mensagens do usuário"
+    assert "worker_done with report ×1 [e21] research/x.md" in extra[0], extra
+    assert "No effect:" in linhas[0] and "e13" not in linhas[0], "l1 é só das mensagens do usuário"
     # só relatórios abertos: l1 não diz "nenhum" de forma enganosa
     so_rel = [e for e in ev if e.get("origem") in ("relatorio",)]
-    assert "Relatório" in orq_mod.resumo(so_rel, None, None)
+    assert "Reports not triaged" in orq_mod.resumo(so_rel, None, None)
 
 
 def test_hook_prompt_dispara_ingest_em_segundo_plano():
@@ -1291,7 +1291,7 @@ def test_hook_prompt_dispara_ingest_em_segundo_plano():
         time.sleep(0.1)
     assert len(_entradas(a, "relatorio")) == 8 and len(_entradas(a, "relatorio_worker")) == 2
     ctx = json.loads(a.prompt("e agora").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Relatório" in ctx and len(ctx.splitlines()) <= 5, ctx
+    assert "Reports not triaged" in ctx and len(ctx.splitlines()) <= 5, ctx
 
 
 def test_ingest_falha_aberta_e_uma_fonte_nao_derruba_a_outra():
@@ -1323,7 +1323,7 @@ def test_relatorio_ilegivel_nao_derruba_o_ingest():
     _ingest_env(a, runs=runs)
     assert a.orq("ingest").returncode == 0
     rel = [e for e in _entradas(a, "relatorio") if e["ref"] == ok[0]["id"]]
-    assert len(rel) == 1 and "ler existe.md" in rel[0]["texto"]
+    assert len(rel) == 1 and "read existe.md" in rel[0]["texto"]
 
 
 def _steer_env(a):
@@ -1346,8 +1346,8 @@ def test_steer_manda_o_send_e_grava_o_evento_e_o_intake():
     _steer_env(a)
     r = a.orq("steer", "task_rodando", "use o índice novo", "--entrada", "e1")
     assert r.returncode == 0, r.stderr
-    assert _enviados(a) == [["send", "--run", "run_a", "--to", "dispatch:ctx_1", "--subject", "Ajuste",
-                             "--body", "use o índice novo\n\n## Pedido do usuário (acréscimo)\najusta o worker", "--priority", "high", "--json"]]
+    assert _enviados(a) == [["send", "--run", "run_a", "--to", "dispatch:ctx_1", "--subject", "Adjustment",
+                             "--body", "use o índice novo\n\n## User request (addition)\najusta o worker", "--priority", "high", "--json"]]
     ev = [e for e in a.events() if e["tipo"] == "steer"]
     assert len(ev) == 1 and (ev[0]["task"], ev[0]["dispatch"], ev[0]["run"], ev[0]["texto"], ev[0]["msg_id"]) == \
         ("task_rodando", "ctx_1", "run_a", "use o índice novo", "msg_9")
@@ -1361,7 +1361,7 @@ def test_steer_sem_entrada_grava_o_intake_implicito_da_unica_entrada_aberta():
     r = a.orq("steer", "task_rodando", "oi")
     assert r.returncode == 0 and len(_enviados(a)) == 1
     (i,) = [e for e in a.events() if e["tipo"] == "intake"]
-    assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "steer", "task_rodando", "run_a") and "(implícito)" in r.stderr
+    assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "steer", "task_rodando", "run_a") and "(implicit)" in r.stderr
 
 
 def test_steer_recusa_task_que_nao_esta_dispatched_ou_nao_existe():
@@ -1466,7 +1466,7 @@ def test_achado_1_mensagem_entregue_pelo_orca_perto_da_resposta_marca_suspeita_s
     _inbox(a, _msg(-2))  # o Orca entregou uma mensagem ao Run 2 s antes; nenhum UserPromptSubmit a viu
     r = _ask_freio(a, RECOMENDADA)
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "resposta suspeita em freio-prod: confirme" in ctx, r
+    assert "suspect answer in freio-prod: confirm" in ctx, r
     assert _ids_pend(a) == ["freio-prod", "avisar-x"], "suspeita não fecha"
     (s,) = [e for e in a.events() if e["tipo"] == "resposta_suspeita"]
     assert s["chegada"] == "inbox" and s["msg"] == "msg_1000"
@@ -1489,7 +1489,7 @@ def test_achado_1_so_e_suspeita_com_mensagem_perto_ao_coordenador_e_resposta_rec
         _inbox(a, *msgs)
         r = _ask_freio(a, resposta)
         assert r.returncode == 0, r
-        assert ("suspeita" in r.stdout) == suspeita, (msgs, resposta, r.stdout)
+        assert ("suspect answer" in r.stdout) == suspeita, (msgs, resposta, r.stdout)
         assert ("freio-prod" in _ids_pend(a)) == suspeita, (msgs, resposta)
 
 
@@ -1497,16 +1497,16 @@ def test_achado_1_recomendada_que_nao_e_a_primeira_e_multiselect_com_so_a_primei
     a = Amb()
     _inbox(a, _msg(-1))
     r = _ask_freio(a, "Outra (Recomendado)", opcoes=[("Primeira", "x"), ("Outra (Recomendado)", "y")])
-    assert "suspeita" in r.stdout and "freio-prod" in _ids_pend(a)
+    assert "suspect answer" in r.stdout and "freio-prod" in _ids_pend(a)
     a = Amb()
     _inbox(a, _msg(-1))
     for i in ("alice", "bob"):
         a.orq("pend", "add", "--id", i, "--tipo", "avisar", "--titulo", i)
     q = [_pergunta("ja-fez", [("Alice: schemaVersion", "[alice] Avisar"), ("Bob: maxmemory", "[bob] Avisar")], multi=True)]
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Alice: schemaVersion"}))
-    assert "suspeita" in r.stdout and "alice" in _ids_pend(a)
+    assert "suspect answer" in r.stdout and "alice" in _ids_pend(a)
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Bob: maxmemory"}))  # marcou a segunda: resposta de gente
-    assert "suspeita" not in r.stdout and "bob" not in _ids_pend(a)
+    assert "suspect answer" not in r.stdout and "bob" not in _ids_pend(a)
 
 
 def test_achado_1_inbox_fora_do_ar_nao_fecha_nada_e_loga():
@@ -1559,11 +1559,11 @@ def test_achado_2_cursor_corrompido_guarda_a_copia_e_recomeca_pelo_log():
     caminho = os.path.join(a.home, "cursor.json")
     open(caminho, "w").write("{quebrado")
     r = a.prompt("segunda")
-    assert "entrada e2" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], "o prompt vira entrada, com id do log"
+    assert "entry e2" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], "o prompt vira entrada, com id do log"
     copias = [f for f in os.listdir(a.home) if f.startswith("cursor.json.corrompido-")]
     assert len(copias) == 1 and open(os.path.join(a.home, copias[0])).read() == "{quebrado", "o que não se leu fica guardado"
     assert _cursor(a)["entrada"] == 2 and _cursor(a)["recuperado"]["copia"] == copias[0]
-    assert "cursor.json ilegível" in a.log() and copias[0] in a.log()
+    assert "cursor.json unreadable" in a.log() and copias[0] in a.log()
     _ingest_env(a, desde=None)
     open(caminho, "w").write("[1, 2]")  # raiz que não é objeto
     r = a.orq("ingest")
@@ -1646,14 +1646,14 @@ def test_achado_5_coordenador_sem_preambulo_continua_registrado_sem_chamar_o_wor
     a = Amb(run="run_a")
     a.set("workers.json", [{"handle": "term_de_worker", "run": "run_a"}])
     out = json.loads(a.prompt("primeira").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "entrada e1" in out
+    assert "entry e1" in out
     a.prompt("segunda")
     cur = _cursor(a)
     assert cur["runs"] == {"abcdef123456": "run_a"} and "papeis" not in cur
     chamadas = [json.loads(x) for x in open(os.path.join(a.fake, "calls.log"))]
     assert not [c for c in chamadas if c[0] == "worker-list"], "o worker-list não é sinal de papel"
     a.set("run.json", None)
-    assert "binding perdido" in a.prompt("terceira").stdout
+    assert "binding lost" in a.prompt("terceira").stdout
 
 
 def test_achado_5_despacho_vale_mesmo_sem_run_ligado_e_a_sessao_de_worker_nao_chama_o_orca():
@@ -1718,7 +1718,7 @@ def test_achado_7_run_com_dado_quebrado_ou_task_list_falhando_nao_derruba_os_out
     assert b.orq("ingest", "--refresh", FAKE_FAIL_RUN="run_c").returncode == 0
     ab = _ler_estado(os.path.join(b.home, "aberto.json"))
     assert [i["id"] for i in ab["backlog"]] == ["t1"] and ab["falhas"] == ["run_c"] and "run_c" in b.log()
-    assert "1 Run sem leitura" in orq_mod.resumo([], ab, None), "o resumo diz que faltou um Run"
+    assert "1 Run unread" in orq_mod.resumo([], ab, None), "o resumo diz que faltou um Run"
 
 
 def test_achado_7_refresh_segue_o_next_cursor_do_run_list():
@@ -1741,7 +1741,7 @@ def test_achado_7_resumo_e_painel_mostram_a_idade_do_cache():
     from datetime import datetime, timezone
     ab = {"ts": "2026-09-29T14:48:30Z", "backlog": [], "rodando": 0, "bloqueado": [], "gates": []}
     hora = datetime(2026, 9, 29, 14, 48, 30, tzinfo=timezone.utc).astimezone().strftime("%H:%M")
-    assert f"Aberto (cache de {hora}):" in orq_mod.resumo([], ab, None)
+    assert f"Open (cache from {hora}):" in orq_mod.resumo([], ab, None)
 
 
 # achado 8: o teto de 3 s passa pelo alarme
@@ -1776,7 +1776,7 @@ def test_achado_8_cursor_lock_preso_e_cortado_pelo_alarme_de_3s():
 # achado 9: a limpeza de mergeados só roda no coordenador
 
 def test_achado_9_limpeza_so_no_coordenador():
-    limpou = "Limpeza de branches mergeadas"
+    limpou = "Cleanup of merged branches"
     assert limpou in _limpar("1163 merged"), "coordenador dispara"
     sem_run = Amb(run=None)
     assert _limpar("1163 merged", sem_run) == "", "terminal sem Run é worker"
@@ -1806,9 +1806,9 @@ def test_achado_10_entrada_sem_id_nao_cega_o_stop():
         f.write(json.dumps({"tipo": "entrada", "origem": "usuario", "texto": "editada à mão, sem id"}) + "\n")
         f.write(json.dumps({"tipo": "intake", "efeito": "conversa"}) + "\n")
     r = a.orq("hook", "stop", stdin="{}")
-    assert "1 entrada(s) sem efeito: e1" in json.loads(r.stdout)["systemMessage"], r
+    assert "1 entry(ies) without effect: e1" in json.loads(r.stdout)["systemMessage"], r
     assert a.log() == ""
-    assert "entrada e2" in a.prompt("outra").stdout
+    assert "entry e2" in a.prompt("outra").stdout
 
 
 # achado 11: resposta suspeita expira
@@ -1852,7 +1852,7 @@ def test_achado_12_mensagem_e_relatorio_venenosos_nao_travam_o_ingest():
     assert len(_entradas(a, "relatorio_worker")) == 2, "a mensagem venenosa não pode segurar as outras"
     assert "msg_ruim" in a.log()
     rel = [e for e in _entradas(a, "relatorio") if e["ref"] == ok[0]["id"]]
-    assert len(rel) == 1 and "ler binario.md" in rel[0]["texto"], "relatório que não é UTF-8 vira o item 'ler'"
+    assert len(rel) == 1 and "read binario.md" in rel[0]["texto"], "relatório que não é UTF-8 vira o item 'ler'"
     assert _cursor(a)["ingest"]["inbox_seq"] == 933
     tamanho = len(open(a.env["ORQ_LOG"]).read())
     a.orq("ingest")
@@ -1870,7 +1870,7 @@ def test_achado_12_janela_da_inbox_perdida_e_logada():
     a.set("inbox.json", ib)
     json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
     assert a.orq("ingest").returncode == 0
-    assert "janela perdida" in a.log()
+    assert "window lost" in a.log()
 
 
 # achado 13: o dedupe das automations não tem teto
@@ -2021,13 +2021,13 @@ def test_divergencia_gate_que_falha_desfaz_a_pendencia_e_task_so_vale_para_decis
     assert r.returncode == 1 and "gate" in r.stderr
     assert "gate-dec" not in _ids_pend(a) and not [e for e in a.events() if e["tipo"] == "pend"]
     r = a.orq("pend", "add", "--id", "acao-x", "--tipo", "acao", "--titulo", "X", "--task", "task_1")
-    assert r.returncode == 1 and "decisão" in r.stderr and "acao-x" not in _ids_pend(a)
+    assert r.returncode == 1 and "decision" in r.stderr and "acao-x" not in _ids_pend(a)
 
 
 def test_divergencia_pendencia_com_espera_nao_vira_pergunta():
     a = Amb()
     r = a.orq("pend", "add", "--id", "esp-dec", "--tipo", "decisao", "--titulo", "X", "--espera", "Alice")
-    assert r.returncode == 1 and "espera" in r.stderr and "esp-dec" not in _ids_pend(a)
+    assert r.returncode == 1 and "waiting" in r.stderr and "esp-dec" not in _ids_pend(a)
     a.orq("pend", "add", "--id", "avisar-alice", "--tipo", "avisar", "--titulo", "Avisar o Alice", "--espera", "Alice")
     q = [_pergunta("avisar-alice", [("Sim", "x")])]
     a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}))
@@ -2039,7 +2039,7 @@ def test_divergencia_aviso_do_intake_de_outro_run_diz_que_e_recusado():
     a.prompt("faz isso")
     a.set("tasks_run_b.json", [{"id": "task_b", "status": "ready", "created_at": "2026-09-18T00:00:00Z"}])
     r = a.orq("intake", "e1", "tarefa", "task_b", "--run", "run_b")
-    assert "é recusado (consumer_fenced)" in r.stderr and "pode ser recusado" not in r.stderr and "run-use --id run_b" in r.stderr, r.stderr
+    assert "is refused (consumer_fenced)" in r.stderr and "may be refused" not in r.stderr and "run-use --id run_b" in r.stderr, r.stderr
 
 
 # ---------- segundo review de 29/09 (review-2.md): um teste por achado ----------
@@ -2057,9 +2057,9 @@ def test_review2_m2_cursor_ilegivel_nao_desliga_o_orq_e_avisa_no_resumo_e_no_sto
     open(os.path.join(a.home, "cursor.json"), "w").write("{quebrado")
     r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
     out = _aviso_do_stop(r.stdout)
-    assert "1 entrada(s) sem efeito: e3" in out and "cursor.json estava ilegível" in out, "o Stop não fica mudo"
+    assert "1 entry(ies) without effect: e3" in out and "cursor.json was unreadable" in out, "o Stop não fica mudo"
     ctx = json.loads(a.prompt("quarta mensagem").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "entrada e4 (usuário)" in ctx and "cursor.json estava ilegível" in ctx and "Sem efeito: e3" in ctx, ctx
+    assert "entry e4 (user)" in ctx and "cursor.json was unreadable" in ctx and "No effect: e3" in ctx, ctx
     assert [e["id"] for e in a.events() if e["tipo"] == "entrada"] == ["e1", "e2", "e3", "e4"], "id vem do maior eN do log, mais um"
     (copia,) = [f for f in os.listdir(a.home) if f.startswith("cursor.json.corrompido-")]
     assert open(os.path.join(a.home, copia)).read() == "{quebrado"
@@ -2075,8 +2075,8 @@ def test_review2_m2_o_aviso_de_cursor_recuperado_expira_em_24h():
     rec = {"recuperado": {"ts": "2026-09-29T13:00:00Z", "copia": "cursor.json.corrompido-x"}}
     assert orq_mod.cursor_recuperado(rec, agora) is not None
     assert orq_mod.cursor_recuperado(rec, datetime(2026, 9, 30, 13, 1, tzinfo=timezone.utc)) is None
-    assert "cursor.json estava ilegível" in orq_mod.resumo([], None, None, cursor=rec, agora=agora)
-    assert "ilegível" not in orq_mod.resumo([], None, None, cursor={}, agora=agora)
+    assert "cursor.json was unreadable" in orq_mod.resumo([], None, None, cursor=rec, agora=agora)
+    assert "unreadable" not in orq_mod.resumo([], None, None, cursor={}, agora=agora)
 
 
 OPCOES_INDICADOR = [("A: badge só quando falta (Recomendado)", "x"), ("B: badge sempre", "y")]
@@ -2089,36 +2089,36 @@ def test_review2_m3_texto_livre_nao_fecha_a_decisao_nem_resolve_o_gate():
     q = [_pergunta("Indicador", OPCOES_INDICADOR)]
     livre = "Quero ver, não vi como ficou o protótipo"
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: livre}))
-    assert 'resposta livre em Indicador: se decidiu, feche com orq pend done Indicador --resposta "<o que foi decidido>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert 'free-text answer in Indicador: if decided, close it with orq pend done Indicador --answer "<what was decided>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "Indicador" in _ids_pend(a), "a pendência segue aberta"
     assert not [x for x in open(os.path.join(a.fake, "gates.log")) if "gate-resolve" in x], "o gate segue pendente"
     (res,) = [e for e in a.events() if e["tipo"] == "resposta"]
     assert res["resposta"] == livre and res["livre"] is True and "fechou" not in res
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert 'resposta livre em Indicador: se decidiu, feche com orq pend done Indicador --resposta "<o que foi decidido>"' in ctx, "o resumo lembra enquanto a pendência está aberta"
+    assert 'free-text answer in Indicador: if decided, close it with orq pend done Indicador --answer "<what was decided>"' in ctx, "o resumo lembra enquanto a pendência está aberta"
     # opção marcada junto com texto também é livre; só a opção sozinha fecha e resolve
     a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "B: badge sempre, mas depois eu vejo"}))
     assert "Indicador" in _ids_pend(a)
     a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "B: badge sempre"}))
     assert "Indicador" not in _ids_pend(a)
     assert '"gate-resolve", "--id", "gate_1", "--resolution", "B: badge sempre"' in open(os.path.join(a.fake, "gates.log")).read().replace("\\", "")
-    assert "resposta livre" not in json.loads(a.prompt("fechou?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "free-text answer" not in json.loads(a.prompt("fechou?").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_review2_m3_pend_done_a_mao_apaga_o_aviso_de_resposta_livre():
     a = Amb()
     q = [_pergunta("freio-prod", OPCOES_FREIO)]
     a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "vamos ver primeiro"}))
-    assert "resposta livre em freio-prod" in a.prompt("oi").stdout
+    assert "free-text answer in freio-prod" in a.prompt("oi").stdout
     assert a.orq("pend", "done", "freio-prod", "--resposta", "decidi: sem freio").returncode == 0
-    assert "resposta livre" not in a.prompt("oi de novo").stdout
+    assert "free-text answer" not in a.prompt("oi de novo").stdout
 
 
 def test_review2_m4_mensagem_de_outro_run_perto_da_resposta_recomendada_marca_suspeita():
     a = Amb(run="run_a")
     _inbox(a, _msg(-1, run="run_b"))  # o heartbeat do Run B digitado com o terminal ligado ao Run A
     r = _ask_freio(a, RECOMENDADA)
-    assert "resposta suspeita em freio-prod" in r.stdout and "freio-prod" in _ids_pend(a), r
+    assert "suspect answer in freio-prod" in r.stdout and "freio-prod" in _ids_pend(a), r
     (s,) = [e for e in a.events() if e["tipo"] == "resposta_suspeita"]
     assert s["chegada"] == "inbox" and s["msg"] == "msg_1000"
 
@@ -2130,7 +2130,7 @@ def test_review2_b1_recomendado_pelo_worker_conta_como_recomendada():
     a = Amb()
     _inbox(a, _msg(-1))
     r = _ask_freio(a, ops[1][0], opcoes=ops)
-    assert "suspeita" in r.stdout and "freio-prod" in _ids_pend(a)
+    assert "suspect answer" in r.stdout and "freio-prod" in _ids_pend(a)
 
 
 def test_review2_b3_aviso_do_orca_ingere_o_inbox_sem_refazer_o_aberto():
@@ -2207,7 +2207,7 @@ def test_review2_b5_falha_transitoria_do_orca_nao_perde_a_mensagem_do_inbox():
     a = Amb()
     _inbox_scout(a)
     assert a.orq("ingest", FAKE_FAIL="task-list").returncode == 0  # o task-list do título do scout falha
-    assert _cursor(a)["ingest"]["inbox_seq"] == 0 and "adiada" in a.log(), "o cursor não passa da mensagem"
+    assert _cursor(a)["ingest"]["inbox_seq"] == 0 and "postponed" in a.log(), "o cursor não passa da mensagem"
     assert not [e for e in a.events() if e["tipo"] == "alerta"]
     assert a.orq("ingest").returncode == 0
     (al,) = [e for e in a.events() if e["tipo"] == "alerta"]
@@ -2220,7 +2220,7 @@ def test_review2_b5_mensagem_que_sempre_falha_e_descartada_no_teto():
     _inbox_scout(a)
     for _ in range(orq_mod.MAX_TENTATIVAS):
         a.orq("ingest", FAKE_FAIL="task-list")
-    assert _cursor(a)["ingest"]["inbox_seq"] == 960 and "descartada depois de" in a.log(), "não trava o ingest para sempre"
+    assert _cursor(a)["ingest"]["inbox_seq"] == 960 and "discarded after" in a.log(), "não trava o ingest para sempre"
 
 
 def test_review2_b5_run_de_automation_que_falha_nao_e_pulado_pelo_auto_desde():
@@ -2277,14 +2277,14 @@ def test_auditar_respostas_lista_so_a_recomendada_a_ate_2s_de_uma_entrega_ao_coo
     antes = sorted(os.listdir(a.tmp.name))
     r = a.orq("auditar-respostas", "--sessao", "deee6621")
     assert r.returncode == 0, r.stderr
-    assert "6 perguntas respondidas" in r.stdout and "4 escolheram só a opção recomendada, 1 delas" in r.stdout, r.stdout
+    assert "6 questions answered" in r.stdout and "4 chose only the recommended option, 1 of them" in r.stdout, r.stdout
     linhas = [l for l in r.stdout.splitlines() if l.startswith("| 2")]  # as linhas de dados começam com a data
     assert len(linhas) == 1 and "Princípio" in linhas[0] and "msg_1" in linhas[0] and "run_b" in linhas[0], r.stdout
     assert not any(h in r.stdout for h in ("Super admin", "Permissão", "Livre", "Longe")), r.stdout
     assert linhas[0].startswith("| 25/09/2026")
     assert sorted(f for f in os.listdir(a.tmp.name) if f != "orq.log") == antes and not os.path.exists(a.home), "só leitura: nada foi gravado (fora a linha do apelido no orq.log, ticket 129)"
     assert a.orq("auditar-respostas", "--sessao", "inexistente").returncode == 1
-    assert "coordenador" in a.orq("auditar-respostas").stderr, "sem --sessao e sem cursor.json pede o id"
+    assert "coordinator" in a.orq("auditar-respostas").stderr, "sem --sessao e sem cursor.json pede o id"
 
 
 # ---------- terceiro review de 29/09 (review-3.md): um teste por achado ----------
@@ -2318,11 +2318,11 @@ def test_review3_m5_decisao_fechada_em_outro_run_avisa_e_o_gate_espera_o_run_cer
         assert a.orq("ingest").returncode == 0
     assert not _calls(a, "gate-resolve") and not [e for e in a.events() if e["tipo"] == "gate_falha"]
     ctx = json.loads(a.prompt("e o gate?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "ainda pendentes" in ctx and "gate_1" in ctx and "run-use --id run_a" in ctx, ctx
+    assert "still pending" in ctx and "gate_1" in ctx and "run-use --id run_a" in ctx, ctx
     a.set("run.json", {"id": "run_a"})  # volta ao Run certo: o próximo ingest resolve
     a.orq("ingest")
     assert [e["gate"] for e in a.events() if e["tipo"] == "gate_resolvido"] == ["gate_1"] and _resolucoes(a) == ["Sim"]
-    assert "ainda pendentes" not in json.loads(a.prompt("resolvido?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "still pending" not in json.loads(a.prompt("resolvido?").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_review3_m5_resposta_do_ask_com_gate_de_outro_run_avisa_no_contexto():
@@ -2358,14 +2358,14 @@ def test_review3_m6_pend_done_sem_resposta_usa_a_ultima_resposta_livre():
     txt = "Use B, mas só depois do deploy"
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: txt}))
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert 'orq pend done dec1 --resposta "<o que foi decidido>"' in ctx, ctx
+    assert 'orq pend done dec1 --answer "<what was decided>"' in ctx, ctx
     assert a.orq("pend", "done", "dec1").returncode == 0
     assert _resolucoes(a) == [txt], "o worker destravado recebe o texto do usuário"
     assert [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "done"][0]["resposta"] == txt
     b = Amb()  # sem resposta livre, o texto antigo
     _gate_pend(b, "dec2")
     b.orq("pend", "done", "dec2")
-    assert _resolucoes(b) == ["fechada sem resposta"]
+    assert _resolucoes(b) == ["closed without an answer"]
     c = Amb()  # --resposta explícita ganha da resposta livre
     q = _gate_pend(c, "dec3")
     c.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "vamos ver"}))
@@ -2377,7 +2377,7 @@ def test_review3_m6_pend_done_sem_resposta_usa_a_ultima_resposta_livre():
     d.orq("pend", "done", "dec4", "--resposta", "fechei")
     _gate_pend(d, "dec4")
     d.orq("pend", "done", "dec4")
-    assert _resolucoes(d) == ["fechei", "fechada sem resposta"]
+    assert _resolucoes(d) == ["fechei", "closed without an answer"]
 
 
 def test_review3_b6_preambulo_sem_a_linha_de_abertura_tambem_e_despacho():
@@ -2401,10 +2401,10 @@ def test_review3_b7_cursor_legivel_com_a_forma_errada_nao_desliga_o_orq():
         os.makedirs(a.home)
         open(os.path.join(a.home, "cursor.json"), "w").write(conteudo)
         r = a.prompt("oi")
-        assert r.returncode == 0 and "entrada e1 (usuário)" in r.stdout, (conteudo, r.stdout, a.log())
-        assert "Sem efeito" in a.orq("status").stdout
+        assert r.returncode == 0 and "entry e1 (user)" in r.stdout, (conteudo, r.stdout, a.log())
+        assert "No effect" in a.orq("status").stdout
         s = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
-        assert "sem efeito" in s.stdout, (conteudo, s.stdout, a.log())
+        assert "without effect" in s.stdout, (conteudo, s.stdout, a.log())
         q = [_pergunta("freio-prod", OPCOES_FREIO)]
         a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sem freio"}))
         assert "freio-prod" not in _ids_pend(a), conteudo
@@ -2422,10 +2422,10 @@ def test_review3_b8_grupo_de_worker_done_mostra_quantos_relatorios_e_o_mais_novo
                  "caminho": f"/r/orquestrador-plan/{n}.md", "ref": f"m{i}"} for i, n in enumerate(nomes, 3)]
     ev = entradas("a", "b", "c", "d", "e")
     linha = orq_mod._extra(ev, orq_mod.abertas(ev), agora)
-    assert "×5" in linha and "5 relatórios" in linha and "orquestrador-plan/e.md" in linha and "a.md" not in linha, linha
+    assert "×5" in linha and "5 reports" in linha and "orquestrador-plan/e.md" in linha and "a.md" not in linha, linha
     ev = entradas("a", "a", "a")
     linha = orq_mod._extra(ev, orq_mod.abertas(ev), agora)
-    assert "×3" in linha and "orquestrador-plan/a.md" in linha and "relatórios" not in linha, linha
+    assert "×3" in linha and "orquestrador-plan/a.md" in linha and "reports" not in linha, linha
 
 
 def _orca_direto(a, *args):
@@ -2456,7 +2456,7 @@ def test_review3_b10_nota_da_opcao_marcada_e_resposta_livre():
     assert "dec1" in _ids_pend(a) and not _calls(a, "gate-resolve"), "a nota impede o fechamento"
     (res,) = [e for e in a.events() if e["tipo"] == "resposta"]
     assert res["livre"] is True and res["nota"] == "só se o deploy passar" and res["resposta"] == "Sim", res
-    assert 'orq pend done dec1 --resposta "<o que foi decidido>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert 'orq pend done dec1 --answer "<what was decided>"' in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     a.orq("pend", "done", "dec1")
     (res,) = _resolucoes(a)
     assert "Sim" in res and "só se o deploy passar" in res, res
@@ -2502,18 +2502,18 @@ def test_lavish_resposta_grava_um_evento_por_item_e_fecha_so_a_escolha_explicita
     assert sorted(_ids_pend(a)) == ["Indicador", "avisar-x"], "só a decisão com escolha explícita fecha; ação/aviso e texto livre não"
     (done,) = [e for e in a.events() if e["tipo"] == "pend" and e["op"] == "done"]
     assert done["pend"] == "freio-prod" and done["resposta"] == "Sem freio"
-    assert 'orq pend done Indicador --resposta "<o que foi decidido>"' in r.stdout + r.stderr, "o aviso de resposta livre"
+    assert 'orq pend done Indicador --answer "<what was decided>"' in r.stdout + r.stderr, "o aviso de resposta livre"
     saida = json.loads(r.stdout)
     assert [i["item"] for i in saida["itens"]] == ["L1", "L2", "L3", "L4", "L5"] and saida["itens"][0]["efeito"] == "fechou"
     ctx = json.loads(a.prompt("e o Indicador?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert 'resposta livre em Indicador: se decidiu, feche com orq pend done Indicador --resposta' in ctx, ctx
+    assert 'free-text answer in Indicador: if decided, close it with orq pend done Indicador --answer' in ctx, ctx
     n = len(a.events())
     assert a.orq("lavish-resposta", arq).returncode == 0 and len(a.events()) == n
     assert len([e for e in a.events() if e["tipo"] == "resposta_lavish"]) == 5, "o mesmo lote duas vezes não duplica"
     r = a.orq("lavish-resposta", _lote(a, [{"id": "L6", "header": "Indicador", "resposta": "A: badge", "disposicao": "escolha"}], "p2.json", "prompts"))
     assert r.returncode == 0 and "Indicador" not in _ids_pend(a), r.stderr
     assert _resolucoes(a) == ["A: badge"], "a escolha resolve o gate da decisão"
-    assert "resposta livre" not in json.loads(a.prompt("fechou?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "free-text answer" not in json.loads(a.prompt("fechou?").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_lavish_resposta_aceita_as_tres_formas_do_json_e_recusa_o_que_nao_e_lote():
@@ -2560,7 +2560,7 @@ def test_ticket100_resposta_ambigua_do_orca_falha_fechada():
     _gate_pend(a)
     r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "gate-dec", "resposta": "Sim", "disposicao": "escolha"}]), FAKE_GATE_STATUS="pending")
     assert r.returncode == 0 and json.loads(r.stdout)["itens"][0]["efeito"] == "nao entregue", r
-    assert "gate-dec" in _ids_pend(a) and "ambígua" in a.log()
+    assert "gate-dec" in _ids_pend(a) and "ambiguous" in a.log()
     assert [e for e in a.events() if e["tipo"] == "gate_falha"], "a recusa fica no registro"
 
 
@@ -2592,7 +2592,7 @@ def test_guard_recusa_a_caixa_com_despacho_ativo_em_qualquer_run():
     out = json.loads(r.stdout)["hookSpecificOutput"]
     assert out["hookEventName"] == "PreToolUse" and out["permissionDecision"] == "deny"
     motivo = out["permissionDecisionReason"]
-    assert "Lavish" in motivo and "orq lavish-resposta" in motivo and "1 despacho ativo" in motivo and "run_b" in motivo, motivo
+    assert "Lavish" in motivo and "orq lavish-answer" in motivo and "1 active dispatch" in motivo and "run_b" in motivo, motivo
     lista = _calls(a, "worker-list")
     assert lista and "--run" not in lista[0], "lista de todos os Runs: o worker-list escopado só veria o Run ligado"
 
@@ -2672,7 +2672,7 @@ def _sem_dica(saida):
     if not (saida or "").strip():
         return ""
     ctx = json.loads(saida).get("hookSpecificOutput", {}).get("additionalContext", "")
-    resto = [l for l in ctx.splitlines() if not l.startswith("orq: leia e confirme a caixa com `orq caixa ")]
+    resto = [l for l in ctx.splitlines() if not l.startswith("orq: read and confirm the inbox with `orq inbox ")]
     return "\n".join(resto)
 
 
@@ -2693,7 +2693,7 @@ def test_heartbeat_so_heartbeats_bloqueia_e_confirma():
     a.caixa(_hb("lendo"), _hb("testando"))
     r = a.prompt(AVISO_A)
     out = json.loads(r.stdout)
-    assert _bloqueado(r) and out["reason"] == f"{orq_mod.MARCA} 2 sinais de vida absorvidos (run_a)" and "\n" not in out["reason"] and "hookSpecificOutput" not in out, r
+    assert _bloqueado(r) and out["reason"] == f"{orq_mod.MARCA} 2 heartbeats absorbed (run_a)" and "\n" not in out["reason"] and "hookSpecificOutput" not in out, r
     assert set(a.estados().values()) == {"acked"}, "consumiu e confirmou o lote"
     calls = _chamadas_check(a)
     assert [("--peek" in c, "--ack" in c) for c in calls] == [(True, False), (False, False), (False, True)], calls
@@ -2861,8 +2861,8 @@ def test_resumo_mostra_fase_e_hora_do_heartbeat_de_cada_dispatch_rodando():
     ctx = json.loads(a.prompt("cria a task").stdout)["hookSpecificOutput"]["additionalContext"]
     linhas = ctx.splitlines()
     assert len(linhas) <= 5
-    l2 = next(l for l in linhas if l.startswith("Aberto"))
-    assert "Vivos: task_aaaa… testando " in l2 and "task_bbbb… sem heartbeat" in l2 and "lendo" not in l2, l2
+    l2 = next(l for l in linhas if l.startswith("Open"))
+    assert "Live: task_aaaa… testando " in l2 and "task_bbbb… no heartbeat" in l2 and "lendo" not in l2, l2
 
 
 def test_resumo_sem_despacho_rodando_nao_ganha_a_linha_de_vivos():
@@ -3075,12 +3075,12 @@ def test_review4_a2_depois_de_uma_hora_sem_arquivo_desiste_e_grava_o_item_ler():
     _run_cache(a, criado_min=120, base=os.path.join(a.tmp.name, "repo"))
     a.orq("ingest")
     (e,) = _entradas(a, "relatorio")
-    assert e["texto"] == "ler 2026-09-29-tarde.md", e
+    assert e["texto"] == "read 2026-09-29-tarde.md", e
     b = Amb()
     _run_cache(b, criado_min=120, snapshot=False)
     b.orq("ingest")
     (e,) = _entradas(b, "relatorio")
-    assert "sem arquivo de relatório" in e["texto"] and not e.get("caminho"), e
+    assert "no report file" in e["texto"] and not e.get("caminho"), e
 
 
 def test_review4_a2_snapshot_sem_caminho_espera_e_depois_procura_o_arquivo_da_data_do_run():
@@ -3143,8 +3143,8 @@ def test_review4_m7_o_motivo_da_recusa_diz_quais_disposicoes_fecham():
     a = Amb(run="run_a")
     _workers(a, ("w_ativo", "run_b", "dispatched"))
     motivo = json.loads(_guard(a).stdout)["hookSpecificOutput"]["permissionDecisionReason"]
-    assert 'disposicao "escolha"' in motivo and "livre" in motivo and "adiar" in motivo and "saída do poll" in motivo, motivo
-    assert "JSON devolvido" not in motivo
+    assert 'disposicao "escolha"' in motivo and "livre" in motivo and "adiar" in motivo and "poll output" in motivo, motivo
+    assert "returned JSON" not in motivo
 
 
 def test_review4_m7_manter_e_trocar_com_resposta_fecham_e_conversar_adia_sem_virar_resolucao():
@@ -3161,7 +3161,7 @@ def test_review4_m7_manter_e_trocar_com_resposta_fecham_e_conversar_adia_sem_vir
     ev = {e["item"]: e for e in a.events() if e["tipo"] == "resposta_lavish"}
     assert ev["3"]["livre"] is True and ev["3"]["resposta"] == "", "__conversar é adiamento, sem texto"
     a.orq("pend", "done", "D-conv")
-    assert "__conversar" not in _resolucoes(a) and _resolucoes(a)[-1] == "fechada sem resposta", _resolucoes(a)
+    assert "__conversar" not in _resolucoes(a) and _resolucoes(a)[-1] == "closed without an answer", _resolucoes(a)
 
 
 # ---- M8: falha do Orca no meio do lavish-resposta ----
@@ -3208,7 +3208,7 @@ def test_review4_b12_intake_mostra_qual_entrada_fechou_e_recusa_conversa_em_rela
     b.orq("ingest")
     rel = _entradas(b, "relatorio")
     r = b.orq("intake", rel[0]["id"], "conversa", "--nota", "D02 confirmado pelo usuário via Lavish")
-    assert r.returncode == 1 and "relatório" in r.stderr and "descartado" in r.stderr, r
+    assert r.returncode == 1 and "report item" in r.stderr and "discarded" in r.stderr, r
     assert not [e for e in b.events() if e["tipo"] == "intake"], "nada foi gravado"
     r = b.orq("intake", rel[0]["id"], "descartado", "--nota", "já tratado")
     out = json.loads(r.stdout)
@@ -3223,7 +3223,7 @@ def test_review4_b12_o_stop_cita_as_tres_primeiras_entradas_sem_efeito():
         a.prompt(t)
     msg = json.loads(a.orq("hook", "stop", stdin=json.dumps({"session_id": "s"})).stdout)["systemMessage"]
     longo = orq_mod._cita("um assunto longo demais para caber inteiro na citação do stop")
-    assert f"4 entrada(s) sem efeito: e1 ({longo!r}), e2 ('dois'), e3 ('três') +1" in msg and longo.endswith("…"), msg
+    assert f"4 entry(ies) without effect: e1 ({longo!r}), e2 ('dois'), e3 ('três') +1" in msg and longo.endswith("…"), msg
 
 
 def test_review4_b13_o_motivo_lista_o_despacho_e_diz_como_sair():
@@ -3281,7 +3281,7 @@ def test_review4_b16_preambulo_colado_numa_sessao_que_coordena_nao_a_vira_worker
     assert (r.returncode, r.stdout) == (0, "")
     assert _cursor(a).get("papeis", {}).get("abcdef123456") != "worker" and _cursor(a)["runs"] == {"abcdef123456": "run_a"}, _cursor(a)
     assert "preâmbulo" in a.log()
-    assert "entrada e2" in json.loads(a.prompt("segunda").stdout)["hookSpecificOutput"]["additionalContext"], "o coordenador segue registrando"
+    assert "entry e2" in json.loads(a.prompt("segunda").stdout)["hookSpecificOutput"]["additionalContext"], "o coordenador segue registrando"
 
 
 def test_review4_b17_a_dica_de_resposta_livre_sai_com_aspas_quando_o_header_tem_espaco():
@@ -3289,10 +3289,10 @@ def test_review4_b17_a_dica_de_resposta_livre_sai_com_aspas_quando_o_header_tem_
     a.orq("pend", "add", "--id", "4 quem", "--tipo", "decisao", "--titulo", "Quem?")
     q = [_pergunta("4 quem", [("A", "x"), ("B", "y")])]
     ctx = json.loads(a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "nenhuma, outra coisa"})).stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "orq pend done '4 quem' --resposta" in ctx, ctx
+    assert "orq pend done '4 quem' --answer" in ctx, ctx
     r = a.orq("lavish-resposta", _lote(a, [{"id": "1", "header": "4 quem", "resposta": "depois vejo", "disposicao": "livre"}]))
-    assert "orq pend done '4 quem' --resposta" in r.stderr, r.stderr
-    assert "orq pend done '4 quem' --resposta" in json.loads(a.prompt("e aí?").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "orq pend done '4 quem' --answer" in r.stderr, r.stderr
+    assert "orq pend done '4 quem' --answer" in json.loads(a.prompt("e aí?").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_review4_b18_o_ingest_nao_conta_gate_resolvido_como_entrada_nova():
@@ -3303,7 +3303,7 @@ def test_review4_b18_o_ingest_nao_conta_gate_resolvido_como_entrada_nova():
     a.orq("pend", "done", "gate-dec", "--resposta", "Sim")
     a.set("run.json", {"id": "run_a"})
     r = a.orq("ingest")
-    assert r.returncode == 0 and "0 entrada(s) nova(s)" in r.stdout and "1 gate(s) resolvido(s)" in r.stdout, r.stdout
+    assert r.returncode == 0 and "0 new entry(ies)" in r.stdout and "1 gate(s) resolved" in r.stdout, r.stdout
     assert "gate(s)" not in a.orq("ingest").stdout, "sem gate resolvido a linha não aparece"
 
 
@@ -3457,7 +3457,7 @@ def test_agentes_texto_lista_estado_e_sugere_o_steer_do_travado():
     r = a.orq("agentes")
     assert r.returncode == 0, r.stderr
     assert "travado" in r.stdout and "perguntando" in r.stdout and "Ticket 03" in r.stdout
-    assert 'orq steer task_t1 "' in r.stdout and "orq liberar ctx_term_e1" in r.stdout, r.stdout
+    assert 'orq steer task_t1 "' in r.stdout and "orq release ctx_term_e1" in r.stdout, r.stdout
 
 
 def test_agentes_worker_list_escopado_recusa_sem_run():
@@ -3506,10 +3506,10 @@ def test_resumo_uma_linha_de_agentes_e_alerta_de_travado_com_o_steer():
     ab = _aberto_ag("rodando", ultimo_heartbeat=now_iso(-1200), desde=now_iso(-3000))
     txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
     assert len(txt.splitlines()) <= 5, txt
-    assert "Travado: task_aaaaaaaaaa" in txt and 'orq steer task_aaaaaaaaaa "' in txt, txt
-    assert "Vivos:" in txt and "TRAVADO" in txt, txt
+    assert "Stuck: task_aaaaaaaaaa" in txt and 'orq steer task_aaaaaaaaaa "' in txt, txt
+    assert "Live:" in txt and "STUCK" in txt, txt
     ok = orq_mod.resumo([], _aberto_ag("rodando", ultimo_heartbeat=now_iso(-120), desde=now_iso(-3000)), {"itens": []}, agora=agora)
-    assert "Travado" not in ok and "TRAVADO" not in ok and "fase-3" in ok, ok
+    assert "Stuck" not in ok and "STUCK" not in ok and "fase-3" in ok, ok
 
 
 def test_resumo_reavalia_o_travado_com_o_heartbeat_mais_novo_do_log():
@@ -3518,9 +3518,9 @@ def test_resumo_reavalia_o_travado_com_o_heartbeat_mais_novo_do_log():
     ab = _aberto_ag("travado", ultimo_heartbeat=now_iso(-2000), desde=now_iso(-3000))
     fresco = [{"tipo": "heartbeat_absorvido", "run": "run_a", "heartbeats": [{"dispatch": "ctx_1", "task": "task_aaaaaaaaaa", "fase": "fase-7", "ts": now_iso(-30)}]}]
     txt = orq_mod.resumo(fresco, ab, {"itens": []}, agora=agora)
-    assert "Travado" not in txt and "fase-7" in txt, txt
+    assert "Stuck" not in txt and "fase-7" in txt, txt
     velho = orq_mod.resumo([], _aberto_ag("rodando", ultimo_heartbeat=None, desde=now_iso(-960)), {"itens": []}, agora=agora)
-    assert "Travado: task_aaaaaaaaaa" in velho, "sem heartbeat, a idade conta desde o despacho"
+    assert "Stuck: task_aaaaaaaaaa" in velho, "sem heartbeat, a idade conta desde o despacho"
 
 
 def test_resumo_perguntando_e_entregue_sem_liberar_entram_na_mesma_linha():
@@ -3530,8 +3530,8 @@ def test_resumo_perguntando_e_entregue_sem_liberar_entram_na_mesma_linha():
     ab["agentes"].append({**ab["agentes"][0], "dispatch": "ctx_2", "task": "task_bbbbbbbbbb", "estado": "entregue"})
     ab["agentes"].append({**ab["agentes"][0], "dispatch": "ctx_3", "task": "task_cccccccccc", "estado": "entregue", "retido": "user_takeover"})
     txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
-    l2 = next(l for l in txt.splitlines() if l.startswith("Aberto"))
-    assert "pergunta" in l2 and "sem liberar 1" in l2, l2
+    l2 = next(l for l in txt.splitlines() if l.startswith("Open"))
+    assert "question" in l2 and "not released: 1" in l2, l2
     assert len(txt.splitlines()) <= 5
 
 
@@ -3544,7 +3544,7 @@ def test_hook_prompt_injeta_o_travado_do_cache_em_ate_cinco_linhas():
     os.makedirs(a.home, exist_ok=True)
     a.set("../orq/aberto.json", _aberto_ag("rodando", ultimo_heartbeat=now_iso(-1300), desde=now_iso(-3000)))
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert len(ctx.splitlines()) <= 5 and "Travado: task_aaaaaaaaaa" in ctx and "orq steer" in ctx, ctx
+    assert len(ctx.splitlines()) <= 5 and "Stuck: task_aaaaaaaaaa" in ctx and "orq steer" in ctx, ctx
 
 
 # ---- orq liberar ----
@@ -3636,7 +3636,7 @@ def test_liberar_recusa_dispatch_ainda_rodando():
     a = Amb(run="run_a")
     _lib_env(a)
     r = a.orq("liberar", "ctx_term_w2")
-    assert r.returncode == 1 and "rodando" in r.stderr and not _log(a, "released.log"), r
+    assert r.returncode == 1 and "still running" in r.stderr and not _log(a, "released.log"), r
 
 
 def test_liberar_so_confirma_as_mensagens_do_proprio_dispatch():
@@ -3650,7 +3650,7 @@ def test_liberar_so_confirma_as_mensagens_do_proprio_dispatch():
     _lib_env(b)
     b.caixa(("worker_done", {"taskId": "task_w2", "dispatchId": "ctx_term_w2"}))
     out = json.loads(b.orq("liberar", "ctx_term_w1").stdout)
-    assert "acked" not in b.estados().values() and "outro dispatch" in out["aviso"], (b.estados(), out)  # o Orca entrega os dois no mesmo lote
+    assert "acked" not in b.estados().values() and "another dispatch" in out["aviso"], (b.estados(), out)  # o Orca entrega os dois no mesmo lote
     c = Amb(run="run_a")
     c.set("workers.json", [{"handle": "term_w1", "run": "run_a", "status": "completed", "terminal": "active"}])
     c.caixa(("worker_done", {"taskId": "t", "dispatchId": "ctx_term_outro"}))
@@ -3665,7 +3665,7 @@ def test_liberar_com_o_gerente_em_outro_run_pula_o_ack_e_ainda_libera():
     r = a.orq("liberar", "ctx_term_w1")
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["estado"] == "released" and "ack" in out["aviso"] and "orq gerente ligar --terminal term_ger --run run_a" in out["aviso"], out
+    assert out["estado"] == "released" and "ack" in out["aviso"] and "orq manager bind --terminal term_ger --run run_a" in out["aviso"], out
     assert _log(a, "released.log")
 
 
@@ -3738,8 +3738,8 @@ def test_despachar_com_entrada_poe_o_pedido_literal_no_topo_do_spec():
     _despachar(a, "--entrada", "e1", spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
-    assert spec == ('# Ticket 05\n\n## Pedido do usuário\ncria o ticket 05, com "aspas" e acento\n\n'
-                    'O que o coordenador escreveu abaixo não o substitui: o pronto se confere contra este pedido.\n\nFaça X.\n\n' + orq_mod.BLOCO_ESPERANDO + "\n"), spec
+    assert spec == ('# Ticket 05\n\n## User request\ncria o ticket 05, com "aspas" e acento\n\n'
+                    'What the coordinator wrote below does not replace it: done is checked against this request.\n\nFaça X.\n\n' + orq_mod.BLOCO_ESPERANDO + "\n"), spec
 
 
 def test_despachar_sem_entrada_so_acrescenta_o_bloco_esperando_ao_spec():
@@ -3754,7 +3754,7 @@ def test_despachar_entrada_com_spec_sem_titulo_poe_o_pedido_depois_do_titulo_que
     a.prompt("pedido")
     _despachar(a, "--entrada", "e1", spec=_spec(a, "Faça X.\n"))
     (arg,) = _log(a, "started.log")
-    assert arg[arg.index("--spec") + 1].startswith("# Ticket 05\n\n## Pedido do usuário\npedido\n"), arg
+    assert arg[arg.index("--spec") + 1].startswith("# Ticket 05\n\n## User request\npedido\n"), arg
 
 
 def test_despachar_poe_o_bloco_esperando_no_fim_do_spec_uma_vez():
@@ -3762,8 +3762,8 @@ def test_despachar_poe_o_bloco_esperando_no_fim_do_spec_uma_vez():
     _despachar(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
-    assert spec.count("## Esperando") == 1 and spec.rstrip().endswith("já espera dentro do comando."), spec
-    for regra in ("encerre o turno", "600000 ms", "repita o mesmo comando", "segundo plano"):
+    assert spec.count("## Waiting") == 1 and spec.rstrip().endswith("already waits inside the command."), spec
+    for regra in ("end the turn", "600000 ms", "repeat the same command", "Never background"):
         assert regra in spec, regra
 
 
@@ -3849,7 +3849,7 @@ def test_despachar_com_o_prompt_que_nunca_entra_marca_nao_iniciou_e_avisa():
     r = _despachar(a, FAKE_INICIO="nunca")
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["estado"] == "nao_iniciou" and out["enter"] is True and "não entrou" in out["aviso"] and "aviso:" in r.stderr, out
+    assert out["estado"] == "nao_iniciou" and out["enter"] is True and "did not reach" in out["aviso"] and "warning:" in r.stderr, out
     assert len(_log(a, "send.log")) == 1, "um Enter só"
     (ev,) = [e for e in a.events() if e["tipo"] == "nao_iniciou"]
     assert ev["dispatch"] == "ctx_term_novo1" and ev["run"] == "run_a"
@@ -3951,7 +3951,7 @@ def test_heartbeat_visto_de_outro_run_mantem_o_dispatch_vivo_no_resumo_e_no_agen
     ab = _aberto_ag("travado", ultimo_heartbeat=now_iso(-2000), desde=now_iso(-3000), dispatch="ctx_term_o1")
     evs = orq_mod_events(a.home)
     txt = orq_mod.resumo(evs, ab, {"itens": []}, agora=datetime.now(timezone.utc))
-    assert "Travado" not in txt and "fase-8" in txt, txt
+    assert "Stuck" not in txt and "fase-8" in txt, txt
 
 
 def test_heartbeat_de_outro_run_bloqueado_nao_perde_o_worker_done_que_chega_depois():
@@ -4022,7 +4022,7 @@ def test_ticket_novo_cria_a_task_com_o_titulo_e_o_spec_curto():
     out = json.loads(_novo(a, "Título exato do ticket").stdout)
     (arg,) = _log(a, "created.log")
     assert arg[:1] == ["task-create"] and arg[arg.index("--task-title") + 1] == "Título exato do ticket"
-    assert arg[arg.index("--spec") + 1] .startswith(f"Leia e execute o ticket {out['arquivo']}\n\n## Esperando\n"), arg
+    assert arg[arg.index("--spec") + 1] .startswith(f"Leia e execute o ticket {out['arquivo']}\n\n## Waiting\n"), arg
     assert "--deps" not in arg and arg[arg.index("--run") + 1] == "run_a"
     tasks = json.load(open(os.path.join(a.fake, "tasks_run_a.json")))
     assert [(t["id"], t["task_title"], t["status"]) for t in tasks] == [("task_tk1", "Título exato do ticket", "ready")]
@@ -4150,7 +4150,7 @@ def test_ticket_fechar_falha_do_orca_resolve_o_ticket_e_avisa():
     out = json.loads(r.stdout)
     assert out["status"] == "resolved" and out["task_fechada"] is False and "task-update" in out["aviso"], out
     assert "Status: resolved" in _lido(a, "01"), "o arquivo é a verdade; a task fecha depois"
-    assert "aviso" in r.stderr
+    assert "warning" in r.stderr
 
 
 def test_ticket_fechar_ticket_sem_task_so_grava_o_arquivo():
@@ -4200,17 +4200,17 @@ def test_hook_session_injeta_status_tickets_abertos_e_o_caminho_do_mapa():
     ctx = _ctx_session(a)
     linhas = ctx.splitlines()
     assert len(linhas) <= 12, ctx
-    assert "[orq]" in linhas[0] and "Sem efeito" in linhas[0] and "Com você:" in ctx, "o orq status"
-    assert "Tickets abertos (2)" in ctx and "01 Base (ready-for-agent)" in ctx, ctx
+    assert "[orq]" in linhas[0] and "No effect" in linhas[0] and "With you:" in ctx, "o orq status"
+    assert "Open tickets (2)" in ctx and "01 Base (ready-for-agent)" in ctx, ctx
     assert "02 Depende do base (ready-for-agent; Blocked by: 01)" in ctx, ctx
     assert "Já feito" not in ctx, "resolvido não aparece"
-    assert f"Mapa: {a.env['ORQ_MAPA']}" in linhas[-1], linhas[-1]
+    assert f"Map: {a.env['ORQ_MAPA']}" in linhas[-1], linhas[-1]
 
 
 def test_hook_session_sem_ticket_aberto_diz_isso_em_uma_linha():
     a = Amb(run="run_a")
     ctx = _ctx_session(a)
-    assert "Tickets abertos: nenhum" in ctx and len(ctx.splitlines()) <= 12 and "Mapa:" in ctx
+    assert "Open tickets: none" in ctx and len(ctx.splitlines()) <= 12 and "Map:" in ctx
 
 
 def test_hook_session_muitos_tickets_ficam_em_12_linhas_com_o_resto_contado():
@@ -4220,8 +4220,8 @@ def test_hook_session_muitos_tickets_ficam_em_12_linhas_com_o_resto_contado():
     ctx = _ctx_session(a)
     linhas = ctx.splitlines()
     assert len(linhas) == 12, (len(linhas), ctx)
-    assert "Tickets abertos (9)" in ctx and "+" in linhas[-2] and "orq ticket lista" in linhas[-2], linhas[-2]
-    assert linhas[-1].startswith("Mapa:") and "01 Ticket numero 1 " in ctx
+    assert "Open tickets (9)" in ctx and "+" in linhas[-2] and "orq ticket list" in linhas[-2], linhas[-2]
+    assert linhas[-1].startswith("Map:") and "01 Ticket numero 1 " in ctx
 
 
 def test_hook_session_so_no_coordenador_worker_fica_mudo():
@@ -4307,7 +4307,7 @@ def test_lugar_checkout_principal_fora_da_branch_padrao_avisa():
     p, _ = _repo(a.tmp.name, ramo="feat/outra")
     for r in (_lugar(a, p), _lugar(a, p, cmd="cd x && git push origin HEAD"), _lugar(a, p, tool="Write")):
         msg = _aviso(r)
-        assert "lugar errado" in msg and "feat/outra" in msg and "main" in msg, msg
+        assert "wrong place" in msg and "feat/outra" in msg and "main" in msg, msg
     assert _aviso(_lugar(a, p, cmd="echo git commit")) == ""
 
 
@@ -4316,7 +4316,7 @@ def test_lugar_cwd_em_worktree_de_worker_avisa_mas_a_casa_do_coordenador_nao():
     a.prompt("oi")
     p, w = _repo(a.tmp.name)
     msg = _aviso(_lugar(a, w, CLAUDE_PROJECT_DIR=p))
-    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+    assert "wrong place" in msg and os.path.realpath(w) in msg, msg
     assert _aviso(_lugar(a, w, CLAUDE_PROJECT_DIR=w)) == "", "coordenador que mora numa worktree ligada não é engano"
 
 
@@ -4338,7 +4338,7 @@ def test_lugar_so_no_coordenador_e_abaixo_de_100_ms():
 
 def test_lugar_esta_no_settings_de_exemplo():
     cfg = json.load(open(os.path.join(AQUI, "settings.hooks.example.json")))
-    g = [x for x in cfg["hooks"]["PreToolUse"] if "orq.py hook lugar" in json.dumps(x)]
+    g = [x for x in cfg["hooks"]["PreToolUse"] if "orq.py hook place" in json.dumps(x)]
     assert len(g) == 1 and "Bash" in g[0]["matcher"] and "Edit" in g[0]["matcher"], g
 
 
@@ -4372,8 +4372,8 @@ def test_migracao_um_ticket_por_fatia_entregue_e_um_para_cada_aberta():
 
 def test_worker_routing_manda_a_tarefa_nova_nascer_como_ticket():
     txt = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
-    linha = [l for l in txt.splitlines() if "orq ticket novo" in l]
-    assert len(linha) == 1 and "ticket" in linha[0].lower() and "orq ticket fechar" in linha[0], linha
+    linha = [l for l in txt.splitlines() if "orq ticket new" in l]
+    assert len(linha) == 1 and "ticket" in linha[0].lower() and "orq ticket close" in linha[0], linha
 
 
 # "já fez" pelo Lavish (pedido de 29/09, lote 339e0af655)
@@ -4519,7 +4519,7 @@ def test_review5_m9_user_takeover_sem_transcrito_ou_de_outro_dispatch_nao_fecha(
     a = Amb(run="run_a")
     _takeover(a)  # nenhum transcrito
     out = json.loads(a.orq("liberar", "ctx_term_w1").stdout)
-    assert out["fechado"] is False and "transcrito" in out["aviso"] and not _log(a, "close.log"), out
+    assert out["fechado"] is False and "transcript" in out["aviso"] and not _log(a, "close.log"), out
     b = Amb(run="run_a")
     _takeover(b)
     _transcrito_do_worker(b, "ctx_outro_dispatch")  # o transcrito é de outro worker
@@ -4555,7 +4555,7 @@ def test_review5_m9_agentes_mostra_o_user_takeover_entregue_com_o_orq_liberar_e_
     ag = _agentes(a)["ctx_term_w1"]
     assert ag["estado"] == "entregue" and not ag.get("retido"), ag
     r = a.orq("agentes")
-    assert "orq liberar ctx_term_w1" in r.stdout, r.stdout
+    assert "orq release ctx_term_w1" in r.stdout, r.stdout
     a.orq("ingest", "--refresh")
     assert "ctx_term_w1" in {x["dispatch"] for x in _ler_estado(os.path.join(a.home, "aberto.json"))["agentes"]}
     a.set("terminals.json", ["term_w1"])
@@ -4574,7 +4574,7 @@ def test_review5_m9_o_resumo_conta_o_user_takeover_entre_os_entregues_sem_libera
     a.set("runs.json", [{"id": "run_a", "objective": "A"}])
     a.orq("ingest", "--refresh")
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Entregues sem liberar 1" in ctx, ctx
+    assert "Delivered, not released: 1" in ctx, ctx
 
 
 def test_review5_m10_liberar_acha_a_linha_pelo_dispatch_e_nao_fecha_terminal_reaproveitado_por_worker_rodando():
@@ -4741,7 +4741,7 @@ def test_review5_b28_os_hooks_python_saem_com_zero_e_sem_traceback_em_entrada_ru
 def test_marca_heartbeat_absorvido_uma_linha_com_a_contagem():
     a = Amb()
     a.caixa(_hb("a"), _hb("b"), _hb("c"))
-    assert json.loads(a.prompt(AVISO_A).stdout)["reason"] == "🟣 orq · 3 sinais de vida absorvidos (run_a)"
+    assert json.loads(a.prompt(AVISO_A).stdout)["reason"] == "🟣 orq · 3 heartbeats absorbed (run_a)"
 
 
 def test_marca_heartbeat_atrasado():
@@ -4778,7 +4778,7 @@ def test_review6_m13_resumo_nao_pede_para_liberar_o_que_o_liberar_ja_liberou():
     from datetime import datetime, timezone
     ab = _aberto_ag("entregue")
     d = ab["agentes"][0]["dispatch"]
-    assert "sem liberar 1" in orq_mod.linha_vivos([], ab, datetime.now(timezone.utc))
+    assert "not released: 1" in orq_mod.linha_vivos([], ab, datetime.now(timezone.utc))
     assert orq_mod.linha_vivos([{"tipo": "liberar", "dispatch": d, "fechado": True}], ab) == ""
     assert orq_mod.linha_vivos([{"tipo": "liberar", "dispatch": d, "estado": "released", "fechado": False}], ab) == ""
 
@@ -4787,14 +4787,14 @@ def test_review6_m13_liberar_repetido_nao_manda_release_nem_close_e_o_resumo_bat
     a = Amb(run="run_a")
     _lib_env(a, release="retained")
     a.orq("ingest", "--refresh")
-    assert "sem liberar 1" in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "not released: 1" in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
     assert json.loads(a.orq("liberar", "ctx_term_w1").stdout)["fechado"] is True
     a.set("terminals.json", ["term_w2", "term_coord"])
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
     assert "sem liberar" not in ctx, ctx
     n = len(_log(a, "calls.log"))
     out = json.loads(a.orq("liberar", "ctx_term_w1").stdout)
-    assert out["aviso"] == "já liberado" and len([e for e in a.events() if e["tipo"] == "liberar"]) == 1
+    assert out["aviso"] == "already released" and len([e for e in a.events() if e["tipo"] == "liberar"]) == 1
     assert not [c for c in _log(a, "calls.log")[n:] if c[0] in ("worker-release", "close")]
     assert len(_log(a, "close.log")) == 1
 
@@ -4842,7 +4842,7 @@ def test_review7_b38_dispatch_liberado_nao_vira_travado_com_cache_de_antes_do_wo
         ab = _aberto_ag(estado, ultimo_heartbeat=hb)
         assert orq_mod.linha_vivos([{"tipo": "liberar", "dispatch": "ctx_1", "fechado": True}], ab, agora) == "", estado
         assert not [a for a in orq_mod.reavalia(ab["agentes"], [{"tipo": "liberar", "dispatch": "ctx_1", "fechado": True}], agora) if a["estado"] == "travado"]
-    assert "TRAVADO" in orq_mod.linha_vivos([], _aberto_ag("rodando", ultimo_heartbeat=hb), agora)
+    assert "STUCK" in orq_mod.linha_vivos([], _aberto_ag("rodando", ultimo_heartbeat=hb), agora)
 
 
 def test_review7_b39_alerta_some_quando_o_agente_da_task_esta_liberado_no_cache():
@@ -4899,7 +4899,7 @@ def test_gerente_ligado_o_hook_de_prompt_ve_o_coordenador_e_injeta_o_estado():
     a = Amb(run="run_a")
     _gerente(a)
     r = a.prompt("oi")
-    assert r.returncode == 0 and "additionalContext" in r.stdout and "binding perdido" not in r.stdout, r
+    assert r.returncode == 0 and "additionalContext" in r.stdout and "binding lost" not in r.stdout, r
 
 
 def test_gerente_de_outro_coordenador_nao_muda_nada():
@@ -4948,7 +4948,7 @@ def test_gerente_ligar_recusa_terminal_morto_o_proprio_e_sem_run():
     r = a.orq("gerente", "ligar", "--terminal", "term_ger")
     assert r.returncode == 1 and "term_ger" in r.stderr, r
     r = a.orq("gerente", "ligar", "--terminal", "term_coord")
-    assert r.returncode == 1 and "próprio" in r.stderr, r
+    assert r.returncode == 1 and "own terminal" in r.stderr, r
     b = Amb(run=None)
     b.set("terminals.json", ["term_ger"])
     r = b.orq("gerente", "ligar", "--terminal", "term_ger")
@@ -5002,7 +5002,7 @@ def test_gerente_absorver_fora_do_gerente_nao_faz_nada():
     a = Amb(run="run_a")  # term_coord, sem gerente.json: o painel sem gerente ligado
     a.caixa(_hb("lendo"))
     r = a.orq("gerente", "absorver")
-    assert r.returncode == 0 and "desligado" in r.stdout, r
+    assert r.returncode == 0 and "off" in r.stdout, r
     assert a.estados() == {"msg_1": "unread"} and not _calls(a, "check")
 
 
@@ -5132,7 +5132,7 @@ def test_gerente_absorver_fica_no_run_do_aviso_ate_o_coordenador_confirmar():
     assert a.orq("gerente", "absorver").returncode == 0
     a.caixa(_hb("depois"), run="run_a")  # chega em outro Run enquanto o coordenador não leu
     r = a.orq("gerente", "absorver")
-    assert "esperando o coordenador" in r.stdout and "run_a" not in r.stdout, r.stdout
+    assert "waiting for the coordinator" in r.stdout and "run_a" not in r.stdout, r.stdout
     assert a.estados()["msg_2"] == "unread" and _binds(a)["run_b"] == "term_ger", "não sai do Run: a entrega do coordenador cairia (consumer_fenced)"
     assert len(_log(a, "send.log")) == 1, "um aviso por entrega"
     d = _check_run(a, "run_b")["result"]["deliveryId"]
@@ -5231,12 +5231,12 @@ def test_gerente_waiter_acorda_com_escalation_de_run_do_gerente_que_nao_e_o_liga
 
 def _inteiro(texto):
     """O aviso inteiro: o digitado, ou o arquivo que ele cita quando passou do AVISO_MAX (ticket 98)."""
-    return open(texto.split("completo em ")[1], encoding="utf-8").read() if "completo em /" in texto else texto
+    return open(texto.split("full text at ")[1], encoding="utf-8").read() if "full text at /" in texto else texto
 
 
 def _aviso_inteiro(texto):
     """O aviso como o coordenador o lê: o texto digitado e, quando passou do teto (ticket 98), o arquivo que ele cita com o texto inteiro."""
-    achou = re.search(r"completo em (\S+\.txt)", texto)
+    achou = re.search(r"full text at (\S+\.txt)", texto)
     return texto if not achou else open(achou.group(1), encoding="utf-8").read()
 
 
@@ -5287,11 +5287,11 @@ def test_ticket20_coordenador_no_meio_do_turno_nao_recebe_texto_e_o_aviso_sai_um
     a.caixa(("worker_done", {"taskId": "task_1", "dispatchId": "ctx_1"}))
     for _ in range(3):
         r = a.orq("gerente", "absorver")
-        assert r.returncode == 0 and "ficar livre" in r.stdout, r.stdout
+        assert r.returncode == 0 and "to be free" in r.stdout, r.stdout
     assert _avisos_enviados(a) == [], "texto digitado no meio do turno fica parado na caixa: nada é digitado"
     a.set("busy.json", [])
     r = a.orq("gerente", "absorver")
-    assert "avisado ao coordenador" in r.stdout, r.stdout
+    assert "coordinator notified" in r.stdout, r.stdout
     a.orq("gerente", "absorver")
     (env,) = _avisos_enviados(a)
     assert "--enter" in env, env
@@ -5387,7 +5387,7 @@ def test_ticket74_o_aviso_digitado_tem_o_teto_e_o_arquivo_guarda_o_resumo_de_ate
     (env,) = _avisos_enviados(a, "term_w1")
     texto = env[env.index("--text") + 1]
     assert "\n" not in texto and len(texto) <= orq_mod.AVISO_MAX, texto  # ticket 98: o digitado cabe no teto
-    completo = open(texto.split("completo em ")[1], encoding="utf-8").read()  # e o arquivo citado guarda o resumo do ajuste (STEER_AVISO_MAX)
+    completo = open(texto.split("full text at ")[1], encoding="utf-8").read()  # e o arquivo citado guarda o resumo do ajuste (STEER_AVISO_MAX)
     assert "x" * 250 in completo and "x" * 301 not in completo, completo
 
 
@@ -5425,8 +5425,8 @@ def test_ticket20_agent_prompt_blocked_do_orca_conta_como_ocupado_no_painel_e_no
     _multi(a, {"run_a": "term_ger"}, ["run_a"])
     a.caixa(("worker_done", {"taskId": "task_1", "dispatchId": "ctx_1"}))
     r = a.orq("gerente", "absorver", FAKE_PROMPT_BLOCKED="1")
-    assert "ficar livre" in r.stdout and not _existe_estado(os.path.join(a.home, "gerente-aviso.json")), r.stdout
-    assert "avisado ao coordenador" in a.orq("gerente", "absorver").stdout, "passou o turno: o aviso sai"
+    assert "to be free" in r.stdout and not _existe_estado(os.path.join(a.home, "gerente-aviso.json")), r.stdout
+    assert "coordinator notified" in a.orq("gerente", "absorver").stdout, "passou o turno: o aviso sai"
     b = Amb()
     assert _steer_com_worker(b, FAKE_PROMPT_BLOCKED="1").returncode == 0
     assert "aviso_terminal" not in [e for e in b.events() if e["tipo"] == "steer"][0], "worker ocupado: o Orca avisa sozinho"
@@ -5456,7 +5456,7 @@ def test_gerente_absorver_solta_run_parado_sem_task_aberta_e_sem_mensagem():
     assert r.returncode == 0, r.stderr
     assert _gerente_runs(a) == ["run_a"], "run_b não tem task aberta nem mensagem há mais de RUN_PARADO_MIN"
     (ev,) = [e for e in a.events() if e["tipo"] == "gerente" and e["op"] == "soltar"]
-    assert ev["run"] == "run_b" and "sem task aberta" in ev["motivo"], ev
+    assert ev["run"] == "run_b" and "no open task" in ev["motivo"], ev
 
 
 def test_gerente_absorver_nao_solta_run_recente_com_mensagem_ou_o_ultimo():
@@ -5676,7 +5676,7 @@ def test_ticket24_texto_de_agentes_diz_nao_comecou_e_parado_no_prompt_com_o_stee
     _agentes_24(a, {"ctx_term_p": {"task": "task_term_p", "inicio": now_iso(-600), "fim": now_iso(-300)}})
     r = a.orq("agentes")
     assert r.returncode == 0, r.stderr
-    assert "não começou" in r.stdout and "parado no prompt há 5 min" in r.stdout, r.stdout
+    assert "did not start" in r.stdout and "stopped at the prompt for 5 min" in r.stdout, r.stdout
     assert 'orq steer task_term_p "' in r.stdout and 'orq steer task_term_n "' in r.stdout, r.stdout
 
 
@@ -5686,10 +5686,10 @@ def test_ticket24_resumo_e_aberto_carregam_o_nao_comecou_e_o_parado():
     ab = _aberto_ag("parado", agente="claude", desde=now_iso(-3000), turno_inicio=now_iso(-900), turno_fim=now_iso(-600), idade_s=600)
     ab["agentes"].append({**ab["agentes"][0], "dispatch": "ctx_2", "task": "task_bbbbbbbbbb", "estado": "nao_comecou", "turno_inicio": None, "turno_fim": None, "desde": now_iso(-400)})
     txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
-    assert "Parado no prompt: task_aaaaaaaaaa" in txt and "há 10 min" in txt and "Não começou: task_bbbbbbbbbb" in txt and 'orq steer task_aaaaaaaaaa "' in txt, txt
+    assert "Stopped at prompt: task_aaaaaaaaaa" in txt and "for 10 min" in txt and "Not started: task_bbbbbbbbbb" in txt and 'orq steer task_aaaaaaaaaa "' in txt, txt
     assert len(txt.splitlines()) <= 5
     vivo = orq_mod.resumo([], ab, {"itens": []}, agora=agora, turnos={"ctx_1": {"inicio": now_iso(-5), "fim": None}})
-    assert "Parado no prompt" not in vivo, "o turnos.json mais novo que o cache tira o parado"
+    assert "Stopped at prompt" not in vivo, "o turnos.json mais novo que o cache tira o parado"
 
 
 def test_ticket24_constantes_com_nome():
@@ -5715,7 +5715,7 @@ def test_ticket25_esperando_ha_30_min_nao_e_travado():
 
 def test_ticket25_espera_sem_prazo_vira_travada_depois_do_teto_com_o_motivo():
     ag, _, _ = _espera_25("esperando: fila de E2E", 61)
-    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+    assert ag["estado"] == "travado" and ag["motivo"] == "wait expired", ag
 
 
 def test_ticket25_fase_comum_continua_com_os_15_min():
@@ -5727,7 +5727,7 @@ def test_ticket25_fase_comum_continua_com_os_15_min():
 def test_ticket25_prazo_declarado_vale_ate_o_horario_e_depois_vence():
     assert _espera_25(f"esperando: CI até {_hhmm_25(40)}", 30)[0]["estado"] == "rodando"
     ag = _espera_25(f"esperando: CI até {_hhmm_25(-5)}", 30)[0]
-    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+    assert ag["estado"] == "travado" and ag["motivo"] == "wait expired", ag
 
 
 def test_ticket25_monta_agentes_usa_a_mesma_regra():
@@ -5738,16 +5738,16 @@ def test_ticket25_monta_agentes_usa_a_mesma_regra():
     assert orq_mod.monta_agentes(ws, msgs, [], agora)[0]["estado"] == "rodando"
     msgs[0]["created_at"] = _iso(-3700)
     ag = orq_mod.monta_agentes(ws, msgs, [], agora)[0]
-    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida"
+    assert ag["estado"] == "travado" and ag["motivo"] == "wait expired"
 
 
 def test_ticket25_resumo_mostra_a_espera_numa_linha_so_uma_vez():
     ag, ab, agora = _espera_25("esperando: fila de E2E", 30)
     txt = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
-    assert txt.count("esperando: fila de E2E") == 1 and "Travado" not in txt, txt
+    assert txt.count("esperando: fila de E2E") == 1 and "Stuck" not in txt, txt
     ab["agentes"][0]["ultimo_heartbeat"] = now_iso(-3700)
     venc = orq_mod.resumo([], ab, {"itens": []}, agora=agora)
-    assert "espera vencida" in venc and "Travado: task_aaaaaaaaaa" in venc, venc
+    assert "wait expired" in venc and "Stuck: task_aaaaaaaaaa" in venc, venc
 
 
 def _ws_43(hb_min, fase="compilando", controle_min=None, turno=True):
@@ -5769,14 +5769,14 @@ def test_ticket43_tela_com_shell_em_execucao_e_espera_e_nao_parado():
     assert sem["estado"] == "parado", "sem a tela o turno encerrado continua parado"
     r = orq_mod.reavalia([ag], ev, agora, turnos)[0]
     assert r["estado"] == "rodando" and r["espera"], "o cache dos hooks de prompt guarda a espera sem ler a tela"
-    assert "esperando: 1 shell still running" in orq_mod.texto_agentes([ag])
+    assert "waiting: 1 shell still running" in orq_mod.texto_agentes([ag])
 
 
 def test_ticket43_shell_em_execucao_sem_heartbeat_alem_do_teto_e_travado():
     ws, msgs, ev, agora, det, turnos = _ws_43(46)
     ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos, telas={"ctx_1": "shell still running (tela)"})[0]
-    assert ag["estado"] == "travado" and ag["motivo"] == "shell sem heartbeat", ag
-    assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["motivo"] == "shell sem heartbeat"
+    assert ag["estado"] == "travado" and ag["motivo"] == "shell without heartbeat", ag
+    assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["motivo"] == "shell without heartbeat"
 
 
 def test_ticket43_tela_lida_antes_de_novo_heartbeat_deixa_de_valer():
@@ -5794,14 +5794,14 @@ def test_ticket43_heartbeat_waiting_em_ingles_e_espera():
     assert ag["estado"] == "rodando" and ag["espera"] == "for E2E queue", ag
     ws, msgs, ev, agora, det, turnos = _ws_43(61, fase="waiting…")
     ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
-    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", "waiting sem prazo vence no teto"
+    assert ag["estado"] == "travado" and ag["motivo"] == "wait expired", "waiting sem prazo vence no teto"
     assert orq_mod.espera_declarada("waiting…", now_iso(0))[0] == "esperando"
 
 
 def test_ticket43_interromper_pausa_o_worker_e_nao_e_travado():
     ws, msgs, ev, agora, det, turnos = _ws_43(127, controle_min=5)
     ag = orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]
-    assert ag["estado"] == "rodando" and ag["espera"] == "interrompido pelo coordenador", ag
+    assert ag["estado"] == "rodando" and ag["espera"] == "interrupted by the coordinator", ag
     assert orq_mod.reavalia([ag], ev, agora, turnos)[0]["estado"] == "rodando"
     ws, msgs, ev, agora, det, turnos = _ws_43(127, controle_min=200)  # interrompido antes do último heartbeat: o worker voltou a dar sinal
     assert orq_mod.monta_agentes(ws, msgs, ev, agora, det, turnos=turnos)[0]["estado"] == "parado"
@@ -5924,18 +5924,18 @@ def test_ticket26_terceira_falha_grava_o_alerta_e_para_de_digitar():
     assert len(_digitados_26(a)) == 3 and not [e for e in a.events() if e["tipo"] == "alerta"], "três tentativas, ainda sem alerta"
     _envelhece_26(a, 100)
     r = a.orq("steers")
-    assert "steer não lido" in r.stdout, r.stdout
+    assert "steer not read" in r.stdout, r.stdout
     (al,) = [e for e in a.events() if e["tipo"] == "alerta"]
     assert (al["alerta"], al["task"], al["dispatch"], al["run"], al["msg_id"]) == ("steer_nao_lido", "task_rodando", "ctx_1", "run_a", "msg_9"), al
     _envelhece_26(a, 100)
     a.orq("steers")
     assert len(_digitados_26(a)) == 3 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
-    assert "steer não lido" in a.orq("status").stdout, "o resumo carrega o alerta"
+    assert "steer not read" in a.orq("status").stdout, "o resumo carrega o alerta"
     ag = _agentes(a)["ctx_1"]
-    assert ag["alerta"] == "steer não lido", ag
-    assert "steer não lido" in a.orq("agentes").stdout
+    assert ag["alerta"] == "steer not read", ag
+    assert "steer not read" in a.orq("agentes").stdout
     a.orq("alerta", "visto", "task_rodando")
-    assert "steer não lido" not in a.orq("status").stdout and "alerta" not in _agentes(a)["ctx_1"], "orq alerta visto trata o alerta"
+    assert "steer not read" not in a.orq("status").stdout and "alerta" not in _agentes(a)["ctx_1"], "orq alerta visto trata o alerta"
 
 
 def test_ticket118_worker_com_pergunta_aberta_nao_recebe_aviso_nem_alerta():
@@ -5950,7 +5950,7 @@ def test_ticket118_worker_com_pergunta_aberta_nao_recebe_aviso_nem_alerta():
                                           "created_at": _iso(-5), "delivered_at": None})
     _envelhece_26(a, 100)
     r = a.orq("steers")
-    assert r.returncode == 0 and "steer não lido" not in r.stdout, r.stdout
+    assert r.returncode == 0 and "steer not read" not in r.stdout, r.stdout
     assert not [e for e in a.events() if e["tipo"] == "alerta"], "a pergunta aberta é a razão do silêncio: sem alerta"
     assert len(_digitados_26(a)) == 3
 
@@ -6041,7 +6041,7 @@ def test_ticket26_painel_do_gerente_reentrega_a_cada_volta():
     _linha_26(a)
     _envelhece_26(a, 100)
     r = a.orq("gerente", "absorver")
-    assert r.returncode == 0 and len(_digitados_26(a)) == 1 and "task_rodando" in r.stdout and "redigitado" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and len(_digitados_26(a)) == 1 and "task_rodando" in r.stdout and "retyped" in r.stdout, (r.stdout, r.stderr)
 
 
 def test_ticket99_tolerancia_corre_do_fim_do_turno_que_passou_da_tolerancia():
@@ -6102,12 +6102,12 @@ def test_ticket28_pendencia_viva_futura_vencida_esperando_e_envelhecida():
     hoje = date(2026, 9, 29)
     base = {"id": "p", "tipo": "acao", "titulo": "t", "desde": "2026-09-25"}
     assert orq_mod.pend_depois(base, hoje) is None, "viva"
-    assert orq_mod.pend_depois({**base, "ate": "2026-10-05"}, hoje) == "até 2026-10-05", "data futura"
+    assert orq_mod.pend_depois({**base, "ate": "2026-10-05"}, hoje) == "until 2026-10-05", "data futura"
     assert orq_mod.pend_depois({**base, "ate": "2026-09-29"}, hoje) is None, "data de hoje volta"
     assert orq_mod.pend_depois({**base, "ate": "2026-09-20", "espera": "Ana", "desde": "2026-08-01"}, hoje) is None, "data vencida volta, mesmo esperando e velha"
-    assert orq_mod.pend_depois({**base, "espera": "Ana"}, hoje) == "esperando Ana"
+    assert orq_mod.pend_depois({**base, "espera": "Ana"}, hoje) == "waiting on Ana"
     assert orq_mod.pend_depois({**base, "desde": "2026-09-15"}, hoje) is None, "14 dias ainda é viva"
-    assert orq_mod.pend_depois({**base, "desde": "2026-09-14"}, hoje) == "parada há 15 d", "envelhecida"
+    assert orq_mod.pend_depois({**base, "desde": "2026-09-14"}, hoje) == "stale for 15 d", "envelhecida"
     assert orq_mod.pend_depois({**base, "desde": "2026-08-01", "gate": "g1"}, hoje) is None, "decisão com gate não some"
     assert orq_mod.pend_depois({"id": "sem-desde", "tipo": "avisar", "titulo": "t"}, hoje) is None, "item antigo sem desde segue vivo"
 
@@ -6121,7 +6121,7 @@ def test_ticket28_resumo_mostra_so_as_vivas_e_conta_depois():
         {"id": "velha", "tipo": "acao", "titulo": "t", "desde": "2020-01-01"},
     ]})
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Com você: 1 (1 decisões). Depois: 3." in ctx, ctx
+    assert "With you: 1 (1 decisions). Later: 3." in ctx, ctx
     assert "Depois" not in orq_mod.resumo([], None, {"itens": [{"id": "v", "tipo": "acao", "titulo": "t", "desde": "2099-01-01"}]})
 
 
@@ -6131,11 +6131,11 @@ def test_ticket28_pend_add_ate_e_lista():
     r = a.orq("pend", "add", "--id", "depois", "--tipo", "acao", "--titulo", "mais tarde", "--ate", "2099-12-31")
     assert r.returncode == 0 and json.loads(r.stdout)["ate"] == "2099-12-31", r.stderr
     r = a.orq("pend", "add", "--id", "ruim", "--tipo", "acao", "--titulo", "x", "--ate", "31/12/2099")
-    assert r.returncode == 1 and "AAAA-MM-DD" in r.stderr
+    assert r.returncode == 1 and "YYYY-MM-DD" in r.stderr
     viva = a.orq("pend", "lista").stdout
     assert "antiga" in viva and "depois" not in viva, "as pendências atuais continuam aparecendo"
     todas = a.orq("pend", "lista", "--todas").stdout
-    assert "antiga" in todas and "depois  acao  mais tarde  [Depois: até 2099-12-31]" in todas, todas
+    assert "antiga" in todas and "depois  acao  mais tarde  [Later: until 2099-12-31]" in todas, todas
 
 
 def _amb_resumo():
@@ -6181,12 +6181,12 @@ def test_ticket29_resumo_traz_as_quatro_partes_e_as_decisoes():
     r = a.orq("resumo")
     assert r.returncode == 0, r.stderr
     out = r.stdout
-    assert "Com você (1)" in out and "publicar" in out and "Publicar o repositório" in out and "Fica pra depois" not in out, out
-    assert "Entrou" in out and "e2" in out and "tarefa task_f1" in out and "e3" in out and "sem efeito" in out and "e4" in out and "pend revisar-pr" in out, out
+    assert "With you (1)" in out and "publicar" in out and "Publicar o repositório" in out and "Fica pra depois" not in out, out
+    assert "In (" in out and "e2" in out and "tarefa task_f1" in out and "e3" in out and "no effect" in out and "e4" in out and "pend revisar-pr" in out, out
     assert "e1" not in out, "a entrada anterior à última mensagem do usuário fica de fora"
-    assert "Anda (1)" in out and "Corrigir o filtro de marca" in out and "implementing" in out and "Worker parado" not in out, out
-    assert "Vem" in out and "pronto: 02 Pronto" in out and "bloqueado: 04 Travado (espera 02)" in out and "Andando" not in out and "Base" not in out, out
-    assert "Decisões (3)" in out and "Publicar orq: Recriar o repo" in out and "Inspetor: Mascarada + id" in out and "freio-prod: liberado" in out and "Antiga" not in out, out
+    assert "Moving (1)" in out and "Corrigir o filtro de marca" in out and "implementing" in out and "Worker parado" not in out, out
+    assert "Next" in out and "ready: 02 Pronto" in out and "blocked: 04 Travado (waits on 02)" in out and "Andando" not in out and "Base" not in out, out
+    assert "Decisions (3)" in out and "Publicar orq: Recriar o repo" in out and "Inspetor: Mascarada + id" in out and "freio-prod: liberado" in out and "Antiga" not in out, out
 
 
 def test_ticket29_resumo_desde_muda_a_janela():
@@ -6194,7 +6194,7 @@ def test_ticket29_resumo_desde_muda_a_janela():
     out = a.orq("resumo", "--desde", "2026-09-29T08:00:00Z").stdout
     assert "e1" in out and "Antiga: Sim" in out, out
     vazio = a.orq("resumo", "--desde", "2026-09-30T00:00:00Z").stdout
-    assert "Entrou: nada" in vazio and "Decisões: nenhuma" in vazio, vazio
+    assert "In: nothing" in vazio and "Decisions: none" in vazio, vazio
 
 
 def test_ticket29_resumo_e_curto_e_sem_dados_nao_cai():
@@ -6202,7 +6202,7 @@ def test_ticket29_resumo_e_curto_e_sem_dados_nao_cai():
     assert len(a.orq("resumo").stdout.splitlines()) <= 40
     b = Amb()
     r = b.orq("resumo")
-    assert r.returncode == 0 and "Com você" in r.stdout and "Vem: nenhum ticket aberto" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "With you" in r.stdout and "Next: no open ticket" in r.stdout, r.stdout + r.stderr
     assert b.orq("resumo", "--desde", "ontem").returncode == 1
 
 
@@ -6259,14 +6259,14 @@ def test_it_should_warn_when_the_cited_commit_does_not_exist():
     with tempfile.TemporaryDirectory() as t:
         repo, _ = _repo_git(t)
         av = orq_mod.confere_entrega("commit abc1234 publicado", [repo])
-        assert len(av) == 1 and "entrega sem commit" in av[0] and "abc1234" in av[0], av
+        assert len(av) == 1 and "delivery without commit" in av[0] and "abc1234" in av[0], av
 
 
 def test_it_should_warn_when_the_tree_is_dirty():
     with tempfile.TemporaryDirectory() as t:
         repo, sha = _repo_git(t, sujo=True)
         av = orq_mod.confere_entrega(f"commit {sha}", [repo])
-        assert len(av) == 1 and "árvore suja" in av[0], av
+        assert len(av) == 1 and "dirty tree" in av[0], av
 
 
 def test_it_should_check_the_pr_commits_with_gh_and_ignore_a_missing_gh():
@@ -6292,10 +6292,10 @@ def test_it_should_show_the_delivery_warning_in_the_resumo_and_in_orq_agentes():
         a.orq("ingest")
         ev = [e for e in a.events() if e.get("tipo") == "entrega"]
         assert len(ev) == 1 and ev[0]["dispatch"] == "ctx_e", a.events()
-        assert "Entrega sem prova" in a.orq("resumo").stdout and "abc1234" in a.orq("resumo").stdout
+        assert "Delivery without proof" in a.orq("resumo").stdout and "abc1234" in a.orq("resumo").stdout
         ags = orq_mod.monta_agentes([{"dispatchId": "ctx_e", "taskId": "task_e", "dispatchStatus": "completed", "agentTerminalHandle": "term_e"}],
                                     [], a.events(), datetime.now(timezone.utc), vivos=["term_e"])
-        assert ags[0]["entrega"] and "AVISO: entrega sem commit" in orq_mod.texto_agentes(ags)
+        assert ags[0]["entrega"] and "NOTICE: delivery without commit" in orq_mod.texto_agentes(ags)
 
 
 # ---------- ticket 32: interromper, encerrar e relançar ----------
@@ -6337,7 +6337,7 @@ def test_it_should_refuse_to_interrupt_a_dispatch_that_is_not_running():
         a = Amb(run="run_a")
         _ctl_env(a, repo, status="completed")
         r = a.orq("interromper", "ctx_w1")
-        assert r.returncode == 1 and "não está rodando" in r.stderr, r
+        assert r.returncode == 1 and "is not running" in r.stderr, r
         assert not _log(a, "send.log") and not _ctl_eventos(a)
         assert a.orq("interromper", "ctx_fantasma").returncode == 1
 
@@ -6377,7 +6377,7 @@ def test_it_should_require_a_reason_to_encerrar():
         _ctl_env(a, repo)
         assert a.orq("encerrar", "ctx_w1").returncode == 2
         r = a.orq("encerrar", "ctx_w1", "--motivo", "  ")
-        assert r.returncode == 1 and "motivo" in r.stderr and not _log(a, "stopped.log")
+        assert r.returncode == 1 and "reason" in r.stderr and not _log(a, "stopped.log")
 
 
 def test_it_should_only_release_when_the_dispatch_already_finished():
@@ -6409,7 +6409,7 @@ def test_it_should_report_a_partial_encerrar_when_the_release_fails_and_keep_the
         _ctl_env(a, repo)
         antes = _head(repo)
         r = a.orq("encerrar", "ctx_w1", "--motivo", "x", FAKE_FAIL="worker-release")
-        assert r.returncode == 1 and "orq liberar ctx_w1" in r.stderr, r.stderr
+        assert r.returncode == 1 and "orq release ctx_w1" in r.stderr, r.stderr
         ev = _ctl_eventos(a, "encerrar")[-1]
         assert ev["resultado"] == "parcial" and ev["passo"] == "release" and ev["worktree_intacta"] is True, ev
         assert os.path.isdir(repo) and _head(repo) == antes
@@ -6447,7 +6447,7 @@ def test_it_should_refuse_a_relaunch_without_a_note():
         _ctl_env(a, repo)
         assert a.orq("relancar", "ctx_w1").returncode == 2
         r = a.orq("relancar", "ctx_w1", "--nota", " ")
-        assert r.returncode == 1 and "nota" in r.stderr and not _log(a, "stopped.log")
+        assert r.returncode == 1 and "note" in r.stderr and not _log(a, "stopped.log")
 
 
 def test_it_should_refuse_before_stopping_when_the_worktree_is_gone():
@@ -6483,7 +6483,7 @@ def test_it_should_keep_the_worktree_and_the_note_when_nothing_starts():
         antes = _head(repo)
         r = a.orq("relancar", "ctx_w1", "--nota", "use a branch nova", FAKE_FAIL="worker-start")
         assert r.returncode == 1, r
-        assert "orq relancar ctx_w1 --nota" in r.stderr and "use a branch nova" in r.stderr, "a mensagem traz o comando para repetir, com a nota"
+        assert "orq relaunch ctx_w1 --note" in r.stderr and "use a branch nova" in r.stderr, "a mensagem traz o comando para repetir, com a nota"
         ev = _ctl_eventos(a, "relancar")[-1]
         assert ev["resultado"] == "falhou" and ev["passo"] == "worker-start" and ev["nota"] == "use a branch nova" and ev["worktree_intacta"] is True, ev
         assert not _log(a, "released.log"), "o terminal do worker antigo fica retido para inspeção"
@@ -6504,7 +6504,7 @@ def test_it_should_show_the_control_history_in_orq_agentes():
         assert [c["acao"] for c in ags["ctx_w1"]["controle"]] == ["interromper", "relancar"], ags["ctx_w1"]
         assert ags["ctx_term_novo2"]["controle"] == [c for c in ags["ctx_w1"]["controle"] if c["acao"] == "relancar"], "o novo dispatch cita o relançamento"
         texto = a.orq("agentes", "--todos").stdout
-        assert "controle: interromper ok" in texto and "relancar ok" in texto and "ctx_w1" in texto, texto
+        assert "control: interromper ok" in texto and "relancar ok" in texto and "ctx_w1" in texto, texto
 
 
 def test_it_should_not_list_control_lines_for_dispatches_without_history():
@@ -6577,7 +6577,7 @@ def test_review8_m15_a_run_solto_pede_o_gerente_ligar_e_nao_o_run_use():
                            {"handle": "term_w2", "run": "run_b", "task": "t3", "dispatch": "ctx_2", "status": "completed"}])
     a.prompt("oi")
     for r in (a.orq("steer", "t2", "ajuste", "--run", "run_b"), a.orq("liberar", "ctx_2", "--run", "run_b")):
-        assert r.returncode == 1 and "orq gerente ligar --terminal term_ger --run run_b" in r.stderr and "run-use" not in r.stderr, r.stderr
+        assert r.returncode == 1 and "orq manager bind --terminal term_ger --run run_b" in r.stderr and "run-use" not in r.stderr, r.stderr
     assert not _log(a, "sent.log") and not _log(a, "released.log")
     assert a.orq("gerente", "ligar", "--terminal", "term_ger", "--run", "run_b").returncode == 0  # o que a mensagem manda fazer resolve
     assert a.orq("steer", "t2", "ajuste", "--run", "run_b").returncode == 0
@@ -6590,10 +6590,10 @@ def test_review8_m15_b_sem_run_e_com_o_gerente_em_dois_runs_recusa_em_vez_de_sor
     a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "t1", "dispatch": "ctx_1", "status": "dispatched"}])
     a.prompt("oi")
     r = a.orq("steer", "t1", "ajuste")
-    assert r.returncode == 1 and "passe --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr, r.stderr
+    assert r.returncode == 1 and "pass --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr, r.stderr
     assert not _log(a, "sent.log"), "o painel estar no run_a não pode decidir o alvo"
     r = _novo(a)
-    assert r.returncode == 1 and "passe --run" in r.stderr and not _log(a, "created.log"), r.stderr
+    assert r.returncode == 1 and "pass --run" in r.stderr and not _log(a, "created.log"), r.stderr
     assert a.orq("steer", "t1", "ajuste", "--run", "run_a").returncode == 0
 
 
@@ -6631,7 +6631,7 @@ def test_review8_m15_c_gate_com_o_gerente_em_dois_runs_pede_o_run():
     _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
     a.prompt("oi")
     r = a.orq("pend", "add", "--id", "gate-dec", "--tipo", "decisao", "--titulo", "Sobe?", "--task", "task_b1")
-    assert r.returncode == 1 and "passe --run" in r.stderr and not _gates_log(a), r.stderr
+    assert r.returncode == 1 and "pass --run" in r.stderr and not _gates_log(a), r.stderr
 
 
 def test_review8_m16_espera_declarada_com_o_turno_encerrado_continua_rodando_e_vencida_e_travado():
@@ -6646,9 +6646,9 @@ def test_review8_m16_espera_declarada_com_o_turno_encerrado_continua_rodando_e_v
     assert ag["estado"] == "rodando" and ag["espera"] == "fila de E2E" and ag["turno"] == "parado", ag
     ab = {"agentes": [ag]}
     assert orq_mod.reavalia(ab["agentes"], [], agora, turnos)[0]["estado"] == "rodando"
-    assert "parado no prompt" not in orq_mod.linha_vivos([], ab, agora, turnos)
+    assert "stopped at the prompt" not in orq_mod.linha_vivos([], ab, agora, turnos)
     ag = orq_mod.monta_agentes(ws, msgs(f"esperando: fila de E2E até {_hhmm_25(-5)}"), [], agora, det, turnos=turnos)[0]
-    assert ag["estado"] == "travado" and ag["motivo"] == "espera vencida", ag
+    assert ag["estado"] == "travado" and ag["motivo"] == "wait expired", ag
     assert orq_mod.reavalia([ag], [], agora, turnos)[0]["estado"] == "travado"
     ag = orq_mod.monta_agentes(ws, msgs("compilando"), [], agora, det, turnos=turnos)[0]
     assert ag["estado"] == "parado", "sem espera declarada o turno encerrado continua parado"
@@ -6659,9 +6659,9 @@ def test_review8_m17_resumo_sem_desde_nao_conta_o_pedido_do_proprio_resumo():
     with open(os.path.join(a.home, "events.jsonl"), "a") as f:
         f.write(json.dumps({"ts": now_iso(-5), "tipo": "entrada", "id": "e5", "origem": "usuario", "texto": "me dá o resumo do que rolou"}) + "\n")
     out = a.orq("resumo").stdout
-    assert "Com você (1)" in out and "e2" in out and "tarefa task_f1" in out and "e4" in out and "pend revisar-pr" in out, out
-    assert "e1" not in out and "Decisões (3)" in out and "freio-prod: liberado" in out, out
-    assert "Anda (1)" in out and "Corrigir o filtro de marca" in out, out
+    assert "With you (1)" in out and "e2" in out and "tarefa task_f1" in out and "e4" in out and "pend revisar-pr" in out, out
+    assert "e1" not in out and "Decisions (3)" in out and "freio-prod: liberado" in out, out
+    assert "Moving (1)" in out and "Corrigir o filtro de marca" in out, out
 
 
 def test_review8_m17_anda_mostra_o_worker_perguntando_e_o_travado():
@@ -6669,7 +6669,7 @@ def test_review8_m17_anda_mostra_o_worker_perguntando_e_o_travado():
                       {"dispatch": "ctx_8", "task": "t8", "titulo": "Worker rodando", "estado": "rodando", "fase": "testando"},
                       {"dispatch": "ctx_7", "task": "t7", "titulo": "Worker entregue", "estado": "entregue"}]}
     out = orq_mod.resumo_quatro([], ab, {"itens": []}, [], agora=datetime.now(timezone.utc))
-    assert "Anda (2)" in out and "Worker perguntando [perguntando]" in out and "Worker rodando [testando]" in out and "entregue" not in out, out
+    assert "Moving (2)" in out and "Worker perguntando [perguntando]" in out and "Worker rodando [testando]" in out and "entregue" not in out, out
 
 
 def test_review8_m18_lugar_reconhece_prefixos_antes_do_git():
@@ -6678,7 +6678,7 @@ def test_review8_m18_lugar_reconhece_prefixos_antes_do_git():
     p, _ = _repo(a.tmp.name, ramo="feat/outra")
     for cmd in ("git commit -m x", "cd /x && git push", "git -C /r commit", "rtk git commit -m x", "GIT_EDITOR=true git commit --amend",
                 "env git push", "command git push", "time git commit", "sudo git push"):
-        assert "lugar errado" in _aviso(_lugar(a, p, cmd=cmd)), cmd
+        assert "wrong place" in _aviso(_lugar(a, p, cmd=cmd)), cmd
     for cmd in ("rtk git status", "echo git commit", "git log --oneline", "GIT_EDITOR=true git rebase --continue"):
         assert _aviso(_lugar(a, p, cmd=cmd)) == "", cmd
 
@@ -6689,14 +6689,14 @@ def test_review8_m18_lugar_olha_o_dash_c_e_nao_so_o_cwd():
     p, w = _repo(a.tmp.name)  # o cwd é o checkout principal, limpo, em main
     assert _aviso(_lugar(a, p, CLAUDE_PROJECT_DIR=p)) == ""
     msg = _aviso(_lugar(a, p, cmd=f"git -C {w} commit -m x", CLAUDE_PROJECT_DIR=p))
-    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+    assert "wrong place" in msg and os.path.realpath(w) in msg, msg
 
 
 def test_review8_m18_lugar_usa_a_branch_padrao_do_origin_head():
     a = Amb(run="run_a")
     a.prompt("oi")
     p, _ = _repo(a.tmp.name, ramo="develop")
-    assert "lugar errado" in _aviso(_lugar(a, p)), "sem origin/HEAD a padrão é main"
+    assert "wrong place" in _aviso(_lugar(a, p)), "sem origin/HEAD a padrão é main"
     subprocess.run(["git", "-C", p, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"], check=True, capture_output=True)
     assert _aviso(_lugar(a, p)) == "", "develop é a branch padrão deste repositório: não é engano"
 
@@ -6713,21 +6713,21 @@ def test_review8_m19_painel_parado_aparece_no_prompt_no_status_e_no_resumo():
     _gerente(a)
     a.set("terminals.json", ["term_coord", "term_ger"])  # o terminal do gerente existe: só o painel parou
     for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
-        assert "painel do agent manager sem carimbo" in saida, saida
+        assert "agent manager panel has no stamp" in saida, saida
     _painel_tocado(a, 200)
     for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
-        assert "painel do agent manager parado há 3 min" in saida, saida
+        assert "agent manager panel stopped for 3 min" in saida, saida
     _painel_tocado(a, 20)
     for saida in (json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"], a.orq("status").stdout, a.orq("resumo").stdout):
-        assert "painel do agent manager" not in saida, "carimbo de 20 s: o painel está vivo"
+        assert "agent manager panel" not in saida, "carimbo de 20 s: o painel está vivo"
 
 
 def test_review8_m19_sem_gerente_ou_de_outro_coordenador_nao_avisa_do_painel():
     a = Amb(run="run_a")
-    assert "painel do agent manager" not in a.orq("status").stdout
+    assert "agent manager panel" not in a.orq("status").stdout
     b = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_outro")
     _gerente(b)
-    assert "painel do agent manager" not in b.orq("status").stdout, "o gerente.json só vale para o coordenador que o ligou"
+    assert "agent manager panel" not in b.orq("status").stdout, "o gerente.json só vale para o coordenador que o ligou"
 
 
 def test_review8_m19_o_painel_toca_o_carimbo_antes_do_orq_e_com_o_orq_quebrado():
@@ -6811,7 +6811,7 @@ def test_review9_b49_anda_mostra_travado_parado_e_nao_comecou():
            {**base, "dispatch": "ctx_n", "task": "t3", "desde": z(900)}]
     assert sorted(a["estado"] for a in orq_mod.reavalia(ags, [], agora)) == ["nao_comecou", "parado", "travado"]
     out = orq_mod.resumo_quatro([], {"agentes": ags}, {"itens": []}, [], agora=agora)
-    assert "Anda (3)" in out, out
+    assert "Moving (3)" in out, out
 
 
 def test_review9_b49_lavish_resposta_fecha_o_gate_de_um_run_que_o_coordenador_segura_fora_do_gerente():
@@ -6829,7 +6829,7 @@ def test_review9_b50_sem_run_com_o_gerente_num_run_e_o_coordenador_noutro_pede_o
     _multi(a, {"run_a": "term_ger", "run_b": "term_coord"}, ["run_a"])
     a.prompt("oi")
     r = _novo(a)
-    assert r.returncode == 1 and "passe --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr and not _log(a, "created.log"), r.stderr
+    assert r.returncode == 1 and "pass --run" in r.stderr and "run_a" in r.stderr and "run_b" in r.stderr and not _log(a, "created.log"), r.stderr
     assert _novo(a, "Ticket de teste", "--run", "run_b").returncode == 0
 
 
@@ -6855,7 +6855,7 @@ def test_review9_b52_heartbeat_de_um_run_do_coordenador_fora_do_gerente_e_absorv
     a.caixa(_hb("lendo"), run="run_b")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900))
     r = a.prompt(AVISO_B)
-    assert _bloqueado(r) and "absorvidos" in json.loads(r.stdout)["reason"], r.stdout
+    assert _bloqueado(r) and "absorbed" in json.loads(r.stdout)["reason"], r.stdout
     assert a.estados() == {"msg_1": "acked"}, "o check confirmou a entrega: o aviso de Run próprio não cai no bloqueio sem confirmar"
 
 
@@ -6883,7 +6883,7 @@ def test_review9_b53_lugar_reconhece_rtk_proxy_git():
     a.prompt("oi")
     p, _ = _repo(a.tmp.name, ramo="feat/outra")
     for cmd in ("rtk proxy git commit -m x", "rtk proxy git push"):
-        assert "lugar errado" in _aviso(_lugar(a, p, cmd=cmd)), cmd
+        assert "wrong place" in _aviso(_lugar(a, p, cmd=cmd)), cmd
     assert _aviso(_lugar(a, p, cmd="rtk proxy git status")) == ""
 
 
@@ -6926,9 +6926,9 @@ def test_noite_despachar_recusado_depois_do_horario():
     a = Amb(run="run_a")
     _noite(a, ate_h=-1)
     r = _despachar(a)
-    assert r.returncode != 0 and "horário" in r.stderr, r.stderr
+    assert r.returncode != 0 and "past the end" in r.stderr, r.stderr
     assert not _log(a, "started.log"), "não pode ter subido worker"
-    assert [e["motivo"] for e in a.events() if e["tipo"] == "noite_parou"][0].startswith("passou do horário")
+    assert [e["motivo"] for e in a.events() if e["tipo"] == "noite_parou"][0].startswith("past the end of the night")
 
 
 def test_noite_despachar_recusado_no_teto_de_despachos():
@@ -6936,7 +6936,7 @@ def test_noite_despachar_recusado_no_teto_de_despachos():
     _noite(a, max_despachos=2)
     _desp_ev(a, "d1"), _desp_ev(a, "d2")
     r = _despachar(a)
-    assert r.returncode != 0 and "teto de 2 despachos" in r.stderr, r.stderr
+    assert r.returncode != 0 and "cap of 2 dispatches" in r.stderr, r.stderr
     _noite(a, max_despachos=3)
     assert _despachar(a).returncode == 0, "abaixo do teto despacha"
 
@@ -6950,7 +6950,7 @@ def test_noite_despachar_recusado_na_terceira_falha_seguida():
     assert _despachar(a).returncode == 0, "duas falhas ainda despacham"
     _wd(a, ("d1", "failed", False), ("d2", "failed", False), ("d3", "failed", False))
     r = _despachar(a)
-    assert r.returncode != 0 and "3 falhas seguidas" in r.stderr, r.stderr
+    assert r.returncode != 0 and "3 consecutive worker failures" in r.stderr, r.stderr
 
 
 def test_noite_falha_reportada_reinicia_a_contagem():
@@ -6971,9 +6971,9 @@ def test_noite_desligar_libera():
     _noite(a, ate_h=-1)
     assert _despachar(a).returncode != 0
     r = a.orq("noite", "desligar")
-    assert r.returncode == 0 and "desligado" in r.stdout, r.stderr
+    assert r.returncode == 0 and "off" in r.stdout, r.stderr
     assert _despachar(a).returncode == 0
-    assert "modo noite desligado" in a.orq("noite").stdout
+    assert "night mode off" in a.orq("noite").stdout
 
 
 def test_noite_ligar_grava_evento_e_estado():
@@ -6983,7 +6983,7 @@ def test_noite_ligar_grava_evento_e_estado():
     n = _ler_estado(os.path.join(a.home, "cursor.json"))["noite"]
     assert n["max_despachos"] == 5 and n["max_falhas"] == 3 and _hora_de(n["ate"]) == "06:30", n
     assert [e for e in a.events() if e["tipo"] == "noite_ligar"][0]["max_despachos"] == 5
-    assert "Regras" in r.stdout and "0/5 despachos" in r.stdout, r.stdout
+    assert "Rules" in r.stdout and "0/5 dispatches" in r.stdout, r.stdout
     assert a.orq("noite", "ligar", "--ate", "25:00").returncode != 0
     assert a.orq("noite", "ligar").returncode != 0
 
@@ -6997,9 +6997,9 @@ def test_noite_motivo_aparece_uma_vez_em_status_e_em_agentes():
     _noite(a, ate_h=-1)
     _despachar(a)
     st = a.orq("status").stdout
-    assert st.count("Parou de despachar") == 1 and "horário" in st, st
+    assert st.count("Stopped dispatching") == 1 and "past the end" in st, st
     ag = a.orq("agentes").stdout
-    assert ag.count("Parou de despachar") == 1, ag
+    assert ag.count("Stopped dispatching") == 1, ag
 
 
 def test_noite_hooks_injetam_as_regras_e_desligado_nada_muda():
@@ -7007,9 +7007,9 @@ def test_noite_hooks_injetam_as_regras_e_desligado_nada_muda():
     assert "orq noite" not in a.prompt("oi").stdout and "orq noite" not in a.orq("status").stdout
     _noite(a)
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "[orq noite] Regras" in ctx and "AskUserQuestion" in ctx and "push" in ctx, ctx
+    assert "[orq night] Rules" in ctx and "AskUserQuestion" in ctx and "push" in ctx, ctx
     aviso = a.orq("hook", "prompt", stdin=json.dumps({"prompt": "You have 1 orchestration messages. Run `orca orchestration check`", "session_id": "abcdef123456"}))
-    assert "[orq noite]" in aviso.stdout, "o aviso do Orca também leva as regras"
+    assert "[orq night]" in aviso.stdout, "o aviso do Orca também leva as regras"
     t0 = time.time()
     orq_mod.linhas_noite(orq_mod._cursor_ro(), [])
     assert time.time() - t0 < 0.1
@@ -7032,7 +7032,7 @@ def test_noite_externas_nega_cada_comando_com_o_modo_ligado():
     for cmd in EXTERNAS:
         out = _externas(a, cmd)
         assert out and out["permissionDecision"] == "deny", cmd
-        assert "orq pend add" in out["permissionDecisionReason"] and "orq noite desligar" in out["permissionDecisionReason"], cmd
+        assert "orq pend add" in out["permissionDecisionReason"] and "orq night off" in out["permissionDecisionReason"], cmd
 
 
 def test_noite_externas_libera_com_o_modo_desligado():
@@ -7156,8 +7156,8 @@ def test_cartao_worktree_suja_e_commit_sem_push_com_os_comandos_para_colar():
             e.update(sem_push=2)
     linhas = _cartao(evs, cur)
     txt = "\n".join(linhas)
-    assert "Worktrees sujas (1)" in txt and "Frente d2: 3 arquivos" in txt, txt
-    assert "Sem push (1)" in txt and "Frente d3: 2 commits" in txt, txt
+    assert "Dirty worktrees (1)" in txt and "Frente d2: 3 files" in txt, txt
+    assert "Not pushed (1)" in txt and "Frente d3: 2 commits" in txt, txt
     assert "git -C /wt/d2 status --short" in txt and "git -C /wt/d3 log --oneline origin/main..HEAD" in txt, txt
     assert "/wt/d1" not in txt, "worktree limpa e sem commit pendente não vira comando"
 
@@ -7167,34 +7167,34 @@ def test_cartao_vivo_pega_o_estado_das_worktrees_dos_dispatches_sem_fim():
     evs.append(_ev("04:00:00", "despacho", dispatch="d7", task="t_d7", run="run_a", titulo="Frente d7"))
     vivos = {"d7": {"caminho": "/wt/d7", "sujo": 2, "sem_push": 0}}
     txt = "\n".join(_cartao(sorted(evs, key=lambda e: e["ts"]), cur, vivos=vivos))
-    assert any("Frente d7" in l and l.rstrip().endswith("rodando") for l in txt.splitlines()), txt
-    assert "Frente d7: 2 arquivos" in txt and "git -C /wt/d7 status --short" in txt, txt
+    assert any("Frente d7" in l and l.rstrip().endswith("running") for l in txt.splitlines()), txt
+    assert "Frente d7: 2 files" in txt and "git -C /wt/d7 status --short" in txt, txt
 
 
 def test_cartao_lacuna_maior_que_10_min_no_log():
     evs, cur = _noite_log()
     txt = "\n".join(_cartao(evs, cur))
-    assert "a máquina pode ter dormido às " + _hora_de("2026-09-30T03:15:00Z") in txt, txt
+    assert "the machine may have slept at " + _hora_de("2026-09-30T03:15:00Z") in txt, txt
     evs2, cur2 = _noite_log(*[_ev(f"{h:02d}:{m:02d}:00", "heartbeat_absorvido") for h in range(2, 9) for m in range(0, 60, 5) if (h, m) >= (2, 20)])
     assert "dormido" not in "\n".join(_cartao(evs2, cur2)), "passos de 5 min não são lacuna"
 
 
 def test_cartao_gerente_vivo_ou_parado():
     evs, cur = _noite_log(_ev("08:59:00", "heartbeat_absorvido"))
-    assert "Gerente: vivo" in "\n".join(_cartao(evs, cur))
+    assert "Manager: alive" in "\n".join(_cartao(evs, cur))
     evs, cur = _noite_log(volta="05:30:00")
-    assert f"Gerente: parou às {_hora_de('2026-09-30T05:30:00Z')}" in "\n".join(_cartao(evs, cur))
+    assert f"Manager: stopped at {_hora_de('2026-09-30T05:30:00Z')}" in "\n".join(_cartao(evs, cur))
     evs, cur = _noite_log()
     cur.pop("gerente_volta")
-    assert "Gerente: sem rodada" in "\n".join(_cartao(evs, cur))
+    assert "Manager: no absorb round" in "\n".join(_cartao(evs, cur))
 
 
 def test_cartao_decisoes_estacionadas_e_parada_do_orcamento():
     evs, cur = _noite_log(_ev("04:00:00", "pend", op="add", pend="freio-x"), _ev("04:05:00", "pend", op="add", pend="freio-y"), _ev("06:00:00", "pend", op="done", pend="freio-y"),
-                          _ev("07:00:00", "noite_parou", motivo="teto de 6 despachos da noite"))
+                          _ev("07:00:00", "noite_parou", motivo="cap of 6 dispatches for the night"))
     txt = "\n".join(orq_mod.cartao_noite(evs, cur, {"itens": [{"id": "freio-x", "tipo": "decisao", "titulo": "Liberar o freio?"}]}, orq_mod._dt("2026-09-30T09:05:00Z")))
-    assert "Decisões estacionadas (1)" in txt and "freio-x" in txt and "freio-y" not in txt, txt
-    assert "Parou de despachar às " + _hora_de("2026-09-30T07:00:00Z") + ": teto de 6 despachos da noite" in txt, txt
+    assert "Parked decisions (1)" in txt and "freio-x" in txt and "freio-y" not in txt, txt
+    assert "Stopped dispatching at " + _hora_de("2026-09-30T07:00:00Z") + ": cap of 6 dispatches for the night" in txt, txt
 
 
 def test_cartao_cabe_em_40_linhas_com_muitos_dispatches():
@@ -7210,13 +7210,13 @@ def test_cartao_cabe_em_40_linhas_com_muitos_dispatches():
 
 
 def test_cartao_sem_noite_no_log_diz_que_nao_houve():
-    assert _cartao([_ev("01:00:00", "entrada")], {}) == ["Nenhuma noite no log: rode orq noite ligar --ate HH:MM"]
+    assert _cartao([_ev("01:00:00", "entrada")], {}) == ["No night in the log: run orq night on --until HH:MM"]
 
 
 def test_cartao_primeira_linha_no_session_start_so_ate_12_h_depois_do_fim():
     evs, cur = _noite_log()
     linha = orq_mod.cartao_primeira_linha(evs, orq_mod._dt("2026-09-30T10:00:00Z"))
-    assert linha and "6 despachos" in linha and "1 entregue" in linha and "orq resumo --noite" in linha, linha
+    assert linha and "6 dispatches" in linha and "1 entregue" in linha and "orq summary --night" in linha, linha
     assert orq_mod.cartao_primeira_linha(evs, orq_mod._dt("2026-09-30T21:01:00Z")) is None, "12 h depois do fim o cartão sai do SessionStart"
     assert orq_mod.cartao_primeira_linha([], orq_mod._dt("2026-09-30T10:00:00Z")) is None
 
@@ -7283,8 +7283,8 @@ def test_resumo_noite_imprime_o_cartao_e_status_nao_muda():
     json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
     r = a.orq("resumo", "--noite")
     assert r.returncode == 0, r.stderr
-    assert r.stdout.startswith("[orq noite] Cartão da manhã") and "Frente d3" in r.stdout and len(r.stdout.splitlines()) <= 40, r.stdout
-    assert "Cartão da manhã" not in a.orq("resumo").stdout
+    assert r.stdout.startswith("[orq night] Morning card") and "Frente d3" in r.stdout and len(r.stdout.splitlines()) <= 40, r.stdout
+    assert "Morning card" not in a.orq("resumo").stdout
 
 
 def test_session_start_injeta_so_a_primeira_linha_do_cartao_quando_a_noite_acabou_ha_pouco():
@@ -7298,7 +7298,7 @@ def test_session_start_injeta_so_a_primeira_linha_do_cartao_quando_a_noite_acabo
     with open(os.path.join(a.home, "events.jsonl"), "w") as f:
         f.writelines(json.dumps(e) + "\n" for e in evs)
     ctx = json.loads(a.orq("hook", "session", stdin=json.dumps({"session_id": "abcdef123456"})).stdout)["hookSpecificOutput"]["additionalContext"]
-    assert ctx.count("Cartão da manhã") == 1 and "orq resumo --noite" in ctx and "Despachos (" not in ctx, ctx
+    assert ctx.count("Morning card") == 1 and "orq summary --night" in ctx and "Dispatches (" not in ctx, ctx
 
 
 def test_gerente_absorver_carimba_a_rodada_no_cursor():
@@ -7381,11 +7381,11 @@ def test_pr_ligar_lista_e_desligar():
     (ev,) = [e for e in a.events() if e["tipo"] == "pr"]
     assert (ev["op"], ev["task"], ev["url"]) == ("ligar", "task_feat1", PR1)
     lista = a.orq("pr", "lista").stdout
-    assert "task_feat1" in lista and "#1216" in lista and "development" in lista and "aberto" in lista and "issue #1210" in lista, lista
+    assert "task_feat1" in lista and "#1216" in lista and "development" in lista and "open" in lista and "issue #1210" in lista, lista
     assert "task_feat1" not in a.orq("pr", "lista", "--task", "task_outra").stdout
     r = a.orq("pr", "desligar", "task_feat1", PR1)
     assert r.returncode == 0, r.stderr
-    assert "nenhum PR" in a.orq("pr", "lista").stdout
+    assert "no PR" in a.orq("pr", "lista").stdout
     assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "desligar"]
 
 
@@ -7395,9 +7395,9 @@ def test_pr_ligar_recusas():
     assert a.orq("pr", "ligar", "nao-e-task", PR1).returncode == 1
     assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
     r = a.orq("pr", "ligar", "task_feat1", PR1)
-    assert r.returncode == 1 and "já está ligado" in r.stderr, r
+    assert r.returncode == 1 and "already linked" in r.stderr, r
     r = a.orq("pr", "desligar", "task_feat1", PR2)
-    assert r.returncode == 1 and "não está ligado" in r.stderr, r
+    assert r.returncode == 1 and "not linked" in r.stderr, r
     assert len(_ler_estado(os.path.join(a.home, "prs.json"))["itens"]) == 1
 
 
@@ -7424,7 +7424,7 @@ def test_pr_poll_merge_vira_uma_entrada_uma_so_vez():
     assert r.returncode == 0, r.stderr
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
     assert ent["origem"] == "pr" and ent["ref"] == PR1 and ent["task"] == "task_feat1", ent
-    assert "PR #1216 entrou em development" in ent["texto"] and "pronto para staging" in ent["texto"], ent["texto"]
+    assert "PR #1216 entered development" in ent["texto"] and "ready for staging" in ent["texto"], ent["texto"]
     antes = len(_gh_chamadas(a))
     assert a.orq("pr", "poll", "--forcar").returncode == 0
     assert len([e for e in a.events() if e["tipo"] == "entrada"]) == 1, "o mesmo merge não vira outra entrada"
@@ -7477,7 +7477,7 @@ def test_pr_poll_fechado_sem_merge_vira_entrada_e_nao_sugere_o_proximo():
     _pr(a, PR1, "CLOSED", "development")
     assert a.orq("pr", "poll", "--forcar").returncode == 0
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
-    assert "PR #1216 fechado sem merge" in ent["texto"] and "pronto para" not in ent["texto"], ent["texto"]
+    assert "PR #1216 closed without merge" in ent["texto"] and "ready for" not in ent["texto"], ent["texto"]
     assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "fechou", "fechada"]
 
 
@@ -7537,23 +7537,23 @@ def _linha_pr(a):
 def test_pr_status_mostra_o_ambiente_e_sugere_o_proximo_sem_abrir():
     a = _prs_env()
     a.orq("pr", "ligar", "task_feat1", PR1)
-    assert "task_feat1" in _linha_pr(a) and "#1216 development aberto" in _linha_pr(a)
+    assert "task_feat1" in _linha_pr(a) and "#1216 development open" in _linha_pr(a)
     _pr(a, PR1, "MERGED", "development")
     a.orq("pr", "poll", "--forcar")
     out = _linha_pr(a)
-    assert "#1216 development ✓" in out and "pronto para staging" in out, out
+    assert "#1216 development ✓" in out and "ready for staging" in out, out
     _pr(a, PR2, "OPEN", "staging")
     a.orq("pr", "ligar", "task_feat1", PR2)
     out = _linha_pr(a)
-    assert "#1220 staging aberto" in out and "pronto para" not in out, out
+    assert "#1220 staging open" in out and "ready for" not in out, out
     _pr(a, PR2, "MERGED", "staging")
     a.orq("pr", "poll", "--forcar")
-    assert "pronto para main" in _linha_pr(a)
+    assert "ready for main" in _linha_pr(a)
     PR3 = PR1.replace("1216", "1230")
     _pr(a, PR3, "MERGED", "main")
     a.orq("pr", "ligar", "task_feat1", PR3)
     out = _linha_pr(a)
-    assert "em main" in out and "pronto para" not in out, out
+    assert "in main" in out and "ready for" not in out, out
 
 
 def test_pr_entrada_aparece_no_prompt_e_fecha_com_intake():
@@ -7562,7 +7562,7 @@ def test_pr_entrada_aparece_no_prompt_e_fecha_com_intake():
     _pr(a, PR1, "MERGED", "development")
     a.orq("pr", "poll", "--forcar")
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "PR #1216 entrou em development" in ctx, ctx
+    assert "PR #1216 entered development" in ctx, ctx
     assert len(ctx.splitlines()) <= 5
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
     assert a.orq("intake", ent["id"], "conversa").returncode == 1, "com obrigação aberta o intake conversa é recusado (ticket 114)"
@@ -7573,9 +7573,9 @@ def test_pr_entrada_aparece_no_prompt_e_fecha_com_intake():
 
 
 def test_pr_aviso_digitado_no_coordenador_nao_vira_entrada_do_usuario():
-    assert orq_mod.origem("orq: PR #1216 entrou em development (task_feat1): pronto para staging.") == "aviso_orq"
+    assert orq_mod.origem("orq: PR #1216 entered development (task_feat1): ready for staging.") == "aviso_orq"
     a = _prs_env()
-    r = a.prompt("orq: PR #1216 entrou em development (task_feat1): pronto para staging. Entrada e1.")
+    r = a.prompt("orq: PR #1216 entered development (task_feat1): ready for staging. Entrada e1.")
     assert r.returncode == 0 and not [e for e in a.events() if e.get("origem") == "usuario"]
 
 
@@ -7590,7 +7590,7 @@ def test_pr_gerente_digita_o_aviso_no_coordenador_uma_vez():
     assert len(envios) == 1, envios
     assert envios[0][envios[0].index("--terminal") + 1] == "term_coord"
     texto = envios[0][envios[0].index("--text") + 1]
-    assert orq_mod.origem(texto) == "aviso_orq" and "PR #1216 entrou em development" in texto and "pronto para staging" in texto, texto
+    assert orq_mod.origem(texto) == "aviso_orq" and "PR #1216 entered development" in texto and "ready for staging" in texto, texto
     (ent,) = [e for e in a.events() if e["tipo"] == "entrada"]
     assert ent["id"] in texto
     assert [e["op"] for e in a.events() if e["tipo"] == "pr"] == ["ligar", "entrou", "avisado"]
@@ -7632,7 +7632,7 @@ def test_worktrees_paradas_avisa_uma_vez_por_dia_no_status():
             wts = [_wt("/w/velha", 5, agora)]
             args = (agora, wts, set(), lambda c: 4)
             (linha,) = orq_mod.linhas_worktrees(*args)
-            assert "Worktrees paradas (1)" in linha and "velha" in linha and "5 dias" in linha and "4 commits fora da main" in linha, linha
+            assert "Stopped worktrees (1)" in linha and "velha" in linha and "5 days" in linha and "4 commits outside main" in linha, linha
             assert orq_mod.linhas_worktrees(*args) == []  # o mesmo dia não repete
             assert len(orq_mod.linhas_worktrees(agora + timedelta(days=1), wts, set(), lambda c: 4)) == 1  # o dia seguinte volta
             assert orq_mod.linhas_worktrees(agora + timedelta(days=2), [], set(), lambda c: 0) == []  # nada parado: sem linha
@@ -7704,11 +7704,11 @@ def test_it_should_list_a_pr_without_a_known_task_and_show_it_in_status():
     r = _pos_pr(a, p, cmd="gh pr create --head feat/desconhecida --base development")
     d = _prs_json(a)
     assert d["itens"] == [] and [(x["url"], x["head"]) for x in d["sem_task"]] == [(PR1, "feat/desconhecida")], d
-    assert "sem tarefa" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "without task" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     st = a.orq("status").stdout
-    assert "PR sem tarefa" in st and "#1216" in st and "feat/desconhecida" in st, st
+    assert "PR without task" in st and "#1216" in st and "feat/desconhecida" in st, st
     a.orq("pr", "ligar", "task_feat1", PR1)  # ligar à mão tira o PR da lista
-    assert _prs_json(a)["sem_task"] == [] and "PR sem tarefa" not in a.orq("status").stdout
+    assert _prs_json(a)["sem_task"] == [] and "PR without task" not in a.orq("status").stdout
 
 
 def _fila_json(a):
@@ -7741,7 +7741,7 @@ def test_it_should_open_a_main_step_that_names_the_environments_already_merged()
     _pr(a, PR2, state="MERGED", base="staging")
     a.orq("pr", "poll")
     _pos_pr(a, p, saida=PR3 + "\n")
-    assert [(x["passo"], x["nome"], x["por"], x["prs"]) for x in _fila_json(a)][1] == (2, "Filtro por marca para main", "development e staging já entraram (#1216, #1220)", [1230])
+    assert [(x["passo"], x["nome"], x["por"], x["prs"]) for x in _fila_json(a)][1] == (2, "Filtro por marca for main", "development and staging already entered (#1216, #1220)", [1230])
 
 
 def test_it_should_not_duplicate_the_queue_step_when_the_pr_is_reopened():
@@ -7764,7 +7764,7 @@ def test_it_should_keep_a_pr_without_a_task_out_of_the_queue():
     a, p = _fila_auto_env()
     a.set("workers.json", [])
     _pos_pr(a, p, cmd="gh pr create --head feat/desconhecida --base development")
-    assert not _existe_estado(os.path.join(a.home, "fila.json")) and "PR sem tarefa" in a.orq("status").stdout
+    assert not _existe_estado(os.path.join(a.home, "fila.json")) and "PR without task" in a.orq("status").stdout
 
 
 def test_it_should_ignore_what_is_not_a_fresh_pr_create_or_not_the_coordinator():
@@ -7788,9 +7788,9 @@ def test_it_should_tell_when_development_and_staging_both_merged_to_open_main():
     _pr(a, PR2, "MERGED", "staging")
     a.orq("pr", "poll", "--forcar")
     ents = [e["texto"] for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
-    assert "abrir o de main" not in ents[0], "com o PR de staging ainda aberto, nada a abrir"
-    assert "development e staging entraram" in ents[1] and "abrir o de main" in ents[1], ents
-    assert "abrir o de main" in _linha_pr(a)
+    assert "open the one for main" not in ents[0], "com o PR de staging ainda aberto, nada a abrir"
+    assert "development and staging entered" in ents[1] and "open the one for main" in ents[1], ents
+    assert "open the one for main" in _linha_pr(a)
 
 
 def test_it_should_not_tell_to_open_main_when_the_main_pr_is_already_there():
@@ -7799,11 +7799,11 @@ def test_it_should_not_tell_to_open_main_when_the_main_pr_is_already_there():
     _pr(a, PR2, "MERGED", "staging")
     a.orq("pr", "ligar", "task_feat1", PR1)
     a.orq("pr", "ligar", "task_feat1", PR2)
-    assert "abrir o de main" in _linha_pr(a)
+    assert "open the one for main" in _linha_pr(a)
     PR3 = PR1.replace("1216", "1230")
     _pr(a, PR3, "OPEN", "main")
     a.orq("pr", "ligar", "task_feat1", PR3)
-    assert "abrir o de main" not in _linha_pr(a)
+    assert "open the one for main" not in _linha_pr(a)
 
 
 # ---------- digest e modo ausente (ticket 47) ----------
@@ -7953,8 +7953,8 @@ def test_digest_ordem_de_merge_segue_o_blocked_by_e_development_vem_antes_de_sta
     _, h = _html(a)
     assert h.index("Base de auth") < h.index("Tela nova"), "o ticket 02 espera o 01 mesmo com o PR ligado antes"
     assert h.index("#1216") < h.index("#1230"), "development antes de staging dentro do passo"
-    assert "Espera: Base de auth" in h, "o passo bloqueado diz de quem espera"
-    assert "Blocked by dos tickets" in h, "a página diz que a ordem veio dos tickets"
+    assert "Waits for: Base de auth" in h, "o passo bloqueado diz de quem espera"
+    assert "no step was declared" in h, "a página diz que a ordem veio dos tickets"
 
 
 def test_digest_ordem_pura_com_ciclo_e_transitivo_sem_travar():
@@ -7977,7 +7977,7 @@ def test_digest_passo_fica_feito_so_quando_entrou_em_main_ou_so_tem_fechado():
     a.orq("pr", "poll", "--forcar")
     d = _json_digest(a, "--html")
     _, h = _html(a)
-    assert "Próximo: pronto para staging" in h and 'class="feito"' not in h, "development entrou, falta promover: ainda não é feito"
+    assert "Next: ready for staging" in h and 'class="feito"' not in h, "development entrou, falta promover: ainda não é feito"
     assert [p["feito"] for p in d["fila"]] == [False, False]
     _pr(a, PR1, "MERGED", "development")
     _pr(a, PR3, "MERGED", "main")
@@ -8002,7 +8002,7 @@ def test_digest_nao_chama_gh_nem_orca_e_le_o_estado_dos_prs_do_poll():
     antes_gh, antes_orca = len(_gh_chamadas(a)), len(_log(a, "calls.log"))
     _, h = _html(a)
     assert (len(_gh_chamadas(a)), len(_log(a, "calls.log"))) == (antes_gh, antes_orca), "o digest só lê arquivos locais"
-    assert "estado dos PRs é do poll das" in h
+    assert "The PR state is from the poll at" in h
 
 
 def test_digest_abrir_pede_a_aba_ao_orca_com_a_url_do_arquivo():
@@ -8016,7 +8016,7 @@ def test_digest_abrir_pede_a_aba_ao_orca_com_a_url_do_arquivo():
 def test_digest_abrir_com_o_orca_fora_do_ar_mostra_o_caminho_e_nao_falha():
     a = _digest_env()
     r = a.orq("digest", "--abrir", FAKE_FAIL="create")
-    assert r.returncode == 0 and "aviso" in r.stderr and os.path.exists(os.path.join(a.home, "digest", "atual.json")), r
+    assert r.returncode == 0 and "warning" in r.stderr and os.path.exists(os.path.join(a.home, "digest", "atual.json")), r
     (pagina,) = [l for l in r.stdout.splitlines() if l.endswith(".html")]
     assert os.path.exists(pagina)
 
@@ -8027,7 +8027,7 @@ def test_digest_vazio_gera_o_arquivo_e_a_pagina_dizendo_que_nao_ha_nada():
     d = _json_digest(a)
     assert (d["fila"], d["features"], d["pendencias"], d["linha"], d["rodando"]) == ([], [], [], [], []), d
     _, h = _html(a)
-    assert h.lower().count("nada") >= 4 and "<!doctype html>" in h.lower(), h[:400]
+    assert h.lower().count("nothing") >= 4 and "<!doctype html>" in h.lower(), h[:400]
 
 
 def test_pr_ligar_guarda_titulo_tag_e_nota_para_o_digest():
@@ -8059,16 +8059,16 @@ def _fila_add(a, passo="1", nome="Plano 2 para main", por="Destrava o plano 1", 
 
 def test_fila_add_lista_feito_e_rm():
     a = _digest_env()
-    assert "nenhum passo" in a.orq("fila", "lista").stdout
+    assert "no step" in a.orq("fila", "lista").stdout
     r = _fila_add(a)
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout) == {"passo": 1, "nome": "Plano 2 para main", "por": "Destrava o plano 1", "prs": [1216, 1230], "feito": False}
     _fila_add(a, "2", "Tela", "Depende do 1", "1220")
     lista = a.orq("fila", "lista").stdout.splitlines()
-    assert lista[0].startswith("1  Plano 2 para main  [a fazer]  #1216 open ? sem leitura do CI, #1230 open ? sem leitura do CI") and "Destrava o plano 1" in lista[0] and lista[1].startswith("2  Tela"), lista
-    assert lista[-1] == "Próximo a mergear: nenhum passo pronto", lista
+    assert lista[0].startswith("1  Plano 2 para main  [to do]  #1216 open ? no CI reading, #1230 open ? no CI reading") and "Destrava o plano 1" in lista[0] and lista[1].startswith("2  Tela"), lista
+    assert lista[-1] == "Next to merge: no step ready", lista
     assert a.orq("fila", "feito", "1").returncode == 0
-    assert "[feito]" in a.orq("fila", "lista").stdout.splitlines()[0]
+    assert "[done]" in a.orq("fila", "lista").stdout.splitlines()[0]
     assert a.orq("fila", "rm", "2").returncode == 0
     assert len(a.orq("fila", "lista").stdout.splitlines()) == 2  # o passo e a linha do próximo
     assert [(e["op"], e["passo"]) for e in a.events() if e["tipo"] == "fila"] == [("add", 1), ("add", 2), ("feito", 1), ("rm", 2)]
@@ -8108,8 +8108,8 @@ def test_fila_lista_mostra_o_check_vermelho_pelo_nome_o_conflito_e_o_ci_rodando(
     a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE"), _ck("e2e", "TIMED_OUT")]}, pr2={"mergeable": "CONFLICTING", "statusCheckRollup": [_ck("test", None, "QUEUED")]})
     l1, l2, fim = a.orq("fila", "lista").stdout.splitlines()
     assert "#1216 open ✗ lint, e2e" in l1, l1
-    assert "#1220 open ⚠ conflito ⏳ CI rodando" in l2, l2
-    assert fim == "Próximo a mergear: nenhum passo pronto"
+    assert "#1220 open ⚠ conflict ⏳ CI running" in l2, l2
+    assert fim == "Next to merge: no step ready"
 
 
 def _ckw(nome, workflow, conclusao="SUCCESS"):
@@ -8119,8 +8119,8 @@ def _ckw(nome, workflow, conclusao="SUCCESS"):
 def test_fila_pr_de_main_com_falha_so_no_workflow_de_staging_fica_pronto_com_a_nota():
     a = _fila_ci(pr1={"baseRefName": "main", "statusCheckRollup": [_ckw("lint", "Web CI"), _ckw("check", "Web Deploy Staging", "FAILURE")]})
     out = a.orq("fila", "lista").stdout.splitlines()
-    assert "#1216 open ✓ ℹ falha em outro ambiente: Web Deploy Staging" in out[0] and "✗" not in out[0], out
-    assert out[-1] == "Próximo a mergear: passo 1 (Primeiro)", out
+    assert "#1216 open ✓ ℹ failure in another environment: Web Deploy Staging" in out[0] and "✗" not in out[0], out
+    assert out[-1] == "Next to merge: step 1 (Primeiro)", out
     ci = {i["numero"]: i["ci"] for i in _ler_estado(os.path.join(a.home, "prs.json"))["itens"]}
     assert ci[1216]["falhas"] == [] and ci[1216]["outro_ambiente"] == ["Web Deploy Staging"], ci
 
@@ -8128,27 +8128,27 @@ def test_fila_pr_de_main_com_falha_so_no_workflow_de_staging_fica_pronto_com_a_n
 def test_fila_pr_de_main_com_falha_no_workflow_da_propria_base_fica_vermelho():
     a = _fila_ci(pr1={"baseRefName": "main", "statusCheckRollup": [_ckw("check", "Web Deploy Staging", "FAILURE"), _ckw("check", "Web Deploy Production", "FAILURE")]})
     l1 = a.orq("fila", "lista").stdout.splitlines()[0]
-    assert "#1216 open ✗ check" in l1 and "falha em outro ambiente: Web Deploy Staging" in l1, l1
+    assert "#1216 open ✗ check" in l1 and "failure in another environment: Web Deploy Staging" in l1, l1
 
 
 def test_fila_lista_aponta_o_primeiro_passo_a_fazer_com_todos_os_prs_prontos():
     a = _fila_ci(pr1={"statusCheckRollup": [_ck("lint", "FAILURE")]})
     out = a.orq("fila", "lista").stdout.splitlines()
-    assert out[-1] == "Próximo a mergear: passo 2 (Segundo)" and "#1220 open ✓" in out[1], out
+    assert out[-1] == "Next to merge: step 2 (Segundo)" and "#1220 open ✓" in out[1], out
     a.orq("fila", "feito", "2")
-    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Próximo a mergear: nenhum passo pronto", "passo feito não é o próximo"
+    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Next to merge: no step ready", "passo feito não é o próximo"
 
 
 def test_fila_lista_leitura_velha_aparece_como_velha_e_nao_conta_como_pronta():
     a = _fila_ci()
-    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Próximo a mergear: passo 1 (Primeiro)"
+    assert a.orq("fila", "lista").stdout.splitlines()[-1] == "Next to merge: step 1 (Primeiro)"
     arq = os.path.join(a.home, "prs.json")
     d = _ler_estado(arq)
     for i in d["itens"]:
         i["ci"]["lido_em"] -= 3600
     json.dump(d, open(arq, "w"))
     out = a.orq("fila", "lista").stdout.splitlines()
-    assert "leitura velha, 60 min" in out[0] and out[-1] == "Próximo a mergear: nenhum passo pronto", out
+    assert "stale reading, 60 min" in out[0] and out[-1] == "Next to merge: no step ready", out
 
 
 def test_fila_conflito_entre_passos_vira_aviso_no_passo_de_baixo():
@@ -8165,7 +8165,7 @@ def test_fila_conflito_entre_passos_vira_aviso_no_passo_de_baixo():
         g("commit", "-am", ramo)
     out = a.orq("fila", "lista", ORQ_REPOS=repo).stdout.splitlines()
     assert out[0].startswith("1  Primeiro") and out[1].startswith("2  Segundo"), out
-    assert out[2] == "   ⚠ #1220 conflita com #1216 (passo 1): a.js", out
+    assert out[2] == "   ⚠ #1220 conflicts with #1216 (step 1): a.js", out
     g("checkout", "main"), g("checkout", "-B", "feat/pr2", "main")
     open(os.path.join(repo, "b.js"), "w").write("x\n")
     g("add", "."), g("commit", "-m", "outro arquivo")
@@ -8187,7 +8187,7 @@ def test_fila_add_troca_o_passo_de_mesmo_numero_e_recusa_pr_nao_ligado_e_passo_i
     (p,) = _ler_estado(os.path.join(a.home, "fila.json"))["passos"]
     assert (p["nome"], p["prs"]) == ("Outro nome", [1220]), p
     r = _fila_add(a, "3", "x", "y", "9999")
-    assert r.returncode == 1 and "#9999" in r.stderr and "orq pr ligar" in r.stderr, r
+    assert r.returncode == 1 and "#9999" in r.stderr and "orq pr link" in r.stderr, r
     assert _fila_add(a, "0").returncode == 1
     assert a.orq("fila", "feito", "7").returncode == 1 and a.orq("fila", "rm", "7").returncode == 1
 
@@ -8205,7 +8205,7 @@ def test_digest_fila_declarada_vale_mais_que_a_dos_tickets_com_o_estado_real_dos
     assert [p["feito"] for p in d["fila"]] == [True, False] and d["fila"][0]["prs"][0]["estado"] == "MERGED", d["fila"]
     assert [x["nome"] for x in d["features"]] == ["Base de auth", "Tela nova"], "features seguem a ordem pelos tickets"
     _, h = _html(a)
-    assert "Ordem declarada com" in h and h.index("Tela primeiro") < h.index("Auth depois")
+    assert "Order declared with" in h and h.index("Tela primeiro") < h.index("Auth depois")
 
 
 def test_digest_passo_declarado_marcado_feito_a_mao_vale_com_pr_aberto():
@@ -8227,27 +8227,27 @@ def test_digest_passo_declarado_ignora_pr_desligado():
 
 def test_ausente_ligar_e_desligar_guardam_o_estado_e_o_log():
     a = Amb(run="run_a")
-    assert "desligado" in a.orq("ausente").stdout
+    assert "away mode off" in a.orq("ausente").stdout
     r = a.orq("ausente", "ligar")
-    assert r.returncode == 0 and "ligado" in r.stdout and os.path.join(a.home, "digest", "atual.json") in r.stdout, r
+    assert r.returncode == 0 and "away mode on" in r.stdout and os.path.join(a.home, "digest", "atual.json") in r.stdout, r
     assert _cursor(a)["ausente"]["ligada_em"]
     r = a.orq("ausente")
-    assert "ligado" in r.stdout and "desligado" not in r.stdout
-    assert "desligado" in a.orq("ausente", "desligar").stdout and "ausente" not in _cursor(a)
+    assert "away mode on" in r.stdout and "away mode off" not in r.stdout
+    assert "away mode off" in a.orq("ausente", "desligar").stdout and "ausente" not in _cursor(a)
     assert [e["tipo"] for e in a.events() if e["tipo"].startswith("ausente")] == ["ausente_ligar", "ausente_desligar"]
 
 
 def test_away_alterna_e_aceita_on_off_status_sem_tirar_o_ausente():
     a = Amb(run="run_a")
-    assert "away mode ligado" in a.orq("away").stdout and _cursor(a)["ausente"]["ligada_em"]
-    assert "ligado" in a.orq("away", "status").stdout and "desligado" not in a.orq("away", "status").stdout
-    assert "away mode ligado" in a.orq("away", "on").stdout
+    assert "away mode on" in a.orq("away").stdout and _cursor(a)["ausente"]["ligada_em"]
+    assert "away mode on" in a.orq("away", "status").stdout and "away mode off" not in a.orq("away", "status").stdout
+    assert "away mode on" in a.orq("away", "on").stdout
     r = a.orq("away")
-    assert "away mode desligado" in r.stdout and "entradas na linha do tempo" in r.stdout and "localhost:8765" in r.stdout and "ausente" not in _cursor(a), r
-    assert "desligado" in a.orq("away", "status").stdout
+    assert "away mode off" in r.stdout and "timeline entries" in r.stdout and "localhost:8765" in r.stdout and "ausente" not in _cursor(a), r
+    assert "away mode off" in a.orq("away", "status").stdout
     assert not os.path.exists(os.path.join(a.fake, "calls.log")) or "8765" not in open(os.path.join(a.fake, "calls.log")).read()
-    assert "ligado" in a.orq("away", "on").stdout and "ligado" in a.orq("ausente").stdout
-    assert "away mode desligado" in a.orq("away", "off").stdout
+    assert "away mode on" in a.orq("away", "on").stdout and "away mode on" in a.orq("ausente").stdout
+    assert "away mode off" in a.orq("away", "off").stdout
 
 
 def test_away_off_entrega_o_relatorio_da_ausencia_so_com_a_janela_do_away():
@@ -8268,13 +8268,13 @@ def test_away_off_entrega_o_relatorio_da_ausencia_so_com_a_janela_do_away():
     r = a.orq("away", "off")
     assert r.returncode == 0, r
     out = r.stdout
-    ordem = [out.index(t) for t in ("Decisões que ficaram", "Problemas", "Resumos", "Entregas dos workers", "PRs (", "Tickets")]
+    ordem = [out.index(t) for t in ("Decisions left", "Problems", "Summaries", "Worker deliveries", "PRs (", "Tickets")]
     assert ordem == sorted(ordem), out
     assert "http://127.0.0.1:4387/session/x" in out and PR1 in out and "Fechei o passo 1" in out and "ticket 8 quebrou" in out
     assert "de antes do away" not in out
     arq = [f for f in os.listdir(pasta) if f.endswith("-ausencia.md")]
     assert len(arq) == 1 and PR1 in open(os.path.join(pasta, arq[0])).read()
-    assert any("Relatório da ausência" in l for l in _atual(a)["ausencia"])
+    assert any("Away report" in l for l in _atual(a)["ausencia"])
 
 
 def _stop(a, **ev):
@@ -8328,7 +8328,7 @@ def test_ausente_linha_guarda_so_o_que_aconteceu_desde_que_ligou():
     linha = _atual(a)["linha"]
     assert "ANTIGA de 2020" not in json.dumps(linha) and "use o índice novo" not in json.dumps(linha), "o que veio antes de ligar fica de fora"
     assert [(x["tipo"], x["titulo"]) for x in linha] == [
-        ("sec", "Worker falhou: Falhou no E2E"), ("ok", "PR #1216 entrou em development"), ("sec", "PR #1220 fechado sem merge"), ("info", "Coordenador respondeu a um worker")], linha
+        ("sec", "Worker failed: Falhou no E2E"), ("ok", "PR #1216 entered development"), ("sec", "PR #1220 closed without merge"), ("info", "Coordinator answered a worker")], linha
 
 
 def test_ausente_desligado_a_linha_do_contrato_volta_vazia_mesmo_com_eventos():
@@ -8434,9 +8434,9 @@ def test_ticket48_retomar_cria_o_terminal_com_o_comando_certo_liga_ao_dispatch_e
     res = json.loads(r.stdout)
     assert [(w["dispatch"], w["estado"], w.get("novo")) for w in res["workers"]] == [("ctx_term_w1", "retomado", "term_ret1"), ("ctx_term_w3", "sem_sessao", None)], res
     (c,) = _log(a, "create.log")
-    assert c[c.index("--worktree") + 1] == "path:" + a.wt + "/w1" and c[c.index("--title") + 1] == "Ticket 99 (retomado)", c
+    assert c[c.index("--worktree") + 1] == "path:" + a.wt + "/w1" and c[c.index("--title") + 1] == "Ticket 99 (resumed)", c
     comando = c[c.index("--command") + 1]
-    assert comando.startswith("claude --resume sess-w1 --model claude-opus-5-5 --dangerously-skip-permissions 'Continue de onde parou."), comando
+    assert comando.startswith("claude --resume sess-w1 --model claude-opus-5-5 --dangerously-skip-permissions 'Continue where you left off."), comando
     assert "final-report.md" in comando
     (ev,) = [e for e in a.events() if e["tipo"] == "retomada"]
     assert (ev["dispatch"], ev["terminal"], ev["anterior"], ev["sessao"], ev["cwd"]) == ("ctx_term_w1", "term_ret1", "term_w1", "sess-w1", a.wt + "/w1"), ev
@@ -8452,7 +8452,7 @@ def test_ticket48_retomar_sessao_que_nao_voltou_ou_terminal_que_nao_abriu_nao_so
     _queda48(a)
     a.set("screens.json", {"term_ret1": ["No conversation found with session ID: sess-w1"]})
     (w1, _) = json.loads(a.orq("retomar", "--json").stdout)["workers"]
-    assert w1["estado"] == "sem_atividade" and "orq relancar ctx_term_w1" in w1["aviso"], w1
+    assert w1["estado"] == "sem_atividade" and "orq relaunch ctx_term_w1" in w1["aviso"], w1
     b = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
     _queda48(b)
     res = json.loads(b.orq("retomar", "--json", FAKE_FAIL_CREATE_PATH="/wt/w1").stdout)
@@ -8465,8 +8465,8 @@ def test_ticket48_retomar_worktree_que_sumiu_nao_sobe_terminal():
     _queda48(a)
     os.rmdir(a.wt + "/w1")
     (w1, w3) = json.loads(a.orq("retomar", "--json").stdout)["workers"]
-    assert w1["estado"] == "sem_worktree" and "não existe" in w1["aviso"], w1
-    assert "orq relancar ctx_term_w3" in w3["aviso"], w3
+    assert w1["estado"] == "sem_worktree" and "does not exist" in w1["aviso"], w1
+    assert "orq relaunch ctx_term_w3" in w3["aviso"], w3
     assert not _log(a, "create.log")
 
 
@@ -8475,7 +8475,7 @@ def test_ticket48_retomar_sem_lista_de_terminais_confiavel_recusa():
     _queda48(a)
     open(os.path.join(a.fake, "terminals_truncados"), "w").close()
     r = a.orq("retomar")
-    assert r.returncode == 1 and "nada foi retomado" in r.stderr, r
+    assert r.returncode == 1 and "nothing was resumed" in r.stderr, r
     assert not _log(a, "create.log")
 
 
@@ -8492,7 +8492,7 @@ def test_ticket48_retomar_sobe_o_painel_do_gerente_e_religa_os_runs():
     assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}" and "--worktree" not in c, c
     assert _ler_estado(os.path.join(a.home, "gerente.json")) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a", "run_b"]}
     assert {c[c.index("--id") + 1] for c in _log(a, "calls.log") if c[0] == "run-use"} == {"run_a", "run_b"}
-    assert a.orq("retomar", "--dry-run").stdout.strip() == "nada a retomar", "religado, não há mais o que fazer"
+    assert a.orq("retomar", "--dry-run").stdout.strip() == "nothing to resume", "religado, não há mais o que fazer"
 
 
 def test_ticket48_gerente_vivo_de_outro_coordenador_vivo_nao_e_tocado():
@@ -8502,10 +8502,10 @@ def test_ticket48_gerente_vivo_de_outro_coordenador_vivo_nao_e_tocado():
     a.set("terminals.json", ["term_coord", "term_old", "term_ger_old"])
     velho = {"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a", "run_b"]}
     _grava_estado(os.path.join(a.home, "gerente.json"), velho)
-    assert a.orq("retomar").stdout.strip() == "nada a retomar"
+    assert a.orq("retomar").stdout.strip() == "nothing to resume"
     assert _ler_estado(os.path.join(a.home, "gerente.json")) == velho and not _log(a, "create.log")
     r = a.orq("gerente", "desligar")
-    assert r.returncode == 1 and "não está ligado a este coordenador" in r.stderr, r
+    assert r.returncode == 1 and "is not bound to this coordinator" in r.stderr, r
 
 
 def test_ticket48_gerente_desligar_depois_da_queda_aceita_o_coordenador_novo():
@@ -8580,7 +8580,7 @@ def test_it_should_warn_on_the_prompt_when_the_manager_terminal_is_gone_and_say_
     _painel_tocado(a, 200)
     _contexto(a)  # a primeira checagem roda fora do hook
     ctx = _contexto(a)
-    assert "sumiu" in ctx and "term_ger" in ctx and "orq gerente subir" in ctx, ctx
+    assert "vanished" in ctx and "term_ger" in ctx and "orq manager spawn" in ctx, ctx
 
 
 def test_it_should_not_ask_the_orca_while_the_manager_stamp_is_fresh_nor_more_than_once_a_minute():
@@ -8604,7 +8604,7 @@ def test_it_should_keep_the_old_stopped_message_when_the_terminal_exists_but_the
     _painel_tocado(a, 200)
     _contexto(a)
     ctx = _contexto(a)
-    assert "parado há 3 min" in ctx and "sumiu" not in ctx, ctx
+    assert "stopped for 3 min" in ctx and "vanished" not in ctx, ctx
 
 
 def test_it_should_raise_a_new_manager_terminal_and_rebind_every_run_of_the_gerente_json():
@@ -8626,7 +8626,7 @@ def test_it_should_refuse_to_raise_the_manager_while_its_terminal_still_exists()
     _gerente(a)
     a.set("terminals.json", ["term_coord", "term_ger"])
     r = a.orq("gerente", "subir")
-    assert r.returncode == 1 and "ainda existe" in r.stderr and not _log(a, "create.log"), r
+    assert r.returncode == 1 and "still exists" in r.stderr and not _log(a, "create.log"), r
     assert a.orq("gerente", "subir", "--forcar").returncode == 0
     assert a.orq("gerente", "subir", "--forcar", ORQ_HOME=os.path.join(a.tmp.name, "vazio")).returncode == 1, "sem gerente.json não há o que subir"
 
@@ -8703,7 +8703,7 @@ def test_it_should_show_who_holds_the_e2e_queue_and_how_many_wait():
         _ticket_e2e(fila, "0000000003-3", 3, vivo=True, inicio=1600, projeto="e2e-z")
         f = orq_mod.fila_e2e(fila, agora=1000 + 600)
         assert (f["projeto"], f["min"], f["esperam"], f["presa"]) == ("e2e-x", 10, 2, None), f
-        assert "e2e-x" in orq_mod.linha_e2e(f) and "10 min" in orq_mod.linha_e2e(f) and "2 esperando" in orq_mod.linha_e2e(f) and "PRESA" not in orq_mod.linha_e2e(f)
+        assert "e2e-x" in orq_mod.linha_e2e(f) and "10 min" in orq_mod.linha_e2e(f) and "2 waiting" in orq_mod.linha_e2e(f) and "STUCK" not in orq_mod.linha_e2e(f)
 
 
 def test_it_should_mark_the_e2e_queue_stuck_when_the_owner_died_or_the_session_has_no_test():
@@ -8711,12 +8711,12 @@ def test_it_should_mark_the_e2e_queue_stuck_when_the_owner_died_or_the_session_h
         _ticket_e2e(fila, "0000000001-1", 1, vivo=False, inicio=1000)
         _ticket_e2e(fila, "0000000002-2", 2, vivo=True, inicio=1100)
         f = orq_mod.fila_e2e(fila, agora=1100)
-        assert "dono" in f["presa"] and f["esperam"] == 1 and "PRESA" in orq_mod.linha_e2e(f), f
+        assert "owner" in f["presa"] and f["esperam"] == 1 and "STUCK" in orq_mod.linha_e2e(f), f
     with tempfile.TemporaryDirectory() as fila:
         _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=1000)
         assert orq_mod.fila_e2e(fila, agora=1000 + 5 * 60)["presa"] is None, "sessão recém-aberta ainda não está presa"
         f = orq_mod.fila_e2e(fila, agora=1000 + 30 * 60)
-        assert "sessão" in f["presa"] and f["min"] == 30, f
+        assert "session" in f["presa"] and f["min"] == 30, f
 
 
 def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
@@ -8729,7 +8729,7 @@ def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
             _away_ligado(home)
             _ticket_e2e(fila, "0000000001-1", 1, vivo=False, sessao=True, inicio=0)
             f = orq_mod.fila_e2e(fila, agora=40 * 60)
-            assert orq_mod.avisa_fila_e2e(f) and len(enviados) == 1 and "PRESA" in enviados[0][1], enviados
+            assert orq_mod.avisa_fila_e2e(f) and len(enviados) == 1 and "STUCK" in enviados[0][1], enviados
             assert orq_mod.avisa_fila_e2e(f) == [] and len(enviados) == 1, "o mesmo ticket não avisa de novo"
             assert orq_mod.avisa_fila_e2e(None) == []
         finally:
@@ -8738,7 +8738,7 @@ def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
 
 def _prs_avisar(home, avisado=False):
     json.dump({"itens": [{"task": "task_a", "url": PR1, "numero": 1216, "base": "development", "estado": "mergeado", "avisado": avisado,
-                          "entrada": "e292", "texto": "PR #1216 entrou em development (task_a)"}], "sem_task": []}, open(os.path.join(home, "prs.json"), "w"))
+                          "entrada": "e292", "texto": "PR #1216 entered development (task_a)"}], "sem_task": []}, open(os.path.join(home, "prs.json"), "w"))
     _grava_estado(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
     _away_ligado(home)
 
@@ -8830,10 +8830,10 @@ def test_it_should_show_the_untyped_notices_once_in_the_next_prompt_context():
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "não foram digitados" in ctx and "PRESA" in ctx, ctx
+    assert "were not typed" in ctx and "STUCK" in ctx, ctx
     assert "PR #1216" not in ctx, "o PR aparece na linha PR: do resumo (a entrada), a fila não o repete"
     ctx2 = json.loads(a.prompt("mais uma").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "não foram digitados" not in ctx2 and "PRESA" not in ctx2, "o aviso sai uma vez só"
+    assert "were not typed" not in ctx2 and "STUCK" not in ctx2, "o aviso sai uma vez só"
 
 
 def _nao_digita():
@@ -8853,7 +8853,7 @@ def test_it_should_type_a_queued_notice_only_after_the_coordinator_is_idle_for_n
             assert orq_mod.avisos_entregar() == [] and enviados == [], "2 min: ainda tem gente"
             os.remove(os.path.join(home, "events.jsonl"))
             _usuario_falou(home, 30)
-            assert orq_mod.avisos_entregar() and len(enviados) == 1 and "PRESA" in enviados[0], enviados
+            assert orq_mod.avisos_entregar() and len(enviados) == 1 and "STUCK" in enviados[0], enviados
             assert orq_mod.avisos_entregar() == [] and len(enviados) == 1, "o aviso digitado sai da fila"
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
@@ -8888,7 +8888,7 @@ def test_ticket86_aviso_de_pressao_da_maquina_nao_e_digitado_com_o_usuario_no_co
     assert not _log(a, "send.log"), "o coordenador tem gente: nada é digitado"
     assert [e["tipo"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["maquina_aviso"], "adiado é entrega: um aviso por episódio"
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "não foram digitados" in ctx and "máquina sob pressão" in ctx, ctx
+    assert "were not typed" in ctx and "machine under pressure" in ctx, ctx
 
 
 def test_ticket86_gerente_absorver_acorda_o_coordenador_parado_ha_mais_de_dois_minutos_e_adia_antes_disso():
@@ -8910,11 +8910,11 @@ def test_ticket86_gerente_absorver_nao_digita_o_aviso_enquanto_o_usuario_fala_co
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0, r.stderr
     assert _log(a, "send.log") == [], "o coordenador tem gente: o aviso do gerente não é digitado"
-    assert "avisado ao coordenador" in r.stdout, r.stdout
+    assert "coordinator notified" in r.stdout, r.stdout
     a.orq("gerente", "absorver")
     assert _log(a, "send.log") == [], "adiado já é entrega: a volta seguinte não o repete"
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "não foram digitados" in ctx and "check --run run_b" in ctx, ctx
+    assert "were not typed" in ctx and "check --run run_b" in ctx, ctx
 
 
 def test_it_should_not_type_when_the_second_read_finds_text_in_the_box():
@@ -8945,7 +8945,7 @@ def test_it_should_not_type_into_a_busy_worker_when_the_second_read_finds_a_draf
 
 
 def test_it_should_not_record_the_typed_orq_notices_as_user_prompts():
-    for t in ("orq: PR #1 entrou em staging", "orq: Fila do E2E: x PRESA", "orq: uso do plano, semana em 93%", "orq: worker task_a pergunta na tela"):
+    for t in ("orq: PR #1 entrou em staging", "orq: Fila do E2E: x STUCK", "orq: plan usage, week at 93%", "orq: worker task_a pergunta na tela"):
         assert orq_mod.origem(t) == "aviso_orq", t
     assert orq_mod.origem("orq: faça isso") == "usuario"
 
@@ -8968,7 +8968,7 @@ def test_it_should_notify_on_macos_only_when_the_config_turns_it_on():
             os.remove(os.path.join(home, "e2e-notice.json"))
             _grava_estado(os.path.join(home, "gerente.json"), {**cfg, "notificar_macos": True})
             orq_mod.avisa_fila_e2e(orq_mod.fila_e2e(fila, agora=40 * 60))
-            assert "display notification" in open(log).read() and "PRESA" in open(log).read()
+            assert "display notification" in open(log).read() and "STUCK" in open(log).read()
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
             os.environ.pop("ORQ_OSASCRIPT", None) if env is None else os.environ.__setitem__("ORQ_OSASCRIPT", env)
@@ -8998,7 +8998,7 @@ def test_ticket51_uso_le_o_rate_limits_do_quadro_do_hud_sem_chamar_o_orca():
     _uso51(a, semana=93, cinco_h=86)
     u = json.loads(a.orq("uso", "--json").stdout)
     assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 86, "pausa"), u
-    assert "semana em 93% (limiar 92%), vira em 2d" in u["motivo"], u
+    assert "week at 93% (threshold 92%), turns over in 2d" in u["motivo"], u
     assert not _log(a, "calls.log"), "ler o uso não fala com o Orca"
     _uso51(a, semana=80, cinco_h=50)
     assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "ok"
@@ -9027,11 +9027,11 @@ def test_ticket51_despachar_recusa_acima_do_limiar_da_semana_e_da_janela_de_5h()
     a = Amb(run="run_a")
     _uso51(a, semana=93, cinco_h=10)
     r = _despachar(a)
-    assert r.returncode == 1 and "uso do plano" in r.stderr and "semana em 93%" in r.stderr and "orq pausar" in r.stderr, r
+    assert r.returncode == 1 and "plan usage" in r.stderr and "week at 93%" in r.stderr and "orq pause" in r.stderr, r
     assert not _log(a, "started.log"), "nada foi despachado"
     _uso51(a, semana=50, cinco_h=91)
     r = _despachar(a)
-    assert r.returncode == 1 and "janela de 5 h em 91%" in r.stderr and "janela virar" in r.stderr, r
+    assert r.returncode == 1 and "5 h window at 91%" in r.stderr and "window to turn over" in r.stderr, r
     assert not _log(a, "started.log")
     _uso51(a, semana=90, cinco_h=89)
     assert _despachar(a).returncode == 0, "abaixo dos limiares de pausa e de segurar o despacho sai"
@@ -9046,7 +9046,7 @@ def test_ticket51_gerente_avisa_o_coordenador_uma_vez_por_nivel_e_janela():
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
     assert env[env.index("--terminal") + 1] == "term_coord"
-    assert "uso do plano, semana em 93%" in env[env.index("--text") + 1] and "orq pausar" in env[env.index("--text") + 1]
+    assert "plan usage, week at 93%" in env[env.index("--text") + 1] and "orq pause" in env[env.index("--text") + 1]
     assert [e["nivel"] for e in a.events() if e["tipo"] == "uso_aviso"] == ["pausa"]
     _uso51(a, semana=50)  # voltou ao normal: o aviso reabre
     a.orq("gerente", "absorver")
@@ -9153,11 +9153,11 @@ def test_ticket51_retomar_pausados_sobe_com_resume_e_so_os_pausados_e_o_retomar_
     assert a.orq("pausar").returncode == 0
     f.result()
     a.set("terminals.json", ["term_coord", "term_s", "term_p"])  # f e i fecharam
-    assert a.orq("retomar", "--dry-run").stdout.strip() == "nada a retomar", "o crash-recovery não revive o que o orçamento pausou"
+    assert a.orq("retomar", "--dry-run").stdout.strip() == "nothing to resume", "o crash-recovery não revive o que o orçamento pausou"
     a.set("screens.json", {"term_ret1": ["esc to interrupt"], "term_ret2": ["esc to interrupt"]})
     _uso51(a, semana=95)
     r = a.orq("retomar", "--pausados")
-    assert r.returncode == 1 and "uso do plano ainda alto" in r.stderr and not _log(a, "create.log"), r
+    assert r.returncode == 1 and "plan usage still high" in r.stderr and not _log(a, "create.log"), r
     _uso51(a, semana=70, cinco_h=20)
     r = a.orq("retomar", "--pausados", "--json")
     assert r.returncode == 0, r.stderr
@@ -9166,10 +9166,10 @@ def test_ticket51_retomar_pausados_sobe_com_resume_e_so_os_pausados_e_o_retomar_
     c = _log(a, "create.log")
     assert c[0][c[0].index("--worktree") + 1] == "path:" + a.wt + "/i"
     comando = c[0][c[0].index("--command") + 1]
-    assert comando.startswith("claude --resume sess-i --model claude-opus-5-5 --dangerously-skip-permissions 'O uso do plano voltou"), comando
+    assert comando.startswith("claude --resume sess-i --model claude-opus-5-5 --dangerously-skip-permissions 'Plan usage is back to normal"), comando
     assert not _cursor(a).get("pausados") and {e["dispatch"] for e in a.events() if e["tipo"] == "pausa_fim"} == {"ctx_term_f", "ctx_term_i"}
     assert [e["terminal"] for e in a.events() if e["tipo"] == "retomada"] == ["term_ret1", "term_ret2"]
-    assert a.orq("retomar", "--pausados").stdout.strip() == "nada a retomar"
+    assert a.orq("retomar", "--pausados").stdout.strip() == "nothing to resume"
 
 
 def test_ticket51_orq_prioridade_troca_a_prioridade_e_aparece_em_agentes_status_e_digest():
@@ -9183,7 +9183,7 @@ def test_ticket51_orq_prioridade_troca_a_prioridade_e_aparece_em_agentes_status_
     assert _agentes(a)["ctx_term_f"]["prioridade"] == 1, "a troca vale sobre o padrão"
     assert a.orq("prioridade", "task_term_f", "3").returncode == 0 and _agentes(a)["ctx_term_f"]["prioridade"] == 3, "a última troca vale"
     r = a.orq("prioridade", "xyz", "2")
-    assert r.returncode == 1 and "não é um id de task" in r.stderr, r
+    assert r.returncode == 1 and "is not a task id" in r.stderr, r
     assert a.orq("prioridade", "task_term_f", "5").returncode == 2
     a.orq("prioridade", "task_term_p", "1")
     # digest: 'rodando' sai da prioridade mais alta para a mais baixa
@@ -9210,7 +9210,7 @@ def test_ticket51_prioridade_1_passa_pela_janela_de_5h_mas_nao_pela_pausa_da_sem
     assert _despachar(a, "--prioridade", "1").returncode == 0, "urgente passa pela janela de 5 h"
     _uso51(a, semana=95, cinco_h=10)
     r = _despachar(a, "--prioridade", "1")
-    assert r.returncode == 1 and "semana" in r.stderr, "a pausa da semana vale para todas"
+    assert r.returncode == 1 and "week" in r.stderr, "a pausa da semana vale para todas"
 
 
 # ---------- ticket 52: pergunta ou permissão presa no terminal do worker ----------
@@ -9249,10 +9249,10 @@ def test_ticket52_gerente_avisa_o_coordenador_uma_vez_e_o_agentes_mostra_a_pergu
     a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
     _tela_no_gerente52(a)
     r = a.orq("gerente", "absorver")
-    assert r.returncode == 0 and "pergunta na tela (permissao)" in r.stdout, r
+    assert r.returncode == 0 and "screen question (permissao)" in r.stdout, r
     (env,) = _avisos_enviados(a)
     texto = _aviso_inteiro(env[env.index("--text") + 1])
-    assert "Do you want to proceed?" in texto and "1) Yes" in texto and "orq responder-tela task_term_w1 <opção>" in texto, texto
+    assert "Do you want to proceed?" in texto and "1) Yes" in texto and "orq answer-screen task_term_w1 <option>" in texto, texto
     a.orq("gerente", "absorver")
     assert len(_avisos_enviados(a)) == 1, "o mesmo menu não é avisado de novo"
     (ev,) = [e for e in a.events() if e["tipo"] == "pergunta_tela"]
@@ -9261,7 +9261,7 @@ def test_ticket52_gerente_avisa_o_coordenador_uma_vez_e_o_agentes_mostra_a_pergu
     w = next(x for x in ag if x["dispatch"] == "ctx_term_w1")
     assert w["estado"] == "perguntando" and w["pergunta"]["tipo"] == "permissao", w
     txt = a.orq("agentes", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout
-    assert "PERGUNTA NA TELA (permissao)" in txt and "orq responder-tela task_term_w1" in txt, txt
+    assert "QUESTION ON SCREEN (permissao)" in txt and "orq answer-screen task_term_w1" in txt, txt
     a.set("screens.json", {"term_w1": ["● seguindo"]})  # respondido: o evento fecha
     a.orq("gerente", "absorver")
     a.set("screens.json", {"term_w1": _tela52("tela-permissao.txt")})
@@ -9297,12 +9297,12 @@ def test_ticket52_responder_tela_recusa_sem_menu_aberto_ou_com_opcao_que_nao_exi
     a = Amb(run="run_a")
     _tela_no_gerente52(a)
     r = a.orq("responder-tela", "task_term_w1", "9", ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode != 0 and "não existe no menu" in r.stderr and not _log(a, "send.log"), r
+    assert r.returncode != 0 and "does not exist in the menu" in r.stderr and not _log(a, "send.log"), r
     a.set("screens.json", {"term_w1": ["● trabalhando"]})
     r = a.orq("responder-tela", "task_term_w1", "1", ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode != 0 and "não mostra um menu" in r.stderr and not _log(a, "send.log"), "um número digitado no prompt comum viraria mensagem ao worker"
+    assert r.returncode != 0 and "does not show a menu" in r.stderr and not _log(a, "send.log"), "um número digitado no prompt comum viraria mensagem ao worker"
     r = a.orq("responder-tela", "task_nao_existe", "1", ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode != 0 and "nada a responder" in r.stderr
+    assert r.returncode != 0 and "nothing to answer" in r.stderr
 
 
 def test_ticket52_hook_guard_recusa_askuserquestion_so_no_worker_e_rapido():
@@ -9382,12 +9382,12 @@ def test_ticket73_hook_do_worker_codex_grava_o_turno_com_o_harness_e_o_transcrit
 def test_ticket73_hook_com_harness_desconhecido_sai_0_e_o_exemplo_do_codex_instala_cada_hook_com_o_argumento():
     a = Amb(run=None)
     r = a.orq("hook", "prompt", "cursor", stdin="{}")
-    assert r.returncode == 0 and not r.stdout and "argumentos inválidos" in a.log(), "fail-open: no Codex a saída 2 bloquearia o prompt"
+    assert r.returncode == 0 and not r.stdout and "invalid arguments" in a.log(), "fail-open: no Codex a saída 2 bloquearia o prompt"
     cfg = json.load(open(os.path.join(AQUI, "codex.hooks.example.json")))["hooks"]
     cmds = {h["command"] for g in cfg.values() for x in g for h in x["hooks"]}
-    for k in ("prompt", "stop", "session", "lugar", "externas", "prligar"):
+    for k in ("prompt", "stop", "session", "place", "external", "prlink"):
         assert f"python3 ~/.claude/orq/orq.py hook {k} codex" in cmds, k
-    assert "apply_patch" in next(x["matcher"] for x in cfg["PreToolUse"] if "hook lugar" in json.dumps(x))
+    assert "apply_patch" in next(x["matcher"] for x in cfg["PreToolUse"] if "hook place" in json.dumps(x))
     assert not [c for c in cmds if "hook guard" in c or "hook ask" in c], "o Codex não tem AskUserQuestion"
 
 
@@ -9399,7 +9399,7 @@ def test_ticket73_lugar_no_codex_le_o_caminho_do_apply_patch_e_a_casa_vem_do_pri
     os.makedirs(os.path.join(w, "sub"))
     r = _hook_codex(a, "lugar", _codex("pre-apply-patch", session_id="abcdef123456", cwd=w, tool_input={"command": patch}))
     msg = _aviso(r)
-    assert "lugar errado" in msg and os.path.realpath(w) in msg, msg
+    assert "wrong place" in msg and os.path.realpath(w) in msg, msg
     b = Amb(run="run_a")
     pb, wb = _repo(b.tmp.name)
     _hook_codex(b, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="oi", cwd=wb))  # coordenador que mora na worktree
@@ -9452,12 +9452,12 @@ def test_ticket73_despachar_recusa_effort_que_o_harness_nao_tem_sem_criar_task()
 
 def test_ticket73_worker_routing_tem_a_tabela_do_codex_com_a_fonte_astra_so_em_low_e_medium_e_sem_terra():
     txt = open(os.path.join(AQUI, "skills", "worker-routing", "SKILL.md")).read()
-    assert "gpt-6-luna" in txt and "gpt-6-sol" in txt and "--agente codex" in txt, "a tabela do Codex e o jeito de despachar"
+    assert "gpt-6-luna" in txt and "gpt-6-sol" in txt and "--agent codex" in txt, "a tabela do Codex e o jeito de despachar"
     assert "learn.chatgpt.com/docs/models" in txt, "a fonte da equivalência"
     terra = [l for l in txt.splitlines() if "terra" in l.lower()]
-    assert terra and all("não" in l.lower() for l in terra), terra
+    assert terra and all("not" in l.lower() for l in terra), terra
     astra = [l for l in txt.splitlines() if "astra" in l.lower()]  # só low e medium, no lugar do Opus xhigh e max
-    assert astra and all("low" in l.lower() or "medium" in l.lower() or "não" in l.lower() for l in astra), astra
+    assert astra and all("low" in l.lower() or "medium" in l.lower() or "not" in l.lower() for l in astra), astra
     assert not [l for l in astra if "astra" in l.lower() and ("astra` high" in l.lower() or "astra` xhigh" in l.lower())], astra
 
 
@@ -9488,7 +9488,7 @@ def test_ticket73_retomar_worker_codex_sobe_com_codex_resume_modelo_e_effort():
     assert [(w["dispatch"], w["estado"]) for w in res["workers"]] == [("ctx_term_c1", "retomado")], res
     (c,) = _log(a, "create.log")
     comando = c[c.index("--command") + 1]
-    assert comando.startswith("codex resume thr-c1 -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"' --dangerously-bypass-approvals-and-sandbox 'Continue de onde parou."), comando
+    assert comando.startswith("codex resume thr-c1 -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"' --dangerously-bypass-approvals-and-sandbox 'Continue where you left off."), comando
 
 
 def test_ticket73_retomar_sem_sessao_gravada_acha_a_sessao_pelo_indice_do_orca():
@@ -9549,7 +9549,7 @@ def test_ticket73_uso_do_codex_vem_do_orca_account_list():
     a = Amb()
     _conta73(a, codex_semana=93, codex_5h=10)
     u = json.loads(a.orq("uso", "--agente", "codex", "--json").stdout)
-    assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 10, "pausa") and "vira em 2d" in u["motivo"], u
+    assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 10, "pausa") and "turns over in 2d" in u["motivo"], u
     _conta73(a, codex_semana=40)
     u = json.loads(a.orq("uso", "--agente", "codex", "--json").stdout)
     assert (u["uso"]["cinco_h"], u["nivel"]) == (None, "ok"), "o Codex sem janela de 5 h só tem a semana"
@@ -9730,8 +9730,8 @@ def test_ticket79_despachar_com_o_orcamento_cheio_enfileira_e_nao_sobe_worker():
     r = _desp79(a, "Ticket 05", 2)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert (out["estado"], out["posicao"], out["prioridade"]) == ("enfileirado", 1, 2) and "4/4 workers vivos" in out["motivo"] and "dispatchId" not in out, out
-    assert "orq fila-despacho lista" in r.stderr, "o aviso diz como ver a fila"
+    assert (out["estado"], out["posicao"], out["prioridade"]) == ("enfileirado", 1, 2) and "4/4 live workers" in out["motivo"] and "dispatchId" not in out, out
+    assert "orq dispatch-queue list" in r.stderr, "o aviso diz como ver a fila"
     assert not _log(a, "started.log"), "nada subiu"
     (it,) = _fila79(a)
     assert (it["tipo"], it["run"], it["titulo"], it["modelo"], it["effort"], it["prioridade"]) == ("despacho", "run_a", "Ticket 05", SONNET, "medium", 2), it
@@ -9741,7 +9741,7 @@ def test_ticket79_despachar_com_o_orcamento_cheio_enfileira_e_nao_sobe_worker():
     assert [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"] == ["entrou"]
     assert a.orq("fila-despacho", "rm", "fd_que_nao_existe").returncode == 1
     assert a.orq("fila-despacho", "rm", it["id"]).returncode == 0 and not _fila79(a) and not os.path.exists(it["spec_arquivo"])
-    assert a.orq("fila-despacho", "lista").stdout.strip() == "fila de despacho vazia"
+    assert a.orq("fila-despacho", "lista").stdout.strip() == "dispatch queue empty"
 
 
 def test_ticket79_vaga_aberta_sobe_o_p1_antes_do_p2_e_um_por_volta_do_painel():
@@ -9756,7 +9756,7 @@ def test_ticket79_vaga_aberta_sobe_o_p1_antes_do_p2_e_um_por_volta_do_painel():
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0, r.stderr
     assert _titulos_iniciados79(a) == ["Primeira"], "duas vagas, mas o painel sobe um por volta: o P1 antes do P2"
-    assert "Primeira subiu" in r.stdout
+    assert "Primeira started" in r.stdout
     a.set("terminals.json", [*json.load(open(os.path.join(a.fake, "terminals.json"))), "term_novo5"])  # o terminal do worker novo (o Orca falso não o cria)
     a.orq("gerente", "absorver")
     assert _titulos_iniciados79(a) == ["Primeira", "Segunda"], "a segunda vaga leva o próximo da fila; o worker novo já ocupa a primeira"
@@ -9791,11 +9791,11 @@ def test_ticket79_retomar_com_10_caidos_e_max_workers_4_sobe_4_por_prioridade_e_
     res = json.loads(r.stdout)["workers"]
     assert [w["titulo"] for w in res] == [t for t, _ in mortos], "a resposta segue a ordem do Orca"
     subiram = [c[c.index("--title") + 1] for c in _log(a, "create.log")]
-    assert subiram == ["Segurança a (retomado)", "Segurança b (retomado)", "Ticket 1 (retomado)", "Ticket 2 (retomado)"], "os dois P1 e os dois primeiros P2"
+    assert subiram == ["Segurança a (resumed)", "Segurança b (resumed)", "Ticket 1 (resumed)", "Ticket 2 (resumed)"], "os dois P1 e os dois primeiros P2"
     fila = _fila79(a)
     assert sorted(i["titulo"] for i in fila) == sorted(["Ticket 3", "Ticket 4", "Failover 1", "Failover 2", "Failover 3", "Failover 4"]) and {i["tipo"] for i in fila} == {"retomada"}
     assert {(i["titulo"], i["prioridade"]) for i in fila} >= {("Ticket 3", 2), ("Failover 1", 3)}
-    assert all("4/4 workers vivos" in w["aviso"] for w in res if w["estado"] == "enfileirado")
+    assert all("4/4 live workers" in w["aviso"] for w in res if w["estado"] == "enfileirado")
     again = json.loads(a.orq("retomar", "--dry-run", "--json").stdout)["workers"]
     assert [w["estado"] for w in again].count("a_enfileirar") == 6, "os 4 retomados contam como vivos; os outros seguem esperando"
 
@@ -9810,13 +9810,13 @@ def test_ticket79_a_fila_de_retomada_sobe_por_prioridade_quando_abre_vaga_e_desc
     assert [w["estado"] for w in json.loads(a.orq("retomar", "--json").stdout)["workers"]] == ["enfileirado"] * 3
     _libera79(a, "term_v0")
     a.orq("gerente", "absorver")
-    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (retomado)"], "o P2 mais antigo antes do P3"
+    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (resumed)"], "o P2 mais antigo antes do P3"
     assert sorted(i["titulo"] for i in _fila79(a)) == ["Failover 1", "Ticket 2"]
     _libera79(a, "term_v1", "term_v2")
     a.set("workers.json", [{**w, "status": "completed"} if w["handle"] == "term_m2" else w for w in json.load(open(os.path.join(a.fake, "workers.json")))])  # Ticket 2 terminou sozinho
     r = a.orq("gerente", "absorver")
-    assert "Ticket 2 saiu" in r.stdout and "Failover 1 retomado" in r.stdout, r.stdout
-    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (retomado)", "Failover 1 (retomado)"] and not _fila79(a)
+    assert "Ticket 2 left" in r.stdout and "Failover 1 resumed" in r.stdout, r.stdout
+    assert [c[c.index("--title") + 1] for c in _log(a, "create.log")] == ["Ticket 1 (resumed)", "Failover 1 (resumed)"] and not _fila79(a)
 
 
 def test_ticket79_sob_pressao_alta_nada_sobe_e_o_aviso_sai_uma_vez_por_episodio():
@@ -9826,15 +9826,15 @@ def test_ticket79_sob_pressao_alta_nada_sobe_e_o_aviso_sai_uma_vez_por_episodio(
     a.maquina(carga=40)
     r = _desp79(a, "Ticket 05", 1)
     out = json.loads(r.stdout)
-    assert out["estado"] == "enfileirado" and "carga 40 (máximo 12)" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "load 40 (maximum 12)" in out["motivo"], out
     assert not _log(a, "started.log"), "com vaga de sobra, mas a máquina em pressão: enfileira"
     for _ in range(3):
         assert a.orq("gerente", "absorver").returncode == 0
     assert not _log(a, "started.log") and len(_fila79(a)) == 1
     (env,) = _log(a, "send.log")
     texto = _inteiro(env[env.index("--text") + 1])
-    assert env[env.index("--terminal") + 1] == "term_coord" and "máquina sob pressão" in texto and "carga 40" in texto and "1 na fila de despacho" in texto, texto
-    assert "orq pausar task_term_v0" in texto, "propõe pausar o único worker vivo"
+    assert env[env.index("--terminal") + 1] == "term_coord" and "machine under pressure" in texto and "load 40" in texto and "1 in the dispatch queue" in texto, texto
+    assert "orq pause task_term_v0" in texto, "propõe pausar o único worker vivo"
     assert not _log(a, "close.log"), "propor não é pausar"
     assert [e["tipo"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["maquina_aviso"]
     a.maquina(mem_livre_mb=1000, livre_pct=8)
@@ -9850,7 +9850,7 @@ def test_ticket79_sob_pressao_alta_nada_sobe_e_o_aviso_sai_uma_vez_por_episodio(
 
 def test_ticket79_pressao_por_memoria_livre_e_por_percentual_livre():
     a = Amb(run="run_a")
-    for kw, trecho in (({"mem_livre_mb": 2000}, "memória livre 2000 MB (mínimo 3072 MB)"), ({"livre_pct": 9}, "memória livre 9% (mínimo 15%)")):
+    for kw, trecho in (({"mem_livre_mb": 2000}, "free memory 2000 MB (minimum 3072 MB)"), ({"livre_pct": 9}, "free memory 9% (minimum 15%)")):
         a.maquina(**kw)
         out = json.loads(_desp79(a, "Ticket 05", 2).stdout)
         assert out["estado"] == "enfileirado" and trecho in out["motivo"], out
@@ -9875,7 +9875,7 @@ def test_ticket79_pressao_com_pausar_sob_pressao_ligado_o_gerente_pausa_o_de_men
     a.maquina(carga=40)
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
-    assert "orq pausar task_term_f" in _inteiro(env[env.index("--text") + 1]) and not _log(a, "close.log"), "sem a regra, só propõe: o failover P3, e não o P3 em review"
+    assert "orq pause task_term_f" in _inteiro(env[env.index("--text") + 1]) and not _log(a, "close.log"), "sem a regra, só propõe: o failover P3, e não o P3 em review"
     a.orq("maquina", "set", "pausar_sob_pressao", "true")
     a.maquina()
     a.orq("gerente", "absorver")  # volta a normal: reabre o aviso
@@ -9884,7 +9884,7 @@ def test_ticket79_pressao_com_pausar_sob_pressao_ligado_o_gerente_pausa_o_de_men
     r = a.orq("gerente", "absorver")
     f.result()
     assert r.returncode == 0, r.stderr
-    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_f"] and "pausa automática: task_term_f pausado" in r.stdout, r.stdout
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_f"] and "automatic pause: task_term_f pausado" in r.stdout, r.stdout
 
 
 def test_ticket79_modelo_caro_com_o_teto_cheio_enfileira_e_o_barato_sobe_e_quando_o_opus_libera_o_da_fila_sobe():
@@ -9892,7 +9892,7 @@ def test_ticket79_modelo_caro_com_o_teto_cheio_enfileira_e_o_barato_sobe_e_quand
     _gerente(a)
     _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)])
     out = json.loads(_desp79(a, "Terceiro opus", 1, OPUS).stdout)
-    assert out["estado"] == "enfileirado" and "2/2 workers caros" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "2/2 expensive workers" in out["motivo"], out
     out = json.loads(_desp79(a, "Um sonnet", 2, SONNET).stdout)
     assert out["dispatchId"] and out["taskId"], "o barato continua subindo com vaga geral"
     assert _titulos_iniciados79(a) == ["Um sonnet"] and [i["titulo"] for i in _fila79(a)] == ["Terceiro opus"]
@@ -9946,7 +9946,7 @@ def test_ticket79_max_caros_ajustavel_e_retomar_conta_os_caros_igual():
     a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
     res = {w["titulo"]: w for w in json.loads(a.orq("retomar", "--json").stdout)["workers"]}
     assert (res["Opus caído"]["estado"], res["Sonnet caído"]["estado"]) == ("enfileirado", "retomado"), res
-    assert "2/2 workers caros" in res["Opus caído"]["aviso"] and [i["titulo"] for i in _fila79(a)] == ["Opus caído"]
+    assert "2/2 expensive workers" in res["Opus caído"]["aviso"] and [i["titulo"] for i in _fila79(a)] == ["Opus caído"]
     b = Amb(run="run_a", ORQ_RETOMAR_ESPERA_S="1")
     _frota79(b, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)], mortos=[("Opus caído", OPUS)])
     b.orq("maquina", "set", "max_caros", "3")
@@ -9962,7 +9962,7 @@ def test_ticket79_retomar_pausados_respeita_o_teto_e_deixa_o_resto_pausado():
                                          "sessao": f"s{n}", "cwd": os.path.join(a.wt, "p"), "terminal": f"term_p{n}"} for n in range(2)}}, open(os.path.join(a.home, "cursor.json"), "w"))
     a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
     res = json.loads(a.orq("retomar", "--pausados", "--json").stdout)["workers"]
-    assert [w["estado"] for w in res] == ["retomado", "sem_vaga"] and "3/4" not in res[1]["aviso"] and "4/4 workers vivos" in res[1]["aviso"], res
+    assert [w["estado"] for w in res] == ["retomado", "sem_vaga"] and "3/4" not in res[1]["aviso"] and "4/4 live workers" in res[1]["aviso"], res
     assert list(_cursor(a)["pausados"]) == ["ctx_p1"], "o que não coube continua pausado"
 
 
@@ -9975,7 +9975,7 @@ def test_ticket79_relancar_conta_igual_o_opus_a_mais_e_recusado_sem_parar_ningue
         a.set("workers.json", ws + [_w48("term_v0", modelo=OPUS), _w48("term_v1", modelo=OPUS)])
         a.set("terminals.json", ["term_coord", "term_w1", "term_v0", "term_v1"])
         r = a.orq("relancar", "ctx_w1", "--nota", "x", "--modelo", OPUS, "--effort", "high")
-        assert r.returncode == 1 and "2/2 workers caros" in r.stderr and "nada foi parado" in r.stderr, r
+        assert r.returncode == 1 and "2/2 expensive workers" in r.stderr and "nothing was stopped" in r.stderr, r
         assert not _log(a, "stopped.log") and not _log(a, "started.log")
         r = a.orq("relancar", "ctx_w1", "--nota", "x")
         assert r.returncode == 0, r.stderr
@@ -9997,12 +9997,12 @@ def test_ticket79_status_painel_e_digest_mostram_vagas_ocupadas_livres_e_a_fila(
     ab = _ler_estado(os.path.join(a.home, "aberto.json"))["maquina"]
     assert (ab["max_workers"], ab["ocupadas"], ab["livres"], ab["caros"]) == (4, 4, 0, 4) and [i["titulo"] for i in ab["fila"]] == ["Ticket 06"], ab
     st = a.orq("status").stdout
-    assert "Máquina: 4/4 workers (4/2 caros), 0 vagas livres; 1 na fila de despacho: P2 Ticket 06" in st, st
+    assert "Machine: 4/4 workers (4/2 expensive), 0 free slots; 1 in the dispatch queue: P2 Ticket 06" in st, st
     a.orq("digest", "--html")
     d = json.load(open(os.path.join(a.home, "digest", "atual.json")))
     assert "maquina" not in d, "o contrato do digest não muda"
     pagina = open(os.path.join(a.home, "digest", [f for f in os.listdir(os.path.join(a.home, "digest")) if f.endswith(".html")][0])).read()
-    assert "Máquina: 4/4 vagas ocupadas, 0 livres, 1 na fila de despacho" in pagina
+    assert "Machine: 4/4 slots busy, 0 free, 1 in the dispatch queue" in pagina
 
 
 def test_ticket79_digest_nao_conta_o_worker_hibernado_nas_vagas_ocupadas():
@@ -10017,7 +10017,7 @@ def test_ticket79_status_sem_worker_sem_fila_e_sem_pressao_nao_diz_nada_da_maqui
     a = Amb(run="run_a")
     assert "Máquina:" not in a.orq("status").stdout
     a.maquina(carga=30)
-    assert "PRESSÃO ALTA: carga 30 (máximo 12)" in a.orq("status").stdout
+    assert "HIGH PRESSURE: load 30 (maximum 12)" in a.orq("status").stdout
 
 
 def test_ticket79_item_da_fila_que_falha_tres_vezes_sai_e_o_segurado_pelo_uso_espera():
@@ -10028,7 +10028,7 @@ def test_ticket79_item_da_fila_que_falha_tres_vezes_sai_e_o_segurado_pelo_uso_es
     _libera79(a, "term_v0")
     _uso51(a, semana=95)
     r = a.orq("gerente", "absorver")
-    assert "segue esperando" in r.stdout and "uso do plano" in r.stdout, r.stdout
+    assert "is still waiting" in r.stdout and "plan usage" in r.stdout, r.stdout
     (it,) = _fila79(a)
     assert it["falhas"] == 0 and it["nao_antes"] > time.time(), "o uso do plano segura sem contar como falha"
     n = len([e for e in a.events() if e["tipo"] == "uso_parou"])
@@ -10184,11 +10184,11 @@ def test_ticket60_ocioso_ha_mais_de_n_min_hiberna_fecha_o_terminal_guarda_a_sess
     a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
     volta = _no_gerente60(a, parado_min=20)
     r = volta()
-    assert r.returncode == 0 and "task_term_w1: hibernado (ocioso no prompt, ~732 MB)" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "task_term_w1: hibernated (idle at the prompt, ~732 MB)" in r.stdout, (r.stdout, r.stderr)
     assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
     h = _hibernados60(a)["ctx_term_w1"]
     assert (h["sessao"], h["cwd"], h["modelo"], h["task"], h["run"], h["agente"], h["entregue"], h["motivo"]) == \
-        ("sess-w1", a.wt + "/w1", "claude-opus-5-5", "task_term_w1", "run_a", "claude", False, "ocioso no prompt"), h
+        ("sess-w1", a.wt + "/w1", "claude-opus-5-5", "task_term_w1", "run_a", "claude", False, "idle at the prompt"), h
     ev = next(e for e in a.events() if e["tipo"] == "hibernar")
     assert (ev["dispatch"], ev["rss_antes_mb"], ev["rss_depois_mb"], ev["rss_liberado_mb"]) == ("ctx_term_w1", 732, 0, 732), "o RSS do claude e do MCP, não o do outro programa"
     assert h["rss_liberado_mb"] == 732
@@ -10250,7 +10250,7 @@ def test_ticket60_coordenador_gerente_e_terminal_que_nao_e_worker_do_orq_nunca_h
     assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
     for alvo in ("task_term_coord", "task_term_ger"):  # nem à mão
         r = a.orq("hibernar", alvo, "--run", "run_a", "--forcar")
-        assert r.returncode == 1 and "coordenador ou o gerente" in r.stderr, (alvo, r.stderr)
+        assert r.returncode == 1 and "coordinator or the manager" in r.stderr, (alvo, r.stderr)
 
 
 def test_ticket60_espera_externa_conhecida_pendencia_pr_ou_ticket_bloqueado_hiberna_antes_do_n():
@@ -10260,27 +10260,27 @@ def test_ticket60_espera_externa_conhecida_pendencia_pr_ou_ticket_bloqueado_hibe
     volta()
     assert not _hibernados60(a), "parado há 5 min sem nada que ele espere: fica"
     json.dump(pend, open(a.env["ORQ_PENDENCIAS"], "w"))
-    assert "esperando: pendência teto-pod" in volta().stdout
-    assert _hibernados60(a)["ctx_term_w1"]["motivo"] == "esperando: pendência teto-pod"
+    assert "waiting: pending item teto-pod" in volta().stdout
+    assert _hibernados60(a)["ctx_term_w1"]["motivo"] == "waiting: pending item teto-pod"
     b = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
     _gh(b)
     _pr(b, PR1)
     volta = _no_gerente60(b, parado_min=5)
     assert b.orq("pr", "ligar", "task_term_w1", PR1).returncode == 0
-    assert "esperando: PR #1216 esperando merge" in volta().stdout
+    assert "waiting: PR #1216 waiting for merge" in volta().stdout
     c = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
     os.makedirs(c.env["ORQ_ISSUES"])
     open(os.path.join(c.env["ORQ_ISSUES"], "01-base.md"), "w").write("# 01: Base\n\nStatus: claimed\nBlocked by: (nenhum)\n\n## What to build\n\nx\n")
     open(os.path.join(c.env["ORQ_ISSUES"], "02-feature.md"), "w").write("# 02: Feature\n\nStatus: claimed\nBlocked by: 01\nTask: task_term_w1\n\n## What to build\n\nx\n")
     volta = _no_gerente60(c, parado_min=5)
-    assert "esperando: ticket 02 bloqueado por 01" in volta().stdout
+    assert "waiting: ticket 02 blocked by 01" in volta().stdout
 
 
 def test_ticket60_entregue_e_sem_liberar_hiberna_e_o_liberar_tira_da_lista():
     a = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
     volta = _no_gerente60(a, parado_min=20, status="completed", terminal="retained")
     assert _agentes(a, "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord")["ctx_term_w1"]["estado"] == "entregue"
-    assert "entregue e sem liberar" in volta().stdout
+    assert "delivered and not released" in volta().stdout
     h = _hibernados60(a)["ctx_term_w1"]
     assert h["entregue"] is True and [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_w1"]
     assert _agentes(a, "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord")["ctx_term_w1"]["estado"] == "hibernado", "o terminal fechado não o faz sumir: ele não foi liberado"
@@ -10293,7 +10293,7 @@ def test_ticket60_steer_num_hibernado_acorda_com_resume_e_entrega_a_mensagem():
     a = Amb(run="run_a", **HIB60)
     _hib60(a)
     r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
-    assert r.returncode == 0 and "hibernado (manual)" in r.stdout and "RSS 732 -> 0 MB" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "hibernated (manual)" in r.stdout and "RSS 732 -> 0 MB" in r.stdout, (r.stdout, r.stderr)
     assert _log(a, "close.log") and not _log(a, "create.log")
     r = a.orq("steer", "task_term_w1", "Faça o rebase na main antes do push")
     assert r.returncode == 0, r.stderr
@@ -10301,7 +10301,7 @@ def test_ticket60_steer_num_hibernado_acorda_com_resume_e_entrega_a_mensagem():
     assert c[c.index("--worktree") + 1] == "path:" + a.wt + "/w1"
     comando = c[c.index("--command") + 1]
     assert comando.startswith("claude --resume sess-w1 --model claude-opus-5-5 --dangerously-skip-permissions '"), comando
-    assert "Faça o rebase na main antes do push" in comando and "hibernado" in comando and "--type escalation" in comando and "--task-id task_term_w1" in comando, comando
+    assert "Faça o rebase na main antes do push" in comando and "hibernated" in comando and "--type escalation" in comando and "--task-id task_term_w1" in comando, comando
     assert not _enviados(a), "nada vai ao terminal morto: o resume leva a mensagem"
     assert not _hibernados60(a)
     tipos = [e["tipo"] for e in a.events()]
@@ -10340,13 +10340,13 @@ def test_ticket60_pendencia_respondida_e_pr_mergeado_acordam_pelo_gerente_mas_o_
     assert not _log(a, "create.log"), "nada o acorda sozinho"
     _pr(a, PR1, state="MERGED", base="development")
     r = volta()
-    assert "task_term_w1: acordado (o PR #1216 entrou em development)" in r.stdout, (r.stdout, r.stderr)
+    assert "task_term_w1: woken (PR #1216 entered development)" in r.stdout, (r.stdout, r.stderr)
     assert set(_hibernados60(a)) == {"ctx_term_w2"}
     assert a.orq("pend", "done", "teto-pod", "--resposta", "usar 4").returncode == 0
     r = volta()
-    assert "task_term_w2: acordado (a pendência teto-pod foi respondida: usar 4)" in r.stdout, r.stdout
+    assert "task_term_w2: woken (pending item teto-pod was answered: usar 4)" in r.stdout, r.stdout
     c1, c2 = _log(a, "create.log")
-    assert "claude --resume sess-w1" in c1[c1.index("--command") + 1] and "PR #1216 entrou em development" in c1[c1.index("--command") + 1]
+    assert "claude --resume sess-w1" in c1[c1.index("--command") + 1] and "PR #1216 entered development" in c1[c1.index("--command") + 1]
     assert "claude --resume sess-w2" in c2[c2.index("--command") + 1] and "usar 4" in c2[c2.index("--command") + 1]
     assert not _hibernados60(a)
     e = Amb(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIB60)
@@ -10382,11 +10382,11 @@ def test_ticket60_agentes_e_digest_mostram_hibernado_desde_hh_mm_e_a_economia():
     assert ag["estado"] == "hibernado" and ag["hibernado_desde"] and ag["motivo_hibernado"] == "manual", ag
     hora = orq_mod._hora_local(ag["hibernado_desde"])
     txt = a.orq("agentes", "--run", "run_a").stdout
-    assert f"hibernado desde {hora} (manual)" in txt and "orq acordar task_term_w1" in txt, txt
-    assert "Hibernados: 1, ~732 MB de RSS liberados" in txt, txt
+    assert f"hibernated since {hora} (manual)" in txt and "orq wake task_term_w1" in txt, txt
+    assert "Hibernated: 1, ~732 MB of RSS released" in txt, txt
     assert a.orq("ingest", "--refresh").returncode == 0 and a.orq("digest").returncode == 0
     rod = json.load(open(os.path.join(a.home, "digest", "atual.json")))["rodando"]
-    assert [r["estado"] for r in rod] == [f"hibernado desde {hora}"], rod
+    assert [r["estado"] for r in rod] == [f"hibernated since {hora}"], rod
 
 
 def test_ticket60_hibernar_e_acordar_a_mao_com_as_recusas_e_o_forcar():
@@ -10394,10 +10394,10 @@ def test_ticket60_hibernar_e_acordar_a_mao_com_as_recusas_e_o_forcar():
     _hib60(a)
     _procs60(a, extra=[{"pid": 150, "ppid": 100, "rss": 5000, "args": FILHO60, "cwd": None}])
     r = a.orq("hibernar", "task_term_w1", "--run", "run_a", "--forcar")
-    assert r.returncode == 1 and "processo filho vivo" in r.stderr and not _log(a, "close.log"), "nem --forcar passa processo filho"
+    assert r.returncode == 1 and "live child process" in r.stderr and not _log(a, "close.log"), "nem --forcar passa processo filho"
     _procs60(a, sem=("w1",))
     r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
-    assert r.returncode == 1 and "--forcar" in r.stderr and not _log(a, "close.log"), r.stderr
+    assert r.returncode == 1 and "--force" in r.stderr and not _log(a, "close.log"), r.stderr
     assert a.orq("hibernar", "task_term_w1", "--run", "run_a", "--forcar").returncode == 0 and _log(a, "close.log")
     r = a.orq("hibernar", "task_term_w1", "--run", "run_a")
     assert r.returncode == 1 and "hibernado" in r.stderr, "já hibernado"
@@ -10407,7 +10407,7 @@ def test_ticket60_hibernar_e_acordar_a_mao_com_as_recusas_e_o_forcar():
     (c,) = _log(a, "create.log")
     assert "o PR passou no CI" in c[c.index("--command") + 1]
     r = a.orq("acordar", "task_term_w1")
-    assert r.returncode == 1 and "não está hibernado" in r.stderr, r.stderr
+    assert r.returncode == 1 and "is not hibernated" in r.stderr, r.stderr
 
 
 def test_ticket60_o_resume_adia_a_proxima_hibernacao_e_o_criterio_puro():
@@ -10415,17 +10415,17 @@ def test_ticket60_o_resume_adia_a_proxima_hibernacao_e_o_criterio_puro():
     agora = datetime.now(timezone.utc)
     base = {"estado": "parado", "turno": "parado", "task": "task_t", "turno_inicio": _z60(40), "turno_fim": _z60(20)}
     m = orq_mod.motivo_hibernar
-    assert m(base, agora, cfg) == "ocioso no prompt"
+    assert m(base, agora, cfg) == "idle at the prompt"
     assert m(base, agora, cfg, acordada=_z60(1)) is None, "acordado há 1 min: o turno novo ainda não está no turnos.json"
-    assert m(base, agora, cfg, acordada=_z60(30)) == "ocioso no prompt"
+    assert m(base, agora, cfg, acordada=_z60(30)) == "idle at the prompt"
     assert m({**base, "turno_fim": _z60(10)}, agora, cfg) is None
-    assert m({**base, "turno_fim": _z60(10)}, agora, cfg, pend=[{"id": "p", "task": "task_t"}]) == "esperando: pendência p"
+    assert m({**base, "turno_fim": _z60(10)}, agora, cfg, pend=[{"id": "p", "task": "task_t"}]) == "waiting: pending item p"
     assert m({**base, "turno_inicio": _z60(5)}, agora, cfg) is None, "turno aberto depois do fim"
     for estado in ("travado", "perguntando", "nao_comecou", "hibernado", "liberado"):
         assert m({**base, "estado": estado}, agora, cfg) is None, estado
     assert m({**base, "tela": "1 shell still running (tela)"}, agora, cfg) is None
     assert m({**base, "turno": "aberto"}, agora, cfg) is None
-    assert m({**base, "estado": "entregue", "turno": "unknown"}, agora, cfg) == "entregue e sem liberar"
+    assert m({**base, "estado": "entregue", "turno": "unknown"}, agora, cfg) == "delivered and not released"
     assert m({**base, "estado": "entregue", "turno": "unknown", "retido": "external_terminal"}, agora, cfg) is None
 
 
@@ -10465,7 +10465,7 @@ def _eventos78():
         _ev78("resposta_worker", "2026-09-29T12:00:00Z", **d, msg_id="msg_9", texto="serve a leitura padrão"),
         _ev78("worker_done", "2026-09-29T13:00:00Z", **d, msg="msg_d1", outcome="failed", subject="não deu"),
         _ev78("worker_done", "2026-09-29T13:01:00Z", run="run_x", task="task_b", dispatch="ctx_b", msg="msg_d2", outcome="succeeded", subject="pronto"),
-        _ev78("entrega", "2026-09-29T13:02:00Z", run="run_x", task="task_b", dispatch="ctx_b", msg="msg_d2", avisos=[f"entrega sem commit: árvore suja em {orq_mod.ORQ_INSTALL}"]),
+        _ev78("entrega", "2026-09-29T13:02:00Z", run="run_x", task="task_b", dispatch="ctx_b", msg="msg_d2", avisos=[f"delivery without commit: árvore suja em {orq_mod.ORQ_INSTALL}"]),
         _ev78("fim_dispatch", "2026-09-29T13:10:00Z", run="run_x", task="task_a", dispatch="ctx_a", motivo="sem worker_done", caminho="/wt/a", sujo=3, sem_push=0),
         _ev78("fim_dispatch", "2026-09-29T13:11:00Z", run="run_x", task="task_b", dispatch="ctx_b", motivo="entregue", caminho="/wt/b", sujo=0, sem_push=2),
         _ev78("gate_aviso", "2026-09-29T14:00:00Z", abertas=["e1", "e2"], sessao="s1"),
@@ -10506,7 +10506,7 @@ def test_ticket78_retro_steer_depois_da_entrega_diz_que_o_worker_entregou_sem_o_
     ev = [_ev78("steer", "2026-09-29T11:00:00Z", task="t", dispatch="ctx_z", texto="x", msg_id="msg_z"),
           _ev78("worker_done", "2026-09-29T11:09:00Z", task="t", dispatch="ctx_z", outcome="succeeded")]
     caso = orq_mod.retro_coleta(ev, "2026-09-29T00:00:00Z", "2026-10-01T00:00:00Z")["sinais"]["steer_sem_leitura"]["casos"][0]
-    assert "entregou" in caso["detalhe"], caso
+    assert "delivered" in caso["detalhe"], caso
 
 
 def test_ticket78_retro_respeita_a_janela_e_o_filtro_de_projeto():
@@ -10598,11 +10598,11 @@ def test_ticket78_orq_retro_periodo_sem_falhas_diz_zero_por_extenso():
     a = Amb()
     r = a.orq("retro", "--desde", "2026-09-29", "--ate", "2026-10-01", "--sem-gh", "--sem-transcritos")
     assert r.returncode == 0, r.stderr
-    assert "falhas no período: 0" in r.stdout, r.stdout
+    assert "failures in the period: 0" in r.stdout, r.stdout
     assert "nao_iniciou" in r.stdout and "correcao_do_usuario" in r.stdout, "cada sinal aparece, mesmo com zero"
     linha = next(l for l in r.stdout.splitlines() if l.startswith("nao_iniciou"))
     assert linha.split()[1] == "0", linha
-    assert "n/d" in next(l for l in r.stdout.splitlines() if l.startswith("regra_violada")), "o que não foi consultado não vira zero"
+    assert "n/a" in next(l for l in r.stdout.splitlines() if l.startswith("regra_violada")), "o que não foi consultado não vira zero"
 
 
 def test_ticket78_orq_retro_com_eventos_imprime_ponteiros_json_e_compara_com_a_rodada_gravada():
@@ -10623,7 +10623,7 @@ def test_ticket78_orq_retro_com_eventos_imprime_ponteiros_json_e_compara_com_a_r
     snaps = os.listdir(os.path.join(a.home, "retro"))
     assert len(snaps) == 1, snaps
     r2 = a.orq("retro", "--desde", "2026-10-01", "--ate", "2026-10-08", "--sem-gh", "--sem-transcritos")
-    assert "antes" in r2.stdout and "nao_iniciou" in r2.stdout, r2.stdout
+    assert "before" in r2.stdout and "nao_iniciou" in r2.stdout, r2.stdout
     assert next(l for l in r2.stdout.splitlines() if l.startswith("nao_iniciou")).split()[1:3] == ["0", "1"], "esta rodada 0, a gravada 1"
     assert a.orq("retro", "--desde", "isto-nao-e-data").returncode != 0
 
@@ -10661,7 +10661,7 @@ def test_statusline_imprime_o_hud_igual_desligado_e_com_o_segmento_ligado():
     assert r.returncode == 0 and r.stdout == "X\n", r
     a.orq("ausente", "ligar")
     r = _statusline(a)
-    assert r.returncode == 0 and r.stdout.startswith("X ") and "away desde " in r.stdout and r.stdout.endswith("\n"), r
+    assert r.returncode == 0 and r.stdout.startswith("X ") and "away since " in r.stdout and r.stdout.endswith("\n"), r
     assert _statusline(a, "A\nB").stdout.split("\n")[1] == "B"
 
 
@@ -10705,7 +10705,7 @@ def test_ticket55_conflito_na_integracao_nao_toca_o_orq_instalado():
     vivo, env, g = _repo_vivo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
     antes = g("rev-parse", "HEAD").stdout
     r = subprocess.run([sys.executable, os.path.join(vivo, "scripts", "integrar.py"), "um", "dois"], cwd=vivo, env=env, capture_output=True, text=True)
-    assert r.returncode != 0 and "conflito" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert r.returncode != 0 and "conflict" in r.stdout + r.stderr, r.stdout + r.stderr
     assert g("rev-parse", "HEAD").stdout == antes and g("status", "--porcelain").stdout == "", "a main viva não anda nem suja"
     wt = os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
     assert "<<<<<<<" in open(os.path.join(wt, "nota.txt")).read(), "o conflito vive só na worktree"
@@ -10742,7 +10742,7 @@ def test_ticket55_avancar_recusa_marcador_de_conflito_esquecido():
     g("commit", "-qm", "merge", cwd=wt)
     antes = g("rev-parse", "HEAD").stdout
     r = subprocess.run([sys.executable, integrar, "--avancar", wt], cwd=vivo, env=env, capture_output=True, text=True)
-    assert r.returncode != 0 and "marcador" in r.stdout + r.stderr and g("rev-parse", "HEAD").stdout == antes, r.stdout + r.stderr
+    assert r.returncode != 0 and "marker" in r.stdout + r.stderr and g("rev-parse", "HEAD").stdout == antes, r.stdout + r.stderr
     open(os.path.join(wt, "nota.txt"), "w").write("a\num e dois\nc\n")
     g("commit", "-qam", "resolve", cwd=wt)
     r = subprocess.run([sys.executable, integrar, "--avancar", wt], cwd=vivo, env=env, capture_output=True, text=True)
@@ -10759,7 +10759,7 @@ def test_ticket55_hook_com_import_falho_sai_0_sem_saida_e_grava_o_log():
     for cmd in (["orq.py", "hook", "session"], ["orq.py", "hook", "prligar"], ["precompact.py"], ["precompact.py", "retomar"]):
         r = subprocess.run([sys.executable, os.path.join(t, cmd[0]), *cmd[1:]], input="{}", env=env, capture_output=True, text=True)
         assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), (cmd, r.returncode, r.stdout, r.stderr)
-    assert open(log).read().count("import falhou") == 4, open(log).read()
+    assert open(log).read().count("import failed") == 4, open(log).read()
     # o hook de limpeza importa o orq da instalação (HOME/.claude/orq)
     casa = os.path.join(t, "casa")
     os.makedirs(os.path.join(casa, ".claude", "orq"))
@@ -10797,14 +10797,14 @@ def test_ticket85_carga_vinda_de_fora_segura_o_despacho_lista_os_culpados_e_nao_
     a.orq("maquina", "set", "pausar_sob_pressao", "true")
     a.maquina(carga=14.2, processos=[*_WORKER85(13), *_FORA85])
     out = json.loads(_desp79(a, "Ticket 05", 2).stdout)
-    assert out["estado"] == "enfileirado" and "carga 14.2 (máximo 12)" in out["motivo"] and "mds_stores 146%, OrbStack 77%" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "load 14.2 (maximum 12)" in out["motivo"] and "mds_stores 146%, OrbStack 77%" in out["motivo"], out
     a.orq("gerente", "absorver")
     texto = _texto_aviso85(a)
-    assert "mds_stores 146%, OrbStack 77%" in texto and "fora do orq" in texto and "não alivia" in texto, texto
+    assert "mds_stores 146%, OrbStack 77%" in texto and "outside orq" in texto and "does not help" in texto, texto
     assert "orq pausar" not in texto and not _log(a, "close.log"), "nem sugere nem pausa sozinho, mesmo com pausar_sob_pressao ligado"
     assert not _log(a, "started.log") and len(_fila79(a)) == 1, "o despacho novo segue seguro"
     assert [(e["tipo"], e["causa"]) for e in a.events() if e["tipo"] == "maquina_aviso"] == [("maquina_aviso", "fora")]
-    assert "carga por dono: orq 16% de CPU" in a.orq("maquina").stdout and "fora do orq 227%" in a.orq("maquina").stdout
+    assert "load by owner: orq 16% of CPU" in a.orq("maquina").stdout and "outside orq 227%" in a.orq("maquina").stdout
 
 
 def test_ticket85_carga_vinda_dos_workers_sugere_pausar_o_de_menor_prioridade():
@@ -10815,7 +10815,7 @@ def test_ticket85_carga_vinda_dos_workers_sugere_pausar_o_de_menor_prioridade():
     assert json.loads(_desp79(a, "Ticket 05", 2).stdout)["estado"] == "enfileirado"
     a.orq("gerente", "absorver")
     texto = _texto_aviso85(a)
-    assert "orq pausar task_term_v0" in texto and "fora do orq" not in texto, texto
+    assert "orq pause task_term_v0" in texto and "outside orq" not in texto, texto
     assert [e["causa"] for e in a.events() if e["tipo"] == "maquina_aviso"] == ["orq"]
 
 
@@ -10863,7 +10863,7 @@ def test_ticket85_run_isento_sobe_sem_vaga_mas_o_piso_de_memoria_o_segura():
     assert json.loads(_desp79(a, "Ticket 05", 1).stdout)["dispatchId"], "4/4 workers vivos e o Run isento sobe"
     a.maquina(mem_livre_mb=800, livre_pct=5)
     out = json.loads(_desp79(a, "Ticket 06", 1).stdout)
-    assert out["estado"] == "enfileirado" and "piso de segurança (1024 MB)" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "safety floor (1024 MB)" in out["motivo"], out
     a.maquina(mem_livre_mb=2000, livre_pct=60)
     assert json.loads(_desp79(a, "Ticket 07", 1).stdout)["dispatchId"], "abaixo do mínimo mole, acima do piso: sobe"
 
@@ -10874,7 +10874,7 @@ def test_ticket85_run_isento_respeita_o_max_caros_e_o_opus_enfileira_mesmo_sob_p
     _frota79(a, vivos=[("Opus 1", OPUS), ("Opus 2", OPUS)])
     _runs85(a, "Orquestrador: x")
     out = json.loads(_desp79(a, "Terceiro opus", 1, OPUS).stdout)
-    assert out["estado"] == "enfileirado" and "2/2 workers caros" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "2/2 expensive workers" in out["motivo"], out
     a.maquina(carga=40)
     assert json.loads(_desp79(a, "Ticket 05", 1).stdout)["dispatchId"], "o barato do mesmo Run sobe com a carga alta e 2/4 workers"
     assert [i["titulo"] for i in _fila79(a)] == ["Terceiro opus"]
@@ -10889,7 +10889,7 @@ def test_ticket168_run_isento_enfileira_p2_sem_vaga_e_sobe_p1_e_servico():
     a.orq("maquina", "set", "max_workers", "6")
     _runs85(a, "Orquestrador: x")
     out = json.loads(_desp79(a, "Ticket P2", 2).stdout)
-    assert out["estado"] == "enfileirado" and "6/6 workers vivos" in out["motivo"], out
+    assert out["estado"] == "enfileirado" and "6/6 live workers" in out["motivo"], out
     assert json.loads(_desp79(a, "Ticket P1", 1).stdout)["dispatchId"], "P1 sobe sem vaga"
     r = a.orq("despachar", "--run", "run_a", "--titulo", "Integrador", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium", "--prioridade", "2", "--servico")
     assert json.loads(r.stdout)["dispatchId"], "serviço sobe sem vaga"
@@ -10924,7 +10924,7 @@ def test_grupo_de_roteia_pelo_explicito_pelo_titulo_e_pelo_cwd():
     assert g(GRUPOS_T, titulo="dbq: x", cwd="/h/dev/web")[0] == "pessoal"  # o título vence o cwd
     assert g(GRUPOS_T, titulo="web: x", grupo="orq")[0] == "orq"  # o explícito vence tudo
     nome, motivo = g(GRUPOS_T, titulo="sem prefixo", cwd="/tmp")
-    assert nome is None and "coordenador" in motivo
+    assert nome is None and "coordinator" in motivo
     try:
         g(GRUPOS_T, grupo="nenhum")
         assert False, "grupo inexistente passou"
@@ -10956,7 +10956,7 @@ def test_grupo_de_ambiguo_fica_com_o_coordenador():
     nome, motivo = orq_mod.grupo_de(gs, titulo="orq: painel novo")
     assert nome is None and "orq" in motivo and "painel" in motivo, motivo
     nome, motivo = orq_mod.grupo_de(gs, cwd="/h/.claude/dashboard/web")
-    assert nome is None and "ambíguo" in motivo, motivo
+    assert nome is None and "ambiguous" in motivo, motivo
 
 
 def _grupo(a, nome="orq", **cfg):
@@ -11005,13 +11005,13 @@ def test_orq_status_mostra_uma_linha_por_mate_trabalhando_caido_e_com_pedido():
     _grupo(a, "dados")  # grupo sem mate: sem linha
     assert _linhas_mate(a) == []
     _mate_vivo(a)
-    assert _linhas_mate(a) == ["mate orq: trabalhando (term_mate)"]
+    assert _linhas_mate(a) == ["mate orq: working (term_mate)"]
     a.set("terminals.json", ["term_coord"])  # o terminal do mate sumiu
-    assert _linhas_mate(a) == ["mate orq: caiu (term_mate)"]
+    assert _linhas_mate(a) == ["mate orq: down (term_mate)"]
     a.set("terminals.json", ["term_mate", "term_coord"])
     with open(os.path.join(a.home, "events.jsonl"), "w") as f:
         f.write(json.dumps({"tipo": "mate_pedido", "corr": "p1", "grupo": "orq", "texto": "x", "prazo": 120, "ts": "2026-10-01T12:00:00Z"}) + "\n")
-    assert _linhas_mate(a) == ["mate orq: trabalhando (term_mate) | pedidos: p1 a_entregar"]
+    assert _linhas_mate(a) == ["mate orq: working (term_mate) | requests: p1 a_entregar"]
 
 
 def test_mate_pendentes_conta_o_prazo_do_fim_do_turno_que_recebeu_o_pedido():
@@ -11068,7 +11068,7 @@ def test_mate_pedir_digita_no_mate_e_a_subida_volta_como_entrada_do_coordenador(
     assert p["corr"] == "p1" and p["entrega"] == "enviado", p
     send = [json.loads(x) for x in open(os.path.join(a.fake, "send.log"))]
     texto = next(c[c.index("--text") + 1] for c in send if "--text" in c)
-    assert "term_mate" in send[0] and texto.startswith("orq ▸ pedido p1") and "orq mate subir --corr p1" in texto, texto
+    assert "term_mate" in send[0] and texto.startswith("orq ▸ request p1") and "orq mate raise --corr p1" in texto, texto
     assert orq_mod.origem(texto) == "aviso_orq"  # no mate o pedido não vira entrada: quem o cobra é o prazo
     # o mate responde: vira entrada do coordenador (origem mate) e resolve o pedido
     r = a.orq("mate", "subir", "--tipo", "resposta", "--corr", "p1", "--texto", "despachado, ctx_x", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
@@ -11122,24 +11122,24 @@ def test_mate_volta_entrega_reenvia_uma_vez_escala_e_avisa_o_coordenador():
     assert p["entrega"] == "ocupado", p
     a.set("busy.json", [])
     with EmProcesso(a):
-        assert any("p1 entregue" in x for x in orq_mod.mate_volta())
+        assert any("p1 delivered" in x for x in orq_mod.mate_volta())
         cur = _cursor(a)
         cur["mates"]["orq"]["turnos"] = [[_z(-10), _z(-5)]]  # o turno que recebeu o pedido acabou há tempo (T0 fica no passado)
         json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
         evs = [e for e in a.events() if e.get("tipo") != "mate_entregue"] + [{"tipo": "mate_entregue", "corr": "p1", "ts": _z(-20)}]
         with open(os.path.join(a.home, "events.jsonl"), "w") as f:
             f.write("".join(json.dumps(e) + "\n" for e in evs))
-        assert any("p1 reenviado" in x for x in orq_mod.mate_volta())
+        assert any("p1 resent" in x for x in orq_mod.mate_volta())
         evs = [e if e.get("tipo") != "mate_reenvio" else {**e, "ts": _z(-15)} for e in a.events()]  # o turno -10..-5 veio depois da repostagem
         with open(os.path.join(a.home, "events.jsonl"), "w") as f:
             f.write("".join(json.dumps(e) + "\n" for e in evs))
-        assert any("p1 escalado" in x for x in orq_mod.mate_volta())
+        assert any("p1 escalated" in x for x in orq_mod.mate_volta())
         assert not any("p1" in x for x in orq_mod.mate_volta())  # escalado uma vez só
     send = [json.loads(x) for x in open(os.path.join(a.fake, "send.log"))]
     alvos = [c[c.index("--terminal") + 1] for c in send if "--text" in c]
     textos = [c[c.index("--text") + 1] for c in send if "--text" in c]
     assert alvos == ["term_mate", "term_mate", "term_coord"], alvos
-    assert "de novo" in textos[1] and "p1" in textos[2] and "não respondeu" in textos[2], textos
+    assert "again" in textos[1] and "p1" in textos[2] and "did not answer" in textos[2], textos
 
 
 def test_mate_volta_avisa_a_subida_e_o_mate_morto_uma_vez():
@@ -11150,14 +11150,14 @@ def test_mate_volta_avisa_a_subida_e_o_mate_morto_uma_vez():
         json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
     a.orq("mate", "subir", "--tipo", "pr", "--texto", "PR pronto: t77", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate")
     with EmProcesso(a):
-        assert any("subida" in x for x in orq_mod.mate_volta())
+        assert any("raise" in x for x in orq_mod.mate_volta())
         assert orq_mod.mate_volta() == []  # avisada uma vez
         a.set("terminals.json", ["term_coord"])  # o terminal do mate sumiu
-        assert any("caiu" in x for x in orq_mod.mate_volta())
+        assert any("went down" in x for x in orq_mod.mate_volta())
         assert orq_mod.mate_volta() == []
     textos = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
-    assert textos[0].startswith("orq ▸ mate orq subiu") and "PR pronto" in textos[0], textos
-    assert "orq mate abrir orq" in textos[1], textos
+    assert textos[0].startswith("orq ▸ mate orq raised") and "PR pronto" in textos[0], textos
+    assert "orq mate open orq" in textos[1], textos
 
 
 def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
@@ -11176,10 +11176,10 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     assert not _env_claude(cria), "env VAR=x claude roda não interativo num terminal do Orca (ticket 106)"
     digitado = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
     texto = _aviso_inteiro(digitado)
-    assert "secondmate do grupo orq" in texto and "/h/regras-orq.md" in texto and "orq mate subir" in texto and "\n" not in digitado, texto
+    assert "secondmate of group orq" in texto and "/h/regras-orq.md" in texto and "orq mate raise" in texto and "\n" not in digitado, texto
     assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
     r = a.orq("mate", "abrir", "orq")
-    assert r.returncode != 0 and "aberto" in r.stderr  # um mate por grupo
+    assert r.returncode != 0 and "already open" in r.stderr  # um mate por grupo
     cur = _cursor(a)
     cur["mates"]["orq"]["sessao"] = "sess-mate"
     json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
@@ -11190,7 +11190,7 @@ def test_mate_abrir_sobe_com_orq_mate_no_ambiente_e_retoma_a_sessao():
     cmd = cmd[cmd.index("--command") + 1]
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     textos = [_aviso_inteiro(c[c.index("--text") + 1]) for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
-    assert len(textos) == 2 and "terminal caiu" in textos[1], textos
+    assert len(textos) == 2 and "terminal went down" in textos[1], textos
 
 
 def _env_claude(criados):
@@ -11221,7 +11221,7 @@ def test_mate_nao_abre_pergunta_no_terminal():
     ev = {"session_id": "abcdef123456", "tool_name": "AskUserQuestion", "tool_input": {"questions": []}}
     r = a.orq("hook", "guard", stdin=json.dumps(ev), ORQ_MATE="orq")
     out = json.loads(r.stdout)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "orq mate subir --tipo decisao" in out["hookSpecificOutput"]["permissionDecisionReason"], out
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "orq mate raise --type decision" in out["hookSpecificOutput"]["permissionDecisionReason"], out
 
 
 def test_retomar_sobe_o_mate_que_caiu_pela_sessao():
@@ -11272,10 +11272,10 @@ def test_subida_do_mate_com_o_usuario_no_coordenador_espera_o_proximo_prompt():
     with EmProcesso(a):
         assert not orq_mod.coordenador_ativo()
         a.prompt("o usuário fala com o coordenador")
-        assert any("avisada" in x for x in orq_mod.mate_volta())
+        assert any("reported" in x for x in orq_mod.mate_volta())
         assert orq_mod.mate_volta() == []
     assert not os.path.exists(os.path.join(a.fake, "send.log")), "digitou por cima do usuário"
-    assert "subiu" in _cursor(a)["avisos"][0]["texto"], _cursor(a).get("avisos")
+    assert "raised" in _cursor(a)["avisos"][0]["texto"], _cursor(a).get("avisos")
 
 
 def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
@@ -11285,7 +11285,7 @@ def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
     a.set("terminals.json", ["term_coord"])
     a.set("screens.json", {"term_ret1": ["No conversation found with session ID: sess-mate"]})
     r = a.orq("mate", "abrir", "orq")
-    assert r.returncode != 0 and "não voltou" in r.stderr, r.stderr
+    assert r.returncode != 0 and "did not come back" in r.stderr, r.stderr
     assert "term_ret1" in open(os.path.join(a.fake, "close.log")).read()  # o shell que sobrou não recebe pedido
     m = _cursor(a)["mates"]["orq"]
     assert m.get("terminal") is None and m.get("sessao") is None, m
@@ -11295,7 +11295,7 @@ def test_mate_abrir_fecha_o_terminal_quando_a_sessao_nao_volta():
     assert "--resume" not in cmd[cmd.index("--command") + 1]  # o segundo abre com o charter
     a.set("terminals.json", ["term_coord"])
     r = a.orq("mate", "abrir", "orq")  # o claude não chega ao prompt (term_ret3 sem a caixa na tela): fecha em vez de deixar um shell
-    assert r.returncode != 0 and "não chegou ao prompt" in r.stderr, r.stderr
+    assert r.returncode != 0 and "did not reach the prompt" in r.stderr, r.stderr
     assert "term_ret3" in open(os.path.join(a.fake, "close.log")).read()
 
 
@@ -11305,7 +11305,7 @@ def test_mate_pedir_responde_invalido_nao_grava_e_texto_vai_numa_linha():
     _mate_vivo(a)
     a.prompt("entrada do usuário")
     r = a.orq("mate", "pedir", "orq", "--texto", "x", "--responde", "e1")
-    assert r.returncode != 0 and "nada foi gravado" in r.stderr, r.stderr
+    assert r.returncode != 0 and "nothing was written" in r.stderr, r.stderr
     assert not any(e.get("tipo") == "mate_pedido" for e in a.events())
     p = json.loads(a.orq("mate", "pedir", "orq", "--texto", "linha um\nlinha dois\n\nfim").stdout)
     texto = next(c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c)
@@ -11386,7 +11386,7 @@ def test_ticket94_projetos_lista_cada_arquivo_com_repo_harness_e_grupo():
 def test_ticket94_projetos_sem_pasta_diz_que_nao_ha_projeto_e_sai_0():
     a = Amb(run="run_a")
     r = a.orq("projetos")
-    assert r.returncode == 0 and "nenhum projeto" in r.stdout, r
+    assert r.returncode == 0 and "no project" in r.stdout, r
     assert json.loads(a.orq("projetos", "--json").stdout) == []
 
 
@@ -11399,8 +11399,8 @@ def test_ticket94_projetos_mostra_o_arquivo_invalido_com_o_motivo_sem_derrubar_a
     r = a.orq("projetos")
     assert r.returncode == 0, r.stderr
     for nome, motivo in (("quebrado", "json"), ("sem-repo", "repo"), ("harness-ruim", "gemini")):
-        assert any(l.startswith(nome) and "inválido" in l and motivo in l for l in r.stdout.splitlines()), (nome, r.stdout)
-    assert any(l.startswith("bom") and "inválido" not in l for l in r.stdout.splitlines()), r.stdout
+        assert any(l.startswith(nome) and "invalid" in l and motivo in l for l in r.stdout.splitlines()), (nome, r.stdout)
+    assert any(l.startswith("bom") and "invalid" not in l for l in r.stdout.splitlines()), r.stdout
 
 
 def test_ticket94_despachar_sem_agente_usa_o_harness_do_projeto():
@@ -11575,7 +11575,7 @@ def test_ticket95_pedido_enfileirado_leva_o_projeto_e_o_worktree_para_o_gerente_
     assert (it["projeto"], it["worktree"]) == ("p", "new-top-level"), it
     _libera79(a, "term_v0")
     r = a.orq("gerente", "absorver")  # o gerente roda sem o --projeto e fora do repo: o projeto vem do item
-    assert r.returncode == 0 and "Ticket 05 subiu" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "Ticket 05 started" in r.stdout, r.stdout + r.stderr
     (arg,) = _log(a, "started.log")
     assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
 
@@ -11637,7 +11637,7 @@ def test_perguntar_com_resposta_vazia_ou_sessao_encerrada_deixa_a_pendencia_aber
     b = Amb()
     r = _perguntar(b)  # o poll volta com a sessão encerrada, sem lote
     assert r.returncode == 0 and "badge" in _ids_pend(b) and json.loads(r.stdout)["efeito"] == "aberta"
-    assert "terminou sem resposta" in r.stderr, r.stderr
+    assert "ended without an answer" in r.stderr, r.stderr
     c = Amb()
     r = _perguntar(c, None, "--espera-min", "0.0005", FAKE_POLL="/nao/existe")  # poll quebrado não fecha nada
     assert "badge" in _ids_pend(c)
@@ -11646,9 +11646,9 @@ def test_perguntar_com_resposta_vazia_ou_sessao_encerrada_deixa_a_pendencia_aber
 def test_perguntar_recusa_menos_de_duas_opcoes_e_pendencia_que_nao_e_decisao():
     a = Amb()
     r = a.orq("perguntar", "--id", "x", "--pergunta", "p", "--opcao", "só uma")
-    assert r.returncode != 0 and "duas" in r.stderr
+    assert r.returncode != 0 and "two" in r.stderr
     r = a.orq("perguntar", "--id", "avisar-x", "--pergunta", "p", "--opcao", "a", "--opcao", "b", "--sem-poll")
-    assert r.returncode != 0 and "não decisão" in r.stderr
+    assert r.returncode != 0 and "not a decision" in r.stderr
 
 
 def _hooks_codex_fixture(t, confiar):
@@ -11666,24 +11666,24 @@ def test_ticket77_orq_status_avisa_dos_hooks_do_orq_nao_confiados_no_codex_e_cal
     a = Amb(run=None)
     hj, cfg = _hooks_codex_fixture(a.tmp.name, ["stop:1:0"])  # falta o session_start:0:0
     r = a.orq("status")
-    assert "hooks do orq não confiados no Codex: rode /hooks" in r.stdout and "(1 hook;" in r.stdout, r.stdout
-    assert "hooks do orq não confiados" in a.orq("agentes").stdout
+    assert "orq hooks not trusted in Codex: run /hooks" in r.stdout and "(1 hook;" in r.stdout, r.stdout
+    assert "orq hooks not trusted" in a.orq("agentes").stdout
     _hooks_codex_fixture(a.tmp.name, ["stop:1:0", "session_start:0:0"])
-    assert "não confiados no Codex" not in a.orq("status").stdout
-    assert "não confiados no Codex" not in a.orq("agentes").stdout
+    assert "not trusted in Codex" not in a.orq("status").stdout
+    assert "not trusted in Codex" not in a.orq("agentes").stdout
     open(cfg, "a").write(f'[hooks.state."{hj}:stop:1:0"]\nenabled = false\n')  # chave repetida: o TOML não lê, o trust some
-    assert "não confiados no Codex" in a.orq("status").stdout, "config que não lê vale não confiado"
+    assert "not trusted in Codex" in a.orq("status").stdout, "config que não lê vale não confiado"
 
 
 def test_ticket77_sem_hook_do_orq_no_hooks_json_nao_ha_aviso():
     a = Amb(run=None)
-    assert "não confiados no Codex" not in a.orq("status").stdout, "sem hooks.json o Codex não está ligado ao orq"
+    assert "not trusted in Codex" not in a.orq("status").stdout, "sem hooks.json o Codex não está ligado ao orq"
 
 
 def test_ticket77_o_preambulo_do_coordenador_traz_o_aviso_na_primeira_linha():
     a = Amb(run="run_a")
     _hooks_codex_fixture(a.tmp.name, [])
-    assert _ctx_session(a).splitlines()[0].startswith("⚠ hooks do orq não confiados no Codex: rode /hooks")
+    assert _ctx_session(a).splitlines()[0].startswith("⚠ orq hooks not trusted in Codex: run /hooks")
 
 
 def test_ticket77_o_instalador_acrescenta_no_fim_e_nunca_reordena_os_grupos_existentes():
@@ -11751,7 +11751,7 @@ def test_ticket97_it_should_warn_but_go_on_when_codex_hooks_are_installed_and_no
     a = _amb97("codex")
     _hooks_do_harness(a, "codex", confiar=False)
     r = a.orq("iniciar", "--agente", "codex", "--objetivo", "Frente Y")
-    assert r.returncode == 0 and "hooks do orq não confiados no Codex: rode /hooks" in r.stdout, r
+    assert r.returncode == 0 and "orq hooks not trusted in Codex: run /hooks" in r.stdout, r
     assert _existe_estado(os.path.join(a.home, "gerente.json"))
 
 
@@ -11771,7 +11771,7 @@ def test_ticket97_it_should_refuse_before_touching_the_orca_when_a_hook_is_missi
 def test_ticket97_it_should_need_an_objective_when_there_is_no_run_and_reuse_the_bound_one_otherwise():
     a = _amb97("claude")
     r = a.orq("iniciar", "--agente", "claude")
-    assert r.returncode == 1 and "--objetivo" in r.stderr and not _log(a, "create.log"), r
+    assert r.returncode == 1 and "--objective" in r.stderr and not _log(a, "create.log"), r
     a.set("run.json", {"id": "run_a", "handle": "term_coord"})  # o coordenador já comanda um Run
     r = a.orq("iniciar", "--agente", "claude")
     assert r.returncode == 0, r.stderr
@@ -11800,7 +11800,7 @@ def test_ticket97_it_should_refuse_another_live_coordinators_manager_without_ass
     a.set("terminals.json", ["term_coord", "term_outro", "term_ger"])
     json.dump({"coordenador": "term_outro", "gerente": "term_ger", "runs": ["run_a"]}, open((os.makedirs(a.home, exist_ok=True), os.path.join(a.home, "gerente.json"))[1], "w"))
     r = a.orq("iniciar", "--agente", "claude", "--run", "run_b")
-    assert r.returncode == 1 and "--assumir" in r.stderr and "term_outro" in r.stderr and not _log(a, "create.log"), r
+    assert r.returncode == 1 and "--take-over" in r.stderr and "term_outro" in r.stderr and not _log(a, "create.log"), r
     assert a.orq("iniciar", "--agente", "claude", "--run", "run_b", "--assumir").returncode == 0
     assert _ler_estado(os.path.join(a.home, "gerente.json")) == {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b"]}
     assert not _log(a, "create.log"), "o gerente vivo de quem foi assumido continua"
@@ -11817,7 +11817,7 @@ def test_ticket97_it_should_find_the_harness_from_the_ancestor_processes_and_ask
     sem = _amb97("claude")
     json.dump([{"pid": os.getpid(), "ppid": 1, "rss": 1, "cpu": 0, "args": "/bin/zsh", "cwd": None}], open(procs, "w"))
     r = sem.orq("iniciar", "--objetivo", "Frente Z", ORQ_PROCESSOS=procs, CLAUDECODE="1")
-    assert r.returncode == 1 and "--agente" in r.stderr, "o ambiente herdado não decide sozinho"
+    assert r.returncode == 1 and "--agent" in r.stderr, "o ambiente herdado não decide sozinho"
 
 
 # ---------- ticket 87: orq passar, um worker continua em outro harness na mesma worktree ----------
@@ -11852,8 +11852,8 @@ def test_it_should_hand_a_claude_worker_over_to_codex_in_the_same_worktree_hando
         assert _flag(subir, "--worktree") == "id:repo_1::" + repo and "--spec" not in subir, subir
         texto = open(os.path.join(repo, "HANDOFF.md"), encoding="utf-8").read()
         assert texto.splitlines()[0] == "<!-- orq-passagem v1 de=ctx_w1 para=codex -->", texto
-        titulos = ["## Próximo passo", "## Perguntas abertas", "## Decisões já tomadas", "## Estado do git", "## Relatório parcial", "## Fim do transcrito",
-                   "## Onde está o resto", "## Como agir"]
+        titulos = ["## Next step", "## Open questions", "## Decisions already made", "## Git state", "## Partial report", "## End of the transcript",
+                   "## Where the rest is", "## How to act"]
         pos = [texto.index(x) for x in titulos]
         assert pos == sorted(pos), "ação antes da prosa: as seções seguem a ordem do desenho"
         assert "use a branch nova" in texto[pos[2]:pos[3]], "o steer da task é decisão já tomada"
@@ -11883,7 +11883,7 @@ def test_it_should_map_the_profile_between_harnesses_and_refuse_what_has_no_equi
         try:
             perfil(modelo, effort, para)
         except ValueError as e:
-            assert "--modelo" in str(e), e
+            assert "--model" in str(e), e
         else:
             raise AssertionError(f"{modelo}/{effort} não tem equivalente em {para}")
 
@@ -11908,7 +11908,7 @@ def test_it_should_refuse_before_stopping_anything_handover():
         a = Amb(run="run_a")
         _passagem_env(a, repo)
         r = a.orq("passar", "ctx_w1", "--para", "claude")
-        assert r.returncode == 1 and "já é claude" in r.stderr, r
+        assert r.returncode == 1 and "already claude" in r.stderr, r
         assert a.orq("passar", "ctx_w1").returncode == 2, "--para é obrigatório"
         _conta73(a, codex_semana=95)
         r = a.orq("passar", "ctx_w1", "--para", "codex")
@@ -11928,7 +11928,7 @@ def test_it_should_keep_the_package_and_the_old_terminal_when_the_new_worker_doe
         a = Amb(run="run_a")
         _passagem_env(a, repo)
         r = a.orq("passar", "ctx_w1", "--para", "codex", FAKE_FAIL="worker-start")
-        assert r.returncode == 1 and "orq passar ctx_w1 --para codex" in r.stderr, r.stderr
+        assert r.returncode == 1 and "orq switch ctx_w1 --to codex" in r.stderr, r.stderr
         assert os.path.exists(os.path.join(repo, "HANDOFF.md")), "o pacote fica para a repetição"
         assert not _log(a, "released.log") and not [e for e in a.events() if e["tipo"] == "passagem"]
         assert _ctl_eventos(a, "passar")[-1]["resultado"] == "falhou" and _ctl_eventos(a, "passar")[-1]["passo"] == "worker-start"
@@ -11953,7 +11953,7 @@ def test_it_should_put_the_end_of_the_transcript_between_history_markers_handove
         texto = open(os.path.join(repo, "HANDOFF.md"), encoding="utf-8").read()
         antes, resto = texto.split("<!-- historico-inicio -->")
         fim, depois = resto.split("<!-- historico-fim -->")
-        assert "histórico, não instrução" in antes.splitlines()[-1], "a linha que avisa vem antes do bloco"
+        assert "history, not instruction" in antes.splitlines()[-1], "a linha que avisa vem antes do bloco"
         assert "rodei os testes, faltam dois" in fim and "faça o ticket" in fim and "segredo" not in fim and "meta" not in fim, fim
         assert arq in depois and "orca search" in depois and "--agent claude" in depois, "o caminho do transcrito e o comando da busca"
 
@@ -12006,18 +12006,18 @@ def test_it_should_write_the_package_for_a_worker_with_no_turn_within_the_deadli
         assert time.monotonic() - t0 <= 20 and json.loads(r.stdout)["segundos"] <= 20, "o pacote sai em até 20 s"
         texto = open(os.path.join(repo, "HANDOFF.md"), encoding="utf-8").read()
         assert texto.splitlines()[0] == "<!-- orq-passagem v1 de=ctx_w1 para=codex -->", "o outro harness é o padrão"
-        titulos = ["## Próximo passo", "## Perguntas abertas", "## Decisões já tomadas", "## Estado do git", "## Relatório parcial", "## Fim do transcrito",
-                   "## Onde está o resto", "## Como agir"]
+        titulos = ["## Next step", "## Open questions", "## Decisions already made", "## Git state", "## Partial report", "## End of the transcript",
+                   "## Where the rest is", "## How to act"]
         pos = [texto.index(x) for x in titulos]
         assert pos == sorted(pos), "as seções seguem a ordem da 2.3"
         secao = lambda i: texto[pos[i]:pos[i + 1] if i + 1 < len(pos) else None]  # noqa: E731
-        assert "parou sem fechar o turno" in secao(0) and "Desconhecido" in secao(0), "o transcrito termina numa ferramenta e não há nota do worker"
+        assert "stopped without closing the turn" in secao(0) and "Unknown" in secao(0), "o transcrito termina numa ferramenta e não há nota do worker"
         assert "Posso apagar a coleção velha?" in secao(1) and "Qual índice criar?" not in secao(1), "só a pergunta sem resposta"
         assert "Qual índice criar? → o índice parcial" in secao(2), "a pergunta respondida vira decisão"
-        assert antes[:12] in secao(3) and "arquivos sujos, 1" in secao(3) and "novo" in secao(3), secao(3)
+        assert antes[:12] in secao(3) and "dirty files, 1" in secao(3) and "novo" in secao(3), secao(3)
         assert "criei o índice, falta rodar a suíte" in secao(4), "sem relatório do worker, vale a última resposta visível dele"
         assert "segredo" not in texto and arq in secao(6) and "claude --resume sess-w1" in secao(6), secao(6)
-        assert "não está na fila do E2E" in secao(7)
+        assert "is not in the E2E queue" in secao(7)
         assert not _log(a, "stopped.log") and not _log(a, "started.log") and not _enviados(a), "o worker não é parado, relançado nem consultado"
         assert _head(repo) == antes and not [e for e in a.events() if e["tipo"] == "passagem"]
         (ctl,) = _ctl_eventos(a, "passagem")
@@ -12046,7 +12046,7 @@ def test_it_should_write_the_package_even_when_a_source_is_slow_or_down_handover
         assert r.returncode == 0, r.stderr
         assert time.monotonic() - t0 <= 20, "o inbox parado não segura o pacote além do prazo"
         texto = open(os.path.join(repo, "HANDOFF.md"), encoding="utf-8").read()
-        assert "não li o inbox do Run" in texto, "a fonte que falhou é dita no pacote"
+        assert "did not read the Run inbox" in texto, "a fonte que falhou é dita no pacote"
         assert "criei o índice" in texto and "novo" in texto, "o resto do pacote sai igual"
 
 
@@ -12062,7 +12062,7 @@ def test_it_should_say_when_the_old_worker_holds_the_e2e_queue_handover():
         open(os.path.join(fila, "pids", str(os.getpid())), "w").close()
         assert a.orq("passagem", "ctx_w1", E2E_LOCK_DIR=os.path.dirname(fila)).returncode == 0
         texto = open(os.path.join(repo, "HANDOFF.md"), encoding="utf-8").read()
-        assert "segura a fila do E2E" in texto and "lock-release" in texto, texto[-700:]
+        assert "holds the E2E queue" in texto and "lock-release" in texto, texto[-700:]
 
 
 def test_it_should_refuse_a_passagem_to_the_same_harness_or_without_worktree_handover():
@@ -12071,7 +12071,7 @@ def test_it_should_refuse_a_passagem_to_the_same_harness_or_without_worktree_han
         a = Amb(run="run_a")
         _passagem_env(a, repo)
         r = a.orq("passagem", "ctx_w1", "--para", "claude")
-        assert r.returncode == 1 and "outro harness" in r.stderr and not os.path.exists(os.path.join(repo, "HANDOFF.md")), r
+        assert r.returncode == 1 and "other harness" in r.stderr and not os.path.exists(os.path.join(repo, "HANDOFF.md")), r
         a2 = Amb(run="run_a")
         _passagem_env(a2, os.path.join(t, "sumiu"))
         r = a2.orq("passagem", "ctx_w1")
@@ -12087,7 +12087,7 @@ def test_ticket91_aviso_de_pausa_propoe_passar_cada_worker_a_pausar_quando_o_out
     assert a.orq("gerente", "absorver").returncode == 0
     (env,) = _log(a, "send.log")
     txt = _inteiro(env[env.index("--text") + 1])
-    assert "orq passar ctx_term_f --para codex" in txt and "orq passar ctx_term_i --para codex" in txt, txt
+    assert "orq switch ctx_term_f --to codex" in txt and "orq switch ctx_term_i --to codex" in txt, txt
     assert "ctx_term_s" not in txt and "ctx_term_p" not in txt, "alta e em review não seriam pausados"
 
 
@@ -12100,7 +12100,7 @@ def test_ticket91_aviso_de_pausa_sem_folga_no_outro_harness_ou_sem_numero_dele_s
         _conta73(a, **conta)
         a.orq("gerente", "absorver")
         env = _log(a, "send.log")[0]  # o do Claude vem primeiro; o do Codex, se houver, é outro aviso
-        assert "orq passar" not in _inteiro(env[env.index("--text") + 1]) and "orq pausar" in _inteiro(env[env.index("--text") + 1]), conta
+        assert "orq switch" not in _inteiro(env[env.index("--text") + 1]) and "orq pause" in _inteiro(env[env.index("--text") + 1]), conta
 
 # ticket 92: relatorio-final.md como worker_done de reserva e passagem aberta no status
 
@@ -12169,14 +12169,14 @@ def test_ticket_92_status_mostra_passagem_aberta_ha_mais_de_15_min():
     a = Amb()
     _passagem92(a, 22)
     out = a.orq("status").stdout
-    assert "Passagens abertas" in out and "ctx_B" in out and "ctx_A" in out and "22 min" in out and "claude→codex" in out
+    assert "Open handoffs" in out and "ctx_B" in out and "ctx_A" in out and "22 min" in out and "claude→codex" in out
 
 
 def test_ticket_92_status_cala_passagem_recente_aceita_ou_com_turno_novo():
     for minutos, campos in ((5, {}), (30, {"aceita": True}), (30, {"inicio_novo": True})):
         a = Amb()
         _passagem92(a, minutos, **campos)
-        assert "Passagens abertas" not in a.orq("status").stdout, (minutos, campos)
+        assert "Open handoffs" not in a.orq("status").stdout, (minutos, campos)
 
 
 
@@ -12253,11 +12253,11 @@ def test_ticket105_status_mostra_os_liberados_ate_o_ticket_ser_despachado():
     a = Amb(run="run_a")
     _caso_87(a)
     a.orq("ticket", "fechar", "87", "--answer", "feito")
-    assert "liberados: 91, 88, 93 (P1, P2, P3)" in a.orq("status").stdout, a.orq("status").stdout
+    assert "released: 91, 88, 93 (P1, P2, P3)" in a.orq("status").stdout, a.orq("status").stdout
     _tk105(a, "88", "Passagem escrita", "claimed", task="task_88", extra=MODELO105)  # o 88 subiu
-    assert "liberados: 91, 93 (P1, P3)" in a.orq("status").stdout
+    assert "released: 91, 93 (P1, P3)" in a.orq("status").stdout
     a.orq("ticket", "fechar", "91", "--answer", "ok")
-    assert "liberados: 93 (P3)" in a.orq("status").stdout, "o ticket fechado também sai"
+    assert "released: 93 (P3)" in a.orq("status").stdout, "o ticket fechado também sai"
 
 
 def test_ticket105_fechar_sem_dependentes_nao_muda_nada_alem_do_que_fazia():
@@ -12265,7 +12265,7 @@ def test_ticket105_fechar_sem_dependentes_nao_muda_nada_alem_do_que_fazia():
     _tk105(a, "05", "Sozinho", "claimed", task="task_05")
     _tasks105(a, ("task_05", "dispatched"))
     out = json.loads(a.orq("ticket", "fechar", "05", "--answer", "ok").stdout)
-    assert out["liberados"] == [] and "liberados:" not in a.orq("status").stdout
+    assert out["liberados"] == [] and "released:" not in a.orq("status").stdout
     assert [x[x.index("--status") + 1] for x in _log(a, "updated.log")] == ["completed"]
 
 
@@ -12286,8 +12286,8 @@ def test_ticket105_doctor_tasks_completa_a_task_de_ticket_resolvido_e_lista_a_se
     tasks = {t["id"]: t["status"] for t in json.load(open(os.path.join(a.fake, "tasks_run_a.json")))}
     assert tasks == {"task_b8e395095fb8": "completed", "task_vivo": "blocked", "task_b5a1d9de7e48": "pending", "task_pronta": "ready", "task_feita": "completed"}, tasks
     txt = a.orq("doctor", "tasks").stdout
-    assert "sem ticket: task_b5a1d9de7e48" in txt and "task_b8e395095fb8" not in txt, "a segunda rodada não acha mais nada para completar"
-    assert "completada: task_b8e395095fb8 (ticket 59" in orq_mod.texto_doctor_tasks(out)
+    assert "no ticket: task_b5a1d9de7e48" in txt and "task_b8e395095fb8" not in txt, "a segunda rodada não acha mais nada para completar"
+    assert "completed: task_b8e395095fb8 (ticket 59" in orq_mod.texto_doctor_tasks(out)
 
 
 def test_ticket105_doctor_tasks_dry_run_so_lista():
@@ -12318,7 +12318,7 @@ def test_ticket105_worker_na_fila_do_integrador_fica_aguardando_integracao_e_nao
     t80 = _agentes(a)["ctx_term_t80"]
     assert t80["estado"] == "aguardando_integracao" and t80["integracao"]["branch"] == "feat/secondmate-por-grupo" and t80["integracao"]["ticket"] == "80", t80
     txt = a.orq("agentes").stdout
-    assert "aguardando integração" in txt and "feat/secondmate-por-grupo" in txt and "orq steer" not in txt, txt
+    assert "awaiting integration" in txt and "feat/secondmate-por-grupo" in txt and "orq steer" not in txt, txt
     assert a.orq("integrar", "fila", "rm", "80").returncode == 0
     assert _agentes(a)["ctx_term_t80"]["estado"] == "parado", "saiu da fila: volta ao critério normal"
 
@@ -12338,15 +12338,15 @@ def test_ticket105_o_cache_do_aberto_tambem_vira_aguardando_integracao_sem_suger
     _grava_estado(os.path.join(a.home, "aberto.json"), ab)
     _grava_estado(os.path.join(a.home, "turnos.json"), {"ctx_1": {"task": task, "inicio": now_iso(-1200), "fim": now_iso(-720)}})
     open(os.path.join(a.home, "events.jsonl"), "w").write("".join(json.dumps(e) + "\n" for e in evs))
-    assert 'Parado no prompt: ' + task in a.orq("status").stdout, "sem a fila o status pede o steer"
+    assert 'Stopped at prompt: ' + task in a.orq("status").stdout, "sem a fila o status pede o steer"
     assert a.orq("integrar", "fila", "add", "feat/secondmate-por-grupo", "80").returncode == 0
     txt = a.orq("status").stdout
-    assert "Parado no prompt" not in txt and "orq steer" not in txt and "aguardando integração de feat/secondmate-por-grupo" in txt, txt
+    assert "Stopped at prompt" not in txt and "orq steer" not in txt and "waiting for integration of feat/secondmate-por-grupo" in txt, txt
 
 
 def test_ticket105_fila_do_integrador_lista_add_e_rm():
     a = Amb(run="run_a")
-    assert "vazia" in a.orq("integrar", "fila", "lista").stdout
+    assert "empty" in a.orq("integrar", "fila", "lista").stdout
     assert a.orq("integrar", "fila", "add", "feat/a", "80").returncode == 0
     assert a.orq("integrar", "fila", "add", "feat/a", "80").returncode == 0, "repetir não duplica"
     assert a.orq("integrar", "fila", "add", "feat/b", "81").returncode == 0
@@ -12363,7 +12363,7 @@ def test_ticket105_aguardando_integracao_e_espera_conhecida_para_o_hibernar():
     agora = datetime.now(timezone.utc)
     ag = {"estado": "aguardando_integracao", "turno": "parado", "task": "task_t", "turno_inicio": _z60(40), "turno_fim": _z60(10),
           "integracao": {"branch": "feat/x", "ticket": "80"}}
-    assert orq_mod.motivo_hibernar(ag, agora, cfg) == "esperando: integração de feat/x (ticket 80)", "espera algo que o orq conhece: hiberna depois de externa_min"
+    assert orq_mod.motivo_hibernar(ag, agora, cfg) == "waiting: integration of feat/x (ticket 80)", "espera algo que o orq conhece: hiberna depois de externa_min"
     assert orq_mod.motivo_hibernar({**ag, "turno_fim": _z60(1)}, agora, cfg) is None
 
 
@@ -12392,14 +12392,14 @@ def test_ticket105_servico_entregue_nunca_aparece_como_entregue_sem_liberar_e_mo
     _servico105(a)
     s = _agentes(a)["ctx_term_int"]
     assert s["estado"] == "servico" and s.get("ciclo") is None, s
-    assert "serviço, nenhum ciclo ainda" in a.orq("agentes").stdout and "orq liberar" not in a.orq("agentes").stdout
-    assert "Entregues sem liberar" not in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "service, no cycle yet" in a.orq("agentes").stdout and "orq liberar" not in a.orq("agentes").stdout
+    assert "Delivered, not released" not in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
     r = a.orq("ciclo", "feito", "--dispatch", "ctx_term_int", "--hash", "abc1234", "--nota", "integrou 74, 59 e 79")
     assert r.returncode == 0, r.stderr
     s = _agentes(a)["ctx_term_int"]
     assert s["estado"] == "servico" and s["ciclo"]["hash"] == "abc1234" and s["ciclo"]["nota"] == "integrou 74, 59 e 79", s
     txt = a.orq("agentes").stdout
-    assert "serviço, último ciclo" in txt and "abc1234" in txt and "integrou 74, 59 e 79" in txt and "orq liberar" not in txt, txt
+    assert "service, last cycle" in txt and "abc1234" in txt and "integrou 74, 59 e 79" in txt and "orq liberar" not in txt, txt
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
     assert (ev["dispatch"], ev["hash"], ev["nota"]) == ("ctx_term_int", "abc1234", "integrou 74, 59 e 79")
     assert not _log(a, "sent.log") and not _log(a, "released.log"), "o ciclo não fala com o Orca: o worker não tem mais capability"
@@ -12409,7 +12409,7 @@ def test_ticket105_ciclo_feito_recusa_dispatch_que_nao_e_servico():
     a = Amb(run="run_a")
     _agentes_env(a)
     r = a.orq("ciclo", "feito", "--dispatch", "ctx_term_r1", "--hash", "abc")
-    assert r.returncode == 1 and "serviço" in r.stderr and not [e for e in a.events() if e["tipo"] == "ciclo"], r.stderr
+    assert r.returncode == 1 and "service" in r.stderr and not [e for e in a.events() if e["tipo"] == "ciclo"], r.stderr
 
 
 def test_ticket105_servico_nao_entra_na_hibernacao_do_entregue():
@@ -12436,11 +12436,11 @@ def test_ticket105_volta_lenta_nao_vira_painel_parado_o_limite_acompanha_a_media
     _gerente105(a, voltas=[50, 55, 60])  # média 55 s: 3x = 165 s
     _painel_tocado(a, 100)
     ctx = _ctx105(a)
-    assert "parado há" not in ctx and "painel lento (55 s por volta)" in ctx, ctx
+    assert "stopped for" not in ctx and "slow panel (55 s per loop)" in ctx, ctx
     _painel_tocado(a, 200)
-    assert "painel do agent manager parado há 3 min" in _ctx105(a), "acima de 3x a média é parado de verdade"
+    assert "agent manager panel stopped for 3 min" in _ctx105(a), "acima de 3x a média é parado de verdade"
     _painel_tocado(a, 20)
-    assert "painel do agent manager" not in _ctx105(a)
+    assert "agent manager panel" not in _ctx105(a)
 
 
 def test_ticket105_sem_voltas_gravadas_o_limite_continua_90_s():
@@ -12448,9 +12448,9 @@ def test_ticket105_sem_voltas_gravadas_o_limite_continua_90_s():
     a.set("terminals.json", ["term_coord", "term_ger"])
     _gerente105(a)
     _painel_tocado(a, 75)
-    assert "painel lento" in _ctx105(a) and "parado há" not in _ctx105(a), "entre 60 e 90 s é lento"
+    assert "slow panel" in _ctx105(a) and "parado há" not in _ctx105(a), "entre 60 e 90 s é lento"
     _painel_tocado(a, 100)
-    assert "painel do agent manager parado há 1 min" in _ctx105(a)
+    assert "agent manager panel stopped for 1 min" in _ctx105(a)
 
 
 def test_ticket105_gerente_absorver_toca_o_carimbo_e_grava_a_duracao_da_volta():
@@ -12481,7 +12481,7 @@ def test_ticket120_orq_gerente_intervalo_le_o_gerente_json():
 
 
 def test_ticket120_o_shell_do_painel_dorme_o_que_o_orq_manda_e_10_s_se_o_orq_quebrar():
-    for corpo_orq, esperado in (('[ "$2" = intervalo ] && echo 25', "25"), ("exit 1", "10")):
+    for corpo_orq, esperado in (('[ "$2" = interval ] && echo 25', "25"), ("exit 1", "10")):
         with tempfile.TemporaryDirectory() as t:
             bin_ = os.path.join(t, "bin")
             os.makedirs(bin_)
@@ -12519,7 +12519,7 @@ def test_ticket105_pausar_dispatch_entregue_diz_liberar_e_sai_na_hora_sem_mandar
     t0 = time.time()
     r = a.orq("pausar", "ctx_term_e", ORQ_PAUSA_ESPERA_S="300")
     assert time.time() - t0 < 20, "não espera o PAUSA.md"
-    assert r.returncode == 1 and "orq liberar ctx_term_e" in r.stderr and "entreg" in r.stderr, (r.stdout, r.stderr)
+    assert r.returncode == 1 and "orq release ctx_term_e" in r.stderr and "deliver" in r.stderr, (r.stdout, r.stderr)
     assert not _log(a, "sent.log"), "nem steer nem espera"
 
 
@@ -12529,7 +12529,7 @@ def test_ticket105_pausar_por_criterio_pula_o_entregue_e_segue_com_os_outros():
     out = json.loads(a.orq("pausar", "--dry-run", "--json", "--ate-prioridade", "2").stdout)
     estados = {x["dispatch"]: x["estado"] for x in out["pausados"]}
     assert estados["ctx_term_e"] == "entregue" and estados.get("ctx_term_v") != "entregue", estados
-    assert "orq liberar ctx_term_e" in [x for x in out["pausados"] if x["dispatch"] == "ctx_term_e"][0]["aviso"]
+    assert "orq release ctx_term_e" in [x for x in out["pausados"] if x["dispatch"] == "ctx_term_e"][0]["aviso"]
 
 
 def test_ticket105_ticket_novo_em_outro_run_liga_o_run_e_religa_o_que_estava():
@@ -12558,7 +12558,7 @@ def test_ticket105_com_o_gerente_ligado_o_run_solto_continua_pedindo_o_gerente_l
     a.set("tasks_run_b.json", [{"id": "t2", "status": "dispatched", "dispatch_id": "ctx_1"}])
     a.prompt("oi")
     r = a.orq("steer", "t2", "ajuste", "--run", "run_b")
-    assert r.returncode == 1 and "orq gerente ligar --terminal term_ger --run run_b" in r.stderr, "religar o terminal do coordenador o tiraria do gerente"
+    assert r.returncode == 1 and "orq manager bind --terminal term_ger --run run_b" in r.stderr, "religar o terminal do coordenador o tiraria do gerente"
     assert not [c for c in _log(a, "calls.log") if c[0] == "run-use"]
 
 
@@ -12590,19 +12590,19 @@ def test_ticket114_merge_em_main_com_issue_gera_as_obrigacoes_e_elas_aparecem_no
     e = _merge_main(a)
     ob = _obrig(a, e)
     assert set(ob) == {"deploy", "comentario", "limpeza"}, ob
-    assert "#2045" in ob["comentario"] and "produção" in ob["deploy"], ob
+    assert "#2045" in ob["comentario"] and "production" in ob["deploy"], ob
     ctx = _ctx(a.prompt("e agora?"))
-    assert f"A fazer por você: {e} →" in ctx and "#2045" in ctx and "orq feito" in ctx, ctx
+    assert f"To do by you: {e} →" in ctx and "#2045" in ctx and "orq fulfill" in ctx, ctx
     assert len(ctx.splitlines()) <= 5, ctx
     aviso = a.prompt(f"orq: PR #1282 entrou em main (task_feat1, issue #2045): em main. Entrada {e}.")
-    assert f"A fazer por você: {e} →" in _ctx(aviso), "o aviso digitado pelo painel já traz o que ele pede"
+    assert f"To do by you: {e} →" in _ctx(aviso), "o aviso digitado pelo painel já traz o que ele pede"
     outro = a.prompt("orq: Fila do E2E parada há 40 min.")
-    assert "A fazer por você" not in (outro.stdout or ""), "só o aviso de PR carrega as obrigações"
+    assert "To do by you" not in (outro.stdout or ""), "só o aviso de PR carrega as obrigações"
     for k in range(4):  # avisos antigos não somem com obrigações abertas: elas ficam fora do teto da linha extra
         with open(os.path.join(a.home, "events.jsonl"), "a") as f:
             f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "obrigacao", "op": "nova", "entrada": f"e9{k}", "chave": "deploy", "texto": "x" * 150}) + "\n")
-    linha = next(l for l in _ctx(a.prompt("e agora?")).splitlines() if "A fazer por você" in l)
-    assert linha.index("PR: ") < linha.index("A fazer por você") and "e93 → deploy" in linha, linha
+    linha = next(l for l in _ctx(a.prompt("e agora?")).splitlines() if "To do by you" in l)
+    assert linha.index("PR: ") < linha.index("To do by you") and "e93 → deploy" in linha, linha
 
 
 def test_ticket114_pr_sem_issue_nao_gera_a_obrigacao_de_comentar():
@@ -12639,7 +12639,7 @@ def test_ticket114_intake_conversa_ou_descartado_e_recusado_com_obrigacao_aberta
     e = _merge_main(a)
     for efeito in ("conversa", "descartado"):
         r = a.orq("intake", e, efeito, "--nota", "visto")
-        assert r.returncode == 1 and "obrigação" in r.stderr and "orq feito" in r.stderr and "comentario" in r.stderr, r
+        assert r.returncode == 1 and "obligation" in r.stderr and "orq fulfill" in r.stderr and "comentario" in r.stderr, r
     assert not [x for x in a.events() if x["tipo"] == "intake"]
 
 
@@ -12656,7 +12656,7 @@ def test_ticket114_feito_com_prova_fecha_a_obrigacao_e_a_ultima_fecha_a_entrada(
     a.orq("feito", e, "deploy", "--prova", "v776")
     a.orq("feito", e, "limpeza", "--prova", "branch e worktree removidas")
     assert not _obrig(a, e) and e not in {x["id"] for x in orq_mod.abertas(a.events())}, "sem obrigação aberta a entrada se fecha"
-    assert "A fazer por você" not in _ctx(a.prompt("e agora?"))
+    assert "To do by you" not in _ctx(a.prompt("e agora?"))
 
 
 def test_ticket114_adiar_cria_um_ticket_com_o_motivo():
@@ -12677,8 +12677,8 @@ def test_ticket156_o_stop_barra_a_obrigacao_velha_citando_entrada_e_chave():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
     e = _merge_main(a)
     out = json.loads(_stop(a).stdout)
-    assert out["decision"] == "block" and "Obrigação aberta" in out["reason"] and f"{e} comentario" in out["reason"], out
-    assert "orq feito" in out["reason"] and "orq adiar" in out["reason"], out
+    assert out["decision"] == "block" and "Obligation open" in out["reason"] and f"{e} comentario" in out["reason"], out
+    assert "orq fulfill" in out["reason"] and "orq defer" in out["reason"], out
 
 
 def test_ticket156_obrigacao_com_menos_de_obrigacao_min_deixa_parar():
@@ -12693,7 +12693,7 @@ def test_ticket156_o_terceiro_stop_do_mesmo_conjunto_passa_com_gate_falhou():
     for _ in range(2):
         assert json.loads(_stop(a).stdout)["decision"] == "block"
     out = json.loads(_stop(a).stdout)
-    assert "decision" not in out and "Obrigação aberta" in out["systemMessage"], out
+    assert "decision" not in out and "Obligation open" in out["systemMessage"], out
     assert [x for x in a.events() if x["tipo"] == "gate_falhou"], "o orçamento estourado deixa o evento"
 
 
@@ -12717,13 +12717,13 @@ def test_ticket114_o_mesmo_fluxo_roda_com_o_payload_de_hook_do_codex():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
     e = _merge_main(a)
     r = _hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?"))
-    assert f"A fazer por você: {e} →" in _ctx(r), r.stdout
+    assert f"To do by you: {e} →" in _ctx(r), r.stdout
     assert a.orq("intake", "e2", "conversa").returncode == 0  # o Stop barra entrada sem intake do turno; este teste é da obrigação
     m = _aviso_do_stop(_hook_codex(a, "stop", _codex("stop", session_id="abcdef123456")).stdout)
-    assert "Obrigação aberta" in m and f"{e} deploy" in m, m  # barra (reason): o Codex recebe o mesmo bloqueio
+    assert "Obligation open" in m and f"{e} deploy" in m, m  # barra (reason): o Codex recebe o mesmo bloqueio
     for chave in ("deploy", "comentario", "limpeza"):
         assert a.orq("feito", e, chave, "--prova", "ok").returncode == 0
-    assert "A fazer por você" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
+    assert "To do by you" not in _ctx(_hook_codex(a, "prompt", _codex("userpromptsubmit", session_id="abcdef123456", prompt="e agora?")))
 
 
 def test_ticket107_without_away_mode_no_notice_is_typed_in_the_coordinator_and_all_reach_the_next_prompt():
@@ -12741,7 +12741,7 @@ def test_ticket107_without_away_mode_no_notice_is_typed_in_the_coordinator_and_a
         finally:
             orq_mod.HOME, orq_mod.digita = antes, dig
     ctx = json.loads(a.prompt("e agora?").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "PRESA" in ctx and "wake de teste" in ctx, ctx
+    assert "STUCK" in ctx and "wake de teste" in ctx, ctx
 
 
 def test_ticket107_with_away_mode_the_notice_is_typed_keeping_the_old_guards():
@@ -12791,9 +12791,9 @@ def test_ticket115_projeto_com_dev_e_main_diz_pronto_para_main_depois_do_pr_de_d
     _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "dev"}, {"branch": "main", "producao": True}], "fluxo": "promocao"})
     _entrou(a, PR1, "dev")
     linha = _status_pr(a)
-    assert "pronto para main (dev entrou: abrir o de main)" in linha and "staging" not in linha, linha
+    assert "ready for main (dev entered: open the one for main)" in linha and "staging" not in linha, linha
     _entrou(a, PR2, "main")
-    assert "em main" in _status_pr(a) and "pronto para" not in _status_pr(a)
+    assert "in main" in _status_pr(a) and "ready for" not in _status_pr(a)
 
 
 def test_ticket115_projeto_so_com_main_e_fluxo_direto_nao_pede_pr_de_outro_ambiente():
@@ -12801,9 +12801,9 @@ def test_ticket115_projeto_so_com_main_e_fluxo_direto_nao_pede_pr_de_outro_ambie
     _gh(a)
     _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "main", "producao": True}], "fluxo": "direto"})
     _entrou(a, PR1, "release")  # um PR para outra base não promove nada
-    assert "pronto para" not in _status_pr(a), _status_pr(a)
+    assert "ready for" not in _status_pr(a), _status_pr(a)
     _entrou(a, PR2, "main")
-    assert "em main" in _status_pr(a) and "pronto para" not in _status_pr(a)
+    assert "in main" in _status_pr(a) and "ready for" not in _status_pr(a)
 
 
 def test_ticket115_fluxo_direto_com_ambientes_declarados_so_conta_a_producao():
@@ -12811,7 +12811,7 @@ def test_ticket115_fluxo_direto_com_ambientes_declarados_so_conta_a_producao():
     _gh(a)
     _projeto(a, "app", {"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "main", "producao": True}], "fluxo": "direto"})
     _entrou(a, PR1, "development")
-    assert "pronto para" not in _status_pr(a), _status_pr(a)
+    assert "ready for" not in _status_pr(a), _status_pr(a)
 
 
 def test_ticket115_projeto_sem_bloco_usa_a_branch_padrao_do_remoto_com_fluxo_direto():
@@ -12820,9 +12820,9 @@ def test_ticket115_projeto_sem_bloco_usa_a_branch_padrao_do_remoto_com_fluxo_dir
     d = _repo_remoto(a, "trunk")
     _projeto(a, "app", {"repo": f"path:{d}"})
     _entrou(a, PR1, "development", cwd=d)
-    assert "pronto para" not in _status_pr(a, d), "sem bloco só a branch padrão do remoto conta: " + _status_pr(a, d)
+    assert "ready for" not in _status_pr(a, d), "sem bloco só a branch padrão do remoto conta: " + _status_pr(a, d)
     _entrou(a, PR2, "trunk", cwd=d)
-    assert "em trunk" in _status_pr(a, d), _status_pr(a, d)
+    assert "in trunk" in _status_pr(a, d), _status_pr(a, d)
 
 
 def test_ticket115_projeto_de_tres_ambientes_segue_com_os_textos_de_hoje():
@@ -12830,12 +12830,12 @@ def test_ticket115_projeto_de_tres_ambientes_segue_com_os_textos_de_hoje():
     a.orq("pr", "ligar", "task_feat1", PR1)
     _pr(a, PR1, "MERGED", "development")
     a.orq("pr", "poll", "--forcar")
-    assert "#1216 development ✓ → pronto para staging" in _linha_pr(a), _linha_pr(a)
+    assert "#1216 development ✓ → ready for staging" in _linha_pr(a), _linha_pr(a)
     _entrou(a, PR2, "staging")
-    assert "pronto para main (development e staging entraram: abrir o de main)" in _linha_pr(a), _linha_pr(a)
+    assert "ready for main (development and staging entered: open the one for main)" in _linha_pr(a), _linha_pr(a)
     _, h = _html_com_pr(a)
     assert '<span><span class="dot d"></span> development</span><span><span class="dot s"></span> staging</span><span><span class="dot p"></span> main</span>' in h
-    assert "Dentro de cada passo, development antes de staging." in h
+    assert "Within each step, development before staging." in h
 
 
 def _html_com_pr(a):
@@ -12861,9 +12861,9 @@ def test_ticket115_projetos_valida_os_ambientes_e_lista_o_fluxo():
     _projeto(a, "duas-producoes", {"repo": "path:/r/d", "ambientes": [{"branch": "a", "producao": True}, {"branch": "b", "producao": True}]})
     _projeto(a, "fluxo-ruim", {"repo": "path:/r/f", "fluxo": "cascata"})
     out = a.orq("projetos").stdout.splitlines()
-    assert any(l.startswith("bom") and "ambientes dev > main (promocao, produção main)" in l and "inválido" not in l for l in out), out
-    for nome, motivo in (("malformado", "ambientes"), ("duas-producoes", "produção"), ("fluxo-ruim", "cascata")):
-        assert any(l.startswith(nome) and "inválido" in l and motivo in l for l in out), (nome, out)
+    assert any(l.startswith("bom") and "environments dev > main (promocao, production main)" in l and "invalid" not in l for l in out), out
+    for nome, motivo in (("malformado", "ambientes"), ("duas-producoes", "production"), ("fluxo-ruim", "cascata")):
+        assert any(l.startswith(nome) and "invalid" in l and motivo in l for l in out), (nome, out)
     js = {p["nome"]: p for p in json.loads(a.orq("projetos", "--json").stdout)}
     assert js["bom"]["ambientes"] == ["dev", "main"] and js["bom"]["producao"] == "main" and js["bom"]["fluxo"] == "promocao", js["bom"]
 
@@ -12898,11 +12898,11 @@ def test_ticket115_obrigacoes_do_merge_leem_a_producao_e_os_ambientes_do_projeto
     _projeto_dev_trunk(a)
     _vira_mergeado(a, PR1, "dev")
     textos = [o["texto"] for o in orq_mod.obrigacoes_abertas(a.events())]
-    assert "conferir o deploy de dev" in textos and any("trunk" in t for t in textos), textos
+    assert "check the dev deploy" in textos and any("trunk" in t for t in textos), textos
     assert not any("produção" in t for t in textos), "dev não é a produção do projeto"
     _vira_mergeado(a, PR2, "trunk")
     textos = [o["texto"] for o in orq_mod.obrigacoes_abertas(a.events())]
-    assert "conferir o deploy de produção (quave-one)" in textos and "conferir que a branch e a worktree saíram" in textos, textos
+    assert "check the production deploy (quave-one)" in textos and "check that the branch and the worktree are gone" in textos, textos
 
 
 def test_ticket115_um_projeto_cuja_producao_e_main_em_tres_ambientes_pede_o_deploy_de_producao_so_em_main():
@@ -12911,7 +12911,7 @@ def test_ticket115_um_projeto_cuja_producao_e_main_em_tres_ambientes_pede_o_depl
     a.orq("pr", "ligar", "task_feat1", PR1)
     _pr(a, PR1, "MERGED", "main", headRefName="fix/x")
     assert a.orq("pr", "poll", "--forcar").returncode == 0
-    assert "deploy" in _obrig(a) and "produção" in _obrig(a)["deploy"] and "ticket" not in _obrig(a), _obrig(a)
+    assert "deploy" in _obrig(a) and "production" in _obrig(a)["deploy"] and "ticket" not in _obrig(a), _obrig(a)
 
 
 def test_ticket115_o_merge_na_producao_do_projeto_dispara_a_limpeza_e_o_merge_em_outro_ambiente_nao():
@@ -12982,7 +12982,7 @@ def test_ticket126_com_away_o_hook_nega_askuserquestion_e_manda_para_orq_pend_ad
     assert _guard(a).stdout == "", "away desligado: a caixa passa"
     a.orq("away", "on")
     out = json.loads(_guard(a).stdout)["hookSpecificOutput"]
-    assert out["permissionDecision"] == "deny" and "away ligado" in out["permissionDecisionReason"] and "orq pend add --tipo decisao" in out["permissionDecisionReason"], out
+    assert out["permissionDecision"] == "deny" and "away is on" in out["permissionDecisionReason"] and "orq pend add --type decision" in out["permissionDecisionReason"], out
     assert _guard(a, tool="Bash").stdout == "", "só o AskUserQuestion"
     a.orq("away", "off")
     assert _guard(a).stdout == "", "desligou: a caixa volta a passar"
@@ -13007,7 +13007,7 @@ def test_ticket126_stop_com_away_bloqueia_com_ticket_ready_e_vaga_e_cita_o_ticke
     assert _stop126(a) == {}, "away desligado: nunca bloqueia por isso"
     a.orq("away", "on")
     out = _stop126(a)
-    assert out["decision"] == "block" and "88" in out["reason"] and "orq despachar --ticket 88" in out["reason"], out
+    assert out["decision"] == "block" and "88" in out["reason"] and "orq dispatch --ticket 88" in out["reason"], out
 
 
 def test_ticket126_stop_com_away_deixa_parar_sem_trabalho_desbloqueado():
@@ -13037,20 +13037,20 @@ def test_ticket126_proximo_sem_usuario_entrega_sem_integrar_e_ciclo_sem_push():
     ag = {"dispatch": "d1", "task": "t1", "estado": "entregue"}
     ev = [{"tipo": "despacho", "dispatch": "d1", "task": "t1", "ticket": "50"}]
     prox = lambda **k: orq_mod.proximo_sem_usuario(**{"tks": [_tk126("50", "claimed")], "ags": [ag], "integracao": {}, "fila": [], "events": ev, "cfg": orq_mod.maquina_cfg(), "sem_push": 0, **k})
-    assert "50" in prox() and "orq integrar fila add" in prox(), "entregue, ticket aberto e fora da fila do integrador"
+    assert "50" in prox() and "orq integrate queue add" in prox(), "entregue, ticket aberto e fora da fila do integrador"
     assert prox(integracao={"50": {"ticket": "50"}}) is None, "já espera o integrador"
     assert prox(tks=[_tk126("50", "resolved")]) is None, "ticket fechado: integrado"
     assert prox(ags=[{**ag, "estado": "liberado"}]) is None
     ciclo = ev + [{"tipo": "ciclo", "dispatch": "dI", "hash": "abc1234"}]
     assert prox(ags=[], events=ciclo, sem_push=2) and "abc1234" in prox(ags=[], events=ciclo, sem_push=2) and "push" in prox(ags=[], events=ciclo, sem_push=2)
     assert prox(ags=[], events=ciclo, sem_push=0) is None and prox(ags=[], events=ciclo, sem_push=None) is None, "sem commit a enviar, ou sem saber: deixa parar"
-    assert "2 commit(s) sem push" in prox(ags=[], events=ev, sem_push=2) and "abc1234" not in prox(ags=[], events=ev, sem_push=2), "o integrador não grava o ciclo (ticket 180): os commits sem push bastam"
+    assert "2 commit(s) unpushed" in prox(ags=[], events=ev, sem_push=2) and "abc1234" not in prox(ags=[], events=ev, sem_push=2), "o integrador não grava o ciclo (ticket 180): os commits sem push bastam"
 
 
 def test_ticket126_proximo_sem_usuario_ticket_ready_pede_prioridade_modelo_e_vaga():
     base = {"ags": [], "integracao": {}, "events": [], "sem_push": 0, "cfg": {**orq_mod.maquina_cfg(), "max_workers": 2}}
     prox = lambda tks, **k: orq_mod.proximo_sem_usuario(tks=tks, fila=[], **{**base, **k})
-    assert "orq despachar --ticket 07" in prox([_tk126("07")])
+    assert "orq dispatch --ticket 07" in prox([_tk126("07")])
     assert prox([_tk126("07", bloqueado=["06"])]) is None and prox([_tk126("07", modelo=None)]) is None
     cheio = [{"dispatch": f"d{i}", "estado": "rodando", "modelo": "claude-sonnet-5-5"} for i in range(2)]
     assert prox([_tk126("07")], ags=cheio) is None, "sem slot livre"
@@ -13121,7 +13121,7 @@ def test_ticket126_away_off_lista_as_pendencias_abertas_na_ausencia_decisoes_pri
     a.orq("pend", "add", "--id", "feita", "--tipo", "decisao", "--titulo", "Já respondida")
     a.orq("pend", "done", "feita")
     out = a.orq("away", "off").stdout
-    assert "away mode desligado" in out and "badge" in out and "http://127.0.0.1:4387/session/abc" in out and "aviso-1" in out, out
+    assert "away mode off" in out and "badge" in out and "http://127.0.0.1:4387/session/abc" in out and "aviso-1" in out, out
     assert out.index("badge") < out.index("aviso-1"), "decisões primeiro"
     assert "freio-prod" not in out and "feita" not in out, "só o aberto desde que ligou"
     assert "pendência" not in a.orq("away", "off").stdout, "desligado de novo: sem lista"
@@ -13139,7 +13139,7 @@ def test_ticket137_stop_com_away_bloqueia_com_linha_pendente_do_ciclos_log_e_cit
     a.orq("away", "on")
     _ciclos137(a, "ciclo ok 2026-10-01 21:00 t117 abc1234", PEND137)
     out = _stop126(a)
-    assert out["decision"] == "block" and "integrador parado: main não avançou, árvore viva suja" in out["reason"] and "t118" in out["reason"], out
+    assert out["decision"] == "block" and "integrator stopped: main did not advance, live tree dirty" in out["reason"] and "t118" in out["reason"], out
 
 
 def test_ticket137_linha_pendente_ja_avisada_nao_repete_e_a_nova_avisa_de_novo():
@@ -13238,7 +13238,7 @@ def test_ticket125_orca_yaml_existente_nao_e_sobrescrito_e_mostra_o_diff():
     r = a.orq("projeto", "add", repo)
     assert r.returncode == 0, r.stderr
     assert open(os.path.join(repo, "orca.yaml")).read() == antigo
-    assert "-    echo meu" in r.stdout and "+    npm ci" in r.stdout and "--substituir-orca-yaml" in r.stdout, r.stdout
+    assert "-    echo meu" in r.stdout and "+    npm ci" in r.stdout and "--replace-orca-yaml" in r.stdout, r.stdout
     assert ["add", "--path", repo] in _chamadas_repo(a), "o registro no Orca segue valendo"
     r = a.orq("projeto", "add", repo, "--substituir-orca-yaml")
     assert r.returncode == 0 and "npm ci" in open(os.path.join(repo, "orca.yaml")).read()
@@ -13334,7 +13334,7 @@ def test_ticket125_mate_abrir_sem_o_projeto_no_orca_segue_no_checkout_atual():
     assert "--worktree" not in _log(a, "create.log")[0]
 
 
-# ---------- limpeza de PR fechado sem merge (ticket 104) ----------
+# ---------- limpeza de PR closed without merge (ticket 104) ----------
 
 def _fechado_env(**env):
     """Um origin bare, o checkout `repo` (main, development, staging), a branch feat/x com um commit empurrado e uma worktree dela com relatorio-final.md; o projeto aponta para o repo."""
@@ -13385,7 +13385,7 @@ def test_it_should_mark_the_task_closed_and_clean_it_after_the_grace_period():
     assert [e["op"] for e in a.events() if e["tipo"] == "pr" and e["op"] == "fechada"] == ["fechada"], "marca uma vez, quando o último PR fecha"
     assert a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout.count("limpa") == 0 and _ramos(a) == {"local": True, "remota": True}, "dentro do prazo nada sai"
     r = a.orq("limpar", "--fechados", "--dry-run", cwd=a.repo)
-    assert "limparia feat/x" in r.stdout and "#1216, #1220" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
+    assert "would clean feat/x" in r.stdout and "#1216, #1220" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
     r = a.orq("limpar", "--fechados", cwd=a.repo)
     assert r.returncode == 0 and "Restore branch" in r.stdout, r
     assert _ramos(a) == {"local": False, "remota": False} and not os.path.exists(a.wt)
@@ -13399,26 +13399,26 @@ def test_it_should_not_clean_a_task_with_an_open_pr():
     a = _fechado_env()
     _fechados(a, PR1, PR2, estados=("CLOSED", "OPEN"))
     r = a.orq("limpar", "--fechados", cwd=a.repo)
-    assert "nenhuma task" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
+    assert "no task" in r.stdout and _ramos(a) == {"local": True, "remota": True} and os.path.isdir(a.wt), r
     assert not [e for e in a.events() if e.get("op") in ("fechada", "limpou_fechado")]
 
 
 def test_it_should_never_touch_an_environment_branch_or_a_branch_with_an_open_pr():
     a = _fechado_env()
     _fechados(a, PR1, estados=("CLOSED",), head="development")
-    assert "branch de ambiente" in a.orq("limpar", "--fechados", cwd=a.repo).stdout
+    assert "environment branch" in a.orq("limpar", "--fechados", cwd=a.repo).stdout
     assert a.g("ls-remote", "--heads", "origin", "development") and "development" in a.g("branch", "--list", "development")
     b = _fechado_env()  # outro PR aberto usa a branch como head (outra task): nada sai
     _fechados(b, PR1, estados=("CLOSED",))
     _pr(b, PR2, "OPEN", "development", headRefName="feat/x")
-    assert "tem PR aberto" in b.orq("limpar", "--fechados", cwd=b.repo).stdout and _ramos(b) == {"local": True, "remota": True}
+    assert "has an open PR" in b.orq("limpar", "--fechados", cwd=b.repo).stdout and _ramos(b) == {"local": True, "remota": True}
 
 
 def test_it_should_only_preview_the_automatic_cleanup_until_the_first_real_one():
     a = _fechado_env(ORQ_FECHADO_DIAS="0")
     out = _fechados(a, PR1, estados=("CLOSED",))
-    assert "limparia feat/x" in out and _ramos(a) == {"local": True, "remota": True}, "a primeira vez é só prévia"
-    assert "limparia" not in a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout, "a prévia sai uma vez por task"
+    assert "would clean feat/x" in out and _ramos(a) == {"local": True, "remota": True}, "a primeira vez é só prévia"
+    assert "would clean" not in a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout, "a prévia sai uma vez por task"
     assert a.orq("limpar", "--fechados", cwd=a.repo).returncode == 0 and _ramos(a) == {"local": False, "remota": False}
     assert os.path.exists(os.path.join(a.home, "limpar-fechados.json"))
 
@@ -13439,20 +13439,20 @@ def _m127(fim_min=11, aberto_min=None, **kw):
 def test_ticket127_ocioso_so_com_turno_fechado_sem_pedido_e_sem_worker_vivo():
     sem = lambda: False  # noqa: E731
     com = lambda: True  # noqa: E731
-    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem) == "ocioso há 11 min"
-    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], sem) == "trabalhando", "turno fechado há menos de 10 min"
-    assert orq_mod.mate_situacao(_m127(11), AGORA127, [{"corr": "p1"}], sem) == "trabalhando", "pedido aberto do coordenador"
-    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], com) == "trabalhando", "worker do Run dele vivo (ou entrega sem integrar)"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem) == "idle for 11 min"
+    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], sem) == "working", "turno fechado há menos de 10 min"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [{"corr": "p1"}], sem) == "working", "pedido aberto do coordenador"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], com) == "working", "worker do Run dele vivo (ou entrega sem integrar)"
     aberto = _m127(11)
     aberto["turnos"][-1][1] = None
-    assert orq_mod.mate_situacao(aberto, AGORA127, [], sem) == "trabalhando", "turno ainda aberto"
-    assert orq_mod.mate_situacao(_m127(None), AGORA127, [], sem) == "trabalhando", "sem turno nem abertura gravados não há como medir"
-    assert orq_mod.mate_situacao(_m127(40, aberto_min=3), AGORA127, [], sem) == "trabalhando", "o resume zera o relógio: o turno antigo não vale"
-    assert orq_mod.mate_situacao(_m127(40, aberto_min=12), AGORA127, [], sem) == "ocioso há 12 min"
-    assert orq_mod.mate_situacao(_m127(30, terminal=None, dormiu="2026-10-01T14:40:00Z"), AGORA127, [], sem) == "dormindo"
-    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem, minimo=15) == "trabalhando", "ORQ_MATE_OCIOSO_MIN"
+    assert orq_mod.mate_situacao(aberto, AGORA127, [], sem) == "working", "turno ainda aberto"
+    assert orq_mod.mate_situacao(_m127(None), AGORA127, [], sem) == "working", "sem turno nem abertura gravados não há como medir"
+    assert orq_mod.mate_situacao(_m127(40, aberto_min=3), AGORA127, [], sem) == "working", "o resume zera o relógio: o turno antigo não vale"
+    assert orq_mod.mate_situacao(_m127(40, aberto_min=12), AGORA127, [], sem) == "idle for 12 min"
+    assert orq_mod.mate_situacao(_m127(30, terminal=None, dormiu="2026-10-01T14:40:00Z"), AGORA127, [], sem) == "sleeping"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem, minimo=15) == "working", "ORQ_MATE_OCIOSO_MIN"
     chamado = []
-    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], lambda: chamado.append(1)) == "trabalhando" and not chamado, "o worker só é consultado com o resto ocioso"
+    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], lambda: chamado.append(1)) == "working" and not chamado, "o worker só é consultado com o resto ocioso"
 
 
 def _amb127(fim_min, prontos=(), grupo_cfg=True, **mate):
@@ -13477,7 +13477,7 @@ def test_ticket127_ocioso_por_20_min_sem_ticket_pronto_o_gerente_hiberna_e_grava
     a = _amb127(25)
     with EmProcesso(a):
         r = orq_mod.mates_dormir()
-    assert r == ["mate orq: dormiu (ocioso há 25 min)"], r
+    assert r == ["mate orq: slept (idle for 25 min)"], r
     assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_mate"]
     m = _cursor(a)["mates"]["orq"]
     assert m["terminal"] is None and m["sessao"] == "sess-mate" and m["dormiu"], m
@@ -13488,7 +13488,7 @@ def test_ticket127_ocioso_por_20_min_sem_ticket_pronto_o_gerente_hiberna_e_grava
         assert orq_mod.mates_dormir() == [], "dormindo não dorme de novo"
     assert len(_log(a, "close.log")) == 1
     with EmProcesso(a):
-        assert not any("caiu" in x for x in orq_mod.mate_volta()), "dormir de propósito não é queda"
+        assert not any("went down" in x for x in orq_mod.mate_volta()), "dormir de propósito não é queda"
 
 
 def test_ticket127_ocioso_ha_menos_de_20_min_ou_com_tela_ocupada_nao_hiberna():
@@ -13507,16 +13507,16 @@ def test_ticket127_com_ticket_pronto_do_grupo_avisa_o_coordenador_uma_vez_e_nao_
     a = _amb127(25, prontos=("104", "117"))
     with EmProcesso(a):
         r = orq_mod.mates_dormir()
-        assert r == ["mate orq: ocioso há 25 min, coordenador avisado (104, 117 prontos)"], r
+        assert r == ["mate orq: idle for 25 min, coordinator notified (104, 117 ready)"], r
         assert orq_mod.mates_dormir() == [], "avisado uma vez por ociosidade"
     assert not _log(a, "close.log") and _cursor(a)["mates"]["orq"]["terminal"] == "term_mate"
     avisos = [x["texto"] for x in _cursor(a)["avisos"]]  # sem o modo ausente o aviso espera no contexto do próximo prompt do coordenador (ticket 82)
-    assert len(avisos) == 1 and "mate orq ocioso, tem 104 e 117 prontos" in avisos[0], avisos
+    assert len(avisos) == 1 and "mate orq idle, 104 and 117 ready" in avisos[0], avisos
     # sem vaga livre na máquina o ticket pronto não ocupa o mate: ele dorme
     b = _amb127(25, prontos=("104",))
     _grava_estado(os.path.join(b.home, "maquina.json"), {"max_workers": 0})
     with EmProcesso(b):
-        assert orq_mod.mates_dormir() == ["mate orq: dormiu (ocioso há 25 min)"]
+        assert orq_mod.mates_dormir() == ["mate orq: slept (idle for 25 min)"]
 
 
 def test_ticket127_worker_vivo_ou_pedido_aberto_do_mate_o_mantem_acordado():
@@ -13532,7 +13532,7 @@ def test_ticket127_worker_vivo_ou_pedido_aberto_do_mate_o_mantem_acordado():
     b.orq("mate", "pedir", "orq", "--texto", "status", "--prazo", "0")
     with EmProcesso(b):
         # prazo 0 não espera resposta; com prazo o pedido sem resposta segura o mate
-        assert orq_mod.mates_dormir() == ["mate orq: dormiu (ocioso há 25 min)"]
+        assert orq_mod.mates_dormir() == ["mate orq: slept (idle for 25 min)"]
     c = _amb127(25)
     c.orq("mate", "pedir", "orq", "--texto", "status", "--prazo", "600")
     with EmProcesso(c):
@@ -13551,7 +13551,7 @@ def test_ticket127_mate_pedir_com_o_mate_dormindo_retoma_a_sessao_e_entrega_o_pe
     cmd = cmd[cmd.index("--command") + 1]
     assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
     textos = [c[c.index("--text") + 1] for c in _log(a, "send.log") if "--text" in c]
-    assert len(textos) == 2 and "dormiu" in textos[0] and textos[1].startswith("orq ▸ pedido p1") and "despache o ticket 77" in textos[1], textos
+    assert len(textos) == 2 and "secondmate of group orq" in textos[0] and textos[1].startswith("orq ▸ request p1") and "despache o ticket 77" in textos[1], textos
     m = _cursor(a)["mates"]["orq"]
     assert m["terminal"] == "term_ret1" and not m.get("dormiu") and m["aberto_em"], m
     assert any(e["tipo"] == "mate_acordou" and e["grupo"] == "orq" for e in a.events())
@@ -13569,15 +13569,15 @@ def test_ticket127_retomar_nao_acorda_o_mate_que_dormiu_de_proposito():
 
 def test_ticket127_grupos_e_status_mostram_trabalhando_ocioso_e_dormindo():
     a = _amb127(3)
-    assert "mate trabalhando (term_mate" in a.orq("grupos").stdout
-    assert "mate orq: trabalhando (term_mate)" in a.orq("status").stdout
+    assert "mate working (term_mate" in a.orq("grupos").stdout
+    assert "mate orq: working (term_mate)" in a.orq("status").stdout
     b = _amb127(12)
-    assert "mate ocioso há 12 min (term_mate" in b.orq("grupos").stdout
-    assert "mate orq: ocioso há 12 min (term_mate)" in b.orq("status").stdout
+    assert "mate idle for 12 min (term_mate" in b.orq("grupos").stdout
+    assert "mate orq: idle for 12 min (term_mate)" in b.orq("status").stdout
     c = _amb127(30, terminal=None, dormiu=_z60(4))
     c.set("terminals.json", ["term_coord", "term_ger"])
-    assert "mate dormindo" in c.orq("grupos").stdout and "mate orq: dormindo" in c.orq("status").stdout
-    assert "caiu" not in c.orq("status").stdout
+    assert "mate sleeping" in c.orq("grupos").stdout and "mate orq: sleeping" in c.orq("status").stdout
+    assert "mate orq: down" not in c.orq("status").stdout
 
 
 def test_ticket127_orq_mate_dormir_a_mao_e_a_recusa_com_pedido_aberto():
@@ -13588,7 +13588,7 @@ def test_ticket127_orq_mate_dormir_a_mao_e_a_recusa_com_pedido_aberto():
     b = _amb127(1)
     b.orq("mate", "pedir", "orq", "--texto", "x", "--prazo", "600")
     r = b.orq("mate", "dormir", "orq")
-    assert r.returncode != 0 and "pedido" in r.stderr and not _log(b, "close.log"), (r.stdout, r.stderr)
+    assert r.returncode != 0 and "request" in r.stderr and not _log(b, "close.log"), (r.stdout, r.stderr)
 
 
 
@@ -13762,7 +13762,7 @@ def test_ticket96_transcritos_vem_da_pasta_do_repo_do_projeto_e_o_campo_transcri
         try:
             orq_mod._sessao_do_coordenador("bbbbbbbb")
         except ValueError as e:
-            assert "nenhum" in str(e)
+            assert "none" in str(e)
         else:
             raise AssertionError("sessão que nenhuma pasta tem recusa")
 
@@ -13777,7 +13777,7 @@ def test_ticket96_a_variavel_orq_transcritos_ainda_vale_sozinha_e_duas_pastas_co
         try:
             orq_mod._sessao_do_coordenador("cccccccc")
         except ValueError as e:
-            assert "mais de um" in str(e)
+            assert "more than one" in str(e)
         else:
             raise AssertionError("o mesmo id em dois projetos é ambíguo")
         orq_mod.TRANSCRITOS = os.path.join(c.tmp.name, "p")
@@ -13816,7 +13816,7 @@ def test_ticket93_passagem_coordenador_grava_o_snapshot_e_quem_o_escreveu():
     out = json.loads(r.stdout)
     assert (out["de"], out["para"]) == ("claude", "codex") and out["arquivo"].endswith(".md"), out
     md = open(os.path.join(a.home, "handoff", "ultimo.md")).read()
-    assert "## Run ligado\nrun_a" in md and "## Agentes" in md and "Ticket do snapshot" in md, md
+    assert "## Bound Run\nrun_a" in md and "## Agents" in md and "Ticket do snapshot" in md, md
     reg = _ler_estado(os.path.join(a.home, "handoff", "passagem.json"))
     assert (reg["de"], reg["para"], reg["run"]) == ("claude", "codex", "run_a") and abs(reg["ts"] - time.time()) < 60 and not reg.get("aceita"), reg
 
@@ -13830,13 +13830,13 @@ def test_ticket93_passagem_coordenador_descobre_o_harness_de_origem_pelo_termina
     assert r.returncode == 0 and (json.loads(r.stdout)["de"], json.loads(r.stdout)["para"]) == ("codex", "claude"), r
     c = Amb(run="run_a")
     r = _passagem93(c, CLAUDECODE="")
-    assert r.returncode == 1 and "--para" in r.stderr and not os.path.exists(os.path.join(c.home, "handoff", "passagem.json")), r
+    assert r.returncode == 1 and "--to" in r.stderr and not os.path.exists(os.path.join(c.home, "handoff", "passagem.json")), r
 
 
 def test_ticket93_passagem_coordenador_sem_run_ligado_recusa_e_nao_grava():
     a = Amb(run=None)
     r = _passagem93(a, "--para", "codex")
-    assert r.returncode == 1 and "sem Run ligado" in r.stderr and not os.path.exists(os.path.join(a.home, "handoff")), r
+    assert r.returncode == 1 and "no Run bound" in r.stderr and not os.path.exists(os.path.join(a.home, "handoff")), r
 
 
 def test_ticket93_hook_session_do_outro_harness_injeta_o_snapshot_recente():
@@ -13844,8 +13844,8 @@ def test_ticket93_hook_session_do_outro_harness_injeta_o_snapshot_recente():
     _novo(a, "Ticket do snapshot")
     assert _passagem93(a, "--para", "codex").returncode == 0
     ctx = _sessao93(a, "codex")
-    assert "Passagem do coordenador (de claude" in ctx and "## Run ligado" in ctx and "Ticket do snapshot" in ctx, ctx
-    assert ctx.index("Tickets abertos") < ctx.index("Passagem do coordenador"), "o status de sempre vem primeiro, a passagem depois"
+    assert "Coordinator handoff (from claude" in ctx and "## Bound Run" in ctx and "Ticket do snapshot" in ctx, ctx
+    assert ctx.index("Open tickets") < ctx.index("Coordinator handoff"), "o status de sempre vem primeiro, a passagem depois"
     assert _ler_estado(os.path.join(a.home, "handoff", "passagem.json"))["aceita"]["sessao"] == "s_outro"
 
 
@@ -13866,9 +13866,9 @@ def test_ticket93_hook_session_nao_injeta_passagem_velha_nem_a_que_outra_sessao_
     assert "Passagem do coordenador" not in _sessao93(a, "codex"), "mais de 15 min"
     reg["ts"] = time.time() - 14 * 60
     json.dump(reg, open(arq, "w"))
-    assert "Passagem do coordenador" in _sessao93(a, "codex", sid="s_um"), "14 min ainda vale"
+    assert "Coordinator handoff" in _sessao93(a, "codex", sid="s_um"), "14 min ainda vale"
     assert "Passagem do coordenador" not in _sessao93(a, "codex", sid="s_dois"), "a primeira sessão levou"
-    assert "Passagem do coordenador" in _sessao93(a, "codex", sid="s_um", source="resume"), "a mesma sessão, ao reabrir, a relê"
+    assert "Coordinator handoff" in _sessao93(a, "codex", sid="s_um", source="resume"), "a mesma sessão, ao reabrir, a relê"
 
 
 def test_ticket93_hook_session_sem_passagem_ou_com_registro_ilegivel_segue_como_antes():
@@ -13876,7 +13876,7 @@ def test_ticket93_hook_session_sem_passagem_ou_com_registro_ilegivel_segue_como_
     assert "Passagem do coordenador" not in _sessao93(a, "codex")
     os.makedirs(os.path.join(a.home, "handoff"))
     open(os.path.join(a.home, "handoff", "passagem.json"), "w").write("{isto não é json")
-    assert "Tickets abertos" in _sessao93(a, "codex")
+    assert "Open tickets" in _sessao93(a, "codex")
 
 
 # ---------- ticket 90: reconhecer o limite do plano na tela do worker ----------
@@ -13910,7 +13910,7 @@ def test_ticket90_agentes_mostra_o_worker_como_limite_nos_dois_harnesses():
         w = next(x for x in json.loads(a.orq("agentes", "--json", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout) if x["dispatch"] == "ctx_term_w1")
         assert w["estado"] == "limite" and "limit" in w["limite"], w
         txt = a.orq("agentes", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout
-        assert txt.lstrip().startswith("limite") and "limite do plano" in txt, txt
+        assert txt.lstrip().startswith("limite") and "plan limit" in txt, txt
         a.set("screens.json", {"term_w1": ["● seguindo"]})
         w = next(x for x in json.loads(a.orq("agentes", "--json", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout) if x["dispatch"] == "ctx_term_w1")
         assert w["estado"] != "limite", "a tela voltou ao normal"
@@ -13920,7 +13920,7 @@ def test_ticket90_gerente_avisa_o_coordenador_do_limite_uma_vez_so():
     a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
     _limite90(a, "tela-claude-limite-sessao.txt")
     r = a.orq("gerente", "absorver")
-    assert r.returncode == 0 and "limite do plano" in r.stdout, r
+    assert r.returncode == 0 and "plan limit" in r.stdout, r
     (env,) = _avisos_enviados(a)
     texto = _aviso_inteiro(env[env.index("--text") + 1])
     assert "task_term_w1" in texto and "session limit" in texto and texto.startswith("orq: worker "), texto
@@ -14153,7 +14153,7 @@ def test_ticket101_m2_converte_emite_o_backlog_confere_as_contagens_e_so_escreve
     assert meta == {"spec": "issues/03-x.md", "orca": "task_c3 run_a", "modelo": "claude-opus-5-5", "effort": "high", "issue": "2045"}, meta
     meta5, _ = backlog_mod.meta_corpo(it["t05"]["corpo"], backlog_mod.META_TICKET)
     assert meta5["despacho"] == "manual, só depois da fase 3" and meta5["espera"] == "integrador vazio", meta5
-    assert it["esp-x"]["hold"] == {"motivo": "esperando time de ops Alice", "kind": "external", "until": "2999-01-01"} and it["esp-x"]["repo"] == "pend"
+    assert it["esp-x"]["hold"] == {"motivo": "waiting on time de ops Alice", "kind": "external", "until": "2999-01-01"} and it["esp-x"]["repo"] == "pend"
     assert open(os.path.join(a.tmp.name, "data", ".tasks.toml")).read().count("done_keep = 100000") == 1
     r2 = _converte(a, saida)
     assert r2.returncode == 1 and "já existe" in r2.stderr, "não sobrescreve o backlog que existe"
@@ -14217,10 +14217,10 @@ def test_ticket101_m3_pend_add_done_grava_no_backlog_espelha_o_json_e_registra_o
 def test_ticket101_m3_recusas_como_no_json_e_sem_evento_nem_item_pela_metade():
     a = _amb_bl()
     n_eventos = len([e for e in a.events() if e["tipo"] == "pend"])
-    for args, texto in ((("--id", "id-com-mais-de-12", "--tipo", "decisao", "--titulo", "X"), "12"), (("--id", "freio-prod", "--tipo", "acao", "--titulo", "dup"), "já existe"),
-                        (("--id", "t01", "--tipo", "acao", "--titulo", "X", "--ate", "amanhã"), "AAAA-MM-DD"), (("--id", "com espaço", "--tipo", "acao", "--titulo", "X"), "letras, dígitos"),
-                        (("--id", "tag", "--tipo", "acao", "--titulo", "termina assim (repo: x)"), "tag do backlog"),
-                        (("--id", "traco", "--tipo", "acao", "--titulo", "-x como opção"), "começar com '-'")):
+    for args, texto in ((("--id", "id-com-mais-de-12", "--tipo", "decisao", "--titulo", "X"), "12"), (("--id", "freio-prod", "--tipo", "acao", "--titulo", "dup"), "already exists"),
+                        (("--id", "t01", "--tipo", "acao", "--titulo", "X", "--ate", "amanhã"), "YYYY-MM-DD"), (("--id", "com espaço", "--tipo", "acao", "--titulo", "X"), "letters, digits"),
+                        (("--id", "tag", "--tipo", "acao", "--titulo", "termina assim (repo: x)"), "backlog tag"),
+                        (("--id", "traco", "--tipo", "acao", "--titulo", "-x como opção"), "cannot start with '-'")):
         r = a.orq("pend", "add", *args)
         assert r.returncode == 1 and texto in r.stderr, (args, r.stderr)
     assert a.orq("pend", "done", "nao-existe").returncode == 1
@@ -14245,9 +14245,9 @@ def test_ticket101_m3_id_de_pendencia_fechada_recomeca_e_o_de_ticket_ou_viva_e_r
     assert it["estado"] == "queued" and it["titulo"] == "De novo" and "sim" not in it["corpo"] and [i["id"] for i in _pend(a)["itens"]].count("freio-prod") == 1
     backlog_mod.cli(a.env["ORQ_BACKLOG"], "add", "t77", "um ticket", "--kind", "ticket")
     r = a.orq("pend", "add", "--id", "t77", "--tipo", "acao", "--titulo", "X")
-    assert r.returncode == 1 and "já existe" in r.stderr
+    assert r.returncode == 1 and "already exists" in r.stderr
     r = a.orq("pend", "add", "--id", "avisar-x", "--tipo", "acao", "--titulo", "X")
-    assert r.returncode == 1 and "já existe" in r.stderr, "pendência viva"
+    assert r.returncode == 1 and "already exists" in r.stderr, "pendência viva"
 
 
 def test_ticket101_m3_pend_edit_corrige_titulo_detalhe_ate_e_espera_e_registra_o_evento():
@@ -14263,7 +14263,7 @@ def test_ticket101_m3_pend_edit_corrige_titulo_detalhe_ate_e_espera_e_registra_o
     assert ev1["campos"] == ["ate", "espera", "titulo"] and ev2["campos"] == ["detalhe"]
     assert a.orq("pend", "edit", "rot").returncode == 1 and a.orq("pend", "edit", "nao-existe", "--titulo", "x").returncode == 1
     r = a.orq("pend", "edit", "freio-prod", "--espera", "alguém")
-    assert r.returncode == 1 and "espera" in r.stderr, "decisão não tem espera"
+    assert r.returncode == 1 and "waiting" in r.stderr, "decisão não tem espera"
     assert [i["id"] for i in _pend(a)["itens"]].count("rot") == 1
 
 
@@ -14275,7 +14275,7 @@ def test_ticket101_m3_lista_esconde_ate_futura_e_mostra_a_vencida_como_antes():
     vivas = a.orq("pend", "lista").stdout
     assert "hoje" in vivas and "futura" not in vivas and "espera  avisar" not in vivas, vivas
     todas = a.orq("pend", "lista", "--todas").stdout
-    assert "futura  acao  Depois  [Depois: até 2999-01-01]" in todas and "[Depois: esperando Alice]" in todas, todas
+    assert "futura  acao  Depois  [Later: until 2999-01-01]" in todas and "[Later: waiting on Alice]" in todas, todas
 
 
 def test_ticket101_m3_hook_ask_fecha_a_decisao_pelo_backlog_e_guarda_a_resposta():
@@ -14291,7 +14291,7 @@ def test_ticket101_m3_hook_ask_fecha_a_decisao_pelo_backlog_e_guarda_a_resposta(
     texto = "nenhum dos dois, vamos ver com o time de dados"
     r = a2.orq("hook", "ask", stdin=_ask(q2, {q2[0]["question"]: texto}, onde="tool_input"))
     assert [i["id"] for i in _pend(a2)["itens"]] == ["freio-prod", "avisar-x"], "texto livre não fecha"
-    assert "resposta livre em freio-prod" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "free-text answer in freio-prod" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_ticket101_m3_gate_da_decisao_resolve_como_hoje_e_o_gate_fica_no_corpo():
@@ -14313,7 +14313,7 @@ def test_ticket101_m3_leituras_nao_chamam_o_tasks_axi_e_a_escrita_sem_ele_recusa
     sem = {"ORQ_TASKS_AXI": "/nao/existe/tasks-axi"}
     assert a.orq("pend", "lista", **sem).stdout.count("\n") == 2
     r = a.prompt("oi", **sem)
-    assert r.returncode == 0 and "Com você: 2" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
+    assert r.returncode == 0 and "With you: 2" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
     assert a.orq("status", **sem).returncode == 0
     antes = open(a.env["ORQ_BACKLOG"]).read()
     r = a.orq("pend", "add", "--id", "novo", "--tipo", "acao", "--titulo", "X", **sem)
@@ -14324,7 +14324,7 @@ def test_ticket101_m3_leituras_nao_chamam_o_tasks_axi_e_a_escrita_sem_ele_recusa
     q = [_pergunta("freio-prod", [("A", "x"), ("B", "y")])]
     r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "A"}), ORQ_TASKS_AXI=exe)
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert r.returncode == 0 and "não consegui fechar freio-prod no backlog" in ctx and "orq pend done freio-prod" in ctx, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "could not close freio-prod in the backlog" in ctx and "orq pend done freio-prod" in ctx, (r.stdout, r.stderr)
     assert "freio-prod" in _bl_itens(a) and _bl_itens(a)["freio-prod"]["estado"] == "queued", "a decisão segue aberta"
     assert len([e for e in a.events() if e["tipo"] == "pend" and e["pend"] in ("novo", "avisar-x") and e["op"] == "done"]) == 0
 
@@ -14332,9 +14332,9 @@ def test_ticket101_m3_leituras_nao_chamam_o_tasks_axi_e_a_escrita_sem_ele_recusa
 def test_ticket101_m3_orq_backlog_diz_o_estado_e_sem_a_variavel_diz_que_esta_desligado():
     a = _amb_bl()
     out = json.loads(a.orq("backlog", "--json").stdout)
-    assert out["tasks-axi"] == "0.2.6 ok" and out["queued"] == 2 and out["pendencias vivas"] == 2 and out["tickets lidos do backlog"] is False, out
+    assert out["tasks-axi"] == "0.2.6 ok" and out["queued"] == 2 and out["live pending items"] == 2 and out["tickets read from the backlog"] is False, out
     off = a.orq("backlog", ORQ_BACKLOG="")
-    assert "desligado" in off.stdout and off.returncode == 0
+    assert "off" in off.stdout and off.returncode == 0
 
 
 def test_ticket167_backlog_path_em_orq_home_liga_o_backlog_sem_a_variavel_e_a_variavel_vazia_desliga():
@@ -14342,14 +14342,14 @@ def test_ticket167_backlog_path_em_orq_home_liga_o_backlog_sem_a_variavel_e_a_va
     caminho = a.env.pop("ORQ_BACKLOG")
     open(os.path.join(a.home, "backlog.path"), "w").write(caminho + "\n")
     ligado = json.loads(a.orq("backlog", "--json").stdout)
-    assert ligado["itens"] == 2 and ligado["pendencias vivas"] == 2, ligado
+    assert ligado["itens"] == 2 and ligado["live pending items"] == 2, ligado
     r = a.orq("pend", "add", "--id", "via-arquivo", "--tipo", "acao", "--titulo", "veio pelo backlog.path")
     assert r.returncode == 0, r.stderr
     assert "via-arquivo" in _bl_itens_de(caminho), "a escrita foi para o backlog do arquivo"
     off = a.orq("backlog", ORQ_BACKLOG="")
-    assert "desligado" in off.stdout, "a variável vazia vence o arquivo"
+    assert "off" in off.stdout, "a variável vazia vence o arquivo"
     os.remove(os.path.join(a.home, "backlog.path"))
-    assert "desligado" in a.orq("backlog").stdout, "sem variável e sem arquivo o backlog fica desligado"
+    assert "off" in a.orq("backlog").stdout, "sem variável e sem arquivo o backlog fica desligado"
 
 
 def test_ticket101_m3_lavish_resposta_fecha_a_decisao_no_backlog():
@@ -14401,9 +14401,9 @@ def test_ticket101_m4_digest_monta_pendencias_e_tickets_orq_do_backlog_com_o_mes
 
 def test_ticket101_m4_resumo_e_cartao_leem_as_pendencias_do_backlog():
     a = _amb_bl()
-    assert "Com você: 2" in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "With you: 2" in json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
     a.set("../pendencias.json", {"itens": []})
-    assert "Com você: 2" in json.loads(a.prompt("de novo").stdout)["hookSpecificOutput"]["additionalContext"], "o espelho vazio não conta: vale o backlog"
+    assert "With you: 2" in json.loads(a.prompt("de novo").stdout)["hookSpecificOutput"]["additionalContext"], "o espelho vazio não conta: vale o backlog"
     assert a.orq("resumo").returncode == 0
 
 
@@ -14420,7 +14420,7 @@ def test_it_should_be_that_orq_transcrito_reads_a_claude_transcript_without_reas
     assert [(e["tipo"], e["papel"]) for e in r["eventos"]] == [("mensagem", "user"), ("mensagem", "assistant"), ("chamada", "assistant"), ("resultado", "user"), ("mensagem", "assistant")], r
     assert r["eventos"][2]["nome"] == "Bash" and r["eventos"][2]["texto"] == "pytest -q" and r["eventos"][3]["texto"] == "2 failed, 40 passed"
     assert "segredo" not in json.dumps(r["eventos"]) and "caveat" not in json.dumps(r["eventos"])
-    assert r["cortes"] == {"raciocínio": 1, "registro meta (isMeta)": 1, "registro meta (summary)": 1} and r["aberto"] is False
+    assert r["cortes"] == {"reasoning": 1, "meta record (isMeta)": 1, "meta record (summary)": 1} and r["aberto"] is False
 
 
 def test_it_should_be_that_orq_transcrito_reads_a_codex_rollout_with_tool_calls():
@@ -14428,13 +14428,13 @@ def test_it_should_be_that_orq_transcrito_reads_a_codex_rollout_with_tool_calls(
     tipos = [e["tipo"] for e in r["eventos"]]
     assert tipos == ["mensagem", "mensagem", "mensagem", "chamada", "resultado", "mensagem"], tipos
     assert r["eventos"][3]["texto"] == "bash -lc pytest -q" and r["eventos"][4]["texto"] == "2 failed, 40 passed"
-    assert r["cortes"] == {"contexto de ambiente": 1, "raciocínio": 1, "registro meta (event_msg)": 1, "registro meta (session_meta)": 1}, r["cortes"]
+    assert r["cortes"] == {"environment context": 1, "reasoning": 1, "meta record (event_msg)": 1, "meta record (session_meta)": 1}, r["cortes"]
 
 
 def test_it_should_be_that_orq_transcrito_keeps_the_last_n_events_and_lists_the_cuts_in_text():
     p = _transcrito_cli(Amb(run="run_a"), "transcrito-claude.jsonl", "--ultimos", "2")
-    assert p.returncode == 0 and p.stdout.splitlines()[:2] == ["[resultado] 2 failed, 40 passed", "[assistant] faltam dois testes"], p.stdout
-    assert "cortado: raciocínio ×1, registro meta (isMeta) ×1, registro meta (summary) ×1" in p.stdout
+    assert p.returncode == 0 and p.stdout.splitlines()[:2] == ["[result] 2 failed, 40 passed", "[assistant] faltam dois testes"], p.stdout
+    assert "cut: meta record (isMeta) ×1, meta record (summary) ×1, reasoning ×1" in p.stdout
 
 
 def test_it_should_be_that_the_reader_flags_an_open_turn_and_truncates_long_texts():
@@ -14444,7 +14444,7 @@ def test_it_should_be_that_the_reader_flags_an_open_turn_and_truncates_long_text
         open(arq, "w").write("\n".join(x if isinstance(x, str) else json.dumps(x) for x in linhas))
         r = orq_mod.ler_transcrito(arq)
     assert r["aberto"] is True and len(r["eventos"][0]["texto"]) == orq_mod.PASSAGEM_MSG_MAX
-    assert r["cortes"] == {"texto truncado": 1, "linha ilegível": 1}, r["cortes"]
+    assert r["cortes"] == {"truncated text": 1, "unreadable line": 1}, r["cortes"]
     assert orq_mod.ler_transcrito("/nao/existe.jsonl") == {"eventos": [], "cortes": {}, "aberto": False}
 
 
@@ -14453,7 +14453,7 @@ def test_it_should_be_that_orq_transcrito_refuses_when_the_file_is_missing():
     os.makedirs(a.home, exist_ok=True)
     _grava_estado(os.path.join(a.home, "turnos.json"), {"ctx_w1": {"task": "task_w1", "transcrito": "/nao/existe.jsonl", "harness": "claude"}})
     r = a.orq("transcrito", "ctx_w1")
-    assert r.returncode == 1 and "não achou o transcrito" in r.stderr, (r.stdout, r.stderr)
+    assert r.returncode == 1 and "could not find the transcript" in r.stderr, (r.stdout, r.stderr)
 
 
 def test_it_should_type_at_most_aviso_max_characters_and_cite_the_file_with_the_full_text():
@@ -14465,7 +14465,7 @@ def test_it_should_type_at_most_aviso_max_characters_and_cite_the_file_with_the_
     try:
         with tempfile.TemporaryDirectory() as d:
             orq_mod.HOME = d
-            curto = "orq: PR #1 entrou em development"
+            curto = "orq: PR #1 entered development"
             longo = "orq: worker task_1 terminou " + "x" * 400
             assert orq_mod.digita("term_c", curto) == "enviado" and enviados == [curto], "o texto curto vai como está e não cria arquivo"
             assert not os.path.exists(os.path.join(d, "avisos"))
@@ -14473,7 +14473,7 @@ def test_it_should_type_at_most_aviso_max_characters_and_cite_the_file_with_the_
                 enviados.clear()
                 fn("term_c", longo)
                 (digitado,) = enviados
-                caminho = digitado.split("completo em ")[1]
+                caminho = digitado.split("full text at ")[1]
                 assert len(digitado) <= orq_mod.AVISO_MAX and digitado.startswith("orq: worker task_1"), digitado
                 assert os.path.isabs(caminho) and open(caminho, encoding="utf-8").read() == longo + "\n", "o caminho citado tem o texto inteiro"
     finally:
@@ -14487,14 +14487,14 @@ def test_it_should_be_that_an_orq_ticket_spec_gets_the_worktree_block():
         assert r.returncode == 0, r.stderr
     for arg in _log(a, "started.log"):
         spec = arg[arg.index("--spec") + 1]
-        assert spec.count("## Worktree do orq") == 1 and "~/.claude/orq-wt/" in spec and "Nunca commite na `main`" in spec, spec
+        assert spec.count("## orq worktree") == 1 and "~/.claude/orq-wt/" in spec and "Never commit on `main`" in spec, spec
 
 
 def test_it_should_be_that_a_non_orq_ticket_spec_gets_no_worktree_block():
     a = Amb(run="run_a")
     a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium")
     (arg,) = _log(a, "started.log")
-    assert "Worktree do orq" not in arg[arg.index("--spec") + 1]
+    assert "orq worktree" not in arg[arg.index("--spec") + 1]
 
 
 def test_it_should_be_that_dispatching_an_orq_ticket_by_number_appends_the_block_once():
@@ -14503,7 +14503,7 @@ def test_it_should_be_that_dispatching_an_orq_ticket_by_number_appends_the_block
     for _ in range(2):
         a.orq("despachar", "--run", "run_a", "--ticket", "01", "--modelo", "claude-sonnet-5-5", "--effort", "medium", FAKE_FAIL="")
     txt = open(next(os.path.join(a.env["ORQ_ISSUES"], n) for n in os.listdir(a.env["ORQ_ISSUES"]) if n.startswith("01-"))).read()
-    assert txt.count("## Worktree do orq") == 1 and "~/.claude/orq-wt/01" in txt, txt
+    assert txt.count("## orq worktree") == 1 and "~/.claude/orq-wt/01" in txt, txt
 
 
 def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_not_the_integrator():
@@ -14578,7 +14578,7 @@ def test_it_should_be_that_a_forbidden_term_in_the_diff_or_message_is_refused_an
         assert r.returncode == 1 and "segredoxyz" in r.stderr, r.stderr
         os.remove(env["ORQ_TERMOS"])
         r = _auditar(repo, env, g, msg="feat: ok", arq=("f", "tem segredoxyz de novo"))
-        assert r.returncode == 0 and "pulada" in r.stderr, r.stderr
+        assert r.returncode == 0 and "skipped" in r.stderr, r.stderr
 
 
 def test_it_should_be_that_code_without_readme_is_refused_and_with_readme_passes():
@@ -14731,7 +14731,7 @@ def test_ticket142_despacho_manual_nunca_entra_na_fila_automatica_mesmo_com_mode
     assert r.returncode == 0, r.stderr
     assert _fila79(a) == [] and "manual" in r.stderr, r.stderr
     assert "Despacho: manual, só depois da fase 3" in a.orq("ticket", "lista").stdout
-    assert "fora da fila de despacho: 88 (Despacho: manual" in a.orq("status").stdout
+    assert "outside the dispatch queue: 88 (Despacho: manual" in a.orq("status").stdout
 
 
 def test_ticket142_espera_integrador_vazio_so_entra_na_fila_com_o_integrador_vazio():
@@ -14739,8 +14739,8 @@ def test_ticket142_espera_integrador_vazio_so_entra_na_fila_com_o_integrador_vaz
     _caso_142(a, "Espera: integrador vazio\n")
     a.orq("integrar", "fila", "add", "feat/x", "50")
     r = a.orq("ticket", "fechar", "87", "--answer", "feito")
-    assert _fila79(a) == [] and "integrador" in r.stderr, r.stderr
-    assert "espera o integrador esvaziar (1 na fila)" in a.orq("ticket", "lista").stdout
+    assert _fila79(a) == [] and "integrator" in r.stderr, r.stderr
+    assert "waiting for the integrator to empty (1 in the queue)" in a.orq("ticket", "lista").stdout
     a2 = Amb(run="run_a")
     _caso_142(a2, "Espera: integrador vazio\n")
     a2.orq("ticket", "fechar", "87", "--answer", "feito")
@@ -14854,7 +14854,7 @@ def test_ticket140_ack_por_outro_handle_da_consumer_fenced():
 def test_ticket140_aviso_do_orca_sugere_orq_caixa():
     a = Amb()
     r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_zz`.")
-    assert r.returncode == 0 and "orq caixa run_zz --ack" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "orq inbox run_zz --ack" in r.stdout, (r.stdout, r.stderr)
 
 
 # ---- ticket 144: orq resumo add ----
@@ -14961,7 +14961,7 @@ def test_ticket141_worker_done_de_ticket_do_produto_ou_sem_branch_ou_falho_nao_e
     b = Amb(run="run_a")
     _entrega141(b, body="pronto, sem nada citado")
     b.orq("ingest")
-    assert not _existe_estado(os.path.join(b.home, "integrar-fila.json")) and "sem branch" in b.log()
+    assert not _existe_estado(os.path.join(b.home, "integrar-fila.json")) and "has no branch" in b.log()
     c = Amb(run="run_a")
     _entrega141(c, outcome="failed")
     c.orq("ingest")
@@ -15025,7 +15025,7 @@ def test_ticket147_liberar_encerra_so_os_processos_com_cwd_dentro_da_worktree():
     assert {p["pid"] for p in json.load(open(arq))} == {303, 304}, "dentro cai (o teimoso no KILL); fora e o coordenador ficam"
     (ev,) = [e for e in a.events() if e["tipo"] == "processos"]
     assert (ev["encerrados"], ev["kill"]) == (3, 1), ev
-    assert "3 processo(s)" in json.loads(r.stdout)["aviso"]
+    assert "3 worktree process(es)" in json.loads(r.stdout)["aviso"]
 
 
 def test_ticket147_liberar_com_terminal_mantido_nao_encerra_processo_nenhum():
@@ -15118,10 +15118,10 @@ def test_ticket146_revisar_recusa_em_pausa_e_em_segura_sem_rodar_o_no_mistakes()
     a = _amb146()
     _uso51(a, semana=93, cinco_h=10)
     r = a.orq("revisar", "task_term_r1")
-    assert r.returncode == 1 and "uso do plano" in r.stderr and not _log(a, "nm.log"), r
+    assert r.returncode == 1 and "plan usage" in r.stderr and not _log(a, "nm.log"), r
     _uso51(a, semana=50, cinco_h=91)
     r = a.orq("revisar", "146")
-    assert r.returncode == 1 and "janela de 5 h" in r.stderr and not _log(a, "nm.log"), "a prioridade 1 também recusa: a revisão é gasto opcional"
+    assert r.returncode == 1 and "5 h window" in r.stderr and not _log(a, "nm.log"), "a prioridade 1 também recusa: a revisão é gasto opcional"
     assert not [e for e in a.events() if e["tipo"] == "revisao_nm"]
 
 
@@ -15140,7 +15140,7 @@ def test_ticket146_revisar_roda_so_o_review_na_worktree_da_task_com_o_nm_home_do
     assert run["nm_home"] == a.env["ORQ_NM_HOME"] != os.path.expanduser("~/.no-mistakes"), "o NM_HOME é o do orq"
     assert "claude-sonnet-5-5" in open(os.path.join(a.env["ORQ_NM_HOME"], "config.yaml")).read()
     assert (out["modelo"], out["effort"], out["achados"]) == ("claude-sonnet-5-5", "low", 1) and "awaiting_approval" in out["saida"], out
-    assert "modelo claude-sonnet-5-5" in a.orq("revisar", "146").stdout, "o orq revisar mostra o modelo usado"
+    assert "model claude-sonnet-5-5" in a.orq("revisar", "146").stdout, "o orq revisar mostra o modelo usado"
 
 
 def test_ticket146_revisar_grava_revisao_nm_com_duracao_achados_e_tokens():
@@ -15157,9 +15157,9 @@ def test_ticket146_revisar_falha_do_no_mistakes_grava_o_erro_e_sai_com_1():
     a = _amb146(FAKE_NM_RC="3")
     _uso51(a, semana=50, cinco_h=10)
     r = a.orq("revisar", "task_term_r1")
-    assert r.returncode == 1 and "saiu com 3" in r.stderr, r
+    assert r.returncode == 1 and "exited with 3" in r.stderr, r
     (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
-    assert "saiu com 3" in e["erro"], e
+    assert "exited with 3" in e["erro"], e
 
 
 def test_ticket146_revisar_conta_um_slot_caro_e_recusa_sem_vaga():
@@ -15169,7 +15169,7 @@ def test_ticket146_revisar_conta_um_slot_caro_e_recusa_sem_vaga():
     _grava_estado(os.path.join(a.home, "maquina.json"), {"max_caros": 1})
     json.dump([{"pid": os.getpid(), "task": "task_outra", "ts": "x"}], open(os.path.join(a.home, "revisao-nm.json"), "w"))  # outra revisão viva
     r = a.orq("revisar", "task_term_r1")
-    assert r.returncode == 1 and "slots caros" in r.stderr and not _log(a, "nm.log"), r
+    assert r.returncode == 1 and "expensive slots" in r.stderr and not _log(a, "nm.log"), r
     json.dump([{"pid": 2 ** 22 + 12345, "task": "task_morta", "ts": "x"}], open(os.path.join(a.home, "revisao-nm.json"), "w"))  # pid morto não ocupa
     assert a.orq("revisar", "task_term_r1").returncode == 0
 
@@ -15177,7 +15177,7 @@ def test_ticket146_revisar_conta_um_slot_caro_e_recusa_sem_vaga():
 def test_ticket146_revisar_task_sem_despacho_recusa():
     a = _amb146()
     r = a.orq("revisar", "task_nao_existe")
-    assert r.returncode == 1 and "sem despacho" in r.stderr and not _log(a, "nm.log"), r
+    assert r.returncode == 1 and "has no dispatch" in r.stderr and not _log(a, "nm.log"), r
 
 
 def test_ticket165_entrega_devolvida_sai_do_stop_ate_o_worker_done_novo():
@@ -15190,7 +15190,7 @@ def test_ticket165_entrega_devolvida_sai_do_stop_ate_o_worker_done_novo():
     devolvido = ev + [{"tipo": "devolver", "dispatch": "d1", "task": "t1", "ts": "2026-10-01T12:00:00Z"}]
     (r,) = orq_mod.reavalia([ag], devolvido, agora, integracao={})
     assert r["estado"] == "devolvida" and prox([r], devolvido) is None, "devolvida: sai do Stop"
-    assert not orq_mod.linha_vivos(devolvido, {"agentes": [ag]}, agora).count("Entregues sem liberar"), "e do 'entregues sem liberar'"
+    assert not orq_mod.linha_vivos(devolvido, {"agentes": [ag]}, agora).count("Delivered, not released"), "e do 'entregues sem liberar'"
     novo = devolvido + [{"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m2"}]
     (r2,) = orq_mod.reavalia([r], novo, agora, integracao={})
     assert r2["estado"] == "entregue" and prox([r2], novo), "worker_done novo volta a ser entrega a integrar"
@@ -15200,7 +15200,7 @@ def test_ticket165_steer_em_task_concluida_sugere_orq_devolver():
     a = Amb()
     _steer_env(a)
     r = a.orq("steer", "task_feita", "oi")
-    assert r.returncode == 1 and "orq devolver task_feita" in r.stderr, r.stderr
+    assert r.returncode == 1 and "orq send-back task_feita" in r.stderr, r.stderr
     assert not _enviados(a)
 
 
@@ -15306,7 +15306,7 @@ def test_ticket155_deploy_check_saida_0_fecha_com_a_primeira_linha_e_recebe_base
     (n,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "nova" and x["chave"] == "deploy"]
     assert n["base"] == "main", n
     assert "deploy" in _obrig(a, e)
-    assert "deploy de main conferido" in _volta155(a)
+    assert "main deploy checked" in _volta155(a)
     assert "deploy" not in _obrig(a, e)
     (f,) = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "feito" and x["chave"] == "deploy"]
     assert f["prova"].startswith("versao-main-") and "segunda" not in f["prova"], f
@@ -15329,7 +15329,7 @@ def test_ticket155_deploy_check_outra_saida_avisa_o_coordenador_uma_vez():
     _volta155(a)
     assert "deploy" in _obrig(a, e)
     assert len([x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "falhou"]) == 1, "uma vez só"
-    assert "deploy_check de main saiu 1" in json.dumps(_py155(a, "print(o._cursor_ro().get('avisos'))")) + json.dumps(_log(a, "calls.log")), "o coordenador foi avisado"
+    assert "deploy_check for main exited 1" in json.dumps(_py155(a, "print(o._cursor_ro().get('avisos'))")) + json.dumps(_log(a, "calls.log")), "o coordenador foi avisado"
 
 
 def test_ticket155_projeto_sem_deploy_check_nao_roda_nada_e_a_ultima_obrigacao_fecha_a_entrada():
@@ -15404,7 +15404,7 @@ def test_ticket172_desistencia_sem_comando_no_evento_cita_o_comando_real():
     a = Amb(run="run_a")
     evs = _desistiu172(a)
     msg = _desistidos172(a, evs)
-    assert "orq despachar --run run_a --ticket 88 --modelo m --effort medium" in msg and "None" not in msg, msg
+    assert "orq dispatch --run run_a --ticket 88 --model m --effort medium" in msg and "None" not in msg, msg
 
 
 def test_ticket172_desistencia_seguida_de_despacho_manual_ou_com_ticket_bloqueado_nao_barra_o_stop():
@@ -15444,7 +15444,7 @@ def test_ticket169_nome_que_nao_e_branch_nao_entra_e_avisa_que_faltou_a_branch()
     _entrega141(a, body="atualizei docs/design.md, commit abc1234def")
     a.orq("ingest")
     assert not _existe_estado(os.path.join(a.home, "integrar-fila.json"))
-    (ev,) = [e for e in a.events() if e["tipo"] == "entrega" and any("sem branch" in x for x in e["avisos"])]
+    (ev,) = [e for e in a.events() if e["tipo"] == "entrega" and any("has no branch" in x for x in e["avisos"])]
     assert "141" in ev["avisos"][0], ev
 # ---- ticket 154: o ciclo do integrador fecha o que integrou ----
 
@@ -15464,9 +15464,9 @@ def test_ticket154_concluir_tira_da_fila_fecha_o_ticket_libera_o_worker_e_grava_
     _integrado154(a)
     r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
     assert r.returncode == 0, r.stderr
-    assert "vazia" in a.orq("integrar", "fila", "lista").stdout
+    assert "empty" in a.orq("integrar", "fila", "lista").stdout
     txt = _lido(a, "07")
-    assert "Status: resolved" in txt.split("\n## ")[0] and txt.rstrip().endswith("integrado na main em abc1234"), txt
+    assert "Status: resolved" in txt.split("\n## ")[0] and txt.rstrip().endswith("integrated into main at abc1234"), txt
     (lib,) = [e for e in a.events() if e["tipo"] == "liberar"]
     assert lib["dispatch"] == "ctx_term_w1", lib
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
@@ -15488,8 +15488,8 @@ def test_ticket154_concluir_ticket_ja_fechado_ou_worker_rodando_avisa_e_segue():
     _integrado154(a)
     assert a.orq("ticket", "fechar", "07", "--answer", "feito antes").returncode == 0
     r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
-    assert r.returncode == 0 and "aviso" in r.stderr, r.stderr
-    assert "vazia" in a.orq("integrar", "fila", "lista").stdout, "a fila esvazia mesmo com o ticket já fechado"
+    assert r.returncode == 0 and "warning" in r.stderr, r.stderr
+    assert "empty" in a.orq("integrar", "fila", "lista").stdout, "a fila esvazia mesmo com o ticket já fechado"
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
 
 
@@ -15507,10 +15507,10 @@ def test_ticket154_ciclo_feito_de_dispatch_conhecido_marca_o_servico_e_grava_o_c
 def test_ticket154_ciclo_feito_de_dispatch_desconhecido_ou_liberado_continua_recusado():
     a = Amb(run="run_a")
     r = a.orq("ciclo", "feito", "--dispatch", "ctx_nao_existe", "--hash", "abc")
-    assert r.returncode == 1 and "serviço" in r.stderr, r.stderr
+    assert r.returncode == 1 and "service" in r.stderr, r.stderr
     _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_l1", "dispatch": "ctx_term_l1"}, {"tipo": "liberar", "dispatch": "ctx_term_l1", "fechado": True})
     r = a.orq("ciclo", "feito", "--dispatch", "ctx_term_l1", "--hash", "abc")
-    assert r.returncode == 1 and "serviço" in r.stderr, r.stderr
+    assert r.returncode == 1 and "service" in r.stderr, r.stderr
     assert not [e for e in a.events() if e["tipo"] in ("servico_marcado", "ciclo")]
 
 
@@ -15527,8 +15527,8 @@ def test_ticket154_integrar_py_depois_do_fast_forward_fecha_o_que_integrou():
     r, g = _integra154(a, "true")
     assert r.returncode == 0, r.stdout + r.stderr
     hash_ = g("rev-parse", "--short", "HEAD").stdout.strip()
-    assert "vazia" in a.orq("integrar", "fila", "lista").stdout
-    assert f"integrado na main em {hash_}" in _lido(a, "07") and "Status: resolved" in _lido(a, "07")
+    assert "empty" in a.orq("integrar", "fila", "lista").stdout
+    assert f"integrated into main at {hash_}" in _lido(a, "07") and "Status: resolved" in _lido(a, "07")
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
     assert (ev["hash"], ev["branches"], ev["tickets"]) == (hash_, ["feat/b1"], ["07"]), ev
@@ -15586,13 +15586,13 @@ def test_ticket170_erro_do_worker_start_avisa_o_coordenador_uma_vez_e_o_stop_do_
     for _ in range(orq_mod.FALHAS_FILA + 2):
         a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL="claude-sonnet-5-5")
     assert not _fila79(a) and [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu"
-    (aviso,) = [e[e.index("--text") + 1] for e in _avisos_enviados(a) if "desistiu" in e[e.index("--text") + 1]]
-    if "… completo em " in aviso:  # o aviso passa do AVISO_MAX: o digitado leva o começo e o caminho do texto inteiro
-        aviso = open(aviso.split("… completo em ")[1]).read()
-    assert "desistiu" in aviso and "orq despachar --run run_a --ticket 88 --modelo claude-sonnet-5-5 --effort medium" in aviso and "model not available" in aviso, aviso
+    (aviso,) = [e[e.index("--text") + 1] for e in _avisos_enviados(a) if "gave up" in e[e.index("--text") + 1]]
+    if "… full text at " in aviso:  # o aviso passa do AVISO_MAX: o digitado leva o começo e o caminho do texto inteiro
+        aviso = open(aviso.split("… full text at ")[1]).read()
+    assert "gave up" in aviso and "orq dispatch --run run_a --ticket 88 --model claude-sonnet-5-5 --effort medium" in aviso and "model not available" in aviso, aviso
     a.orq("away", "on")
     out = _stop126(a)
-    assert out["decision"] == "block" and "desistiu" in out["reason"] and "orq despachar --run run_a --ticket 88 --modelo claude-sonnet-5-5 --effort medium" in out["reason"] and "None" not in out["reason"], out
+    assert out["decision"] == "block" and "gave up" in out["reason"] and "orq dispatch --run run_a --ticket 88 --model claude-sonnet-5-5 --effort medium" in out["reason"] and "None" not in out["reason"], out
     assert a.orq("despachar", "--run", "run_a", "--ticket", "88", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--worktree", "current").returncode == 0
     assert orq_mod.away_desistidos(orq_mod.tickets(), a.events()) is None
 
@@ -15610,7 +15610,7 @@ def test_ticket157_uma_entrada_aberta_e_despachar_sem_entrada_grava_intake_taref
     assert r.returncode == 0, r.stderr
     (i,) = _intakes(a)
     assert (i["entrada"], i["efeito"], i["ref"], i["run"]) == ("e1", "tarefa", "task_novo1", "run_a"), i
-    assert "intake e1 → tarefa task_novo1 (implícito)" in r.stderr, r.stderr
+    assert "intake e1 → tarefa task_novo1 (implicit)" in r.stderr, r.stderr
     json.loads(r.stdout)  # o stdout segue só com o JSON
 
 
@@ -15620,7 +15620,7 @@ def test_ticket157_pend_add_decisao_grava_decisao_e_os_outros_tipos_gravam_pend(
     r = a.orq("pend", "add", "--id", "freio-x", "--tipo", "decisao", "--titulo", "Freio X")
     assert r.returncode == 0, r.stderr
     (i,) = _intakes(a)
-    assert (i["entrada"], i["efeito"], i["ref"]) == ("e1", "decisao", "freio-x") and "intake e1 → decisao freio-x (implícito)" in r.stderr, (i, r.stderr)
+    assert (i["entrada"], i["efeito"], i["ref"]) == ("e1", "decisao", "freio-x") and "intake e1 → decisao freio-x (implicit)" in r.stderr, (i, r.stderr)
     a.prompt("avisa o time")
     a.orq("pend", "add", "--id", "avisar-y", "--tipo", "avisar", "--titulo", "Avisar Y")
     assert [(i["entrada"], i["efeito"]) for i in _intakes(a)] == [("e1", "decisao"), ("e2", "pend")]
@@ -15708,7 +15708,7 @@ def test_ticket102_m5_ciclo_novo_despachar_fechar_deixa_backlog_e_task_coerentes
     assert lista.splitlines() == ["01 orq: Base (ready-for-agent)", "02 Depende (ready-for-agent; Blocked by: 01)"], lista
     base = ["despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium"]
     r = a.orq(*base, "--ticket", "02")
-    assert r.returncode == 1 and "bloqueado por 01" in r.stderr, r.stderr
+    assert r.returncode == 1 and "blocked by 01" in r.stderr, r.stderr
     assert not _log(a, "started.log"), "o gate recusa antes do worker-start"
     r = a.orq(*base, "--ticket", "01")
     assert r.returncode == 0, r.stderr
@@ -15766,7 +15766,7 @@ def test_ticket102_m5_titulo_que_a_gramatica_leria_como_tag_e_recusado_antes_de_
     a = _amb_tk()
     for titulo in ("termina assim (repo: x)", "-começa como opção"):
         r = _novo(a, titulo)
-        assert r.returncode == 1 and ("tag do backlog" in r.stderr or "começar com '-'" in r.stderr), r.stderr
+        assert r.returncode == 1 and ("backlog tag" in r.stderr or "start with '-'" in r.stderr), r.stderr
     assert not _log(a, "created.log") and not os.path.exists(a.env["ORQ_ISSUES"])
 
 
@@ -15826,17 +15826,17 @@ def test_ticket102_m5_sessao_lista_os_tickets_abertos_do_backlog():
     _novo(a, "Aberto dois", "--blocked-by", "01")
     r = a.orq("hook", "session", stdin=json.dumps({"session_id": "s1", "source": "startup", "hook_event_name": "SessionStart"}))
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Tickets abertos (2):" in ctx and "01 Aberto um (ready-for-agent)" in ctx and "02 Aberto dois (ready-for-agent; Blocked by: 01)" in ctx, ctx
+    assert "Open tickets (2):" in ctx and "01 Aberto um (ready-for-agent)" in ctx and "02 Aberto dois (ready-for-agent; Blocked by: 01)" in ctx, ctx
     assert ctx.count("\n") + 1 <= orq_mod.LINHAS_SESSAO
 
 
 def test_ticket102_backlog_tickets_e_o_arquivo_da_maquina_e_a_variavel_vazia_desliga():
     a = _amb_bl()
-    assert json.loads(a.orq("backlog", "--json").stdout)["tickets lidos do backlog"] is False
+    assert json.loads(a.orq("backlog", "--json").stdout)["tickets read from the backlog"] is False
     os.makedirs(a.home, exist_ok=True)
     open(os.path.join(a.home, "backlog.tickets"), "w").write("")
-    assert json.loads(a.orq("backlog", "--json").stdout)["tickets lidos do backlog"] is True, "o arquivo liga para todo processo"
-    assert json.loads(a.orq("backlog", "--json", ORQ_BACKLOG_TICKETS="").stdout)["tickets lidos do backlog"] is False, "a variável vazia desliga"
+    assert json.loads(a.orq("backlog", "--json").stdout)["tickets read from the backlog"] is True, "o arquivo liga para todo processo"
+    assert json.loads(a.orq("backlog", "--json", ORQ_BACKLOG_TICKETS="").stdout)["tickets read from the backlog"] is False, "a variável vazia desliga"
 
 
 # ---- M6: orq doctor backlog ----
@@ -15846,7 +15846,7 @@ def test_ticket102_m6_doctor_backlog_sem_diferenca_diz_o_que_conferiu_e_com_dife
     for t in ("Um", "Dois", "Tres", "Quatro"):
         _novo(a, t)
     r = a.orq("doctor", "backlog")
-    assert r.returncode == 0 and "coerentes (4 tickets, 4 tasks conferidas)" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "consistent (4 tickets, 4 tasks checked)" in r.stdout, (r.stdout, r.stderr)
     bl = a.env["ORQ_BACKLOG"]
     backlog_mod.cli(bl, "done", "t01", "--no-prune")  # Done com a task aberta
     backlog_mod.cli(bl, "start", "t02")  # In flight sem worker despachado
@@ -15860,11 +15860,11 @@ def test_ticket102_m6_doctor_backlog_sem_diferenca_diz_o_que_conferiu_e_com_dife
     linhas = r.stdout.splitlines()
     assert len(linhas) == 5, r.stdout
     por = {l.split(":")[0]: l for l in linhas}
-    assert "Done, mas a task task_tk1 está ready" in por["01"] and "task-update --id task_tk1 --status completed --run run_a" in por["01"]
-    assert "In flight, mas a task task_tk2 está ready, sem worker despachado" in por["02"] and "orq despachar --run run_a --ticket 02" in por["02"]
-    assert "Queued, mas a task task_tk3 já está completed" in por["03"] and "orq ticket fechar 03" in por["03"]
-    assert "Queued, mas a task task_tk4 está dispatched" in por["04"] and f"TASKS_AXI_FILE={bl} tasks-axi start t04" in por["04"]
-    assert "09-solto.md não tem item" in por["09"] and "converte-backlog.py --completa" in por["09"]
+    assert "Done, but task task_tk1 is ready" in por["01"] and "task-update --id task_tk1 --status completed --run run_a" in por["01"]
+    assert "In flight, but task task_tk2 is ready, with no dispatched worker" in por["02"] and "orq dispatch --run run_a --ticket 02" in por["02"]
+    assert "Queued, but task task_tk3 is already completed" in por["03"] and "orq ticket close 03" in por["03"]
+    assert "Queued, but task task_tk4 is dispatched" in por["04"] and f"TASKS_AXI_FILE={bl} tasks-axi start t04" in por["04"]
+    assert "09-solto.md has no item" in por["09"] and "converte-backlog.py --completa" in por["09"]
     assert len(json.loads(a.orq("doctor", "backlog", "--json").stdout)["problemas"]) == 5
 
 
@@ -15874,7 +15874,7 @@ def test_ticket102_m6_doctor_backlog_aponta_a_task_que_o_orca_nao_lista_e_nao_es
     antes = open(a.env["ORQ_BACKLOG"]).read()
     a.set("tasks_run_a.json", [])
     r = a.orq("doctor", "backlog")
-    assert r.returncode == 1 and "a task task_tk1 não está no Run run_a" in r.stdout, r.stdout
+    assert r.returncode == 1 and "task task_tk1 is not in Run run_a" in r.stdout, r.stdout
     assert open(a.env["ORQ_BACKLOG"]).read() == antes and not _log(a, "updated.log"), "o doctor só imprime o conserto"
 
 
@@ -15918,10 +15918,10 @@ def test_ticket102_m7_mover_recusa_dependencia_pendurada_ticket_fora_da_fila_e_g
     assert open(a.env["ORQ_BACKLOG"]).read() == antes and backlog_mod.ler(destino) == [], "nada se moveu"
     a.orq("ticket", "fechar", "01", "--answer", "ok")
     r = a.orq("backlog", "mover", "01", "--grupo", "orq")
-    assert r.returncode == 1 and "só sai o que ainda está na fila" in r.stderr, r.stderr
+    assert r.returncode == 1 and "only what is still queued moves" in r.stderr, r.stderr
     assert a.orq("despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "02").returncode == 0
     r = a.orq("backlog", "mover", "02", "--grupo", "orq")
-    assert r.returncode == 1 and "só sai o que ainda está na fila" in r.stderr
+    assert r.returncode == 1 and "only what is still queued moves" in r.stderr
     assert a.orq("backlog", "mover", "02", "--grupo", "nao-existe").returncode == 1 and a.orq("backlog", "mover", "--grupo", "orq").returncode == 2
 
 
@@ -16016,20 +16016,20 @@ def test_ticket135_dispatch_legado_sem_servico_aparece_no_stop_ate_marcar():
     assert r.returncode == 0, r.stderr
     assert _agentes(a)["ctx_term_int"]["estado"] == "servico"
     assert "ctx_term_int" not in _stop126(a).get("reason", ""), "marcado, o Stop não o cita mais"
-    assert "serviço, nenhum ciclo ainda" in a.orq("agentes").stdout and "orq liberar" not in a.orq("agentes").stdout
+    assert "service, no cycle yet" in a.orq("agentes").stdout and "orq liberar" not in a.orq("agentes").stdout
 
 
 def test_ticket135_servico_marcar_recusa_dispatch_inexistente_ou_liberado():
     a = Amb(run="run_a")
     r = a.orq("servico", "marcar", "ctx_nao_existe")
-    assert r.returncode == 1 and "conhecido" in r.stderr and not [e for e in a.events() if e["tipo"] == "servico_marcado"], r.stderr
+    assert r.returncode == 1 and "known dispatch" in r.stderr and not [e for e in a.events() if e["tipo"] == "servico_marcado"], r.stderr
     _agentes_env(a)
     os.makedirs(a.home, exist_ok=True)
     with open(os.path.join(a.home, "events.jsonl"), "a") as f:
         f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_l1", "dispatch": "ctx_term_l1"}) + "\n" +
                 json.dumps({"tipo": "liberar", "dispatch": "ctx_term_l1", "fechado": True}) + "\n")
     r = a.orq("servico", "marcar", "ctx_term_l1")
-    assert r.returncode == 1 and "liberado" in r.stderr, r.stderr
+    assert r.returncode == 1 and "released" in r.stderr, r.stderr
 
 
 
@@ -16046,7 +16046,7 @@ def _estado158(vivos, hibernados=None, pausados=None, w=None):
 def test_ticket158_monta_agentes_marca_sem_terminal_o_dispatch_aberto_fora_dos_vivos():
     ag = _estado158(["term_outro"])
     assert ag["estado"] == "sem_terminal"
-    assert "orq retomar --dry-run" in orq_mod.texto_agentes([ag]) and "orq steer" not in orq_mod.texto_agentes([ag])
+    assert "orq resume --dry-run" in orq_mod.texto_agentes([ag]) and "orq steer" not in orq_mod.texto_agentes([ag])
 
 
 def test_ticket158_hibernado_pausado_e_terminal_vivo_nao_viram_sem_terminal():
@@ -16064,15 +16064,15 @@ def test_ticket158_a_linha_do_prompt_aparece_com_o_cache_e_some_quando_o_worker_
     os.makedirs(a.home, exist_ok=True)
     a.set("../orq/aberto.json", _aberto_ag("sem_terminal"))
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "1 worker(s) perderam o terminal sem worker_done: orq retomar --dry-run" in ctx, ctx
+    assert "1 worker(s) lost the terminal without worker_done: orq resume --dry-run" in ctx, ctx
     a.set("../orq/aberto.json", _aberto_ag("rodando"))
     ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "perderam o terminal" not in ctx, ctx
+    assert "lost the terminal" not in ctx, ctx
 
 
 def test_ticket158_o_stop_com_away_conta_o_sem_terminal_como_trabalho_sem_usuario():
     ags = [{"dispatch": "ctx_w", "task": "task_w", "estado": "sem_terminal"}]
-    assert "perderam o terminal" in orq_mod.proximo_sem_usuario([], ags, {}, [], [], {}, None)
+    assert "lost the terminal" in orq_mod.proximo_sem_usuario([], ags, {}, [], [], {}, None)
 
 
 def _doctor_antigos178(terminais, ticket_status="resolved", w_status="completed", horas=48, sem_worker=False, extra=()):
@@ -16096,7 +16096,7 @@ def _doctor_antigos178(terminais, ticket_status="resolved", w_status="completed"
 def test_ticket178_despacho_antigo_sem_terminal_e_ticket_resolvido_aparece_e_sai_dos_vivos():
     r, chamados, _ = _doctor_antigos178({"term_outro"})
     assert [x["dispatch"] for x in r["antigos"]] == ["ctx_old"] and r["liberados"] == ["ctx_old"] and chamados == ["ctx_old"], r
-    assert "liberado: ctx_old" in orq_mod.texto_doctor_antigos(r, True)
+    assert "released: ctx_old" in orq_mod.texto_doctor_antigos(r, True)
 
 
 def test_ticket178_sem_registro_no_worker_list_grava_liberar_com_motivo_antigo():
@@ -16112,12 +16112,12 @@ def test_ticket178_released_com_terminal_ja_morto_sai_dos_vivos_e_release_unknow
 
 def test_ticket178_worker_dispatched_nunca_e_liberado():
     r, chamados, gravados = _doctor_antigos178({"term_outro"}, w_status="dispatched")
-    assert r["ficam"][0]["motivo"] == "worker ainda dispatched" and not chamados and not gravados, "dispatched nunca é liberado"
+    assert r["ficam"][0]["motivo"] == "worker still dispatched" and not chamados and not gravados, "dispatched nunca é liberado"
 
 
 def test_ticket178_terminal_vivo_ticket_aberto_e_despacho_recente_ficam():
-    assert _doctor_antigos178({"term_old"})[0]["ficam"][0]["motivo"] == "terminal vivo"
-    assert _doctor_antigos178({"term_outro"}, ticket_status="claimed")[0]["ficam"][0]["motivo"] == "ticket aberto"
+    assert _doctor_antigos178({"term_old"})[0]["ficam"][0]["motivo"] == "live terminal"
+    assert _doctor_antigos178({"term_outro"}, ticket_status="claimed")[0]["ficam"][0]["motivo"] == "ticket open"
     r, chamados, _ = _doctor_antigos178({"term_outro"}, horas=2)
     assert not r["antigos"] and not r["ficam"] and not chamados, "menos de 24 h não entra"
     r, chamados, _ = _doctor_antigos178(None)
@@ -16167,7 +16167,7 @@ def test_ticket174_ciclo_com_commits_sem_push_e_coordenador_parado_digita_o_avis
         assert orq_mod.acorda_parado(_em174(4)) == [] and enviados == []
         assert len(orq_mod.acorda_parado(_em174(5))) == 1 and len(enviados) == 1, enviados
         h, texto = enviados[0]
-        assert h == "term_c" and texto.startswith("orq: coordenador parado") and "2 commit(s) sem push" in texto, enviados
+        assert h == "term_c" and texto.startswith("orq: coordinator stopped") and "2 commit(s) unpushed" in texto, enviados
     finally:
         restaura()
 
@@ -16228,7 +16228,7 @@ def test_ticket180_ff_do_integrador_sem_evento_ciclo_e_coordenador_parado_digita
         assert orq_mod.acorda_parado(_em174(0)) == [] and enviados == [], "viu agora: ainda não passou o prazo"
         assert len(orq_mod.acorda_parado(_em174(6))) == 1 and len(enviados) == 1, enviados
         h, texto = enviados[0]
-        assert h == "term_c" and "2 commit(s) sem push" in texto, enviados
+        assert h == "term_c" and "2 commit(s) unpushed" in texto, enviados
     finally:
         restaura()
 
@@ -16288,20 +16288,20 @@ def test_ticket176_branch_com_commit_fora_da_main_fica_com_o_motivo():
     repo, raiz = _cenario176()
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
     fica = {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}
-    assert "commit fora de origin/main" in fica["2"] and os.path.isdir(os.path.join(raiz, "2")), fica
+    assert "commit outside origin/main" in fica["2"] and os.path.isdir(os.path.join(raiz, "2")), fica
 
 
 def test_ticket176_worktree_suja_fica_mesmo_com_a_branch_integrada():
     repo, raiz = _cenario176()
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
-    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["3"] == "mudança não commitada"
+    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["3"] == "uncommitted changes"
     assert os.path.exists(os.path.join(raiz, "3", "novo.txt"))
 
 
 def test_ticket176_worktree_do_integrador_fica():
     repo, raiz = _cenario176()
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **_k176(repo))
-    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["integracao"] == "worktree do integrador"
+    assert {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}["integracao"] == "integrator worktree"
     assert os.path.isdir(os.path.join(raiz, "integracao"))
 
 
@@ -16331,20 +16331,20 @@ def test_ticket176_hash_reescrito_com_ticket_aberto_ou_assunto_sem_par_fica():
     repo, raiz, k = _reescrita176()
     k["resolvidos"] = set()
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
-    assert "não está resolvido" in _fica176(r, "4") and os.path.isdir(os.path.join(raiz, "4")) and r["bundle"] is None
+    assert "is not resolved" in _fica176(r, "4") and os.path.isdir(os.path.join(raiz, "4")) and r["bundle"] is None
     repo, raiz, k = _reescrita176()
     k["resolvidos"] = {"04", "02"}  # a 2 (feat/fora) tem o assunto "b", que a origin/main não tem
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
-    assert "sem assunto igual" in _fica176(r, "2") and os.path.isdir(os.path.join(raiz, "2"))
+    assert "no matching subject" in _fica176(r, "2") and os.path.isdir(os.path.join(raiz, "2"))
 
 
 def test_ticket176_dispatch_vivo_e_worktree_recente_ficam_mesmo_integradas():
     repo, raiz, k = _reescrita176(vivos={"01", "04"})
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
-    assert _fica176(r, "1") == _fica176(r, "4") == "dispatch vivo do ticket" and os.path.isdir(os.path.join(raiz, "1"))
+    assert _fica176(r, "1") == _fica176(r, "4") == "live dispatch for the ticket" and os.path.isdir(os.path.join(raiz, "1"))
     repo, raiz, k = _reescrita176(agora=time.time())
     r = orq_mod.limpar_worktrees_orq(repo, raiz, **k)
-    assert _fica176(r, "1") == "criada há menos de 24 h" and os.path.isdir(os.path.join(raiz, "1"))
+    assert _fica176(r, "1") == "created less than 24 h ago" and os.path.isdir(os.path.join(raiz, "1"))
 
 
 # --- ticket 129: comandos, flags e valores em inglês, os nomes em pt como apelido ---
@@ -16559,10 +16559,10 @@ def test_ticket129_valor_de_choices_em_pt_vai_para_o_log_e_o_hook_pt_nao():
 
 def test_ticket129_ausente_sem_op_mostra_o_estado_e_away_sem_op_alterna():
     a = Amb(run="run_a")
-    assert "modo ausente desligado" in a.orq("ausente").stdout
-    assert "away mode ligado" in a.orq("away").stdout
-    assert "modo ausente ligado" in a.orq("ausente").stdout
-    assert "away mode desligado" in a.orq("away").stdout
+    assert "away mode off" in a.orq("ausente").stdout
+    assert "away mode on" in a.orq("away").stdout
+    assert "away mode on" in a.orq("ausente").stdout
+    assert "away mode off" in a.orq("away").stdout
 
 
 def test_ticket129_hooks_instalados_com_nome_pt_seguem_funcionando():

@@ -22,11 +22,11 @@ CLI = w("cli", '''#!/usr/bin/env python3
 import json,sys
 a=sys.argv[1:]
 if a[0]=="status": print("Aberto: backlog 1, rodando 1.")
-elif a[0]=="agentes": print(json.dumps([
+elif a[0]=="agents": print(json.dumps([
  {"task":"task_a","run":"run_1","titulo":"vivo","estado":"rodando","modelo":"m","terminal":"term_a","fase":"x"},
  {"task":"task_b","run":"run_2","titulo":"perguntando","estado":"perguntando","modelo":"m","terminal":"term_b"},
  {"task":"task_c","run":"run_3","titulo":"acabou","estado":"liberado","modelo":"m","terminal":"term_c"}]))
-elif a[:2]==["ticket","lista"]: print("12 orq: snapshot (ready-for-agent)")
+elif a[:2]==["ticket","list"]: print("12 orq: snapshot (ready-for-agent)")
 ''', True)
 GH = w("gh", '#!/bin/sh\necho \'[{"number":7,"title":"fix x","url":"https://github.com/o/r/pull/7"}]\'\n', True)
 ENG = w("engram", '#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_ENG"\n', True)
@@ -61,7 +61,7 @@ open(os.path.join(T, "run.json"), "w").write('{"id": "run_1"}')
 rodar([], {"session_id": "s1", "cwd": REPO, "trigger": "manual"})
 md = open(ultimo).read()
 for trecho in ["run_1", "task_a", "task_b", "python3 " + os.path.expanduser("~/.claude/scripts/orca-wait-runs.py") + " run_1 run_2",
-               "12 orq: snapshot", "freio", "time de dados", "https://github.com/o/r/pull/7", "e1", "-> tarefa task_z", "-> sem efeito", "/x/desenho.md"]:
+               "12 orq: snapshot", "freio", "time de dados", "https://github.com/o/r/pull/7", "e1", "-> tarefa task_z", "-> no effect", "/x/desenho.md"]:
     assert trecho in md, trecho
 assert "task_c" not in md  # agente liberado não entra
 assert "orq status" not in md and "Aberto: backlog" not in md  # B29: o status vem do hook session, não daqui
@@ -72,7 +72,7 @@ assert eng[eng.index("--topic") + 1] == "sessao/handoff" and eng[eng.index("--ty
 
 # fora de repo git: seção de PRs avisa em vez de falhar
 rodar([], {"session_id": "s1", "cwd": T})
-assert "fora de repo git" in open(ultimo).read()
+assert "outside a git repo" in open(ultimo).read()
 
 # retomada: só com source compact, no máximo 40 linhas, JSON de SessionStart
 assert rodar(["retomar"], {"session_id": "s1", "source": "startup"}) == ""
@@ -99,8 +99,8 @@ def test_review6_m12_retomada_mostra_a_entrada_mais_nova_e_o_mapa_dentro_do_teto
     rodar([], {"session_id": "s1", "cwd": REPO})
     out = json.loads(rodar(["retomar"], {"session_id": "s1", "source": "compact"}))["hookSpecificOutput"]["additionalContext"]
     assert "pedido 12" in out and "/x/desenho.md" in out and "pedido 3" in out and "pedido 2'" not in out, out
-    assert out.index("pedido 12") < out.index("/x/desenho.md") < out.index("## Agentes") < out.index("## Pendências"), "entradas e mapa vêm antes das seções que cortam (B40)"
-    assert "+7 (orq pend)" in out and "cortadas" not in out and len(out.splitlines()) <= 61, len(out.splitlines())
+    assert out.index("pedido 12") < out.index("/x/desenho.md") < out.index("## Agents") < out.index("## User pending items"), "entradas e mapa vêm antes das seções que cortam (B40)"
+    assert "+7 (orq pend)" in out and "lines cut" not in out and len(out.splitlines()) <= 61, len(out.splitlines())
 
 
 def test_review6_b32_entregues_sem_liberar_aparecem_com_o_comando():
@@ -108,16 +108,16 @@ def test_review6_b32_entregues_sem_liberar_aparecem_com_o_comando():
     open(CLI, "w").write(cli)
     rodar([], {"session_id": "s1", "cwd": REPO})
     md = open(ultimo).read()
-    assert "orq liberar ctx_e" in md and "task_r" not in md and "task_c" not in md, md
+    assert "orq release ctx_e" in md and "task_r" not in md and "task_c" not in md, md
 
 
 def test_review6_b33_ultimo_velho_e_avisado_e_o_teto_pula_o_que_nao_cabe():
     ago = time.time() - 3600
     os.utime(os.path.realpath(ultimo), (ago, ago))
     out = json.loads(rodar(["retomar"], {"session_id": "s1", "source": "compact"}))["hookSpecificOutput"]["additionalContext"]
-    assert out.startswith("Handoff VELHO") and "não gravou" in out, out.splitlines()[0]
+    assert out.startswith("STALE handoff") and "did not write" in out, out.splitlines()[0]
     rodar([], {"session_id": "s1", "cwd": REPO})
-    assert json.loads(rodar(["retomar"], {"session_id": "s1", "source": "compact"}))["hookSpecificOutput"]["additionalContext"].startswith("Handoff salvo")
+    assert json.loads(rodar(["retomar"], {"session_id": "s1", "source": "compact"}))["hookSpecificOutput"]["additionalContext"].startswith("Handoff saved")
     sys.path.insert(0, AQUI)
     os.environ.update({k: ENV[k] for k in ("ORQ_HOME", "ORQ_ORCA", "ORQ_LOG")})
     import precompact

@@ -181,7 +181,7 @@ def emite(itens, cabecalho="# Backlog"):
 def pend_a_item(p):
     """O item de backlog de uma pendência do pendencias.json: kind = tipo, repo `pend`, meta no topo do corpo e o detalhe depois. O hold segura a
     pendência fora do `ready` (kind `external` se espera alguém, `captain` se é do usuário) e leva o `ate` como until; o motivo não aceita parênteses."""
-    motivo = f"esperando {p['espera']}" if p.get("espera") else "decisão do usuário pendente" if p.get("tipo") == "decisao" else "pendência do usuário"
+    motivo = f"waiting on {p['espera']}" if p.get("espera") else "pending user decision" if p.get("tipo") == "decisao" else "pending user item"
     return {"id": p["id"], "titulo": " ".join(p["titulo"].split()), "estado": "queued", "kind": p["tipo"], "repo": "pend", "since": p.get("desde"),
             "hold": {"motivo": " ".join(re.sub(r"[()]", " ", motivo).split()), "kind": "external" if p.get("espera") else "captain", "until": p.get("ate")},
             "corpo": corpo_com_meta(p, p.get("detalhe"), META_PEND)}
@@ -223,9 +223,9 @@ def repo_do_titulo(titulo):
 def problema_titulo(titulo):
     """Por que a CLI não guardaria este título como está (a gramática leria o fim como tag, ou a CLI leria o começo como opção), ou None."""
     if _tags(titulo)[0] != titulo:
-        return f"o título termina numa tag do backlog (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): reescreva {titulo!r}"
+        return f"the title ends in a backlog tag (blocked-by:, (repo: …), (kind: …), (since …), (hold: …)): rewrite {titulo!r}"
     if titulo.startswith("-"):
-        return f"o título não pode começar com '-' (a CLI o leria como opção): reescreva {titulo!r}"
+        return f"the title cannot start with '-' (the CLI would read it as an option): rewrite {titulo!r}"
     return None
 
 
@@ -242,10 +242,10 @@ def confere_versao(exe):
         try:
             r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise BacklogErro(f"não consegui rodar {exe} ({e}): npm i -g tasks-axi@{VERSAO}")
+            raise BacklogErro(f"could not run {exe} ({e}): npm i -g tasks-axi@{VERSAO}")
         _VERSOES[exe] = r.stdout.strip()
     if _VERSOES[exe] != VERSAO:
-        raise BacklogErro(f"tasks-axi {_VERSOES[exe] or '?'} em {exe}: o orq escreve o backlog só na {VERSAO} (npm i -g tasks-axi@{VERSAO})")
+        raise BacklogErro(f"tasks-axi {_VERSOES[exe] or '?'} at {exe}: orq writes the backlog only with {VERSAO} (npm i -g tasks-axi@{VERSAO})")
 
 
 def cli(caminho, *args):
@@ -255,9 +255,9 @@ def cli(caminho, *args):
     com o que a CLI disse.
     """
     if any(a == "--file" or a.startswith("--file=") for a in args):
-        raise ValueError("o backlog é escolhido por ORQ_BACKLOG, nunca por --file")
+        raise ValueError("the backlog is chosen by ORQ_BACKLOG, never by --file")
     if os.path.islink(caminho):
-        raise BacklogErro(f"{caminho} é um symlink: a escrita do tasks-axi o trocaria por um arquivo comum")
+        raise BacklogErro(f"{caminho} is a symlink: the tasks-axi write would replace it with a regular file")
     exe = binario()
     confere_versao(exe)
     pasta = os.path.dirname(os.path.abspath(caminho))
@@ -265,7 +265,7 @@ def cli(caminho, *args):
     try:
         r = subprocess.run([exe, *args], env={**os.environ, "TASKS_AXI_FILE": os.path.abspath(caminho)}, cwd=pasta, capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        raise BacklogErro(f"tasks-axi {args[0]} passou de {CLI_TIMEOUT_S} s")
+        raise BacklogErro(f"tasks-axi {args[0]} exceeded {CLI_TIMEOUT_S} s")
     if r.returncode != 0:
         raise BacklogErro(f"tasks-axi {' '.join(args[:2])}: {(r.stdout + r.stderr).strip()[:300]}")
     return r.stdout
