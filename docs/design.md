@@ -683,6 +683,12 @@ Claude Code asks for a human in three ways that never reach the coordinator: a p
 
 `hooks/worker-routing-guard.py` (PreToolUse on Bash and Agent) refuses `orca orchestration worker-start` without `--model` and `--effort`, `orq dispatch` without `--model` and `--effort`, an Agent call without `model` (forks excepted), and `orca worktree rm` without `--run-hooks`. It only matches `orq dispatch` in command position, so text inside quotes such as a commit message does not trigger it. The refusal points to the `worker-routing` skill, which picks the model from how ambiguous the task is and the effort from how much reasoning this run needs.
 
+## Reminders (ticket 204)
+
+`orq remind "<text>" --in 1h30 | --at 15:00`, `remind list [--all]`, `remind cancel <id>` (pt `lembrar`). State is `reminders.json` (`seq`, `rems`: `id`, `what`, `due` in UTC, `made`, `status` open|fired|canceled, `fired`); the key names avoid the ones the pt/en translation maps (`items`, `text`, `at`). `--at` is local HH:MM, rolled to tomorrow when it is not in the future.
+
+`remind_round` runs in every manager round (`manager_absorb`). For each open reminder with `due <= now` it sets `fired` under `reminders.lock` first and notifies after, so a reminder fires at most once even if the notice fails. The notice is `fail_safe._notify(text, sound="Glass")` (so `ORQ_ALARME=off` and `ORQ_OSASCRIPT` apply), a `lembrete fired` event and a panel line; with away on and a coordinator bound it also goes through `notify_coordinator` (ticket 107). More than `REMIND_LATE_S` after its time, the text says `late by N min`: a sleeping machine or a dead manager fires it on the first round after. `intake <entry> reminder` closes the entry without a ref.
+
 ## Night mode
 
 `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]` stores `night` in `cursor.json` (end time as the next HH:MM, dispatch ceiling, failure limit, start time) and logs `night_on`. `orq night off` clears it and logs `night_off`; `orq night` prints the state. Off, nothing changes.

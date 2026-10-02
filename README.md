@@ -254,6 +254,10 @@ Away on also arms the night budget, so an unattended night is never unbounded: `
 
 For a bounded unattended stretch without away, night mode adds a budget: `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]`. `orq dispatch` refuses past the end time, at the dispatch ceiling or after N failures in a row; push, PR merge, deploy and `--no-verify` are denied by the external-action guard; `orq night off` frees it. `orq summary --night` prints the morning card.
 
+### Reminders (`orq remind`)
+
+`orq remind "<text>" --in 1h30` (also `90m`, `2h`) or `--at 15:00` (local time; tomorrow if it has passed) creates a reminder; `orq remind list [--all]` and `orq remind cancel <id>` manage them (pt: `orq lembrar`). They live in `reminders.json`, so they survive a restart of the manager or the machine. On the round when the time comes the manager fires each one once: a macOS notification with sound, a line in the panel and the TUI, and a short notice typed into the coordinator only with away mode on. A reminder that came due while the machine slept fires on the next round and says how late it is. When the user asks in plain language ("remind me to X in 1h30"), the coordinator runs `orq remind`, and the implicit intake records the effect.
+
 ### 7. Hooks (Claude Code and Codex)
 
 orq does its work in hooks, so the hooks are the one thing you must register. Both example files are complete; merge them, do not rewrite them.
@@ -529,8 +533,8 @@ Weaker on Codex: there is no AskUserQuestion, so decisions go through `orq ask`;
 
 An obligation of the coordinator or a worker that depends on someone remembering a command gets forgotten: intake of an entry, adding a branch to the integrator queue, closing the terminal after a release, the audit before a push, closing a ticket after integrating, the deploy check after a merge. So an obligation is fired by an event (a Claude or Codex hook, the ingest of an Orca message, a manager lap, a git hook), and a manual command is left for decisions, lookups and as an escape. The inventory of every command is in `docs/design.md`, "Obligations are hooks".
 
-- Automatic: entry recording and ingest, the status summary, heartbeat absorption, `pr poll`, linking a PR and joining the merge queue, steer redelivery, hibernating and waking workers, the digest, the dispatch queue, the merge obligations, branch cleanup, the model and effort guard, the intake a command implies, closing what the integrator merged (`orq integrate conclude`: queue entry out, ticket closed, worker released), and reading and acknowledging the Orca inbox (the prompt hook runs `orq inbox --ack` itself on the Orca notice and injects each non-heartbeat message whole; ticket 182).
-- Manual, by design: everything that is a decision (`dispatch`, `steer`, `reply`, `end`, `relaunch`, `switch`, `pause`, `ask`, `pend add`, `defer`, `away`, `night`), lookups (`agents`, `status`, `queue list`, `machine`) and setup (`start`, `project add`, `manager serve`).
+- Automatic: entry recording and ingest, the status summary, heartbeat absorption, `pr poll`, linking a PR and joining the merge queue, steer redelivery, hibernating and waking workers, the digest, the dispatch queue, the merge obligations, branch cleanup, the model and effort guard, the intake a command implies, firing a due reminder (`orq remind`), closing what the integrator merged (`orq integrate conclude`: queue entry out, ticket closed, worker released), and reading and acknowledging the Orca inbox (the prompt hook runs `orq inbox --ack` itself on the Orca notice and injects each non-heartbeat message whole; ticket 182).
+- Manual, by design: everything that is a decision (`dispatch`, `steer`, `reply`, `end`, `relaunch`, `switch`, `pause`, `ask`, `pend add`, `defer`, `away`, `night`, `remind`), lookups (`agents`, `status`, `queue list`, `machine`) and setup (`start`, `project add`, `manager serve`).
 
 ## Development
 

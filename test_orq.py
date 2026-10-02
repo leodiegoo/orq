@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
+import contextlib
 import hashlib
 import json
 import os
@@ -16481,6 +16482,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("pend add --id x --tipo acao --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend add --id x --type action --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
     ("pend add --id x --tipo decisao --titulo T", "pend add --id x --type decision --title T"),
     ("pend add --id x --tipo avisar --titulo T", "pend add --id x --type notify --title T"),
+    ("lembrar x --in 1h", "remind x --in 1h"),
     ("pend lista --todas", "pend list --all"),
     ("pend done x --resposta r", "pend done x --answer r"),
     ("pend edit x --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend edit x --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
@@ -17613,6 +17615,95 @@ def test_ticket181_group_with_mate_auto_should_have_its_mate_opened_by_the_manag
         assert orq_mod.mate_proposals(orq_mod.tickets(), group_map, {"orq": {"terminal": "t"}}, [], orq_mod.machine_cfg()) == [], "a group with a mate is not proposed"
     assert opened == ["orq"]
 
+@contextlib.contextmanager
+def _reminders204(home, start="2026-10-02T12:00:00Z"):
+    """Clock simulated by ORQ_AGORA, HOME in a temp dir and a recorder in place of the macOS notification and the coordinator's terminal."""
+    before = (orq_mod.HOME, orq_mod.type_text, orq_mod.fail_safe._notify, os.environ.get("ORQ_AGORA"))
+    notified, typed = [], []
+    orq_mod.HOME, orq_mod.type_text = home, lambda h, t: typed.append(t) or "enviado"
+    orq_mod.fail_safe._notify = lambda text, sound=None: notified.append((text, sound))
+    os.environ["ORQ_AGORA"] = start
+    _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
+    try:
+        yield notified, typed
+    finally:
+        orq_mod.HOME, orq_mod.type_text, orq_mod.fail_safe._notify = before[:3]
+        os.environ.pop("ORQ_AGORA", None) if before[3] is None else os.environ.__setitem__("ORQ_AGORA", before[3])
+
+
+def _at204(stamp):
+    os.environ["ORQ_AGORA"] = stamp
+    return orq_mod._dt(stamp)
+
+
+def test_ticket204_in_1h30_is_due_at_the_right_minute():
+    with tempfile.TemporaryDirectory() as home, _reminders204(home) as (notified, typed):
+        item = orq_mod.remind_add("ligar a máquina de lavar", in_="1h30")
+        assert item["due"] == "2026-10-02T13:30:00Z", item
+        for spelling, due in (("90m", "13:30"), ("2h", "14:00"), ("45", "12:45")):
+            assert orq_mod.remind_add("x", in_=spelling)["due"] == f"2026-10-02T{due}:00Z", spelling
+            orq_mod.remind_cancel(f"l{orq_mod._dict(orq_mod._read_json(orq_mod._path(orq_mod.REMINDERS)))['seq']}")
+        assert orq_mod.remind_round(_at204("2026-10-02T13:29:59Z")) == [] and notified == [], "antes da hora não dispara"
+        lines = orq_mod.remind_round(_at204("2026-10-02T13:30:00Z"))
+        assert any("ligar a máquina de lavar" in l for l in lines) and ("Reminder: ligar a máquina de lavar", "Glass") in notified, (lines, notified)
+
+
+def test_ticket204_at_in_the_past_becomes_tomorrow():
+    with tempfile.TemporaryDirectory() as home, _reminders204(home):
+        local = orq_mod._dt(orq_mod.now()).astimezone()
+        later = (local + timedelta(hours=1)).strftime("%H:%M")
+        earlier = (local - timedelta(hours=1)).strftime("%H:%M")
+        assert 0 < (orq_mod._dt(orq_mod.remind_add("a", at=later)["due"]) - orq_mod._dt(orq_mod.now())).total_seconds() <= 3600 + 60
+        got = (orq_mod._dt(orq_mod.remind_add("b", at=earlier)["due"]) - orq_mod._dt(orq_mod.now())).total_seconds()
+        assert 23 * 3600 - 60 <= got <= 23 * 3600 + 60, got
+
+
+def test_ticket204_late_reminder_fires_on_return_with_the_delay_and_only_once():
+    with tempfile.TemporaryDirectory() as home, _reminders204(home) as (notified, typed):
+        orq_mod.remind_add("tirar a roupa", in_="30m")
+        lines = orq_mod.remind_round(_at204("2026-10-02T14:00:00Z"))  # the machine slept 1h30 past the time
+        assert len(lines) == 1 and "late by 90 min" in notified[0][0], notified
+        assert orq_mod.remind_round(_at204("2026-10-02T14:00:10Z")) == [] and len(notified) == 1, "dispara uma vez só"
+        assert orq_mod.remind_list() == [] and "fired" in orq_mod.remind_list(True)[0]
+
+
+def test_ticket204_canceled_does_not_fire_and_unknown_id_is_refused():
+    with tempfile.TemporaryDirectory() as home, _reminders204(home) as (notified, typed):
+        i = orq_mod.remind_add("nada", in_="10m")
+        orq_mod.remind_cancel(i["id"])
+        assert orq_mod.remind_round(_at204("2026-10-02T13:00:00Z")) == [] and notified == []
+        for bad in (i["id"], "l99"):
+            try:
+                orq_mod.remind_cancel(bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"cancelar {bad} devia falhar")
+        for kw in ({"in_": "abc"}, {"in_": "0m"}, {"at": "25:00"}, {"in_": "1h", "at": "10:00"}, {}):
+            try:
+                orq_mod.remind_add("x", **kw)
+            except ValueError:
+                continue
+            raise AssertionError(f"{kw} devia falhar")
+
+
+def test_ticket204_types_into_the_coordinator_only_with_away_on():
+    with tempfile.TemporaryDirectory() as home, _reminders204(home) as (notified, typed):
+        orq_mod.remind_add("a", in_="1m")
+        orq_mod.remind_round(_at204("2026-10-02T12:01:00Z"))
+        assert len(notified) == 1 and typed == [], "away desligado: só a notificação"
+        _away_on(home)
+        orq_mod.remind_add("b", in_="1m")
+        orq_mod.remind_round(_at204("2026-10-02T12:02:00Z"))
+        assert len(notified) == 2 and len(typed) == 1 and "Reminder: b" in typed[0], typed
+
+
+def test_ticket204_cli_adds_lists_and_cancels_with_the_pt_alias():
+    a = Env()
+    r = a.orq("lembrar", "ligar a lavadora", "--in", "1h30")
+    assert r.returncode == 0 and json.loads(r.stdout)["id"] == "l1", r.stderr
+    assert "ligar a lavadora" in a.orq("remind", "list").stdout
+    assert a.orq("remind", "cancel", "l1").returncode == 0 and "no open reminders" in a.orq("remind", "list").stdout
+    assert a.orq("remind", "x").returncode != 0, "sem --in nem --at"
 
 
 if __name__ == "__main__":
