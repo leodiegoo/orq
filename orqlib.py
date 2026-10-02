@@ -4284,7 +4284,7 @@ def away_report(since):
          + [f"alert: {_quote(e.get('texto') or e.get('alerta') or e.get('tipo'), 100)}" for e in evs if e.get("tipo") == "alerta"]
          + [f"gate refused: {e.get('gate')}" for e in evs if e.get("tipo") == "gate_falha"]
          + [f"PR closed without merge: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") == "fechou"]),
-        ("Summaries", [f"{_hora_local(e['ts'])} {_quote(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo" and e.get("texto")]),
+        ("Summaries", [f"{_hora_local(e['ts'])} {_quote(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo_add" and e.get("texto")]),
         ("Worker deliveries", [_quote(e.get("subject"), 100) for e in evs if e.get("tipo") == "worker_done" and ok(e)]),
         ("PRs", [f"{'opened' if e['op'] == 'ligar' else 'merged into ' + str(e.get('base'))}: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") in ("ligar", "entrou")]),
         ("Tickets", [f"{'opened' if e['op'] == 'novo' else 'closed'} {e.get('ticket')}" + (f": {_quote(e.get('titulo'), 80)}" if e.get("titulo") else "")

@@ -8263,9 +8263,11 @@ def test_away_off_delivers_the_absence_report_only_with_the_away_window():
     a.orq("away", "on")
     a.set("../pendencias.json", {"itens": [{"id": "freio", "tipo": "decisao", "titulo": "Escolher o freio", "link": "http://127.0.0.1:4387/session/x"}]})
     new, old_value = "2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z"
-    evs = [{"ts": old_value, "tipo": "resumo", "texto": "de antes do away"},
-           {"ts": new, "tipo": "pend", "op": "add", "pend": "freio"},
-           {"ts": new, "tipo": "resumo", "texto": "Fechei o passo 1"},
+    os.makedirs(os.path.join(a.tmp.name, "repo"))
+    _project(a, "app", {"repo": f"path:{os.path.join(a.tmp.name, 'repo')}"})
+    for when, text_value in ((old_value, "de antes do away"), (new, "Fechei o passo 1")):  # the summary as `orq summary add` writes it, never by hand (ticket 216)
+        assert a.orq("resumo", "add", text_value, "--projeto", "app", ORQ_AGORA=when).returncode == 0
+    evs = [{"ts": new, "tipo": "pend", "op": "add", "pend": "freio"},
            {"ts": new, "tipo": "worker_done", "outcome": "succeeded", "subject": "ticket 7 pronto"},
            {"ts": new, "tipo": "worker_done", "outcome": "failed", "subject": "ticket 8 quebrou"},
            {"ts": new, "tipo": "pr", "op": "entrou", "url": PR1, "base": "main", "numero": 1},
