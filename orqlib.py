@@ -529,15 +529,18 @@ def integrate_proof(branches, no_proof=None):
     return proof_guard(checks, no_proof)
 
 
-def audit_publication(revs, repo=None):
+def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "readme")):
     """Reasons why `revs` (args of `git rev-list`, e.g. `base..head`) cannot go to the public main: author or committer outside the configured noreply
     (`ORQ_AUTOR` or `git config user.email`), Co-Authored-By trailer or generator footer, forbidden term in the diff or message, `orqlib.py`/`orq.py` without `README.md` in the range.
-    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check."""
-    git = lambda *x: subprocess.run(["git", *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
+    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check. `checks` narrows it: `orq pr open` on a product repo
+    passes ("author", "trailer"), since the forbidden terms list holds the product's own name and the README rule is orq's (ticket 227)."""
+    git = lambda *x: subprocess.run([GIT, *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
     expected = os.environ.get("ORQ_AUTOR") or git("config", "user.email").strip()
     terms = []
     listing = os.environ.get("ORQ_TERMOS") or os.path.join(PLAN, "termos-proibidos.txt")
-    if os.path.exists(listing):
+    if "terms" not in checks:
+        pass
+    elif os.path.exists(listing):
         spec = importlib.util.spec_from_file_location("audiencia_check", os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "audiencia-check.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -548,17 +551,17 @@ def audit_publication(revs, repo=None):
     for sha in git("rev-list", "--reverse", *revs).split():
         an, ae, cn, ce, msg = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha).split("\0", 4)
         findings = [f"author {an} <{ae}> and committer {cn} <{ce}> must be <{expected}> (git commit --amend --reset-author, or git rebase --exec 'git commit --amend --no-edit --reset-author')"
-                   for _ in [0] if {ae, ce} != {expected}]
-        if re.search(r"^co-authored-by:|generated with|🤖", msg, re.I | re.M):
+                   for _ in [0] if "author" in checks and {ae, ce} != {expected}]
+        if "trailer" in checks and re.search(r"^co-authored-by:|generated with|🤖", msg, re.I | re.M):
             findings.append("Co-Authored-By trailer or generator footer in the message (git commit --amend to remove the line)")
         added_text = "\n".join(l[1:] for l in git("show", "--format=", "--unified=0", sha).splitlines() if l.startswith("+") and not l.startswith("+++"))
         findings += [f"forbidden term /{t.pattern}/ in the diff or the message" for t in terms if t.search(msg) or t.search(added_text)]
         changed_files = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).split())
-        if first_code is None and changed_files & {"orqlib.py", "orq.py"}:
+        if "readme" in checks and first_code is None and changed_files & {"orqlib.py", "orq.py"}:
             first_code = sha
         files_set |= changed_files
         reasons += [f"{sha[:7]} {msg.splitlines()[0] if msg.strip() else ''}: {m}" for m in findings]
-    if first_code and "README.md" not in files_set:
+    if "readme" in checks and first_code and "README.md" not in files_set:
         reasons.append(f"{first_code[:7]}: changes orqlib.py/orq.py and no commit in the range touches README.md (document the change)")
     return reasons
 
@@ -3541,6 +3544,21 @@ def _git_wt(wt, *args, timeout=60):
     return subprocess.run([GIT, "-C", wt, *args], capture_output=True, text=True, timeout=timeout)
 
 
+def branch_guard(wt, branch, prod, previous):
+    """Reasons why `branch` must not go out as a feature PR (ticket 227, git flow: born from `origin/<prod>`, receives only code from it): a commit that is only on the
+    local `<prod>` (unpublished work of another subject), or the tip of `origin/<previous>` (the environment before production) inside it without being in `origin/<prod>`.
+    A `merge/<feature>-<env>` branch is exempt from the second rule: it exists to carry the environment."""
+    g = lambda *x: _git_wt(wt, *x)  # noqa: E731
+    reasons = []
+    mine = set(g("rev-list", f"origin/{prod}..{branch}").stdout.split())
+    if only_local := sorted(mine & set(g("rev-list", f"origin/{prod}..{prod}").stdout.split())):
+        reasons.append(f"carries {len(only_local)} commit(s) only on the local {prod}, never pushed to origin/{prod} (e.g. {only_local[0][:7]}): push {prod} or rebase the branch onto origin/{prod}")
+    if previous and not _no_user_prefix(branch).startswith("merge/") and g("merge-base", "--is-ancestor", f"origin/{previous}", branch).returncode == 0 \
+            and g("merge-base", "--is-ancestor", f"origin/{previous}", f"origin/{prod}").returncode != 0:
+        reasons.append(f"carries origin/{previous}, which is not in origin/{prod}: a feature branch gets code from {prod} only, rebase it onto origin/{prod}")
+    return reasons
+
+
 def pr_open(target, title, body_text, environments=None, cwd=None, no_proof=None):
     """Publishes the delivery: strips the user prefix from the branch, checks `git merge-tree` against each environment (a conflict stops before the push), pushes, opens one
     PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Refuses when the branch tip is not the commit the task's last
@@ -3586,6 +3604,19 @@ def pr_open(target, title, body_text, environments=None, cwd=None, no_proof=None
         if still_missing:
             raise ValueError(f"{flow_info['producao']} only after {' and '.join(still_missing)} enter(s): no merged PR of {task} there")
     new = _no_user_prefix(branch)
+    prod, ambs = flow_info["producao"], flow_info["ambientes"]
+    previous = ambs[ambs.index(prod) - 1] if prod in ambs and ambs.index(prod) > 0 else None
+    for a in dict.fromkeys([envs[0], prod, *([previous] if previous else [])]):
+        subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+    reasons = branch_guard(wt, branch, prod, previous)
+    try:
+        reasons += audit_publication([f"origin/{envs[0]}..{branch}"], wt, checks=("author", "trailer"))
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"did not audit the commits of {branch}: {(e.stderr or '').strip()[-200:]}")
+    if reasons:
+        raise ValueError("; ".join(reasons) + ". Nothing was pushed")
+    subjects = _git_wt(wt, "log", "--reverse", "--format=%h %s", f"origin/{envs[0]}..{branch}").stdout.splitlines()
+    print(f"{len(subjects)} commit(s) go out from {branch} over origin/{envs[0]}:" + "".join(f"\n  {l}" for l in subjects), file=sys.stderr)
     for a in envs:
         subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
     ui_diff = _touches_ui(task, wt, f"origin/{envs[0]}", branch, event_list)

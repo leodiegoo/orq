@@ -15235,6 +15235,87 @@ def test_ticket143_pr_open_main_only_after_staging_enters():
     assert r.returncode == 1 and "staging" in r.stderr and not _log143(a, "gh.log"), r
 
 
+# ---------- ticket 227: orq pr abrir audits the commits and the branch ----------
+
+def _repo227(t):
+    """(clone, g, env): origin with main, development and staging (same tip), a clone on a feature branch; noreply author, forbidden terms naming the product."""
+    env = {**os.environ, "ORQ_TERMOS": os.path.join(t, "termos.txt"), "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull}
+    open(env["ORQ_TERMOS"], "w").write("acmeapp\n")
+    run = lambda *x, **e: subprocess.run(list(x), capture_output=True, text=True, check=True, env={**env, **e}).stdout.strip()  # noqa: E731
+    origin, clone = os.path.join(t, "origin.git"), os.path.join(t, "clone")
+    run("git", "init", "-q", "--bare", "-b", "main", origin)
+    run("git", "clone", "-q", origin, clone)
+    g = lambda *x, **e: run("git", "-C", clone, *x, **e)  # noqa: E731
+    g("config", "user.name", "Leo")
+    g("config", "user.email", "1+leo@users.noreply.github.com")
+    g("checkout", "-q", "-b", "main")
+    open(os.path.join(clone, "f"), "w").write("x")
+    g("add", "f")
+    g("commit", "-qm", "chore: base")
+    for b in ("main", "development", "staging"):
+        g("push", "-q", "origin", f"main:{b}")
+    g("fetch", "-q", "origin")
+    g("checkout", "-q", "-b", "feat/x", "origin/main")
+    return clone, g, env
+
+
+def _commit227(clone, g, msg="feat: x", **e):
+    open(os.path.join(clone, "f"), "a").write("y")
+    g("commit", "-qam", msg, **e)
+
+
+def _guard227(clone, g, env, branch="feat/x"):
+    old = dict(os.environ)
+    os.environ.update({k: env[k] for k in ("ORQ_TERMOS", "ORQ_AUTOR", "GIT_CONFIG_GLOBAL")})
+    try:
+        return (orqlib.branch_guard(clone, branch, "main", "staging")
+                + orqlib.audit_publication([f"origin/development..{branch}"], clone, checks=("author", "trailer")))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+
+
+def test_ticket227_pr_open_audit_refuses_wrong_author_and_trailer_but_not_the_product_name():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        _commit227(clone, g, "feat: acmeapp checkout")  # product name in the message: only orq's own repo forbids it
+        assert _guard227(clone, g, env) == []
+        _commit227(clone, g, "feat: y", GIT_AUTHOR_EMAIL="noreply@anthropic.com")
+        assert "noreply@anthropic.com" in " ".join(_guard227(clone, g, env))
+        g("commit", "--amend", "-qC", "HEAD", "--reset-author")
+        _commit227(clone, g, "feat: z\n\nCo-Authored-By: Claude <noreply@anthropic.com>")
+        assert "Co-Authored-By" in " ".join(_guard227(clone, g, env))
+
+
+def test_ticket227_pr_open_guard_refuses_local_only_main_commit_and_the_environment_inside_the_feature():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        g("checkout", "-q", "main")
+        _commit227(clone, g, "fix: local only")  # on main, never pushed
+        g("checkout", "-q", "-b", "feat/x2")  # born from the local main
+        assert "only on the local main" in " ".join(_guard227(clone, g, env, "feat/x2"))
+        g("checkout", "-q", "-b", "feat/dev", "origin/main")
+        g("checkout", "-q", "-b", "stg", "origin/staging")
+        _commit227(clone, g, "feat: staging only")
+        g("push", "-q", "origin", "stg:staging")
+        g("fetch", "-q", "origin")
+        g("checkout", "-q", "feat/dev")
+        g("merge", "-q", "--no-edit", "origin/staging")
+        assert "origin/staging" in " ".join(_guard227(clone, g, env, "feat/dev"))
+        g("branch", "-m", "merge/dev-staging")
+        assert orqlib.branch_guard(clone, "merge/dev-staging", "main", "staging") == []
+
+
+def test_ticket227_pr_open_clean_branch_passes_and_lists_the_commits():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        _commit227(clone, g, "feat: one")
+        _commit227(clone, g, "fix: two")
+        assert _guard227(clone, g, env) == []
+        a = _open_pr143()
+        r = _open_pr(a, "--ambientes", "development")
+        assert r.returncode == 0 and "commit(s) go out" in r.stderr, r
+
+
 # ---------- ticket 142: Despacho: manual e Espera: integrador vazio ----------
 
 def _case_142(a, extra):
