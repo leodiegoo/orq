@@ -18278,7 +18278,7 @@ def test_ticket215_card_gap_that_opens_on_a_coordinator_stop_is_not_the_machine_
 
 
 def test_ticket215_without_the_new_events_the_report_is_the_old_one():
-    out = _away215(Env(run="run_a"), {"ts": D215 + "01:00:00Z", "tipo": "resumo", "texto": "Fechei o passo 1"})
+    out = _away215(Env(run="run_a"), {"ts": D215 + "01:00:00Z", "tipo": "resumo_add", "texto": "Fechei o passo 1"})
     assert "Summaries (1):" in out and "Fechei o passo 1" in out, out
     for title in ("Coordinator stopped", "Dispatch stops", "Dirty worktrees", "Not pushed", "Manager", "Log gap", "To paste"):
         assert title not in out, (title, out)
@@ -19164,13 +19164,14 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
-    "alerta": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
-    "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped", "entrada": "hook_stop wake_stopped",
-    "gate_falha": "wake_stopped", "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
-    "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
-    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta_coordenador": "hook_stop",
-    "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped", "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped",
-    "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
+    "alerta": "wake_stopped", "alerta_visto": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
+    "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
+    "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
+    "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
+    "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
+    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta": "wake_stopped",
+    "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
+    "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
 }
 NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
 
