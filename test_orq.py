@@ -14473,6 +14473,48 @@ def test_ticket143_pr_abrir_main_so_depois_do_staging_entrar():
     assert r.returncode == 1 and "staging" in r.stderr and not _log143(a, "gh.log"), r
 
 
+# ---------- ticket 142: Despacho: manual e Espera: integrador vazio ----------
+
+def _caso_142(a, extra):
+    _tk105(a, "87", "Origem", "claimed", task="task_87")
+    _tk105(a, "88", "Passagem escrita", bloqueado="87", task="task_88", extra=MODELO105 + extra)
+    _tasks105(a, ("task_87", "dispatched"), ("task_88", "blocked"))
+
+
+def test_ticket142_despacho_manual_nunca_entra_na_fila_automatica_mesmo_com_modelo_e_effort():
+    a = Amb(run="run_a")
+    _caso_142(a, "Despacho: manual, só depois da fase 3\n")
+    r = a.orq("ticket", "fechar", "87", "--answer", "feito")
+    assert r.returncode == 0, r.stderr
+    assert _fila79(a) == [] and "manual" in r.stderr, r.stderr
+    assert "Despacho: manual, só depois da fase 3" in a.orq("ticket", "lista").stdout
+    assert "fora da fila de despacho: 88 (Despacho: manual" in a.orq("status").stdout
+
+
+def test_ticket142_espera_integrador_vazio_so_entra_na_fila_com_o_integrador_vazio():
+    a = Amb(run="run_a")
+    _caso_142(a, "Espera: integrador vazio\n")
+    a.orq("integrar", "fila", "add", "feat/x", "50")
+    r = a.orq("ticket", "fechar", "87", "--answer", "feito")
+    assert _fila79(a) == [] and "integrador" in r.stderr, r.stderr
+    assert "espera o integrador esvaziar (1 na fila)" in a.orq("ticket", "lista").stdout
+    a2 = Amb(run="run_a")
+    _caso_142(a2, "Espera: integrador vazio\n")
+    a2.orq("ticket", "fechar", "87", "--answer", "feito")
+    assert [i["ticket"] for i in _fila79(a2)] == ["88"], "fila do integrador vazia: entra"
+
+
+def test_ticket142_proximo_sem_usuario_respeita_os_dois_cabecalhos():
+    base = {"ags": [], "integracao": {}, "fila": [], "events": [], "sem_push": 0, "cfg": {**orq_mod.maquina_cfg(), "max_workers": 2}}
+    prox = lambda **k: orq_mod.proximo_sem_usuario(**{**base, **k})
+    assert prox(tks=[_tk126("07")])
+    assert prox(tks=[{**_tk126("07"), "despacho": "manual, motivo"}]) is None
+    esp = [{**_tk126("07"), "espera": "integrador vazio"}]
+    assert prox(tks=esp) and prox(tks=esp, integracao={"50": {"ticket": "50"}}) is None
+    ciclo = [{"tipo": "ciclo", "dispatch": "dI", "hash": "abc"}]
+    assert prox(tks=esp, events=ciclo, sem_push=0) and "push" in prox(tks=esp, events=ciclo, sem_push=2), "o ciclo com commits sem push já é outro passo"
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]
@@ -14530,4 +14572,5 @@ def test_ticket135_servico_marcar_recusa_dispatch_inexistente_ou_liberado():
                 json.dumps({"tipo": "liberar", "dispatch": "ctx_term_l1", "fechado": True}) + "\n")
     r = a.orq("servico", "marcar", "ctx_term_l1")
     assert r.returncode == 1 and "liberado" in r.stderr, r.stderr
+
 

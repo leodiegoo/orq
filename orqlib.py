@@ -3084,7 +3084,7 @@ def telas_avisar():
 def estado(entrada=None):
     events, cur = read_events(), _cursor_ro()
     txt = resumo(events, _read_json(_path("aberto.json")), _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel())
-    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets())])])
+    return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets()), linha_espera_despacho(tickets(), events)])])
 
 
 # ---------- digest e modo ausente ----------
@@ -4164,6 +4164,8 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
     na_fila = {i.get("ticket") for i in fila}
     for t in sorted(tks, key=lambda t: (prioridade_de(events, t["task"], None, t["titulo"]), t["num"])):
         if t["status"] != STATUS_NOVO or t["num"] in na_fila or any((por_num.get(b) or {}).get("status") != STATUS_FECHADO for b in t["blocked_by"]):
+            continue
+        if espera_despacho(t, integracao, events, sem_push):
             continue
         if prioridade_de(events, t["task"], None, t["titulo"]) < 3 and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"] and not maquina_vaga(t["modelo"], ocup, cfg):
             return f"o ticket {t['num']} ({_cita(t['titulo'], 50)}) está ready, sem bloqueio e há slot livre: `orq despachar --ticket {t['num']}`"
@@ -5767,6 +5769,7 @@ def le_ticket(caminho):
     return {"num": os.path.basename(caminho).split("-")[0].zfill(2), "arquivo": caminho, "titulo": titulo.group(1).strip(),
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
+            "despacho": _campo(cab, "Despacho") or None, "espera": _campo(cab, "Espera") or None,
             "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
 
 
@@ -5804,9 +5807,28 @@ def _slug(titulo):
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:48].strip("-") or "ticket"
 
 
-def linha_ticket(t):
+def espera_despacho(t, integracao, events, sem_push):
+    """Por que o ticket não entra sozinho na fila de despacho, ou None. `Despacho: manual[, motivo]` nunca entra; `Espera: integrador vazio` só com a fila do
+    integrador vazia e sem ciclo dele com commits sem push (`sem_push`, lido só depois de um ciclo)."""
+    d = (t.get("despacho") or "").strip()
+    if d.lower().startswith("manual"):
+        return f"Despacho: {d}"
+    if (t.get("espera") or "").strip().lower() != "integrador vazio":
+        return None
+    if integracao:
+        return f"espera o integrador esvaziar ({len(integracao)} na fila)"
+    if sem_push and any(e.get("tipo") == "ciclo" for e in events):
+        return f"espera o ciclo do integrador ({sem_push} commit(s) sem push)"
+    return None
+
+
+def linha_ticket(t, espera=None):
     bloq = f"; Blocked by: {', '.join(t['blocked_by'])}" if t["blocked_by"] else ""
-    return f"{t['num']} {_cita(t['titulo'], 60)} ({t['status']}{bloq})"
+    return f"{t['num']} {_cita(t['titulo'], 60)} ({t['status']}{bloq})" + (f" [{espera}]" if espera else "")
+
+
+def _linha_ticket_espera(t, integracao, events, sem_push):
+    return linha_ticket(t, espera_despacho(t, integracao, events, sem_push) if t["status"] == STATUS_NOVO and not t["blocked_by"] else None)
 
 
 def ticket_novo(titulo, spec_arquivo, blocked_by=None, run=None):
@@ -5921,6 +5943,8 @@ def _libera_dependentes(n):
     ts = tickets()
     status = {t["num"]: t["status"] for t in ts}
     liberados, avisos, livres = [], [], []
+    events, integracao = read_events(), integracao_fila()
+    sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
     for t in ts:
         if n not in t["blocked_by"] or t["status"] == STATUS_FECHADO:
             continue
@@ -5936,9 +5960,12 @@ def _libera_dependentes(n):
         livres.append(t)
         if t["status"] != STATUS_NOVO:
             continue
-        prio = prioridade_de(read_events(), t["task"], None, t["titulo"])
+        prio = prioridade_de(events, t["task"], None, t["titulo"])
         item = {"ticket": t["num"], "prioridade": prio}
-        if prio < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
+        espera = espera_despacho(t, integracao, events, sem_push)
+        if espera and prio < 3:
+            avisos.append(f"ticket {t['num']} (P{prio}) liberado, fora da fila de despacho ({espera}): despache com orq despachar --ticket {t['num']}")
+        elif prio < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
             try:
                 item["fila"] = _enfileirar_despacho(f"ticket {n} resolvido: liberou o {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], None, None, None, None, t, prio, "claude")["fila"]
             except (OSError, ValueError) as e:
@@ -5957,6 +5984,14 @@ def _libera_dependentes(n):
         except Exception as e:  # noqa: BLE001 - os arquivos já estão certos; a task volta a ready à mão
             avisos.append(f"task {t['task']} do ticket {t['num']} segue blocked ({e}): orca orchestration task-update --id {t['task']} --status ready")
     return sorted(liberados, key=lambda x: (x["prioridade"], x["ticket"])), avisos
+
+
+def linha_espera_despacho(ts, events):
+    """'fora da fila de despacho: 88 (Despacho: manual, ...)': os tickets ready sem bloqueio que um cabeçalho Despacho/Espera segura; '' se não há."""
+    integracao = integracao_fila()
+    sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in events) else None
+    seg = [(t["num"], m) for t in ts if t["status"] == STATUS_NOVO and not t["blocked_by"] and (m := espera_despacho(t, integracao, events, sem_push))]
+    return f"fora da fila de despacho: {'; '.join(f'{n} ({m})' for n, m in seg)}" if seg else ""
 
 
 def linha_liberados(events, ts):
@@ -10510,7 +10545,12 @@ def main(argv=None):
                     print(f"aviso: {r['aviso']}", file=sys.stderr)
             else:
                 ts = [t for t in tickets() if a.todos or t["status"] != STATUS_FECHADO]
-                print(json.dumps(ts, ensure_ascii=False) if a.json else "\n".join(linha_ticket(t) for t in ts) or "nenhum ticket aberto")
+                integracao, evs = integracao_fila(), read_events()
+                sem_push = _sem_push() if any(e.get("tipo") == "ciclo" for e in evs) else None
+                if a.json:
+                    print(json.dumps([{**t, "espera_motivo": espera_despacho(t, integracao, evs, sem_push) if t["status"] == STATUS_NOVO and not t["blocked_by"] else None} for t in ts], ensure_ascii=False))
+                else:
+                    print("\n".join(_linha_ticket_espera(t, integracao, evs, sem_push) for t in ts) or "nenhum ticket aberto")
         elif a.cmd == "perguntar":
             r = perguntar(a.id, a.pergunta, a.opcao, a.recomendada, a.detalhe, a.espera_min, not a.sem_poll)
             print(json.dumps(r, ensure_ascii=False))
