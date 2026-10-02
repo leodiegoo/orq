@@ -5011,7 +5011,7 @@ def reentrega_steers(agora=None):
     transcrito do worker (lido_no_transcrito): `steer_fim` (lido).
     Dispatch que já entregou: `steer_fim` (encerrado). Worker `parado` (turno encerrado, pelos hooks): redigita o aviso com `digita`, que não digita
     por cima de um turno em andamento nem de rascunho e por isso não gasta a tentativa. Depois de STEER_TENTATIVAS redigitações sem leitura grava o
-    alerta `steer_nao_lido` (resumo e `orq agentes`) e o steer sai do acompanhamento. Worker ocupado não recebe nada, como no steer."""
+    alerta `steer_nao_lido` (resumo e `orq agentes`) e o steer sai do acompanhamento. Worker ocupado não recebe nada, como no steer; worker `perguntando` (pergunta aberta) também não: nem aviso nem alerta."""
     agora = agora or datetime.now(timezone.utc)
     vencidos = {m: s for m, s in steers_abertos(read_events(), agora).items() if (agora - s["ultima"]).total_seconds() >= STEER_LEITURA_S}
     if not vencidos:
@@ -5031,6 +5031,8 @@ def reentrega_steers(agora=None):
         ag = ags.get(st.get("dispatch"))
         if not ag or ag["estado"] in ("entregue", "liberado"):
             append_event({"tipo": "steer_fim", **base, "motivo": "encerrado"})
+        elif ag["estado"] == "perguntando":
+            continue  # o worker espera a resposta do coordenador: redigitar ou alertar só empilha ruído, o steer segue aberto até o worker voltar
         elif s["tentativas"] >= STEER_TENTATIVAS:
             append_event({"tipo": "alerta", "alerta": "steer_nao_lido", **base})
             linhas.append(f"{st.get('task')}: steer não lido depois de {s['tentativas']} avisos (alerta gravado)")

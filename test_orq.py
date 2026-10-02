@@ -5720,6 +5720,23 @@ def test_ticket26_terceira_falha_grava_o_alerta_e_para_de_digitar():
     assert "steer não lido" not in a.orq("status").stdout and "alerta" not in _agentes(a)["ctx_1"], "orq alerta visto trata o alerta"
 
 
+def test_ticket118_worker_com_pergunta_aberta_nao_recebe_aviso_nem_alerta():
+    a = Amb()
+    _steer_26(a)
+    for _ in range(3):
+        _envelhece_26(a, 100)
+        assert a.orq("steers").returncode == 0
+    assert len(_digitados_26(a)) == 3
+    _inbox(a, _pergunta_ask(950, "ctx_1"), {"id": "msg_9", "run_id": "run_a", "type": "status", "priority": "high", "subject": "Ajuste", "body": "x",
+                                          "payload": None, "from_handle": "term_coord", "to_handle": "dispatch:ctx_1", "read": 0, "sequence": 900,
+                                          "created_at": _iso(-5), "delivered_at": None})
+    _envelhece_26(a, 100)
+    r = a.orq("steers")
+    assert r.returncode == 0 and "steer não lido" not in r.stdout, r.stdout
+    assert not [e for e in a.events() if e["tipo"] == "alerta"], "a pergunta aberta é a razão do silêncio: sem alerta"
+    assert len(_digitados_26(a)) == 3
+
+
 def test_ticket26_nenhuma_reentrega_depois_da_leitura():
     a = Amb()
     _steer_26(a)
