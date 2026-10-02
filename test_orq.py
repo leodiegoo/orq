@@ -110,7 +110,7 @@ if sys.argv[1] == "account":
     print(json.dumps({"ok": True, "result": {"rateLimits": read_value("account.json", {})}})); sys.exit(0)
 if sys.argv[1] == "terminal" and cmd == "create":
     # orca terminal create: grava no create.log, dá o handle term_ret<N> e o põe no terminals.json (ticket 48); FAKE_FAIL_CREATE_PATH falha nessa worktree
-    if os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", ""):
+    if os.environ.get("FAKE_FAIL") == "create" or (os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", "")):
         failure("selector_not_found")
     open(os.path.join(d, "create.log"), "a").write(json.dumps(a) + "\\n")
     new = "term_ret%d" % len(ler_linhas("create.log"))
@@ -8799,10 +8799,16 @@ def _context(a):
     return json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
+def _respawn_state(a, terminal="term_ger", attempts=3, seconds_ago=0):
+    """The manager-respawn.json of ticket 230: `attempts` on-its-own respawns of `terminal`, the last one `seconds_ago` ago."""
+    _write_state(os.path.join(a.home, "manager-respawn.json"), {"terminal": terminal, "tentativas": attempts, "ts": time.time() - seconds_ago})
+
+
 def test_it_should_warn_on_the_prompt_when_the_manager_terminal_is_gone_and_say_how_to_raise_it():
     a = Env(run="run_a")
     _manager(a)
     a.set("terminals.json", ["term_coord"])  # the manager's terminal vanished from Orca
+    _respawn_state(a)  # the on-its-own respawns (ticket 230) already failed: only the manual notice is left
     _panel_touched(a, 200)
     _context(a)  # the first check runs outside the hook
     ctx = _context(a)
@@ -8813,6 +8819,7 @@ def test_it_should_not_ask_the_orca_while_the_manager_stamp_is_fresh_nor_more_th
     a = Env(run="run_a")
     _manager(a)
     a.set("terminals.json", ["term_coord"])
+    _respawn_state(a)  # without it the first check would bring the manager back up (ticket 230) and the next prompt would check again
     _panel_touched(a, 20)
     for _ in range(3):
         assert "sumiu" not in _context(a)
@@ -19537,6 +19544,143 @@ def test_ticket229_panel_shell_touches_manager_ok_only_when_absorb_exits_0():
                            capture_output=True, timeout=20)
             assert os.path.exists(os.path.join(home, "manager-alive"))
             assert os.path.exists(os.path.join(home, "manager-ok")) is expect_ok
+
+# ---------- ticket 230: the Stop, the prompt and the SessionStart of the coordinator bring the dead manager back up on their own ----------
+
+def _dead_manager(a):
+    """Manager bound to term_ger, whose terminal vanished from Orca, with the panel stamp old (the check is due)."""
+    _manager(a)
+    a.set("terminals.json", ["term_coord"])
+    _panel_touched(a, 200)
+
+
+def _creates(a):
+    return _log(a, "create.log")
+
+
+def test_ticket230_stop_hook_brings_the_dead_manager_back_up_on_its_own():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert r.returncode == 0, r.stderr
+    (c,) = _creates(a)
+    assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}", c
+    assert _read_state(os.path.join(a.home, "gerente.json")) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a"]}
+    (e,) = [e for e in a.events() if e.get("tipo") == "gerente" and e.get("op") == "subiu_sozinho"]
+    assert e["terminal"] == "term_ret1" and e["anterior"] == "term_ger", e
+    assert not os.path.exists(os.path.join(a.fake, "send.log")), "nothing is typed over the coordinator"
+    assert "agent manager came back up on its own (terminal term_ret1)" in _context(a), "the next prompt's context carries the line"
+
+
+def test_ticket230_session_start_and_prompt_hooks_do_the_same():
+    for hook in ("session", "prompt"):
+        a = Env(run="run_a")
+        _dead_manager(a)
+        stdin = {"session_id": "abcdef123456", "source": "startup", "hook_event_name": "SessionStart", "prompt": "oi"}
+        assert a.orq("hook", hook, stdin=json.dumps(stdin)).returncode == 0
+        assert len(_creates(a)) == 1, hook
+
+
+def test_ticket230_nothing_to_do_with_fresh_stamp_live_terminal_or_unreadable_list():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    _panel_touched(a, 20)  # fresh stamp: not even the Orca list is asked
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert not _terminal_lists(a) and not _creates(a)
+    b = Env(run="run_a")
+    _dead_manager(b)
+    b.set("terminals.json", ["term_coord", "term_ger"])  # alive: only the panel stopped
+    b.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert _terminal_lists(b) and not _creates(b)
+    c = Env(run="run_a")
+    _dead_manager(c)
+    open(os.path.join(c.fake, "terminals_truncados"), "w").close()  # unreadable list proves nothing
+    c.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert _terminal_lists(c) and not _creates(c)
+    assert _read_state(os.path.join(c.home, "gerente.json"))["gerente"] == "term_ger"
+
+
+def test_ticket230_two_concurrent_checks_create_a_single_terminal():
+    a = Env(run="run_a", FAKE_SLEEP_CMD="create:1")  # the first one is still inside `terminal create` when the second one arrives
+    _dead_manager(a)
+    procs = [subprocess.Popen([sys.executable, ORQ, "manager", "check"], env=a.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    for p in procs:
+        p.communicate(timeout=30)
+    assert len(_creates(a)) == 1, _creates(a)
+    assert len([e for e in a.events() if e.get("op") == "subiu_sozinho"]) == 1
+
+
+def test_ticket230_a_second_check_after_the_respawn_finds_the_new_manager_alive_and_creates_nothing():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    assert a.orq("manager", "check").returncode == 0 and len(_creates(a)) == 1
+    assert json.loads(a.orq("manager", "check").stdout)["morto"] is False and len(_creates(a)) == 1
+
+
+def test_ticket230_three_failed_attempts_leave_only_the_manual_notice_and_retries_wait_5_min():
+    a = Env(run="run_a", FAKE_FAIL="create")
+    _dead_manager(a)
+
+    def tries():
+        return _read_state(os.path.join(a.home, "manager-respawn.json"))["tentativas"]
+
+    def check_after(seconds):
+        _respawn_state(a, attempts=tries(), seconds_ago=seconds)
+        a.orq("manager", "check")
+        return tries()
+    a.orq("manager", "check")
+    assert tries() == 1
+    a.orq("manager", "check")
+    assert tries() == 1, "a new attempt before 5 min does not happen"
+    assert check_after(100) == 1
+    assert check_after(301) == 2
+    assert check_after(301) == 3
+    assert check_after(10_000) == 3 and not _creates(a), "after the 3rd failure only the manual notice is left"
+    ctx = _context(a)
+    assert "failed 3 times" in ctx and "orq manager spawn" in ctx and "on its own (" not in ctx, ctx
+
+
+def test_ticket230_the_manager_of_another_live_coordinator_is_never_taken():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_old"])  # term_old is a live coordinator; its manager vanished
+    os.makedirs(a.home, exist_ok=True)
+    value = {"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a"]}
+    _write_state(os.path.join(a.home, "gerente.json"), value)
+    _panel_touched(a, 200)
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    a.orq("manager", "check")
+    assert not _creates(a) and _read_state(os.path.join(a.home, "gerente.json")) == value
+
+
+def test_ticket230_the_panel_notice_says_it_is_spawning_on_its_own_while_attempts_remain():
+    a = Env(run="run_a", FAKE_FAIL="create")
+    _dead_manager(a)
+    a.orq("manager", "check")  # the attempt fails: the dead terminal stays in gerente.json and the check says morto
+    assert "bringing it back up on its own (attempt 1 of 3" in _context(a)
+
+
+def test_ticket230_stop_and_prompt_hooks_stay_under_100_ms_with_a_slow_orca():
+    a = Env(run="run_a", ORQ_NO_BG="", FAKE_SLEEP="0.5")
+    _dead_manager(a)
+    ev = {"session_id": "abcdef123456", "prompt": "oi"}
+    before = dict(os.environ), orq_mod.HOME
+    os.environ.update(a.env)
+    orq_mod.HOME = a.home
+    try:
+        t = time.perf_counter()
+        orq_mod.check_manager_bg()  # what the Stop and the prompt add: stamps and a Popen, never Orca
+        spent = time.perf_counter() - t
+    finally:
+        orq_mod.HOME = before[1]
+        os.environ.clear()
+        os.environ.update(before[0])
+    assert spent < 0.1, f"check_manager_bg took {spent:.3f} s"
+    for _ in range(100):  # the child, in the background, did the work
+        if _creates(a):
+            break
+        time.sleep(0.1)
+    assert len(_creates(a)) == 1
+
 
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
