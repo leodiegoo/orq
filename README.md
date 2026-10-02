@@ -275,7 +275,7 @@ For a bounded unattended stretch, night mode adds a budget: `orq night on --unti
 | `merge-env` | allow | `gh pr merge` into an environment before production (e.g. `development`, `staging`) |
 | `push-env` | deny | `git push` to any other environment branch of the project |
 | `push-force` | deny | `git push --force`, `--force-with-lease` or a `+refspec` |
-| `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, `-c`, a `:refspec`, a glob, a tag, another option, or a destination orq cannot tell |
+| `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, `-c`, `--git-dir`, a `:refspec`, a glob, a tag, another option, or a destination orq cannot tell (after `popd`, a subshell `cd`, or a `HEAD` push after a command that may switch branch) |
 | `merge-prod` | deny | `gh pr merge` into production (e.g. `main`) or into a branch that is no environment |
 | `merge-unknown` | deny | `gh pr merge` with no `--base` whose base `gh pr view` did not give within 1 s |
 | `workflow` | deny | `gh workflow run` (deploy) |

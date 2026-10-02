@@ -6130,6 +6130,8 @@ def _away_push(ev, m):
         args = shlex.split(m.group(2), comments=True)
     except ValueError:
         return "push-other"
+    if ev.get("_dir_unknown"):
+        return "push-other"
     flags, pos = [a for a in args if a.startswith("-")], [a for a in args if not a.startswith("-")]
     if "--no-verify" in flags:
         return "no-verify"
@@ -6183,6 +6185,8 @@ def _away_merge(ev, m):
         args = shlex.split(f"{m.group(1)} {m.group(2)}", comments=True)
     except ValueError:
         return "merge-unknown"
+    if ev.get("_dir_unknown"):
+        return "merge-unknown"
     opts, selector, i = {}, None, 0
     while i < len(args):
         k, eq, v = args[i].partition("=")
@@ -6214,6 +6218,16 @@ def _away_line(seg, ev):
     return "reset" if m and _reset_in_main_checkout(ev, m) else None
 
 
+_KEEPS_HEAD = re.compile(_EXT_GIT + r"(?:status|log|diff|show|fetch|add|commit|rev-parse|remote|config|tag|push|pull|merge|rebase|reset|restore|rm|mv|cherry-pick|"
+                         r"describe|ls-files|grep|blame|show-ref|reflog|shortlog|notes|clean|apply|am|revert|branch(?!\s.*(?:-[a-zA-Z]*[mM]|--move))|"
+                         r"stash(?!\s+branch)|worktree|gc|prune|fsck|count-objects|cat-file|ls-remote|ls-tree|merge-base|name-rev|rev-list|for-each-ref|symbolic-ref\s+(?:-q\s+|--short\s+)*HEAD$)(?![-\w])")
+
+
+def _moves_head(seg):
+    """Can the segment change what HEAD names before a later `git push ... HEAD` runs? An allow list: any git subcommand outside _KEEPS_HEAD, and `gh pr checkout`."""
+    return bool(re.match(_EXT_GIT, seg) and not _KEEPS_HEAD.match(seg)) or bool(re.match(_EXT_GH + r"pr\s+checkout\b", seg))
+
+
 def _asks_help(seg):
     """Is the segment a `--help` read? Only a whole `--help` token before any `#` comment, and not the value of an option (`-t --help`, `-m --help`): those still run."""
     toks = seg.split()
@@ -6233,11 +6247,15 @@ def _external_denied(ev, cur):
         return None
     segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
     if away:
+        subshell = bool(re.search(r"[()]", cmdnorm.no_text(cmd)))
         for seg in segs:
             if m := re.match(r"(?:cd|pushd)(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
-                ev = {**ev, "cwd": os.path.join(ev.get("cwd") or os.getcwd(), os.path.expanduser(m.group(1) or "~"))}
+                unknown = subshell or m.group(1) == "-"  # `(cd w) && git push` runs in the cwd: with parentheses, orq cannot tell where it is
+                ev = {**ev, "_dir_unknown": True} if unknown else {**ev, "cwd": os.path.join(ev.get("cwd") or os.getcwd(), os.path.expanduser(m.group(1) or "~"))}
                 continue
-            if re.match(_EXT_GIT + r"(?:checkout|switch|symbolic-ref|branch\s.*(?:-[a-zA-Z]*[mM]|--move))(?![-\w])", seg) or re.match(_EXT_GH + r"pr\s+checkout\b", seg):  # the hook runs before the command: HEAD still names the old branch
+            if re.match(r"popd\b", seg):
+                ev = {**ev, "_dir_unknown": True}
+            if _moves_head(seg):  # the hook runs before the command: HEAD still names the old branch
                 ev = {**ev, "_head_moves": True}
             try:
                 line = _away_line(seg, ev)

@@ -7301,12 +7301,15 @@ def test_away_external_denies_merge_into_production_and_force_push_and_allows_th
                       ("gh pr checkout 12 && git push", "push-other"), ("gh pr merge 12 --squash -t --help --base main", "merge-prod"),
                       ("git commit --no-verify -m --help", "no-verify"), ("env -C /x git push --force origin HEAD:main", "push-force"),
                       (f"env -C {a.tmp.name} git push origin main", "push-other"), ("git --git-dir=/x/.git push origin feat/x", "push-other"),
-                      ("GIT_DIR=/x/.git git push origin feat/x", "push-other")):
+                      ("GIT_DIR=/x/.git git push origin feat/x", "push-other"), (f"(cd {r}) && git push origin feat/x", "push-other"),
+                      ("pushd /x && popd && git push origin feat/x", "push-other"), ("git stash branch staging && git push origin HEAD", "push-other"),
+                      ("timeout 60 git push --force origin HEAD:main", "push-force"), ("time -p git push --force origin HEAD:main", "push-force"),
+                      ("nice git push --force origin HEAD:main", "push-force"), ("timeout -s KILL 5 gh pr merge 12 --base main", "merge-prod")):
         out = _external(a, cmd, cwd=r)
         assert out and out["permissionDecision"] == "deny", cmd
         assert f"line `{line}`" in out["permissionDecisionReason"] and "orq pend add" in out["permissionDecisionReason"], (cmd, out["permissionDecisionReason"])
     for cmd in ("git push -u origin feat/x", "git push", "git push origin HEAD", "git push origin feat/x:feat/x", "gh pr create --base development --fill",
-                "gh pr merge 12 --base development --squash", "gh pr merge 12 --base=staging", "git status", "gh pr view 12", "git push --help", f"cd {r} && git push -u origin feat/x"):
+                "gh pr merge 12 --base development --squash", "gh pr merge 12 --base=staging", "git status", "gh pr view 12", "git push --help", f"cd {r} && git push -u origin feat/x", "git add -A && git commit -m x && git push origin HEAD"):
         assert _external(a, cmd, cwd=r) is None, cmd
     subprocess.run(["git", "-C", r, "config", "push.default", "upstream"], check=True)
     out = _external(a, "git push", cwd=r)
