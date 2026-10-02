@@ -11,14 +11,17 @@ and at each step the real commands run in a subprocess with the fake Orca of tes
   (c) the branch a delivery puts on the integrator queue is the branch of the ticket's worktree, never a file name from the worker's text.
 
 What the log does not hold (unpushed commits, when the coordinator sat idle, the delivery branches) is in verdade.json, from the tickets' reports.
+The fixture is the real log through scripts/anonimizar-noite.py (ticket 349): versioned, with nothing the public repository cannot hold; a missing one fails here, loudly.
 `python3 test_noite_replay.py` runs the night and the self-checks; `scripts/integrar.py` runs it before the fast-forward."""
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +30,17 @@ import test_orq as t  # noqa: E402 - Env, the fake Orca and the isolated ORQ_HOM
 
 orqlib = t.orqlib
 FIX = os.path.join(HERE, "fixtures", "noite-2026-10-01")
+FIXTURE_FILES = ("events.jsonl", "cursor.json", "verdade.json", "ciclos.log")
+GENERATE = "python3 scripts/anonimizar-noite.py --in <folder with the real events.jsonl and cursor.json> --out fixtures/noite-2026-10-01"
+
+
+def _require_fixture(folder):
+    """A replay with no night to play must not pass: it exits 1 naming what is missing and the command that generates it."""
+    if missing := [f for f in FIXTURE_FILES if not os.path.isfile(os.path.join(folder, f))]:
+        sys.exit(f"night replay: the fixture is incomplete, {', '.join(missing)} missing in {folder}\nthe real log stays out of git, so generate the fixture from it:\n  {GENERATE}")
+
+
+_require_fixture(FIX)
 TRUTH = json.load(open(os.path.join(FIX, "verdade.json")))
 RUN = TRUTH["run"]
 LOCAL = timezone(timedelta(hours=-3))  # ciclos.log is in the integrator's local time
@@ -239,6 +253,149 @@ def test_ticket216_a_stop_that_blocks_for_a_service_dispatch_is_a_violation():
            {"tipo": "despacho", "dispatch": "ctx_b", "titulo": "orq: ligar o backlog", "ts": "2026-10-02T02:04:46Z"}]
     assert "dispatched again" in _stop_violation("the dispatch queue gave up on orq: ligar o backlog (New worktrees require --name)", fed)
     assert _stop_violation("worker ctx_x delivered ticket 9 and the delivery was not integrated", fed) is None
+
+
+def _copy_code(dst, fixture=True):
+    """The orq code (top-level *.py) and, with `fixture`, the night fixture, in `dst`: a tree the test may break without touching this one."""
+    for f in os.listdir(HERE):
+        if f.endswith(".py"):
+            shutil.copy(os.path.join(HERE, f), dst)
+    if fixture:
+        shutil.copytree(FIX, os.path.join(dst, "fixtures", "noite-2026-10-01"))
+
+
+def _run_replay(folder):
+    """`python3 test_noite_replay.py the_night_of_10_01` in `folder` (the invariants test alone): (exit code, output)."""
+    r = subprocess.run([sys.executable, "test_noite_replay.py", "the_night_of_10_01"], cwd=folder, capture_output=True, text=True, timeout=300)
+    return r.returncode, r.stdout + r.stderr
+
+
+# What each fix of the night of 10/01 undoes, as (the fix's ticket, text before which the edit applies, the fix as it is, how it reads without it, what the red replay says)
+REVERTS = [
+    (180, "def _no_push():", 'return int(os.environ["ORQ_SEM_PUSH"])', "return 0", "(a) "),  # unpushed commits no longer read
+    (169, "def _integrator_dispatch(", 'branch = (_payload_branch(p.get("branch")) or _orq_wt_branch(t["num"]) or (wt and _orq_branch((_git(wt, "branch", "--show-current") or "").strip()))\n              or _text_branch(text_value))',
+     "branch = next(iter(BRANCH_RE.findall(text_value)), None)", "(c) "),  # the branch read from the worker's text, whatever it cites
+    (135, "def reassess(", "_dispatch_ticket(events), _services(events)", "_dispatch_ticket(events), {}", "blocked for the service dispatch"),  # a legacy integrator is a delivery again
+    (175, "def away_abandoned(", 'and not (e.get("titulo") and v.get("titulo") == e["titulo"])}', "}", "blocked for the give-up"),  # an old give-up no longer matches by title
+]
+
+
+def _revert(fix, folder):
+    """Undoes fix `fix` in the orqlib.py of `folder`: the first `old` at or after `after`. ValueError if the code no longer reads that way: update REVERTS, do not skip."""
+    _, after, old, new, _ = next(x for x in REVERTS if x[0] == fix)
+    path = os.path.join(folder, "orqlib.py")
+    text = open(path, encoding="utf-8").read()
+    where = text.index(old, text.index(after))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text[:where] + new + text[where + len(old):])
+
+
+def test_ticket349_the_fixture_is_not_gitignored():
+    """The root cause of 349: `events.jsonl` and `cursor.json` are runtime state everywhere else, so git dropped the fixture. `git check-ignore -q` exits 1 for a path that is not ignored."""
+    for f in ("events.jsonl", "cursor.json"):
+        r = subprocess.run(["git", "-C", HERE, "check-ignore", "-q", os.path.join("fixtures", "noite-2026-10-01", f)])
+        assert r.returncode == 1, f"fixtures/noite-2026-10-01/{f} is ignored by git (.gitignore needs `!fixtures/**/{f}`)"
+
+
+def test_ticket349_a_missing_fixture_fails_loud_with_the_command_to_generate_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        _copy_code(tmp, fixture=False)
+        code, out = _run_replay(tmp)
+    assert code != 0 and "scripts/anonimizar-noite.py" in out and "events.jsonl" in out, (code, out[-500:])
+
+
+def _sample(folder):
+    """A small made-up 'real' night: what the anonymizer must swap, none of it from the real log."""
+    os.makedirs(folder)
+    lines = [
+        {"ts": "2026-10-01T10:00:00Z", "type": "entry", "path": "/Users/alice/Developer/acme/widgets/.scratch/a.md", "project": "widgets", "task_closed": 1},
+        {"ts": "2026-10-01T10:01:00Z", "type": "pr", "url": "https://github.com/AcmeCorp/widgets/pull/42", "number": 42, "head": "docs/cache-prisma-77", "terminal": "term_deadbeef",
+         "run": "run_0123456789ab", "task": "task_0123456789ab", "title": "widgets: fix for prisma 77, owner bob@acme.example"},
+        {"ts": "2026-10-01T10:02:00Z", "type": "entry", "path": "/Users/alice/.claude/orq/x.md", "group": "billing", "terminal": "term_cafebabe"},
+        {"ts": "2026-10-01T10:03:00Z", "type": "entry", "path": "/Users/alice/orca/workspaces/gadgets/wt1", "project": "gadgets", "terminal": "term_deadbeef", "run": "run_0123456789ab"},
+    ]
+    with open(os.path.join(folder, "events.jsonl"), "w") as f:
+        f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in lines)
+    with open(os.path.join(folder, "cursor.json"), "w") as f:
+        json.dump({"ingest": {"runs": ["run_0123456789ab"]}}, f)
+
+
+def _anonymize(src, out, **env):
+    return subprocess.run([sys.executable, os.path.join(HERE, "scripts", "anonimizar-noite.py"), "--in", src, "--out", out], capture_output=True, text=True,
+                          env={**os.environ, "ORQ_TERMOS": os.path.join(src, "none.txt"), **env})
+
+
+def test_ticket349_the_anonymizer_is_deterministic_and_swaps_every_private_thing():
+    with tempfile.TemporaryDirectory() as tmp:
+        _sample(os.path.join(tmp, "real"))
+        for n in ("one", "two"):
+            r = _anonymize(os.path.join(tmp, "real"), os.path.join(tmp, n))
+            assert r.returncode == 0, r.stderr
+        files = {f: open(os.path.join(tmp, "one", f)).read() for f in ("events.jsonl", "cursor.json")}
+        assert files == {f: open(os.path.join(tmp, "two", f)).read() for f in files}, "two runs gave different bytes"
+    out = "\n".join(files.values())
+    for private in ("alice", "acme", "AcmeCorp", "widgets", "gadgets", "bob@", "billing", "deadbeef", "0123456789ab", "/Users/"):
+        assert private not in out, f"{private!r} survived:\n{out}"
+    rows = [json.loads(x) for x in files["events.jsonl"].splitlines()]
+    assert rows[0]["path"] == "/home/dev/app-a/.scratch/a.md" and rows[0]["project"] == "app-a" and rows[0]["task_closed"] == 1  # a JSON key that looks like an id stays
+    assert rows[1]["url"] == "https://github.com/example-org/app/pull/42" and rows[1]["number"] == 42  # same PR number
+    assert rows[1]["terminal"] == rows[3]["terminal"] == "term_001" and rows[2]["terminal"] == "term_002"  # sequential, one per handle
+    assert rows[1]["run"] == rows[3]["run"] == "run_001" and rows[1]["task"] == "task_001"
+    assert json.loads(files["cursor.json"])["ingest"]["runs"] == ["run_001"], "the cursor must use the events' Run"
+    assert rows[2]["path"] == "/home/dev/.claude/orq/x.md" and rows[3]["path"] == "/home/dev/app-d/wt1" and rows[3]["project"] == "app-d"  # one fake per project, in order of appearance
+    assert rows[2]["group"].startswith("app-") and rows[1]["head"] == "docs/cache-app-b" and "app-b" in rows[1]["title"]  # the group and the client (`prisma 77`) get fakes too
+
+
+def test_ticket349_the_anonymizer_writes_nothing_when_the_forbidden_list_still_matches():
+    with tempfile.TemporaryDirectory() as tmp:
+        _sample(os.path.join(tmp, "real"))
+        with open(os.path.join(tmp, "terms.txt"), "w") as f:
+            f.write("# private\nre:pull/\\d+\n")  # `pull/42` survives the swap (the number stays on purpose), so the list must stop it
+        r = _anonymize(os.path.join(tmp, "real"), os.path.join(tmp, "out"), ORQ_TERMOS=os.path.join(tmp, "terms.txt"))
+        assert r.returncode == 1 and "events.jsonl:2: forbidden term" in r.stderr, (r.returncode, r.stderr)
+        assert not os.path.exists(os.path.join(tmp, "out")), "wrote the fixture although the check failed"
+
+
+def test_ticket349_the_fixture_passes_the_publication_audit():
+    """The fixture goes through `orq audit-publication` as a commit of its own. The private forbidden list is used when this machine has it; the generic leaks (a user's
+    path, an e-mail, a GitHub URL outside example-org) are checked either way, so a clean clone without the list is not a silent pass."""
+    generic = ["re:/Users/", r"re:/home/(?!dev/)", r"re:[\w.+-]+@[\w-]+\.\w", r"re:github\.com/(?!example-org/)"]
+    private = os.environ.get("ORQ_TERMOS") or os.path.join(orqlib.PLAN, "termos-proibidos.txt")
+    with tempfile.TemporaryDirectory() as tmp:
+        terms = os.path.join(tmp, "terms.txt")
+        with open(terms, "w") as f:
+            f.write("\n".join(generic + ([open(private).read()] if os.path.exists(private) else [])) + "\n")
+        repo = os.path.join(tmp, "repo")
+        shutil.copytree(FIX, os.path.join(repo, "fixtures", "noite-2026-10-01"))
+        git = lambda *x: subprocess.run(["git", "-C", repo, *x], check=True, capture_output=True, text=True)  # noqa: E731
+        git("init", "-q")
+        git("config", "user.email", "dev@example.com"), git("config", "user.name", "dev")
+        git("add", "-A"), git("commit", "-q", "-m", "test: add the night fixture")
+        old = {k: os.environ.get(k) for k in ("ORQ_TERMOS", "ORQ_AUTOR")}
+        os.environ["ORQ_TERMOS"], os.environ["ORQ_AUTOR"] = terms, "dev@example.com"
+        try:
+            assert orqlib.audit_publication(["HEAD"], repo=repo) == []
+            with open(os.path.join(repo, "leak.txt"), "w") as f:
+                f.write("/Users/alice/x\n")
+            git("add", "-A"), git("commit", "-q", "-m", "test: a leak")
+            assert orqlib.audit_publication(["HEAD~1..HEAD"], repo=repo), "the audit did not catch a /Users path: the check above proves nothing"
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def test_ticket349_reverting_each_fix_of_the_night_keeps_the_replay_red():
+    """The proof ticket 216 made with the real log, now with the fixture: each fix undone alone (in a copy of the code) turns the invariants test red with its own message."""
+    def red(fix):
+        with tempfile.TemporaryDirectory() as tmp:
+            _copy_code(tmp)
+            _revert(fix, tmp)
+            return fix, *_run_replay(tmp)
+    with ThreadPoolExecutor(len(REVERTS)) as pool:
+        results = list(pool.map(red, [x[0] for x in REVERTS]))
+    for fix, code, out in results:
+        want = next(x[4] for x in REVERTS if x[0] == fix)
+        assert code == 1 and want in out, f"without fix {fix} the replay should fail with {want!r}; exit {code}\n{out[-1500:]}"
 
 
 if __name__ == "__main__":

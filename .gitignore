@@ -75,6 +75,9 @@ gerente-estado.json
 logs/
 tui/node_modules/
 !tui/fixtures/**
+# the anonymized night fixture (ticket 349) is versioned, whatever the runtime-state rules above say
+!fixtures/**/events.jsonl
+!fixtures/**/cursor.json
 !tui/bun.lock
 integrar-fila.json
 integrate-queue.json
