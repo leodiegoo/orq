@@ -35,6 +35,31 @@ def ThreadPoolExecutor(n):  # late import: concurrent.futures costs ~11 ms and o
     from concurrent.futures import ThreadPoolExecutor as _T
     return _T(n)
 
+COVER_HITS = set()  # the `file:function` of the clone this process ran, after cover_start (ticket 328)
+
+
+def cover_start():
+    """Records the top-level functions of the clone's .py files this process runs, as `file:function` in COVER_HITS: the test map of `orq test --affected` (ticket 328).
+    sys.monitoring turns each function off after its first call, so the cost is one callback per function. With ORQ_COVER, appends them to that file at exit."""
+    mon, root = sys.monitoring, orqpaths.HERE + os.sep
+
+    def hit(code, _offset):
+        f = os.path.realpath(code.co_filename)
+        if f.startswith(root) and not code.co_qualname.startswith("<"):
+            COVER_HITS.add(f"{f[len(root):]}:{code.co_qualname.split('.')[0]}")
+        return mon.DISABLE
+    if mon.get_tool(mon.COVERAGE_ID) is None:
+        mon.use_tool_id(mon.COVERAGE_ID, "orq")
+    mon.register_callback(mon.COVERAGE_ID, mon.events.PY_START, hit)
+    mon.set_events(mon.COVERAGE_ID, mon.events.PY_START)
+    if os.environ.get("ORQ_COVER"):
+        import atexit
+        atexit.register(lambda: open(os.environ["ORQ_COVER"], "a").write("".join(f"{h}\n" for h in COVER_HITS)))
+
+
+if os.environ.get("ORQ_COVER"):
+    cover_start()
+
 HOME = orqpaths.HOME  # the clone (ORQ_HOME overrides); the plan and the integration worktrees live in it too (ticket 124)
 PLAN = orqpaths.PLAN  # tickets, specs, reports and the design map (ORQ_PLAN)
 WT_ROOT = orqpaths.WT  # the orq ticket worktrees and the integrator's (ORQ_WT)

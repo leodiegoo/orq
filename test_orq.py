@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
+import argparse
 import contextlib
 import hashlib
 import json
 import os
 import pathlib
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -4830,7 +4833,7 @@ def test_review6_b31_orca_timeout_comes_from_environment_and_runner_shows_end_of
                        env={**os.environ, "ORQ_ORCA_TIMEOUT": "7.5"})
     assert r.stdout.strip() == "7.5", r
     assert orq_mod.TIMEOUT_ORCA == float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)
-    assert "str(e)[-400:]" in open(__file__).read().split('if __name__ == "__main__":')[-1], "o runner tem de mostrar o fim da mensagem (B40)"  # the assert line stays before __main__
+    assert "str(e)[-400:]" in open(__file__).read().split("\ndef _run_child(")[-1].split("\ndef ")[0], "o runner tem de mostrar o fim da mensagem (B40)"  # each test's child (ticket 328)
     assert Env().env["ORQ_ORCA_TIMEOUT"] == "10"
 
 
@@ -18479,16 +18482,222 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
     assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
 
 
-if __name__ == "__main__":
-    filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
-    failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
-    for item_name, fn in tests:
+
+# ---------- ticket 328: the runner (parallel, durations, suite queue, test map) ----------
+
+SUITE_QUEUE = os.environ.get("ORQ_SUITE_QUEUE") or os.path.expanduser("~/.cache/orq-suite/queue")
+
+
+def _private_paths():
+    """The machine paths each test gets of its own, so tests in parallel never share them (ticket 328): the orq link and Codex's config and hooks."""
+    os.environ["ORQ_LINK"] = orq_mod.ORQ_LINK = os.path.join(tempfile.mkdtemp(), "orq")
+    orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
+    orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")
+
+
+def _cpu():
+    """CPU seconds of this process and of its waited children (the orq and fake Orca subprocesses of a test)."""
+    s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
+
+
+def _run_child(name, fn, out, cover):
+    """In the forked child: runs one test with its output in `out`.log and writes {ok, err, cpu, cover} to `out`.json. `cover`: also the repo functions it ran (ORQ_COVER for its subprocesses)."""
+    fd = os.open(out + ".log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    res = {"ok": True, "err": ""}
+    try:
+        _private_paths()
+        if cover:
+            os.environ["ORQ_COVER"] = out + ".cover"
+            orq_mod.cover_start()
+        fn()
+    except BaseException as e:  # noqa: BLE001 - the report shows all failures at once
+        res = {"ok": False, "err": f"{type(e).__name__}: {str(e)[-400:]!r}"}
+    try:
+        hits = set(orq_mod.COVER_HITS)
+        if cover and os.path.exists(out + ".cover"):
+            hits |= set(open(out + ".cover").read().split())
+        res.update(cpu=_cpu(), cover=sorted(hits))
+        with open(out + ".json", "w") as f:
+            json.dump(res, f)
+    finally:
+        sys.stdout.flush()
+        os._exit(0)
+
+
+def _run_tests(tests, jobs, cover=False, echo=print):
+    """Runs `tests` [(name, fn)], each in a forked child of its own and `jobs` at a time, in name order; echoes one line per test as it ends.
+    Returns {name: {ok, err, s, cpu, cover}}. A child that dies without writing its result is a failure with the exit status."""
+    tmp, pending, running, results = tempfile.mkdtemp(prefix="orq-suite-"), list(tests), {}, {}
+    while pending or running:
+        while pending and len(running) < jobs:
+            name, fn = pending.pop(0)
+            out = os.path.join(tmp, name)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            pid = os.fork()
+            if pid == 0:
+                _run_child(name, fn, out, cover)
+            running[pid] = (name, out, time.time())
+        pid, status = os.wait()
+        name, out, t0 = running.pop(pid)
         try:
-            fn()
-            print(f"ok      {item_name}")
-        except Exception as e:  # noqa: BLE001 - the report shows all failures at once
-            failures.append(item_name)
-            print(f"FALHOU  {item_name}: {type(e).__name__}: {str(e)[-400:]!r}")
-    print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram")
+            res = json.load(open(out + ".json"))
+        except (OSError, ValueError):
+            res = {"ok": False, "err": f"the test process died (status {status})", "cpu": 0, "cover": []}
+        res["s"] = time.time() - t0
+        results[name] = res
+        echo(f"ok      {name}" if res["ok"] else f"FALHOU  {name}: {res['err']}")
+        if not res["ok"]:
+            echo(open(out + ".log").read().rstrip()[-2000:] if os.path.exists(out + ".log") else "")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
+@contextlib.contextmanager
+def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
+    """One full suite at a time on the machine (ticket 328), like the E2E queue: a `<time_ns>-<pid>` ticket in `queue` with the worktree, in order of arrival.
+    Waits while an older ticket has a live pid, echoing who is ahead whenever that changes; a dead owner's ticket is removed. The ticket goes away at the end."""
+    os.makedirs(queue, exist_ok=True)
+    mine = f"{time.time_ns():020d}-{os.getpid()}"
+    with open(os.path.join(queue, mine), "w") as f:
+        f.write(HERE)
+    try:
+        shown = None
+        while True:
+            ahead = []
+            for n in sorted(x for x in os.listdir(queue) if x < mine):
+                if not orq_mod._pid_alive(n.rsplit("-", 1)[-1]):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(queue, n))
+                    continue
+                with contextlib.suppress(OSError):
+                    ahead.append((n, open(os.path.join(queue, n)).read().strip()))
+            if not ahead:
+                break
+            if ahead[0][0] != shown:
+                shown, (n, wt) = ahead[0][0], ahead[0]
+                echo(f"suite queue: {len(ahead)} ahead; running: {wt} (pid {n.rsplit('-', 1)[-1]}, {int((time.time_ns() - int(n.split('-')[0])) / 6e10)} min)")
+            time.sleep(poll_s)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(queue, mine))
+
+
+def _write_map(path, results, full):
+    """The test map of `orq test --affected`: {tests: {name: ["file:function", ...]}}. A full run replaces it; a partial one updates its tests."""
+    old = {} if full else _dict_file(path).get("tests", {})
+    data = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": {**old, **{n: r["cover"] for n, r in results.items()}}}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def _dict_file(path):
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _suite_args(argv):
+    """`test_orq.py [-j N] [--map PATH] [name...]`: a name equal to a test picks exactly it, any other is a substring. -j defaults to min(4, CPUs/2)."""
+    ap = argparse.ArgumentParser(prog="test_orq.py")
+    ap.add_argument("-j", "--jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--map", help="writes the test map (the functions each test ran) to PATH")
+    ap.add_argument("names", nargs="*")
+    return ap.parse_args(argv)
+
+
+def _pick(all_tests, names):
+    """The tests the names select: exact name, otherwise substring; no names is everything."""
+    known = {n for n, _ in all_tests}
+    return [(n, f) for n, f in all_tests if not names or any(x == n or (x not in known and x in n) for x in names)]
+
+
+def test_ticket328_runner_picks_exact_names_and_substrings():
+    tests = [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _pick(tests, []) == tests
+    assert _pick(tests, ["test_a"]) == [("test_a", 1)], "an exact name does not drag the longer ones"
+    assert _pick(tests, ["_a", "c"]) == [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _suite_args(["-j", "3", "--map", "m.json", "x"]).__dict__ == {"jobs": 3, "map": "m.json", "names": ["x"]}
+
+
+def test_ticket328_runner_runs_each_test_in_its_own_process_and_reports_failures():
+    def ok():
+        os.environ["LEAK328"] = "1"
+        print("barulho")
+
+    def fails():
+        assert "LEAK328" not in os.environ, "the previous test's environment leaked"
+        raise ValueError("quebrou")
+
+    def dies():
+        os._exit(7)
+    seen = []
+    res = _run_tests([("t_ok", ok), ("t_fails", fails), ("t_dies", dies)], jobs=1, echo=seen.append)
+    assert res["t_ok"]["ok"] and "barulho" not in "".join(seen), "a passing test's output stays out"
+    assert res["t_fails"]["err"] == "ValueError: 'quebrou'", res["t_fails"]
+    assert not res["t_dies"]["ok"] and "died" in res["t_dies"]["err"], res["t_dies"]
+    assert seen[0] == "ok      t_ok" and seen[1].startswith("FALHOU  t_fails"), seen
+    res = _run_tests([(f"t{i}", ok) for i in range(6)], jobs=3, echo=seen.append)
+    assert sorted(res) == [f"t{i}" for i in range(6)] and all(r["ok"] for r in res.values())
+
+
+def test_ticket328_runner_records_the_functions_a_test_runs_in_process_and_in_subprocesses():
+    def runs():
+        orq_mod.origin_name("oi")
+        Env().orq("status")
+    res = _run_tests([("t", runs)], jobs=1, cover=True, echo=lambda _: None)["t"]
+    assert res["ok"], res
+    assert {"orqlib.py:origin_name", "test_orq.py:Env", "orqlib.py:main", "orqlib.py:state"} <= set(res["cover"]), res["cover"][:20]
+    t = tempfile.mkdtemp()
+    _write_map(os.path.join(t, "m.json"), {"t": res}, full=True)
+    _write_map(os.path.join(t, "m.json"), {"u": {"cover": ["x.py:f"]}}, full=False)
+    assert set(_dict_file(os.path.join(t, "m.json"))["tests"]) == {"t", "u"}, "a partial run updates its tests and keeps the rest"
+
+
+def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead_one():
+    q = tempfile.mkdtemp()
+    with open(os.path.join(q, f"{1:020d}-999999"), "w") as f:
+        f.write("/wt/morto")  # dead owner
+    seen = []
+    with _suite_turn(q, poll_s=0.05, echo=seen.append):
+        assert len(os.listdir(q)) == 1 and seen == [], "the dead ticket went away and nobody waited"
+    assert os.listdir(q) == [], "the ticket goes away at the end"
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with open(os.path.join(q, f"{2:020d}-{holder.pid}"), "w") as f:
+            f.write("/wt/vivo")
+        t0 = time.time()
+        threading.Timer(0.3, lambda: (holder.kill(), holder.wait())).start()  # reaped: a zombie still answers kill(pid, 0)
+        with _suite_turn(q, poll_s=0.05, echo=seen.append):
+            pass
+        assert time.time() - t0 >= 0.3 and seen and seen[0].startswith("suite queue: 1 ahead; running: /wt/vivo (pid "), seen
+    finally:
+        holder.kill()
+        holder.wait()
+
+if __name__ == "__main__":
+    opts = _suite_args(sys.argv[1:])
+    os.nice(10)  # the suite yields to interactive work (ticket 328)
+    tests = _pick([(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)], opts.names)
+    failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
+    for n in failures:
+        print(f"FALHOU  {n}")
+    with _suite_turn() if not opts.names else contextlib.nullcontext():
+        w0, c0 = time.time(), _cpu()
+        results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
+        wall, cpu = time.time() - w0, _cpu() - c0
+    if opts.map:
+        _write_map(opts.map, results, full=not opts.names)
+    failures += [n for n, r in results.items() if not r["ok"]]
+    slow = sorted(results.items(), key=lambda x: -x[1]["s"])[:15]
+    print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
+    print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
