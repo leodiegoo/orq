@@ -150,6 +150,21 @@ For a user prompt the hook appends the entry and injects at most five lines of c
 
 `orq hook stop` computes the open entries. If there are any, it appends a `gate_notice` event and shows the user a `systemMessage` naming up to three of them. Since ticket 150 it blocks the end of the turn, whatever `stop_bloqueia` says, when a user entry from the same session (or open for more than 30 min) has no intake, naming the ids and `orq intake <e> task|steer|pend|decision|conversation|discarded`. `stop_bloqueia` (default false, a pending user decision) widens the block to any open entry. The budget is 2 blocks per set of open entries per session, counted in `cursor.json` (`stop_hook_active` is ignored, because another hook can set it); the third Stop of the same set passes and records `gate_blocked`. The prompt hook closes entries that are only `/away` or `/away status` with a `conversation` intake, and the "No effect" line of the hook lists only entries from the last 24 h; older ones show in `orq status`.
 
+### Automatic intake (ticket 337)
+
+The coordinator ran `orq intake eN ...` by hand about 60 times on 02/10 for entries whose effect was already determined. `auto_intake()` now does it at the end of every `ingest` and in the prompt hook (right after the entry is recorded), through the same `intake` function, with a note that says which rule fired. It only looks at the coordinator's open entries (`grupo` unset) and never overrides an effect already recorded.
+
+| Entry | Rule | Effect and note |
+|---|---|---|
+| `relatorio_worker` | an `entrega_orq` event has the same `msg`: the delivery entered the integrator queue | `discarded`, "delivery entered the integrator queue (ticket N, branch)" |
+| `relatorio_worker` | a `conformidade` event with the same `msg` was sent back to the worker | `discarded`, "delivery sent back to the worker" |
+| `pr` (the PR entered) | no open obligation | `conversation`, "PR merged; no obligation left for the coordinator" |
+| `pr` (the PR entered) | a `mate_pedido` after the entry names the entry id, the PR URL or `#number`, and every open obligation is `deploy` or `proximo` | those obligations get `obrigacao` `repassada` (group, corr); the entry closes as `conversation` |
+| `mate` `answer`/`summary` | `mate_avisada_ate` (the manager's high-water mark of what it showed the coordinator) reached its number | `conversation`, "already shown to the coordinator" |
+| `usuario` starting with `orq: machine under pressure` | the panel types it, but it is not in `ORQ_NOTICES` | `conversation`, "the manager already holds the dispatches" |
+
+`repassada` closes an obligation like `feito` and `adiada` (`open_obligations`), without creating a "to do later" ticket: the mate now carries it and its Stop chases it. A request that takes only part of the open obligations records `repassada` for those and leaves the entry open for the rest. Report entries use `discarded` because `conversation` refuses them. Left open on purpose: a user prompt, a mate's `decision`, `block` and `pr`, and PR entries closed without merge. Ceiling: the mate request is matched by text (entry id, URL or `#number`); one that names none of them leaves the entry to the coordinator.
+
 ## Obligations are hooks (ticket 153)
 
 An obligation that depends on someone remembering a command gets forgotten, so it is fired by an event that already exists, and a manual command stays only for decisions, lookups, setup and escapes. The inventory (ticket 153, the ticket 153 report in the plan notes) covers the 82 leaf commands of `orq --help` (56 top-level): 25 are already fired by an event, 7 become automatic, 2 become a reminder that blocks until done, 48 stay manual.
