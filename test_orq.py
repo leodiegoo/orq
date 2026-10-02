@@ -20488,6 +20488,56 @@ def test_ticket328_the_runner_flags_a_test_line_in_a_live_events_file():
     assert leak.startswith(p + ": ") and "wt147" in leak, leak
 
 
+def _queue324(a, n=25):
+    items = [{"id": f"fd{i:06x}", "tipo": "despacho", "run": "run_a", "titulo": f"t{i}", "modelo": "claude-sonnet-5-5", "effort": "medium", "prioridade": 2,
+              "ts": f"2026-10-02T10:{i:02d}:00Z", "motivo": "full", "falhas": 0, **({"mate": "orq", "ticket": "77"} if i == 20 else {})} for i in range(1, n + 1)]
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "dispatch-queue.json"), "w") as f:
+        json.dump({"itens": items}, f)
+
+
+def test_ticket324_dispatch_queue_priority_moves_a_p2_item_ahead_without_losing_its_ts():
+    a = Env()
+    _queue324(a)
+    before = json.loads(a.orq("dispatch-queue", "list", "--json").stdout)
+    assert before[19]["id"] == "fd000014", before[19]
+    r = a.orq("dispatch-queue", "priority", "fd000014", "1")
+    assert r.returncode == 0, r.stderr
+    after = json.loads(a.orq("dispatch-queue", "list", "--json").stdout)
+    assert after[0]["id"] == "fd000014" and after[0]["prioridade"] == 1 and after[0]["ts"] == before[19]["ts"], after[0]
+    assert [i["id"] for i in after[1:]] == [i["id"] for i in before if i["id"] != "fd000014"]
+    ev = [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+    assert len(ev) == 1 and ev[0]["id"] == "fd000014" and ev[0]["valor"] == 1 and ev[0]["de"] == 2 and ev[0]["autor"] == "coordinator", ev
+
+
+def test_ticket324_dispatch_queue_priority_refuses_an_unknown_id_listing_the_existing_ones():
+    a = Env()
+    _queue324(a, 3)
+    r = a.orq("dispatch-queue", "priority", "fdffffff", "1")
+    assert r.returncode == 1 and "fdffffff" in r.stderr and "fd000001, fd000002, fd000003" in r.stderr, r.stderr
+    assert not [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+
+
+def test_ticket324_only_the_coordinator_and_the_owner_mate_change_a_queue_item_and_orq_priority_takes_the_queue_id():
+    a = Env()
+    _queue324(a)
+    r = a.orq("dispatch-queue", "priority", "fd000014", "1", ORQ_MATE="other")
+    assert r.returncode == 1 and "belongs to" in r.stderr, r.stderr
+    r = a.orq("priority", "fd000014", "1", ORQ_MATE="orq")
+    assert r.returncode == 0, r.stderr
+    ev = [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+    assert len(ev) == 1 and ev[0]["autor"] == "orq", ev
+    assert not [e for e in a.events() if e.get("tipo") == "prioridade"]
+
+
+def test_ticket324_dispatch_queue_list_shows_task_ticket_priority_and_owner():
+    a = Env()
+    _queue324(a, 20)
+    r = a.orq("dispatch-queue", "list")
+    line = next(x for x in r.stdout.splitlines() if "fd000014" in x)
+    assert "P2" in line and "ticket 77" in line and "mate orq" in line, line
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
