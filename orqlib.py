@@ -6132,6 +6132,7 @@ def _away_push(ev, m):
         return "push-other"
     if ev.get("_dir_unknown"):
         return "push-other"
+    args = _no_redirects(args)
     flags, pos = [a for a in args if a.startswith("-")], [a for a in args if not a.startswith("-")]
     if "--no-verify" in flags:
         return "no-verify"
@@ -6165,6 +6166,19 @@ def _away_push(ev, m):
             return "push-env"
         line = "push-orq-main"
     return line
+
+
+def _no_redirects(args):
+    """The tokens without shell redirections: `2>/dev/null`, `> out` (operator and its target), and the `2>` left of a `2>&1` that cmdnorm split at the `&`."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif m := re.match(r"\d*(?:>>?|<)", a):
+            skip = m.end() == len(a) and a[:1] in "<>"  # a bare `>` takes the next token; `2>` alone is the half of a `2>&1`
+        else:
+            out.append(a)
+    return out
 
 
 def _pr_base(d, selector, repo):
@@ -6218,7 +6232,7 @@ def _away_line(seg, ev):
     return "reset" if m and _reset_in_main_checkout(ev, m) else None
 
 
-_KEEPS_HEAD = re.compile(_EXT_GIT + r"(?:status|log|diff|show|fetch|add|commit|rev-parse|remote|config|tag|push|pull|merge|rebase|reset|restore|rm|mv|cherry-pick|"
+_KEEPS_HEAD = re.compile(_EXT_GIT + r"(?:status|log|diff|show|fetch|add|commit|rev-parse|tag|push|pull|merge|reset|restore|rm|mv|cherry-pick|"
                          r"describe|ls-files|grep|blame|show-ref|reflog|shortlog|notes|clean|apply|am|revert|branch(?!\s.*(?:-[a-zA-Z]*[mM]|--move))|"
                          r"stash(?!\s+branch)|worktree|gc|prune|fsck|count-objects|cat-file|ls-remote|ls-tree|merge-base|name-rev|rev-list|for-each-ref|symbolic-ref\s+(?:-q\s+|--short\s+)*HEAD$)(?![-\w])")
 
@@ -6247,7 +6261,7 @@ def _external_denied(ev, cur):
         return None
     segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
     if away:
-        subshell = bool(re.search(r"[()]", cmdnorm.no_text(cmd)))
+        subshell = bool(re.search(r"[()]|(?<!\|)\|(?!\|)|(?<![&>])&(?![&>])", cmdnorm.no_text(cmd)))  # parentheses, a pipe or a lone `&` run `cd` in a subshell
         for seg in segs:
             if m := re.match(r"(?:cd|pushd)(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
                 unknown = subshell or m.group(1) == "-"  # `(cd w) && git push` runs in the cwd: with parentheses, orq cannot tell where it is
@@ -6257,6 +6271,8 @@ def _external_denied(ev, cur):
                 ev = {**ev, "_dir_unknown": True}
             if _moves_head(seg):  # the hook runs before the command: HEAD still names the old branch
                 ev = {**ev, "_head_moves": True}
+            if re.match(_EXT_GIT + r"(?:config|remote|branch\s.*(?:-u|--set-upstream-to|--track|-t)\b)", seg):  # the push config orq reads is the one before this runs
+                ev = {**ev, "_dir_unknown": True}
             try:
                 line = _away_line(seg, ev)
             except Exception:  # noqa: BLE001 - fail closed while away, the alarm's TimeoutError included
