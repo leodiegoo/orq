@@ -1289,14 +1289,15 @@ class EmProcesso:
 
     def __enter__(self):
         m = orq_mod
-        self.antes = (m.HOME, m.ORCA, m.LOG, m.PEND, dict(os.environ))
-        m.HOME, m.ORCA, m.LOG, m.PEND = self.a.home, self.a.bin, self.a.env["ORQ_LOG"], self.a.env["ORQ_PENDENCIAS"]
+        self.antes, self.issues = (m.HOME, m.ORCA, m.LOG, m.PEND, dict(os.environ)), m.ISSUES
+        m.HOME, m.ORCA, m.LOG, m.PEND, m.ISSUES = self.a.home, self.a.bin, self.a.env["ORQ_LOG"], self.a.env["ORQ_PENDENCIAS"], self.a.env["ORQ_ISSUES"]
         os.environ.update({k: self.a.env[k] for k in ("FAKE_DIR", "ORCA_TERMINAL_HANDLE")})
         return self
 
     def __exit__(self, *_):
         m = orq_mod
         m.HOME, m.ORCA, m.LOG, m.PEND, env = self.antes
+        m.ISSUES = self.issues
         os.environ.clear()
         os.environ.update(env)
 
@@ -10706,19 +10707,19 @@ def _linhas_mate(a):
     return [x for x in a.orq("status").stdout.splitlines() if x.startswith("mate ")]
 
 
-def test_orq_status_mostra_uma_linha_por_mate_vivo_caido_e_com_pedido():
+def test_orq_status_mostra_uma_linha_por_mate_trabalhando_caido_e_com_pedido():
     a = Amb()
     _grupo(a)
     _grupo(a, "dados")  # grupo sem mate: sem linha
     assert _linhas_mate(a) == []
     _mate_vivo(a)
-    assert _linhas_mate(a) == ["mate orq: vivo (term_mate)"]
+    assert _linhas_mate(a) == ["mate orq: trabalhando (term_mate)"]
     a.set("terminals.json", ["term_coord"])  # o terminal do mate sumiu
     assert _linhas_mate(a) == ["mate orq: caiu (term_mate)"]
     a.set("terminals.json", ["term_mate", "term_coord"])
     with open(os.path.join(a.home, "events.jsonl"), "w") as f:
         f.write(json.dumps({"tipo": "mate_pedido", "corr": "p1", "grupo": "orq", "texto": "x", "prazo": 120, "ts": "2026-10-01T12:00:00Z"}) + "\n")
-    assert _linhas_mate(a) == ["mate orq: vivo (term_mate) | pedidos: p1 a_entregar"]
+    assert _linhas_mate(a) == ["mate orq: trabalhando (term_mate) | pedidos: p1 a_entregar"]
 
 
 def test_mate_pendentes_conta_o_prazo_do_fim_do_turno_que_recebeu_o_pedido():
@@ -12995,6 +12996,175 @@ def test_it_should_only_preview_the_automatic_cleanup_until_the_first_real_one()
     assert "limparia" not in a.orq("pr", "poll", "--forcar", cwd=a.repo).stdout, "a prévia sai uma vez por task"
     assert a.orq("limpar", "--fechados", cwd=a.repo).returncode == 0 and _ramos(a) == {"local": False, "remota": False}
     assert os.path.exists(os.path.join(a.home, "limpar-fechados.json"))
+
+
+# ---------- ticket 127: o mate ocioso dorme, o pedido o acorda ----------
+
+AGORA127 = datetime(2026, 10, 1, 15, 0, 0, tzinfo=timezone.utc)
+
+
+def _m127(fim_min=11, aberto_min=None, **kw):
+    """O registro do mate no cursor: turno que acabou há `fim_min` min em relação a AGORA127 (None: sem turno)."""
+    ts = lambda min_: (AGORA127 - timedelta(minutes=min_)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    return {"terminal": "term_mate", "sessao": "sess-mate", "runs": ["run_m"],
+            "turnos": [[ts(fim_min + 5), ts(fim_min)]] if fim_min is not None else [],
+            **({"aberto_em": ts(aberto_min)} if aberto_min is not None else {}), **kw}
+
+
+def test_ticket127_ocioso_so_com_turno_fechado_sem_pedido_e_sem_worker_vivo():
+    sem = lambda: False  # noqa: E731
+    com = lambda: True  # noqa: E731
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem) == "ocioso há 11 min"
+    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], sem) == "trabalhando", "turno fechado há menos de 10 min"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [{"corr": "p1"}], sem) == "trabalhando", "pedido aberto do coordenador"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], com) == "trabalhando", "worker do Run dele vivo (ou entrega sem integrar)"
+    aberto = _m127(11)
+    aberto["turnos"][-1][1] = None
+    assert orq_mod.mate_situacao(aberto, AGORA127, [], sem) == "trabalhando", "turno ainda aberto"
+    assert orq_mod.mate_situacao(_m127(None), AGORA127, [], sem) == "trabalhando", "sem turno nem abertura gravados não há como medir"
+    assert orq_mod.mate_situacao(_m127(40, aberto_min=3), AGORA127, [], sem) == "trabalhando", "o resume zera o relógio: o turno antigo não vale"
+    assert orq_mod.mate_situacao(_m127(40, aberto_min=12), AGORA127, [], sem) == "ocioso há 12 min"
+    assert orq_mod.mate_situacao(_m127(30, terminal=None, dormiu="2026-10-01T14:40:00Z"), AGORA127, [], sem) == "dormindo"
+    assert orq_mod.mate_situacao(_m127(11), AGORA127, [], sem, minimo=15) == "trabalhando", "ORQ_MATE_OCIOSO_MIN"
+    chamado = []
+    assert orq_mod.mate_situacao(_m127(9), AGORA127, [], lambda: chamado.append(1)) == "trabalhando" and not chamado, "o worker só é consultado com o resto ocioso"
+
+
+def _amb127(fim_min, prontos=(), grupo_cfg=True, **mate):
+    """Um mate vivo com o turno fechado há `fim_min` min (relógio real), a tela ociosa e o coordenador no gerente.json; `prontos`: tickets `ready` do grupo."""
+    a = Amb(run="run_m", **HIB60)
+    _grupo(a)
+    cur = {"mates": {"orq": {"terminal": "term_mate", "sessao": "sess-mate", "cwd": a.home, "runs": ["run_m"],
+                             "turnos": [[_z60(fim_min + 5), _z60(fim_min)]], **mate}}}
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, open(os.path.join(a.home, "gerente.json"), "w"))
+    a.set("terminals.json", ["term_coord", "term_ger", "term_mate"])
+    a.set("screens.json", {"term_mate": _tela52("tela-claude-ocioso.txt"), "term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    a.set("workers.json", [])
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    for n in prontos:
+        with open(os.path.join(a.env["ORQ_ISSUES"], f"{n}-x.md"), "w") as f:
+            f.write(f"# {n}: orq: ticket {n}\n\nStatus: ready\nBlocked by: (nenhum)\n\n## What to build\nx\n\n## Acceptance criteria\n- x\n")
+    return a
+
+
+def test_ticket127_ocioso_por_20_min_sem_ticket_pronto_o_gerente_hiberna_e_grava_mate_dormiu():
+    a = _amb127(25)
+    with EmProcesso(a):
+        r = orq_mod.mates_dormir()
+    assert r == ["mate orq: dormiu (ocioso há 25 min)"], r
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_mate"]
+    m = _cursor(a)["mates"]["orq"]
+    assert m["terminal"] is None and m["sessao"] == "sess-mate" and m["dormiu"], m
+    ev = next(e for e in a.events() if e["tipo"] == "mate_dormiu")
+    assert (ev["grupo"], ev["terminal"], ev["sessao"]) == ("orq", "term_mate", "sess-mate"), ev
+    assert not _log(a, "create.log")
+    with EmProcesso(a):
+        assert orq_mod.mates_dormir() == [], "dormindo não dorme de novo"
+    assert len(_log(a, "close.log")) == 1
+    with EmProcesso(a):
+        assert not any("caiu" in x for x in orq_mod.mate_volta()), "dormir de propósito não é queda"
+
+
+def test_ticket127_ocioso_ha_menos_de_20_min_ou_com_tela_ocupada_nao_hiberna():
+    a = _amb127(15)
+    with EmProcesso(a):
+        assert orq_mod.mates_dormir() == []
+    assert not _log(a, "close.log") and _cursor(a)["mates"]["orq"]["terminal"] == "term_mate"
+    b = _amb127(25)
+    b.set("screens.json", {"term_mate": ["✻ Pensando… (esc to interrupt)"]})
+    with EmProcesso(b):
+        assert orq_mod.mates_dormir() == []
+    assert not _log(b, "close.log"), "tela com spinner: a próxima volta confere de novo"
+
+
+def test_ticket127_com_ticket_pronto_do_grupo_avisa_o_coordenador_uma_vez_e_nao_hiberna():
+    a = _amb127(25, prontos=("104", "117"))
+    with EmProcesso(a):
+        r = orq_mod.mates_dormir()
+        assert r == ["mate orq: ocioso há 25 min, coordenador avisado (104, 117 prontos)"], r
+        assert orq_mod.mates_dormir() == [], "avisado uma vez por ociosidade"
+    assert not _log(a, "close.log") and _cursor(a)["mates"]["orq"]["terminal"] == "term_mate"
+    avisos = [x["texto"] for x in _cursor(a)["avisos"]]  # sem o modo ausente o aviso espera no contexto do próximo prompt do coordenador (ticket 82)
+    assert len(avisos) == 1 and "mate orq ocioso, tem 104 e 117 prontos" in avisos[0], avisos
+    # sem vaga livre na máquina o ticket pronto não ocupa o mate: ele dorme
+    b = _amb127(25, prontos=("104",))
+    json.dump({"max_workers": 0}, open(os.path.join(b.home, "maquina.json"), "w"))
+    with EmProcesso(b):
+        assert orq_mod.mates_dormir() == ["mate orq: dormiu (ocioso há 25 min)"]
+
+
+def test_ticket127_worker_vivo_ou_pedido_aberto_do_mate_o_mantem_acordado():
+    a = _amb127(25)
+    a.set("workers.json", [_w48("term_w1", run="run_m", agente="claude", modelo="claude-opus-5-5")])
+    a.set("tasks_run_m.json", [{"id": "task_term_w1", "task_title": "x", "status": "dispatched", "dispatch_id": "ctx_term_w1", "created_at": _iso(-3600)}])
+    a.set("terminals.json", ["term_coord", "term_ger", "term_mate", "term_w1"])
+    a.set("screens.json", {"term_mate": _tela52("tela-claude-ocioso.txt"), "term_w1": _tela52("tela-claude-ocioso.txt")})
+    with EmProcesso(a):
+        assert orq_mod.mates_dormir() == []
+    assert not _log(a, "close.log")
+    b = _amb127(25)
+    b.orq("mate", "pedir", "orq", "--texto", "status", "--prazo", "0")
+    with EmProcesso(b):
+        # prazo 0 não espera resposta; com prazo o pedido sem resposta segura o mate
+        assert orq_mod.mates_dormir() == ["mate orq: dormiu (ocioso há 25 min)"]
+    c = _amb127(25)
+    c.orq("mate", "pedir", "orq", "--texto", "status", "--prazo", "600")
+    with EmProcesso(c):
+        assert orq_mod.mates_dormir() == []
+    assert not _log(c, "close.log")
+
+
+def test_ticket127_mate_pedir_com_o_mate_dormindo_retoma_a_sessao_e_entrega_o_pedido():
+    a = _amb127(25, terminal=None, dormiu=_z60(5))
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    r = a.orq("mate", "pedir", "orq", "--texto", "despache o ticket 77")
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)
+    assert p["corr"] == "p1" and p["entrega"] == "enviado", p
+    cmd = _log(a, "create.log")[0]
+    cmd = cmd[cmd.index("--command") + 1]
+    assert cmd == f"cd {a.home}; ORQ_MATE=orq claude --resume sess-mate --model claude-sonnet-5-5 --dangerously-skip-permissions", cmd
+    textos = [c[c.index("--text") + 1] for c in _log(a, "send.log") if "--text" in c]
+    assert len(textos) == 2 and "dormiu" in textos[0] and textos[1].startswith("orq ▸ pedido p1") and "despache o ticket 77" in textos[1], textos
+    m = _cursor(a)["mates"]["orq"]
+    assert m["terminal"] == "term_ret1" and not m.get("dormiu") and m["aberto_em"], m
+    assert any(e["tipo"] == "mate_acordou" and e["grupo"] == "orq" for e in a.events())
+    # o relógio de ociosidade parte da abertura: o turno antigo (25 min) não põe o mate de volta para dormir
+    with EmProcesso(a):
+        assert orq_mod.mates_dormir() == []
+
+
+def test_ticket127_retomar_nao_acorda_o_mate_que_dormiu_de_proposito():
+    a = _amb127(25, terminal=None, dormiu=_z60(5))
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    r = a.orq("retomar", "--dry-run")
+    assert r.returncode == 0 and "a_retomar" not in r.stdout and not _log(a, "create.log"), (r.stdout, r.stderr)
+
+
+def test_ticket127_grupos_e_status_mostram_trabalhando_ocioso_e_dormindo():
+    a = _amb127(3)
+    assert "mate trabalhando (term_mate" in a.orq("grupos").stdout
+    assert "mate orq: trabalhando (term_mate)" in a.orq("status").stdout
+    b = _amb127(12)
+    assert "mate ocioso há 12 min (term_mate" in b.orq("grupos").stdout
+    assert "mate orq: ocioso há 12 min (term_mate)" in b.orq("status").stdout
+    c = _amb127(30, terminal=None, dormiu=_z60(4))
+    c.set("terminals.json", ["term_coord", "term_ger"])
+    assert "mate dormindo" in c.orq("grupos").stdout and "mate orq: dormindo" in c.orq("status").stdout
+    assert "caiu" not in c.orq("status").stdout
+
+
+def test_ticket127_orq_mate_dormir_a_mao_e_a_recusa_com_pedido_aberto():
+    a = _amb127(1)
+    r = a.orq("mate", "dormir", "orq")
+    assert r.returncode == 0 and json.loads(r.stdout)["grupo"] == "orq", (r.stdout, r.stderr)
+    assert [c[c.index("--terminal") + 1] for c in _log(a, "close.log")] == ["term_mate"]
+    b = _amb127(1)
+    b.orq("mate", "pedir", "orq", "--texto", "x", "--prazo", "600")
+    r = b.orq("mate", "dormir", "orq")
+    assert r.returncode != 0 and "pedido" in r.stderr and not _log(b, "close.log"), (r.stdout, r.stderr)
+
 
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""

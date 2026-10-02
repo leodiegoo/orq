@@ -4227,6 +4227,8 @@ PRAZO_PEDIDO_S = int(os.environ.get("ORQ_PRAZO_PEDIDO_S") or 120)  # o do firstm
 TIPOS_SUBIDA = ("resposta", "decisao", "pr", "bloqueio", "resumo")
 TURNOS_MATE = 20  # turnos guardados por mate: o prazo conta do primeiro que começou depois da entrega, não do último
 MATE_ESPERA_S = float(os.environ.get("ORQ_MATE_ESPERA_S") or 90)  # a caixa do claude do mate na tela: o resume levou mais de 20 s com a máquina carregada (01/10)
+MATE_OCIOSO_MIN = float(os.environ.get("ORQ_MATE_OCIOSO_MIN") or 10)  # minutos com o turno do mate fechado até ele contar como ocioso (ticket 127)
+MATE_DORMIR_MIN = float(os.environ.get("ORQ_MATE_DORMIR_MIN") or 20)  # minutos ocioso até o gerente pô-lo para dormir (hibernar o mate)
 TURNO_ABERTO_TETO_S = 1800  # turno sem fim (Esc, erro da API: o Stop não rodou) conta como acabado no começo depois disto
 ENTREGUE = ("enviado", "adiado")  # o avisa_coordenador (ticket 82): adiado já é entrega, sai no contexto do próximo prompt do coordenador
 CHARTER_MATE = """Você é o secondmate do grupo {grupo} no orq. O usuário fala só com o coordenador; você coordena os workers deste grupo e não conversa com o usuário.
@@ -4238,6 +4240,8 @@ Projetos do grupo: {projetos}.{regras}
 5. Nunca use AskUserQuestion, não faça push nem abra PR: quem faz é o coordenador, depois da subida `pr`."""
 MSG_MATE_VOLTA = ("Você é o secondmate do grupo {grupo} e o seu terminal caiu. Confira `orq grupos` (o seu Run), `orq agentes --run <run>` e os pedidos sem resposta "
                   "em `orq mate pedidos`; responda cada um com `orq mate subir --corr pN`.")
+MSG_MATE_ACORDA = ("Você é o secondmate do grupo {grupo} e dormiu por ociosidade; o coordenador acabou de mandar um pedido. Ele chega digitado como `orq ▸ pedido pN ...`; "
+                   "confira também `orq grupos` (o seu Run), `orq agentes --run <run>` e `orq mate pedidos`, e responda cada pedido com `orq mate subir --corr pN`.")
 
 
 def grupos():
@@ -4383,8 +4387,9 @@ def mate_pedir(grupo, texto, prazo=PRAZO_PEDIDO_S, responde=None):
     `responde`: a entrada que o mate subiu e este pedido responde (a decisão voltando); ela fecha com o efeito `mate`."""
     if grupo not in grupos():
         raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/")
-    terminal = _dict(_mates().get(grupo)).get("terminal")
-    if not terminal:
+    m0 = _dict(_mates().get(grupo))
+    terminal, dormindo = m0.get("terminal"), bool(m0.get("dormiu")) and not m0.get("terminal")
+    if not terminal and not dormindo:
         raise ValueError(f"o grupo {grupo} não tem mate aberto: orq mate abrir {grupo}")
     if responde:
         eventos = read_events()
@@ -4393,6 +4398,8 @@ def mate_pedir(grupo, texto, prazo=PRAZO_PEDIDO_S, responde=None):
             raise ValueError(f"--responde {responde}: não é uma entrada que o mate {grupo} subiu; nada foi gravado")
         if any(e.get("tipo") == "intake" and e.get("entrada") == responde for e in eventos):
             raise ValueError(f"--responde {responde}: a entrada já foi fechada; nada foi gravado")
+    if dormindo:
+        terminal = mate_abrir(grupo)["terminal"]  # o pedido acorda o mate: retoma a sessão antes de gravar e digitar o pedido
     with _trava("cursor.lock"):
         n = 1 + max((int(e["corr"][1:]) for e in read_events() if e.get("tipo") == "mate_pedido" and re.fullmatch(r"p\d+", str(e.get("corr")))), default=0)
         corr = f"p{n}"
@@ -4421,13 +4428,13 @@ def mate_subir(tipo, texto, corr=None, link=None, grupo=None):
                          **({"corr": corr} if corr else {}), **({"link": link} if link else {})}, novo_id=True)
 
 
-def _comando_mate(grupo, cfg, sessao, cwd=None):
+def _comando_mate(grupo, cfg, sessao, cwd=None, dormia=False):
     """(comando do terminal, texto a digitar depois que o agente subir, ou None se o texto vai na linha de comando)."""
     agente, modelo = cfg.get("harness") or "claude", cfg.get("modelo")
     if agente not in HARNESS:
         raise ValueError(f"harness {agente} do grupo {grupo}: o orq só abre {', '.join(HARNESSES)}")
     if sessao:
-        texto = MSG_MATE_VOLTA.format(grupo=grupo)
+        texto = (MSG_MATE_ACORDA if dormia else MSG_MATE_VOLTA).format(grupo=grupo)
     else:
         regras = f"\nLeia antes as regras do grupo em {cfg['regras']}." if cfg.get("regras") else ""
         texto = CHARTER_MATE.format(grupo=grupo, projetos=", ".join(cfg.get("projetos") or []) or "nenhum", regras=regras)
@@ -4470,7 +4477,7 @@ def mate_abrir(grupo):
     cwd = m.get("cwd") or cfg.get("cwd") or next(iter(cfg.get("projetos") or []), None)
     cwd = cwd and os.path.expanduser(cwd)
     agente = cfg.get("harness") or "claude"
-    comando, texto = _comando_mate(grupo, cfg, m.get("sessao"), cwd)
+    comando, texto = _comando_mate(grupo, cfg, m.get("sessao"), cwd, dormia=bool(m.get("dormiu")))
     # o terminal abre no projeto do grupo, se o Orca o conhece (ele agrupa o mate com o projeto na tela): `projeto_mate`, senão o primeiro dos `projetos`
     pasta_mate = os.path.expanduser(cfg.get("projeto_mate") or next(iter(cfg.get("projetos") or []), "")) or None
     novo = _terminal_novo(f"mate {grupo}{' (retomado)' if m.get('sessao') else ''}", comando, pasta_mate and _repo_no_orca(pasta_mate))
@@ -4484,8 +4491,10 @@ def mate_abrir(grupo):
         append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": False, "falhou": motivo})
         raise ValueError(f"mate {grupo}: {motivo} em {MATE_ESPERA_S:.0f} s; terminal fechado. Rode orq mate abrir {grupo} de novo"
                          + (" para abrir com o charter" if m.get("sessao") else ""))
-    _mate_mut(grupo, terminal=novo, morto=None, **({"cwd": cwd} if cwd else {}))
+    _mate_mut(grupo, terminal=novo, morto=None, dormiu=None, aberto_em=now(), **({"cwd": cwd} if cwd else {}))  # aberto_em: o relógio de ociosidade parte daqui
     append_event({"tipo": "mate", "op": "abrir", "grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao")), "anterior": m.get("terminal")})
+    if m.get("dormiu"):
+        append_event({"tipo": "mate_acordou", "grupo": grupo, "terminal": novo, "sessao": m.get("sessao")})
     return {"grupo": grupo, "terminal": novo, "retomado": bool(m.get("sessao"))}
 
 
@@ -4528,11 +4537,57 @@ def mate_volta():
     return linhas
 
 
+def _ocioso_min(m, agora, pend):
+    """Minutos que o mate está ocioso, ou None se não: turno fechado (ou aberto além do teto, que conta do começo), nenhum pedido aberto. Pura.
+    O relógio parte do maior entre o fim do último turno e `aberto_em` (o resume): o turno antigo do mate que acabou de acordar não vale."""
+    if pend or not m.get("terminal"):
+        return None
+    ts = [t for t in m.get("turnos") or [] if isinstance(t, list) and len(t) == 2]
+    ini, fim = (_ts(ts[-1][0]), _ts(ts[-1][1])) if ts else (None, None)
+    if ts and not fim:
+        if not ini or (agora - ini).total_seconds() <= TURNO_ABERTO_TETO_S:
+            return None
+        fim = ini
+    desde = max(filter(None, [fim, _ts(m.get("aberto_em"))]), default=None)
+    return (agora - desde).total_seconds() / 60 if desde else None
+
+
+def mate_situacao(m, agora, pend, tem_worker, minimo=None):
+    """"dormindo", "ocioso há N min" ou "trabalhando". Ocioso é o turno fechado há `minimo` min (ORQ_MATE_OCIOSO_MIN), sem pedido aberto e sem worker do Run dele
+    vivo (`tem_worker`, só chamado com o resto ocioso). Pura, fora o `tem_worker`."""
+    if m.get("dormiu") and not m.get("terminal"):
+        return "dormindo"
+    ocioso = _ocioso_min(m, agora, pend)
+    if ocioso is None or ocioso < (MATE_OCIOSO_MIN if minimo is None else minimo) or tem_worker():
+        return "trabalhando"
+    return f"ocioso há {int(ocioso)} min"
+
+
+def _mate_tem_worker(m, ags=None):
+    """Há worker de um Run do mate que não foi liberado (rodando, hibernado, entregue sem liberar, na fila de integração)? O Orca ilegível conta como sim."""
+    try:
+        ags = agentes() if ags is None else ags
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        log(f"mate: agentes ilegível ({e}); sem prova de que não há worker")
+        return True
+    return any(a.get("run") in (m.get("runs") or []) and a.get("estado") not in ("liberado", "encerrado") for a in ags)
+
+
 def _mate_do_grupo(nome, mates, vivos, eventos, agora):
-    """(estado, terminal, Runs, pedidos sem resposta) do mate de um grupo; estado "sem mate", "vivo" ou "caiu"."""
+    """(estado, terminal, Runs, pedidos sem resposta) do mate de um grupo; estado "sem mate", "caiu", "dormindo", "ocioso há N min" ou "trabalhando"."""
     m = _dict(mates.get(nome))
-    estado = "sem mate" if not m.get("terminal") else "vivo" if vivos is None or m["terminal"] in vivos else "caiu"
-    return estado, m.get("terminal"), m.get("runs") or [], [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == nome]
+    pend = [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == nome]
+    if m.get("dormiu") and not m.get("terminal"):
+        estado = "dormindo"
+    elif not m.get("terminal"):
+        estado = "sem mate"
+    elif vivos is None:
+        estado = "trabalhando"  # sem a lista do Orca não há prova de ociosidade
+    elif m["terminal"] not in vivos:
+        estado = "caiu"
+    else:
+        estado = mate_situacao(m, agora, pend, lambda: _mate_tem_worker(m))
+    return estado, m.get("terminal"), m.get("runs") or [], pend
 
 
 def texto_grupos(gs, mates, vivos, eventos, agora):
@@ -4546,7 +4601,7 @@ def texto_grupos(gs, mates, vivos, eventos, agora):
 
 
 def linhas_mates():
-    """As linhas do `orq status`: uma por grupo com mate gravado (vivo ou caiu, terminal, pedidos sem resposta). Sem mate, nada."""
+    """As linhas do `orq status`: uma por grupo com mate gravado (trabalhando, ocioso há N min, dormindo ou caiu, terminal, pedidos sem resposta). Sem mate, nada."""
     mates = _mates()
     if not mates:
         return []
@@ -4554,8 +4609,84 @@ def linhas_mates():
     linhas = []
     for nome in grupos():
         estado, terminal, _, pend = _mate_do_grupo(nome, mates, vivos, eventos, agora)
-        if terminal:
-            linhas.append(f"mate {nome}: {estado} ({terminal})" + (f" | pedidos: {', '.join(p['corr'] + ' ' + p['estado'] for p in pend)}" if pend else ""))
+        if terminal or estado == "dormindo":
+            linhas.append(f"mate {nome}: {estado}" + (f" ({terminal})" if terminal else "") + (f" | pedidos: {', '.join(p['corr'] + ' ' + p['estado'] for p in pend)}" if pend else ""))
+    return linhas
+
+
+def mate_dormir(grupo, motivo="manual", ags=None):
+    """Hiberna o mate do grupo: guarda a sessão (já gravada pelos hooks dele), marca `dormiu` e fecha o terminal; `orq mate pedir` o acorda com `--resume`. Recusa, com ValueError,
+    o que a hibernação de worker também recusa: terminal do coordenador, do gerente ou deste processo, tela ocupada ou com rascunho, e o que o mate não pode largar: pedido
+    aberto e worker do Run dele não liberado (o aviso de entrega cairia num terminal fechado)."""
+    cfg, m = grupos().get(grupo), _dict(_mates().get(grupo))
+    if cfg is None:
+        raise ValueError(f"grupo {grupo} não existe em {GRUPOS_DIR}/")
+    t, agente = m.get("terminal"), cfg.get("harness") or "claude"
+    if not t:
+        raise ValueError(f"o mate {grupo} não está aberto" + (" (já dorme)" if m.get("dormiu") else ""))
+    vivos = _terminais_vivos()
+    if vivos is None or t not in vivos:
+        raise ValueError(f"o mate {grupo}: o Orca não lista o terminal {t}; nada foi fechado")
+    g = _gerente_cfg()
+    if t in {os.environ.get("ORCA_TERMINAL_HANDLE"), g.get("coordenador"), g.get("gerente")}:
+        raise ValueError(f"o terminal {t} é o coordenador, o gerente ou o de quem chamou: nunca dorme")
+    if not m.get("sessao") or agente not in HARNESS:
+        raise ValueError(f"o mate {grupo} não tem session_id gravado pelos hooks: não há como voltar")
+    if pend := [p["corr"] for p in mate_pendentes(read_events(), _mates(), datetime.now(timezone.utc)) if p["grupo"] == grupo]:
+        raise ValueError(f"o mate {grupo} tem pedido aberto ({', '.join(pend)})")
+    if _mate_tem_worker(m, ags):
+        raise ValueError(f"o mate {grupo} tem worker do Run dele que não foi liberado")
+    try:
+        ocupada = _tela_ocupada(t, agente) or terminal_livre(t)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        raise ValueError(f"o mate {grupo}: tela ilegível ({e})")
+    if ocupada:
+        raise ValueError(f"o mate {grupo} não está livre: {ocupada}")
+    _mate_mut(grupo, terminal=None, dormiu=now())  # antes do close: uma queda no meio não deixa o gerente avisar "caiu" nem o retomar subir o mate
+    try:
+        orca("close", "--terminal", t, area="terminal")
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        _mate_mut(grupo, terminal=t, dormiu=None)
+        raise ValueError(f"o mate {grupo}: terminal close falhou ({e})")
+    append_event({"tipo": "mate_dormiu", "grupo": grupo, "terminal": t, "sessao": m["sessao"], "motivo": motivo})
+    return {"grupo": grupo, "terminal": t, "sessao": m["sessao"], "motivo": motivo}
+
+
+def _lista_e(itens):
+    return itens[0] if len(itens) == 1 else ", ".join(itens[:-1]) + " e " + itens[-1]
+
+
+def mates_dormir(agora=None):
+    """Uma volta do gerente: o mate ocioso há ORQ_MATE_DORMIR_MIN min dorme (`mate_dormir`), salvo se o grupo tem ticket `ready` e a máquina tem vaga livre: aí avisa o coordenador,
+    uma vez por ociosidade, e não hiberna. Recusa na tela ou nos pedidos é silenciosa: a próxima volta confere de novo. Devolve as linhas do painel."""
+    mates = _mates()
+    if not mates:
+        return []
+    agora, gs, eventos, vivos, linhas = agora or datetime.now(timezone.utc), grupos(), read_events(), _terminais_vivos(), []
+    coord = (_gerente_cfg() or {}).get("coordenador")
+    for g, m in ((g, _dict(m)) for g, m in mates.items()):
+        if vivos is None or g not in gs or m.get("terminal") not in vivos:
+            continue
+        ocioso = _ocioso_min(m, agora, [p for p in mate_pendentes(eventos, mates, agora) if p["grupo"] == g])
+        if ocioso is None or ocioso < MATE_DORMIR_MIN:
+            continue
+        ags = agentes()
+        if _mate_tem_worker(m, ags):
+            continue
+        prontos = [t["num"].lstrip("0") or "0" for t in tickets() if t["status"] == "ready" and grupo_de(gs, titulo=t["titulo"])[0] == g]
+        if prontos and maquina_painel(ags)["livres"] > 0:
+            chave = json.dumps([m.get("aberto_em"), (m.get("turnos") or [])[-1:], prontos])
+            if coord and m.get("prontos_avisados") != chave and avisa_coordenador(
+                    coord, f"orq ▸ mate {g} ocioso, tem {_lista_e(prontos)} prontos. Peça com orq mate pedir {g} --texto \"...\"") in ENTREGUE:
+                _mate_mut(g, prontos_avisados=chave)
+                linhas.append(f"mate {g}: ocioso há {int(ocioso)} min, coordenador avisado ({', '.join(prontos)} prontos)")
+            continue
+        try:
+            mate_dormir(g, f"ocioso há {int(ocioso)} min", ags)
+        except ValueError as e:
+            log(f"mate dormir {g}: recusado ({e})")
+            continue
+        linhas.append(f"mate {g}: dormiu (ocioso há {int(ocioso)} min)")
     return linhas
 
 
@@ -7854,7 +7985,7 @@ def retomar(dry_run=False, run=None):
                 por_d[d] = {**_subir_sessao(linha, linha["sessao"], linha["modelo"], cp, dica, msg_continuar(meu, linha["task"], d, linha["run"]), linha["agente"], linha["effort"]), "prioridade": prio}
     res["workers"] = [por_d[w["dispatchId"]] for w in cand]
     for g, m in _mates().items():  # o mate que caiu volta pela sessão dele (ticket 80); o pedido sem resposta continua com o prazo
-        if _dict(m).get("terminal") not in vivos and _dict(m).get("sessao") and g in grupos():
+        if _dict(m).get("terminal") not in vivos and _dict(m).get("sessao") and not _dict(m).get("dormiu") and g in grupos():  # dormiu de propósito: só o pedido acorda
             try:
                 res.setdefault("mates", []).append({"grupo": g, "estado": "a_retomar"} if dry_run else {**mate_abrir(g), "estado": "retomado"})
             except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
@@ -8716,6 +8847,10 @@ def gerente_absorver():
         linhas += [*acordar_gatilhos(), *hibernar_ociosos()]
     except Exception as e:  # noqa: BLE001 - hibernar é economia, não pode derrubar o painel; a próxima volta tenta
         log(f"hibernar: {type(e).__name__}: {e}")
+    try:
+        linhas += mates_dormir()
+    except Exception as e:  # noqa: BLE001 - idem para o mate ocioso
+        log(f"mates dormir: {type(e).__name__}: {e}")
     _toca_painel()
     _grava_volta(time.time() - inicio)
     return "\n".join(linhas)
@@ -9282,8 +9417,9 @@ def main(argv=None):
     gp.add_argument("--titulo")
     gp.add_argument("--cwd")
     gp.add_argument("--grupo")
-    mt = sub.add_parser("mate", help="o secondmate de um grupo: abrir | pedir | subir | pedidos").add_subparsers(dest="op", required=True)
+    mt = sub.add_parser("mate", help="o secondmate de um grupo: abrir | dormir | pedir | subir | pedidos").add_subparsers(dest="op", required=True)
     mt.add_parser("abrir").add_argument("grupo")
+    mt.add_parser("dormir", help="hiberna o mate do grupo (o gerente faz sozinho depois de ORQ_MATE_DORMIR_MIN min ocioso); orq mate pedir o acorda").add_argument("grupo")
     mp = mt.add_parser("pedir")
     mp.add_argument("grupo")
     mp.add_argument("--texto", required=True)
@@ -9532,6 +9668,8 @@ def main(argv=None):
             print(texto_grupos(grupos(), _mates(), _terminais_vivos() if _mates() else None, read_events(), datetime.now(timezone.utc)))
         elif a.cmd == "mate" and a.op == "abrir":
             print(json.dumps(mate_abrir(a.grupo), ensure_ascii=False))
+        elif a.cmd == "mate" and a.op == "dormir":
+            print(json.dumps(mate_dormir(a.grupo), ensure_ascii=False))
         elif a.cmd == "mate" and a.op == "pedir":
             print(json.dumps(mate_pedir(a.grupo, a.texto, a.prazo, a.responde), ensure_ascii=False))
         elif a.cmd == "mate" and a.op == "subir":
