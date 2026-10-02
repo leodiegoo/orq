@@ -11024,6 +11024,26 @@ def test_ticket55_advance_refuses_forgotten_conflict_marker():
     assert r.returncode == 0 and open(os.path.join(alive, "nota.txt")).read() == "a\num e dois\nc\n", r.stdout + r.stderr
 
 
+
+def test_ticket328_advance_after_a_conflict_only_in_tests_or_docs_runs_the_affected_tests():
+    light = {"um": {"README.md": "um\n", "x.txt": "1\n"}, "dois": {"README.md": "dois\n"}}
+    for branches, resolved, expected in ((light, "README.md", "affected"), ({"um": {"nota.txt": "um\n"}, "dois": {"nota.txt": "dois\n"}}, "nota.txt", "full")):
+        alive, env, g = _alive_repo55(branches)
+        integrate, wt = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
+        ran = os.path.join(alive, "..", "ran.txt")  # the tests run in the worktree, which goes away
+        env = {**env, "ORQ_TESTES": f"echo full > {ran}", "ORQ_TESTES_AFETADOS": f"echo affected > {ran}"}
+        r = subprocess.run([sys.executable, integrate, "um", "dois"], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode != 0 and "conflict" in r.stderr, r.stderr
+        open(os.path.join(wt, resolved), "w").write("um e dois\n")
+        g("commit", "-qam", "resolve", cwd=wt)
+        r = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode == 0 and open(ran).read() == expected + "\n", (expected, r.stdout + r.stderr)
+        assert ("running the affected tests" in r.stdout) == (expected == "affected"), r.stdout
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    ran = os.path.join(alive, "..", "ran.txt")
+    r = subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "um"], cwd=alive, env={**env, "ORQ_TESTES": f"echo full > {ran}"}, capture_output=True, text=True)
+    assert r.returncode == 0 and open(ran).read() == "full\n", "a cycle without a conflict runs the full suite once, on the final tree"
+
 def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_log():
     t = tempfile.mkdtemp()
     for f in ("orq.py", "precompact.py", "fail_safe.py", "orqpaths.py"):

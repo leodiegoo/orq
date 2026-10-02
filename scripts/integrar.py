@@ -8,7 +8,9 @@ After the fast-forward it calls `orq integrate conclude`, which closes what the 
 
 The live clone is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
 markers in orqlib.py and takes everything down. Here the conflict only exists in the worktree.
-Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests)."""
+The full suite runs once per cycle, on the final tree, and writes the test map of `orq test --affected` (plan/test-map.json). After a conflict resolved
+only in test_orq.py, README.md or docs/design.md, `--avancar` runs `orq test --affected` against the live main instead; the full run stays for the next cycle.
+Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests), ORQ_TESTES_AFETADOS (the run after a light conflict)."""
 import os
 import re
 import shlex
@@ -19,7 +21,9 @@ sys.dont_write_bytecode = True  # this runs inside the live main: no __pycache__
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import orqpaths  # noqa: E402
 
-TESTS = "python3 test_orq.py && python3 test_precompact.py"
+TEST_MAP = os.environ.get("ORQ_TEST_MAP") or os.path.join(orqpaths.PLAN, "test-map.json")
+TESTS = f"python3 test_orq.py --map {shlex.quote(TEST_MAP)} && python3 test_precompact.py"
+LIGHT = {"test_orq.py", "README.md", "docs/design.md"}  # a conflict only in these re-runs the affected tests, not the whole suite (ticket 328)
 
 
 def git(cwd, *args):
@@ -42,6 +46,24 @@ def alive():
 def branches_file(wt):
     """Where the worktree keeps the branches the cycle integrates (inside its gitdir, so `--advance` can find them after a conflict)."""
     return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-branches")
+
+
+def conflicts_file(wt):
+    """Where the worktree keeps the files of the conflict that stopped the cycle, for `--avancar`."""
+    return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-conflicts")
+
+
+def tests_for(viva, wt):
+    """The cycle's test command: the full suite, or the affected tests when the conflict that stopped it touched only LIGHT files."""
+    try:
+        conflicts = open(conflicts_file(wt)).read().split()
+    except OSError:
+        conflicts = []
+    if conflicts and set(conflicts) <= LIGHT:
+        print(f"integrar: the conflict was only in {', '.join(conflicts)}: running the affected tests; the full suite runs in the next cycle")
+        main = git(viva, "rev-parse", "HEAD").stdout.strip()
+        return os.environ.get("ORQ_TESTES_AFETADOS") or f"{shlex.quote(sys.executable)} orq.py test --affected --base {main}"
+    return os.environ.get("ORQ_TESTES") or TESTS
 
 
 def conclude(viva, wt):
@@ -73,8 +95,7 @@ def advance(wt):
     markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
     if markers:
         die(f"leftover conflict marker:\n{markers}")
-    tests = os.environ.get("ORQ_TESTES") or TESTS
-    if subprocess.run(tests, shell=True, cwd=wt).returncode:
+    if subprocess.run(tests_for(viva, wt), shell=True, cwd=wt).returncode:
         die(f"tests failing in {wt}; main did not advance")
     ff = git(viva, "merge", "--ff-only", branch)
     if ff.returncode:
@@ -111,6 +132,8 @@ def integrate(branches):
     for b in branches:
         r = git(wt, "merge", "--no-edit", b)
         if r.returncode:
+            with open(conflicts_file(wt), "w") as f:
+                f.write(git(wt, "diff", "--name-only", "--diff-filter=U").stdout)
             die(f"conflict integrating {b} in {wt} (the live main is untouched):\n{git(wt, 'status', '--short').stdout.strip()}\n"
                    f"resolve there, commit and run `integrar.py --avancar {wt}`")
     advance(wt)
