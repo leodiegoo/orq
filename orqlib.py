@@ -1604,7 +1604,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "heartbeat_visto": "heartbeat_seen", "heartbeat_absorvido": "heartbeat_absorbed", "gate_aviso": "gate_notice", "gate_falha": "gate_failed",
     "gate_falhou": "gate_blocked", "gate_resolvido": "gate_resolved", "fim_dispatch": "dispatch_end", "entrega": "delivery",
     "entrega_orq": "orq_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
-    "ausente_desligar": "away_off", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
+    "ausente_desligar": "away_off", "coordenador_parou": "coordinator_stopped", "coordenador_retomou": "coordinator_resumed", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
     "processos": "processes", "resumo_add": "summary_add", "devolver": "send_back", "limite_tela": "screen_limit",
     "pendente_avisado": "pending_notified", "revisao_nm": "nm_review",
 }
@@ -4268,10 +4268,33 @@ def away_lines(cur):
 PANEL_URL = "http://localhost:8765/"
 
 
-def away_report(since):
+COORDINATOR_TURN = ("entrada", "coordenador_retomou", "coordenador_parou")  # the events that start a coordinator turn or end the previous stop
+
+
+def coordinator_stops(evs, end_ts):
+    """[(start, end, motivo)] of the coordinator's stops longer than LACUNA_S: from a `coordenador_parou` to the next event of COORDINATOR_TURN (the user's prompt,
+    a notice typed by the manager or the next Stop), or to `end_ts` when none came."""
+    out, open_stop = [], None
+    for e in evs:
+        if e.get("tipo") in COORDINATOR_TURN:
+            if open_stop:
+                out.append((open_stop["ts"], e["ts"], open_stop.get("motivo")))
+            open_stop = e if e["tipo"] == "coordenador_parou" else None
+    if open_stop:
+        out.append((open_stop["ts"], end_ts, open_stop.get("motivo")))
+    return [x for x in out if (_dt(x[1]) - _dt(x[0])).total_seconds() > LACUNA_S]
+
+
+def away_report(since, live=None, now_at=None):
     """The absence report in pt-BR lines, only from what orq stores (events.jsonl and the pending item list), no LLM, only with what was born after
-    `since`. Sections in order: decisions, problems, summaries, deliveries, PRs, tickets; an empty section does not appear."""
-    evs = [e for e in read_events() if (e.get("ts") or "") >= since]
+    `since`. Sections in order: decisions, problems, coordinator stopped, summaries, deliveries, PRs, tickets, then the morning card's (dispatch stops, dirty
+    worktrees, not pushed, manager, log gap, commands to paste); an empty section does not appear. `live` is `_live_states` for the dispatches still running."""
+    now_at = now_at or datetime.now(timezone.utc)
+    all_events = read_events()
+    evs = [e for e in all_events if (e.get("ts") or "") >= since]
+    stops = [(a, b, why, int((_dt(b) - _dt(a)).total_seconds() // 60)) for a, b, why in coordinator_stops(evs, now_at.strftime("%Y-%m-%dT%H:%M:%SZ"))]
+    stop_line = lambda x: f"{_hora_local(x[0])} to {_hora_local(x[1])} ({x[3]} min): {x[2]}"  # noqa: E731
+    card = _card_parts(evs, since, now_at, True, _cursor_ro(), live)
     born = {e["pend"] for e in evs if e.get("tipo") == "pend" and e.get("op") == "add"}
     open_entries = [i for i in _load_pending()["itens"] if i.get("id") in born]
     pending_line = lambda i: f"{i['id']}: {_quote(i.get('titulo'), 90)} — {i.get('link') or 'no link'}"  # noqa: E731
@@ -4283,12 +4306,20 @@ def away_report(since):
         ("Problems", [f"worker failed: {_quote(e.get('subject'), 100)}" for e in evs if e.get("tipo") == "worker_done" and not ok(e)]
          + [f"alert: {_quote(e.get('texto') or e.get('alerta') or e.get('tipo'), 100)}" for e in evs if e.get("tipo") == "alerta"]
          + [f"gate refused: {e.get('gate')}" for e in evs if e.get("tipo") == "gate_falha"]
-         + [f"PR closed without merge: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") == "fechou"]),
+         + [f"PR closed without merge: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") == "fechou"]
+         + [f"coordinator stopped with work waiting, {stop_line(x)}" for x in stops if x[2] == "trabalho_esperando"]),
+        ("Coordinator stopped", [stop_line(x) for x in stops]),
         ("Summaries", [f"{_hora_local(e['ts'])} {_quote(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo" and e.get("texto")]),
         ("Worker deliveries", [_quote(e.get("subject"), 100) for e in evs if e.get("tipo") == "worker_done" and ok(e)]),
         ("PRs", [f"{'opened' if e['op'] == 'ligar' else 'merged into ' + str(e.get('base'))}: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") in ("ligar", "entrou")]),
         ("Tickets", [f"{'opened' if e['op'] == 'novo' else 'closed'} {e.get('ticket')}" + (f": {_quote(e.get('titulo'), 80)}" if e.get("titulo") else "")
                      for e in evs if e.get("tipo") == "ticket" and e.get("op") in ("novo", "fechar")]),
+        ("Dispatch stops", card["lines"]),
+        ("Dirty worktrees", card["dirty"][1]),
+        ("Not pushed", card["without_push"][1]),
+        ("Manager", [card["manager"]] if card["dispatches"] else []),
+        ("Log gap", [card["gap"]] if card["gap"] else []),
+        ("To paste", card["cmds"]),
     ]
     line_list = [f"Away report (since {_hora_local(since)})"]
     for title, item_list in sections:
@@ -4325,7 +4356,7 @@ def away(op=None):
     away_off()
     if not cur:
         return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}"]
-    rel = away_report(cur["ligada_em"])
+    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]))
     file_path = write_away_report(rel)
     digest_generate()  # atual.json already carries the report
     return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}", "", *rel, "", f"Report saved to {file_path}; hand it to the user in the first reply."]
@@ -4561,49 +4592,68 @@ def _night_end(night_on_event, off_time):
     return _dt(off_time or night_on_event["ate"])
 
 
+def _card_parts(events, start_at, end, finished, cur, live):
+    """What the morning card and the away report share, computed over the events since `start_at` up to `end` (a datetime). Returns a dict: `dispatches` (the
+    despacho events), `lines` (one formatted line per dispatch, up to 8), `stopped` (the noite_parou event or None), `dirty` and `without_push` ((count, lines)),
+    `manager` (one line), `gap` (one line or None; a gap that opens on a `coordenador_parou` is the coordinator's stop, not a sleeping machine) and `cmds`.
+    `live` = {dispatch: worktree_state} for the dispatches still without fim_dispatch."""
+    live = live or {}
+    end_s = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    in_scope = [e for e in events if (e.get("ts") or "") >= start_at]
+    ends = {e["dispatch"]: e for e in in_scope if e.get("tipo") == "fim_dispatch"}
+    dispatch_events = [e for e in in_scope if e.get("tipo") == "despacho"]
+    line = lambda d: f"{_quote(d.get('titulo') or d['dispatch'], 36)}: {ends[d['dispatch']]['motivo'] if d['dispatch'] in ends else 'running'}"
+    states = [(d, {**live.get(d["dispatch"], {}), **ends.get(d["dispatch"], {})}) for d in dispatch_events]
+    dirty_rows = [(_quote(d.get("titulo") or d["dispatch"], 30), w) for d, w in states if (w.get("sujo") or 0) > 0]
+    without_push = [(_quote(d.get("titulo") or d["dispatch"], 30), w) for d, w in states if (w.get("sem_push") or 0) > 0]
+    lap = (cur or {}).get("gerente_volta")
+    manager = ("Manager: no absorb round during the night" if not lap or lap < start_at else
+               f"Manager: alive (last round {_hora_local(lap)})" if (end - _dt(lap)).total_seconds() <= MANAGER_ALIVE_S else
+               f"Manager: stopped at {_hora_local(lap)} (the night ran until {_hora_local(end_s)})")
+    marks = [(start_at, ""), *((e["ts"], e.get("tipo")) for e in in_scope if e.get("ts") and e["ts"] <= end_s), *([(end_s, "")] if finished else [])]
+    gaps = sorted(((_dt(b) - _dt(a)).total_seconds(), a, b) for (a, kind), (b, _) in zip(marks, marks[1:]) if kind != "coordenador_parou")
+    gaps = [x for x in gaps if x[0] > LACUNA_S]
+    gap = None
+    if gaps:
+        seg, a, b = gaps[-1]
+        gap = (f"Gap: no event in the log from {_hora_local(a)} to {_hora_local(b)} ({int(seg // 60)} min): the machine may have slept at {_hora_local(a)}."
+               + (f" +{len(gaps) - 1} smaller gap{'s' if len(gaps) > 2 else ''}." if len(gaps) > 1 else ""))
+    cmds = [f"git -C {w['caminho']} status --short" for _, w in dirty_rows if w.get("caminho")] + [f"git -C {w['caminho']} log --oneline origin/main..HEAD" for _, w in without_push if w.get("caminho")]
+    return {
+        "dispatches": dispatch_events, "lines": _lim(dispatch_events, 8, line),
+        "stopped": next((e for e in reversed(in_scope) if e.get("tipo") == "noite_parou"), None),
+        "dirty": (len(dirty_rows), _lim(dirty_rows, 3, lambda t: f"{t[0]}: {t[1]['sujo']} file{'s' if t[1]['sujo'] != 1 else ''} ({t[1].get('caminho') or '?'})")),
+        "without_push": (len(without_push), _lim(without_push, 3, lambda t: f"{t[0]}: {t[1]['sem_push']} commit{'s' if t[1]['sem_push'] != 1 else ''} ({t[1].get('caminho') or '?'})")),
+        "manager": manager, "gap": gap, "cmds": _lim(cmds, 6, lambda c: c),
+    }
+
+
 def night_card(events, cur, pending, now_at, live=None):
     """The morning card (up to CARD_LINES lines): a pure function of the last night's log. `live` = {dispatch: worktree_state} for the dispatches still without fim_dispatch."""
     night_on_event, off_time = _night_window(events)
     if not night_on_event:
         return ["No night in the log: run orq night on --until HH:MM"]
-    live = live or {}
     start_at, finished = night_on_event["ts"], bool(off_time) or _dt(night_on_event["ate"]) <= now_at
     end = min(_night_end(night_on_event, off_time), now_at)
-    end_s = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-    in_scope = [e for e in events if (e.get("ts") or "") >= start_at]
-    ends = {e["dispatch"]: e for e in in_scope if e.get("tipo") == "fim_dispatch"}
-    dispatch_events = [e for e in in_scope if e.get("tipo") == "despacho"]
-    ls = [f"[orq night] Morning card: {_hora_local(start_at)} to {_hora_local(end_s)}, {len(dispatch_events)} dispatch{'es' if len(dispatch_events) != 1 else ''}."]
-    line = lambda d: f"{_quote(d.get('titulo') or d['dispatch'], 36)}: {ends[d['dispatch']]['motivo'] if d['dispatch'] in ends else 'running'}"
-    ls += [f"Dispatches ({len(dispatch_events)}):", *("  " + x for x in _lim(dispatch_events, 8, line))] if dispatch_events else ["Dispatches: none"]
-    has_stopped = next((e for e in reversed(in_scope) if e.get("tipo") == "noite_parou"), None)
-    if has_stopped:
-        ls.append(f"Stopped dispatching at {_hora_local(has_stopped['ts'])}: {has_stopped['motivo']}.")
-    states = [(d, {**live.get(d["dispatch"], {}), **ends.get(d["dispatch"], {})}) for d in dispatch_events]
-    dirty_rows = [(_quote(d.get("titulo") or d["dispatch"], 30), w) for d, w in states if (w.get("sujo") or 0) > 0]
-    without_push = [(_quote(d.get("titulo") or d["dispatch"], 30), w) for d, w in states if (w.get("sem_push") or 0) > 0]
-    if dirty_rows:
-        ls += [f"Dirty worktrees ({len(dirty_rows)}):", *("  " + x for x in _lim(dirty_rows, 3, lambda t: f"{t[0]}: {t[1]['sujo']} file{'s' if t[1]['sujo'] != 1 else ''} ({t[1].get('caminho') or '?'})"))]
-    if without_push:
-        ls += [f"Not pushed ({len(without_push)}):", *("  " + x for x in _lim(without_push, 3, lambda t: f"{t[0]}: {t[1]['sem_push']} commit{'s' if t[1]['sem_push'] != 1 else ''} ({t[1].get('caminho') or '?'})"))]
-    ids = {e["pend"] for e in in_scope if e.get("tipo") == "pend" and e.get("op") == "add"}
+    c = _card_parts(events, start_at, end, finished, cur, live)
+    n = len(c["dispatches"])
+    ls = [f"[orq night] Morning card: {_hora_local(start_at)} to {_hora_local(end.strftime('%Y-%m-%dT%H:%M:%SZ'))}, {n} dispatch{'es' if n != 1 else ''}."]
+    ls += [f"Dispatches ({n}):", *("  " + x for x in c["lines"])] if n else ["Dispatches: none"]
+    if c["stopped"]:
+        ls.append(f"Stopped dispatching at {_hora_local(c['stopped']['ts'])}: {c['stopped']['motivo']}.")
+    if c["dirty"][0]:
+        ls += [f"Dirty worktrees ({c['dirty'][0]}):", *("  " + x for x in c["dirty"][1])]
+    if c["without_push"][0]:
+        ls += [f"Not pushed ({c['without_push'][0]}):", *("  " + x for x in c["without_push"][1])]
+    ids = {e["pend"] for e in events if (e.get("ts") or "") >= start_at and e.get("tipo") == "pend" and e.get("op") == "add"}
     decision_lines = [i for i in (pending or {}).get("itens", []) if i.get("id") in ids and i.get("tipo") == "decisao"]
     if decision_lines:
         ls += [f"Parked decisions ({len(decision_lines)}):", *("  " + x for x in _lim(decision_lines, 3, lambda i: f"{i['id']}  {_quote(i.get('titulo'), 50)}"))]
-    lap = (cur or {}).get("gerente_volta")
-    ls.append("Manager: no absorb round during the night" if not lap or lap < start_at else
-              f"Manager: alive (last round {_hora_local(lap)})" if (end - _dt(lap)).total_seconds() <= MANAGER_ALIVE_S else
-              f"Manager: stopped at {_hora_local(lap)} (the night ran until {_hora_local(end_s)})")
-    marks = [start_at, *(e["ts"] for e in in_scope if e.get("ts") and e["ts"] <= end_s), *([end_s] if finished else [])]
-    gaps = sorted(((_dt(b) - _dt(a)).total_seconds(), a, b) for a, b in zip(marks, marks[1:]))
-    gaps = [x for x in gaps if x[0] > LACUNA_S]
-    if gaps:
-        seg, a, b = gaps[-1]
-        ls.append(f"Gap: no event in the log from {_hora_local(a)} to {_hora_local(b)} ({int(seg // 60)} min): the machine may have slept at {_hora_local(a)}."
-                  + (f" +{len(gaps) - 1} smaller gap{'s' if len(gaps) > 2 else ''}." if len(gaps) > 1 else ""))
-    cmds = [f"git -C {w['caminho']} status --short" for _, w in dirty_rows if w.get("caminho")] + [f"git -C {w['caminho']} log --oneline origin/main..HEAD" for _, w in without_push if w.get("caminho")]
-    if cmds:
-        ls += ["To paste:", *("  " + x for x in _lim(cmds, 6, lambda c: c))]
+    ls.append(c["manager"])
+    if c["gap"]:
+        ls.append(c["gap"])
+    if c["cmds"]:
+        ls += ["To paste:", *("  " + x for x in c["cmds"])]
     return ls[:CARD_LINES]
 
 
@@ -4625,18 +4675,23 @@ def card_first_line(events, now_at):
             f"{' (' + ', '.join(f'{n} {m}' for m, n in counts.items()) + ')' if counts else ''}; orq summary --night has the rest.")
 
 
-def morning_card(now_at=None):
-    """`orq summary --night`: the card from the log and, for the dispatches still without fim_dispatch, the worktree as seen now (worker-show; whatever fails is left out)."""
-    events, now_at = read_events(), now_at or datetime.now(timezone.utc)
-    night_on_event, _ = _night_window(events)
+def _live_states(events, start_at):
+    """{dispatch: worktree_state} for the dispatches since `start_at` still without fim_dispatch, as worker-show sees them now (up to 10; whatever fails is left out)."""
     ends = {e.get("dispatch") for e in events if e.get("tipo") == "fim_dispatch"}
     live = {}
-    for e in [e for e in events if night_on_event and e.get("tipo") == "despacho" and e["ts"] >= night_on_event["ts"] and e.get("dispatch") not in ends][:10]:
+    for e in [e for e in events if start_at and e.get("tipo") == "despacho" and e["ts"] >= start_at and e.get("dispatch") not in ends][:10]:
         try:
             live[e["dispatch"]] = worktree_state(_checkpoint(e["dispatch"]).get("caminho"))
         except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as x:
             log(f"cartão: worker-show {e['dispatch']}: {x}")
-    return "\n".join(night_card(events, _cursor_ro(), _pending_ro(), now_at, live))
+    return live
+
+
+def morning_card(now_at=None):
+    """`orq summary --night`: the card from the log and, for the dispatches still without fim_dispatch, the worktree as seen now (worker-show; whatever fails is left out)."""
+    events, now_at = read_events(), now_at or datetime.now(timezone.utc)
+    night_on_event, _ = _night_window(events)
+    return "\n".join(night_card(events, _cursor_ro(), _pending_ro(), now_at, _live_states(events, night_on_event and night_on_event["ts"])))
 
 
 # ---- night mode: external actions and worker environment ----
@@ -4909,6 +4964,9 @@ def hook_prompt(ev, run):
     if org == "orca":
         refresh_bg(refresh=False)  # the Orca notice is the new-message signal: ingest the inbox now, without redoing aberto.json (one heartbeat per 100 s)
     if org != "usuario":
+        if not os.environ.get("ORQ_MATE"):
+            with contextlib.suppress(Exception):
+                record_coordinator_resume()
         ln = night_lines(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # the night wakes the coordinator by notice, not by user
         if org == "orca" and (r := NOTICE_RUN.search(ev.get("prompt") or "")):
             ln = [*inbox_in_prompt(r.group(1)), *ln]
@@ -5052,7 +5110,46 @@ def _gate_blocks(session, ids):
     return bool(r)
 
 
+def _stop_motive(events, now_at):
+    """Why the coordinator ends the turn, computed from orq's files: `trabalho_esperando` (a next step that does not depend on the user), `esperando_usuario`
+    (nothing else to do and a decision open) or `sem_trabalho`."""
+    next_one, _ = _work_without_user(events, now_at)
+    return "trabalho_esperando" if next_one else "esperando_usuario" if any(i.get("tipo") == "decisao" for i in _load_pending()["itens"]) else "sem_trabalho"
+
+
+def _last_turn_event(events):
+    return next((e for e in reversed(events) if e.get("tipo") in COORDINATOR_TURN), None)
+
+
+def record_coordinator_stop():
+    """Away on: the Stop that ends the turn records `coordenador_parou` with the motive, once per turn (the previous turn event is not another stop)."""
+    if not away_enabled():
+        return
+    events = read_events()
+    last_item = _last_turn_event(events)
+    if not last_item or last_item["tipo"] != "coordenador_parou":
+        append_event({"tipo": "coordenador_parou", "motivo": _stop_motive(events, datetime.now(timezone.utc))})
+
+
+def record_coordinator_resume():
+    """Away on: a prompt that is not the user's (notice typed by the manager, Orca, notification) closes the open `coordenador_parou` with `coordenador_retomou`."""
+    if away_enabled() and (last_item := _last_turn_event(read_events())) and last_item["tipo"] == "coordenador_parou":
+        append_event({"tipo": "coordenador_retomou"})
+
+
 def hook_stop(ev, run):
+    out = _hook_stop(ev, run)
+    if not os.environ.get("ORQ_MATE") and not (out or {}).get("decision") == "block":
+        try:
+            record_coordinator_stop()
+        except TimeoutError:
+            raise
+        except Exception as e:  # noqa: BLE001 - fail-open like the digest
+            log(f"coordenador_parou: {type(e).__name__}: {e}")
+    return out
+
+
+def _hook_stop(ev, run):
     # an entry with no intake in the turn (same session) or open for more than INTAKE_OLD_MIN always blocks, via _gate_blocks; the others only with `stop_bloqueia`
     if not os.environ.get("ORQ_MATE"):  # the mate's end of turn is not the coordinator's reply to the absent user
         digest_no_stop(ev)

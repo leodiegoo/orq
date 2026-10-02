@@ -17407,6 +17407,94 @@ def test_ticket124_project_add_without_origin_head_guesses_no_environments():
     assert "ambientes" not in _read_state(os.path.join(a.home, "projects", "app.json")), "without origin/HEAD the production is unknown"
 
 
+# ---------- away report: the coordinator's stops and the dispatch stop reasons (ticket 215) ----------
+
+D215 = "2099-01-01T"
+
+
+def _away215(a, *evs):
+    a.orq("away", "on")
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.writelines(json.dumps(e) + "\n" for e in evs)
+    return a.orq("away", "off").stdout
+
+
+def _night215():
+    """The night of 01/10: the coordinator stopped at 00:58 and 06:22 with work waiting; the user came back at 05:21 and a manager notice at 07:35."""
+    return [
+        {"ts": D215 + "00:30:00Z", "tipo": "despacho", "dispatch": "d1", "task": "t1", "run": "r", "titulo": "Frente d1"},
+        {"ts": D215 + "00:50:00Z", "tipo": "fim_dispatch", "dispatch": "d1", "task": "t1", "run": "r", "motivo": "falhou", "sujo": 2, "sem_push": 1, "caminho": "/wt/d1"},
+        {"ts": D215 + "00:58:00Z", "tipo": "coordenador_parou", "motivo": "trabalho_esperando"},
+        {"ts": D215 + "05:21:00Z", "tipo": "entrada", "origem": "usuario", "texto": "bom dia"},
+        {"ts": D215 + "06:22:00Z", "tipo": "coordenador_parou", "motivo": "trabalho_esperando"},
+        {"ts": D215 + "07:35:00Z", "tipo": "coordenador_retomou"},
+        {"ts": D215 + "07:40:00Z", "tipo": "coordenador_parou", "motivo": "esperando_usuario"},
+        {"ts": D215 + "07:45:00Z", "tipo": "entrada", "origem": "usuario", "texto": "e agora"},
+    ]
+
+
+def test_ticket215_away_off_lists_each_coordinator_stop_longer_than_10_min_with_its_motive():
+    out = _away215(Env(run="run_a"), *_night215())
+    assert "Coordinator stopped (2):" in out, out
+    assert "(263 min): trabalho_esperando" in out and "(73 min): trabalho_esperando" in out, out
+    assert "esperando_usuario" not in out, "5 min stop is below the threshold"
+    problems = out[out.index("Problems"):out.index("Coordinator stopped")]
+    assert problems.count("coordinator stopped with work waiting") == 2, out
+
+
+def test_ticket215_away_off_carries_the_dispatch_stop_reason_dirty_worktree_and_unpushed_branch():
+    out = _away215(Env(run="run_a"), *_night215())
+    assert "Dispatch stops (1):" in out and "- Frente d1: falhou" in out, out
+    assert "Dirty worktrees (1):" in out and "Frente d1: 2 files (/wt/d1)" in out, out
+    assert "Not pushed (1):" in out and "Frente d1: 1 commit (/wt/d1)" in out, out
+    assert "git -C /wt/d1 status --short" in out and "git -C /wt/d1 log --oneline origin/main..HEAD" in out, out
+    assert "Manager:" in out
+    assert "may have slept" not in out, "a gap that opens on a coordenador_parou is the coordinator's, not the machine's"
+
+
+def test_ticket215_card_gap_that_opens_on_a_coordinator_stop_is_not_the_machine_sleeping():
+    beats = [_ev(f"02:{m:02d}:00", "heartbeat_absorvido") for m in range(20, 60, 5)] + [_ev(f"03:{m:02d}:00", "heartbeat_absorvido") for m in range(0, 10, 5)]
+    evs, cur = _night_log(*beats, _ev("03:16:00", "coordenador_parou", motivo="trabalho_esperando"))
+    assert "may have slept" not in "\n".join(_card(evs, cur))
+    evs, cur = _night_log(*beats)
+    assert "may have slept" in "\n".join(_card(evs, cur)), "no coordenador_parou: stays as in ticket 40"
+
+
+def test_ticket215_without_the_new_events_the_report_is_the_old_one():
+    out = _away215(Env(run="run_a"), {"ts": D215 + "01:00:00Z", "tipo": "resumo", "texto": "Fechei o passo 1"})
+    assert "Summaries (1):" in out and "Fechei o passo 1" in out, out
+    for title in ("Coordinator stopped", "Dispatch stops", "Dirty worktrees", "Not pushed", "Manager", "Log gap", "To paste"):
+        assert title not in out, (title, out)
+
+
+def test_ticket215_stop_records_coordenador_parou_once_per_turn_and_a_notice_closes_the_interval():
+    a = Env(run="run_a")
+    a.set("../pendencias.json", {"itens": []})
+    _stop(a)
+    assert not [e for e in a.events() if e["tipo"] == "coordenador_parou"], "away off records nothing"
+    a.orq("away", "on")
+    _stop(a)
+    _stop(a)
+    stops = [e for e in a.events() if e["tipo"] == "coordenador_parou"]
+    assert len(stops) == 1 and stops[0]["motivo"] == "sem_trabalho", stops
+    a.prompt("orq: PR #1 foi mergeado")
+    assert [e["tipo"] for e in a.events() if e["tipo"] in ("coordenador_parou", "coordenador_retomou")] == ["coordenador_parou", "coordenador_retomou"]
+    _stop(a)
+    assert len([e for e in a.events() if e["tipo"] == "coordenador_parou"]) == 2
+
+
+def test_ticket215_stop_motive_is_trabalho_esperando_with_a_ready_ticket_and_esperando_usuario_with_a_decision():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    _stop(a)
+    assert [e["motivo"] for e in a.events() if e["tipo"] == "coordenador_parou"] == ["esperando_usuario"], "Env seeds a decision"
+    a.prompt("segue")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODEL105)
+    for _ in range(orq_mod.AWAY_BLOCKERS + 1):  # the Stop blocks the same reason AWAY_BLOCKERS times; only the one that lets the turn end records the stop
+        _stop126(a)
+    assert [e["motivo"] for e in a.events() if e["tipo"] == "coordenador_parou"][-1] == "trabalho_esperando"
+
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
