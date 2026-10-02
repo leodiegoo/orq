@@ -1526,6 +1526,7 @@ def handle_orca():
 # to_pt, which accepts both formats: a stray pt event (a worker or an old branch) is still read. The same map serves scripts/migrar-ingles.py.
 # A new key written in English cannot be a destination of this map (the read would swap it for the pt key); the map's test checks the fixture's keys.
 KEYS_EN = {
+    "conformidade": "conformance", "entrada_real": "real_entry", "esquecidos": "forgotten", "faltando": "missing", "plano": "plan",
     "abertas": "open", "aberto": "is_open", "aberto_em": "opened_at", "abertos": "open_list", "acao": "action", "aceita": "accepted",
     "achados": "findings", "acordado": "woken", "agente": "agent", "agente_de": "agent_from", "agente_para": "agent_to", "agentes": "agents",
     "alerta": "alert", "ambiente": "environment", "ambientes": "environments", "andamento": "in_progress", "anterior": "previous", "antigos": "old",
@@ -1592,6 +1593,7 @@ KEYS_EN = {
     "worktree_intacta": "worktree_intact",
 }
 TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake, worker_done, ticket, steer, mate, doctor, backlog) stay
+    "conformidade": "conformance", "fase_declarada": "phase_declared",
     "entrada": "entry", "obrigacao": "obligation", "steer_fim": "steer_end", "steer_reentrega": "steer_redelivered",
     "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
     "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
@@ -2308,7 +2310,7 @@ def _orq_delivery(m, p):
     return ev["ticket"]
 
 
-def _ingest_msg(m, since, already, titles):
+def _ingest_msg(m, since, already, titles, send=True):
     """One inbox message -> 1 if it became an entry. Raises whatever is wrong with the message; the caller isolates it.
 
     _Transient is an Orca failure (the task-list of the scout title), which merits a retry; the rest belongs to the message and is discarded.
@@ -2318,7 +2320,8 @@ def _ingest_msg(m, since, already, titles):
     p = _payload(m)
     _delivery_proof(m, p)
     try:
-        _orq_delivery(m, p)
+        if _delivery_conformance(m, p, send):  # an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
+            _orq_delivery(m, p)
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
     if p.get("reportPath"):
@@ -2365,7 +2368,7 @@ def ingest_mailbox(msgs):
             try:
                 if m["id"] not in done_items and _dt(m["created_at"]) > since:
                     _record_worker_done(m)
-                _ingest_msg(m, since, already, {})
+                _ingest_msg(m, since, already, {}, send=False)  # inside the prompt hook: the manager's ingest does the send-back
             except Exception as e:  # noqa: BLE001
                 log(f"inbox: ingest of message {m.get('id')}: {type(e).__name__}: {e}")
 
@@ -2448,6 +2451,8 @@ def ingest_final_reports():
         append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": file_path, "ref": msg, "run": run,
                       "task": t.get("task"), **_run_group(run)}, new_id=True)
+        with contextlib.suppress(Exception):  # the same check as a real worker_done (ticket 201); a failure only skips it
+            _delivery_conformance({"id": msg, "subject": subject, "body": "", "run_id": run}, {"dispatchId": dispatch, "taskId": t.get("task"), "outcome": "succeeded", "reportPath": file_path})
         fresh += 1
     return fresh
 
@@ -3175,6 +3180,9 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         dispatch_events = next((e for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("dispatch") == target), None)
         if not dispatch_events:
             raise ValueError(f"unknown dispatch: {target}")
+        verdict = next((e for e in reversed(event_list) if e.get("tipo") == "conformidade" and e.get("dispatch") == target), None)
+        if verdict and not verdict.get("ok"):  # ticket 201: the delivery went back to the worker; the PR waits for the new worker_done
+            raise ValueError(f"the delivery of {target} is incomplete (## Conformance): {'; '.join(verdict.get('faltando') or [])}")
         task, wt = dispatch_events.get("task"), _worker_path(orca("worker-show", "--dispatch", target, timeout=10))
         if not wt:
             raise ValueError(f"Orca does not report the worktree of {target}")
@@ -3186,6 +3194,9 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         task = branch_task(branch, wt, event_list)
     if not branch:
         raise ValueError(f"no branch in worktree {wt}")
+    phases = phase_check(f"{title}\n{text_value}", scratch_roots([wt]), event_list)  # ticket 201: a PR that says "phase N" carries all of it
+    if refusal := phase_refusal(phases):
+        raise ValueError(f"{refusal}. Nothing was pushed: finish them, or name the tickets the PR carries without calling it the phase")
     flow_info = task_flow(task, event_list) if task else repo_flow(wt)
     envs = environments or ([a for a in flow_info["ambientes"] if a != flow_info["producao"]] or [flow_info["producao"]] if flow_info["fluxo"] == "promocao" else [flow_info["producao"]])
     envs = sorted(dict.fromkeys(envs), key=lambda a: flow_info["ambientes"].index(a) if a in flow_info["ambientes"] else len(flow_info["ambientes"]))
@@ -3220,6 +3231,8 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
             queue_auto(pr_link(task, found_matches[-1]))
         elif not task:
             pr_auto(found_matches[-1], head=new, wt=wt)
+    if phases:
+        append_event({"tipo": "fase_declarada", "texto": f"{title}\n{text_value}"[:2000], "urls": urls, "task": task})
     return urls, notices
 
 
@@ -7119,6 +7132,291 @@ def send_back(target, reason, run=None):
         return append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "run": run_, "texto": reason, "via": via, **({"aviso": notice} if notice else {})})
 
 
+# ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
+# The 02/10 incident (#2039): a "phase 1 integrated" went out without four tickets of the plan, and nothing proved item by item what each ticket asked for.
+
+CONFORMANCE_TITLE = "## Delivery conformance"
+REAL_ENTRY = "[real entry]"
+_CHECKBOX = re.compile(r"^[ \t]*- \[[ xX]\][ \t]+(.+?)[ \t]*$", re.M)
+_PRODUCTION = re.compile(r"\b(?:startup|boot|cron(?:job|tab)?|roda a cada|runs every|(?:a cada|every) \d+\s*(?:s|ms|min|h))\b", re.I)
+_PROOF = re.compile(r"`[^`\n]+`")
+_SCRATCH_TICKET = re.compile(r"(?:~?/[^\s`'\"()]*?)?\.scratch/[\w.-]+/issues/\d{2,}-[\w.-]+\.md")
+_ISSUE_TICKET = re.compile(r"~?/[^\s`'\"()]+/issues/\d{2,}-[\w.-]+\.md")
+_SCRATCH_DONE = ("resolved", "done", "closed", "wontfix")
+_PHASE = re.compile(r"\b(?:fase|phase)\s+(\d+)\b", re.I)
+_ISSUE_REF = re.compile(r"#(\d{3,})\b")
+_PLAN_REF = re.compile(r"(?:~?/[^\s`'\"()]*?)?\.scratch/[\w.-]+")
+# "#2039 fase 1, ticket 02: ..." (a product dispatch) or "#2039 fase 1: 04: ..." (an orq ticket): the scratch ticket a title names, before the `scratch` link existed
+_TITLE_TICKET = re.compile(r"#(\d{3,})\b.*?\b(?:ticket\s+|(?:fase|phase)\s+\d+\s*[:,]\s*)(\d{2,})\b", re.I)
+_INTEGRATES = re.compile(r"\bintegr\w*\b[^()]*\(([\d,\se]+)\)", re.I)  # "integrar a fase 1 (02, 05, 08 e 03)": the tickets an integration dispatch carries
+
+
+def spec_items(txt):
+    """What a delivery must prove, in order: each `- [ ]` item, then each top-level bullet of `## Acceptance criteria`."""
+    found = [m.group(1) for m in _CHECKBOX.finditer(txt or "")]
+    if m := _ACCEPTANCE.search(txt or ""):
+        section = re.split(r"^#{1,6} ", txt[m.end():], maxsplit=1, flags=re.M)[0]
+        found += [ln[2:].strip() for ln in section.splitlines() if ln.startswith("- ") and not _CHECKBOX.match(ln)]
+    return list(dict.fromkeys(i for i in found if i))
+
+
+def production_behavior(txt):
+    """Does the text describe something that runs on its own in production (at startup, every N s, a cron)? Then a unit test of the function does not prove it."""
+    return bool(_PRODUCTION.search(txt or ""))
+
+
+def conformance_block(items, real):
+    """The block the dispatch appends to the spec: the numbered items and how orq checks them when the worker_done arrives."""
+    real_line = (f"\nThis ticket describes production behavior (something that starts, runs every N s or at startup): at least one test goes through the real entry point "
+                 f"(the server boot or the E2E), not only the isolated function, and its line carries `{REAL_ENTRY}`.\n") if real else ""
+    return (f"{CONFORMANCE_TITLE}\n\nYour final report (`{FINAL_REPORT}` in the worktree root, or the file of `--report-path`) carries a `## Conformance` section: one line per item "
+            "below, with the same number, and the proof in backticks (the red→green test name, `file:line`, or the command and its output), e.g. "
+            "`1. red→green \\`test_x\\` (test_orq.py:120)`. When the worker_done arrives, orq checks it: a missing line sends the delivery back to you with the list, "
+            f"and it enters neither the integrator queue nor a PR.\n{real_line}\n" + "\n".join(f"{n}. {_quote(i, 200)}" for n, i in enumerate(items, 1)) + "\n")
+
+
+def conformance_missing(items, real, text_value):
+    """The items with no `## Conformance` line carrying a proof in backticks (`N. ...`), plus the real entry point when the ticket asks for it. Empty: the delivery is complete."""
+    m = re.search(r"^#{1,3}[ \t]*(?:Conformance|Conformidade)[ \t]*$", text_value or "", re.M | re.I)
+    section = re.split(r"^#{1,3} ", text_value[m.end():], maxsplit=1, flags=re.M)[0] if m else ""
+    lines = {}
+    for ln in section.splitlines():
+        mm = re.match(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(\d+)[.):][ \t]*(.*)$", ln)
+        if mm and _PROOF.search(mm.group(2)):
+            lines[int(mm.group(1))] = mm.group(2)
+    missing = [f"{n}. {_quote(i, 100)}" for n, i in enumerate(items, 1) if n not in lines]
+    if real and not any(REAL_ENTRY in v.lower() for v in lines.values()):
+        missing.append(f"{REAL_ENTRY}: no line proves the behavior through the real entry point (server boot or E2E)")
+    return missing
+
+
+def cited_tickets(text_value, roots=()):
+    """The ticket files the text cites that exist: an `issues/NN-*.md` by absolute path, or a `.scratch/<feature>/issues/NN-*.md` relative to one of `roots`."""
+    out = []
+    for p in [*_ISSUE_TICKET.findall(text_value or ""), *_SCRATCH_TICKET.findall(text_value or "")]:
+        p = os.path.expanduser(p)
+        for c in [p] if os.path.isabs(p) else [os.path.join(r, p) for r in roots if r]:
+            if os.path.isfile(c):
+                out.append(os.path.realpath(c))
+                break
+    return list(dict.fromkeys(out))
+
+
+def _is_scratch(path):
+    return "/.scratch/" in path and os.path.basename(os.path.dirname(path)) == "issues"
+
+
+def _text_of(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return ""
+
+
+def dispatch_conformance(spec, title, roots=(), ticket_file=None):
+    """(items, real entry?, scratch tickets) of a dispatch. The items come from the spec, the ticket being executed (the `--ticket` file, or the only `issues/NN-*.md` the
+    spec cites: `Leia e execute o ticket <path>`) and the scratch ticket it was born from: the only `.scratch/<feature>/issues/NN-*.md` those cite, when the title names its
+    number. A citation inside a cited file is not followed, and a ticket cited for context (a second one, a repro) brings neither items nor a link."""
+    own = [os.path.realpath(ticket_file)] if ticket_file and os.path.isfile(ticket_file) else []
+    if not own and len(issues := [f for f in cited_tickets(spec, roots) if not _is_scratch(f)]) == 1:
+        own = issues
+    texts = [spec or "", *map(_text_of, own)]
+    scratch = list(dict.fromkeys(f for t in texts for f in cited_tickets(t, roots) if _is_scratch(f)))
+    num = scratch[0] and _FILE_NUM.match(os.path.basename(scratch[0])).group(1).lstrip("0") if len(scratch) == 1 else None
+    scratch = scratch if num and re.search(rf"(?<!\d)0*{num}(?!\d)", title or "") else []
+    texts += map(_text_of, scratch)
+    items = list(dict.fromkeys(i for t in texts for i in spec_items(t)))
+    return items, production_behavior(" ".join([title or "", *items])), scratch
+
+
+def _delivery_text(m, p, disp):
+    """What the worker wrote for the delivery: subject and body of the worker_done, the `--report-path` file and the final report of the dispatch's worktrees
+    (the turn's cwd, Orca's worktree and, for an orq ticket, `<ORQ_WT>/<ticket>`). A final report older than the dispatch belongs to another delivery and is left out."""
+    d, parts = p.get("dispatchId"), [m.get("subject") or "", m.get("body") or "", _text_of(os.path.expanduser(p.get("reportPath") or ""))]
+    folders = [_dict(_turns_ro().get(d)).get("cwd"), _dispatch_worktree(m.get("run_id"), d), disp.get("ticket") and os.path.join(WT_ROOT, disp["ticket"])]
+    since = _ts(disp.get("ts"))
+    for f in dict.fromkeys(worker_file(x, FINAL_REPORT) for x in folders if x):
+        with contextlib.suppress(OSError):
+            if not since or datetime.fromtimestamp(os.path.getmtime(f), timezone.utc) >= since:
+                parts.append(_text_of(f))
+    return "\n".join(parts)
+
+
+CONFORMANCE_SEND_BACKS = 2  # after this many send-backs of the same dispatch the next incomplete delivery goes to the coordinator: a false negative does not loop
+
+
+def _delivery_conformance(m, p, send=True):
+    """worker_done `succeeded` of a dispatch that recorded its items -> `conformidade` event; with something missing, `send_back` with the list (up to
+    CONFORMANCE_SEND_BACKS times per dispatch, then an alert). True when the delivery may go on (to the integrator queue, to a PR); a dispatch with no items is not checked.
+
+    `send=False` (the prompt hook's `orq inbox --ack`) records the verdict without sending back, which can resume a session: the manager's ingest sends it afterwards."""
+    d = p.get("dispatchId")
+    if p.get("outcome") != "succeeded" or not d:
+        return True
+    events = read_events()
+    verdicts = [e for e in events if e.get("tipo") == "conformidade" and e.get("dispatch") == d]
+    prev = next((e for e in reversed(verdicts) if e.get("msg") == m["id"]), None)
+    if prev and (prev.get("ok", True) or prev.get("enviado") or not send):
+        return prev.get("ok", True)
+    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == d), None)
+    if not disp or not disp.get("conformidade"):
+        return True
+    missing = prev["faltando"] if prev else conformance_missing(disp["conformidade"], disp.get("entrada_real"), _delivery_text(m, p, disp))
+    ev = {"tipo": "conformidade", "msg": m["id"], "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "ok": not missing, "faltando": missing}
+    sent = len({e.get("msg") for e in verdicts if e.get("enviado")})
+    if missing and send and sent >= CONFORMANCE_SEND_BACKS:
+        ev["aviso"] = f"sent back {sent} times already: it stays out of the queue for the coordinator (orq send-back {d}, or orq integrate queue add)"
+        append_event({"tipo": "alerta", "alerta": "conformidade_repetida", "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "msg": m["id"], "faltando": missing})
+    elif missing and send:
+        try:
+            send_back(d, "the final report has no `## Conformance` line with a proof for: " + "; ".join(missing), m.get("run_id"))
+            ev["enviado"] = True
+        except Exception as e:  # noqa: BLE001 - the delivery stays out of the queue anyway; the coordinator sends it back by hand
+            ev["aviso"] = f"send-back failed ({type(e).__name__}: {e}): orq send-back {d} \"<the missing list>\""
+            log(f"conformance: {d}: {ev['aviso']}")
+    append_event(ev)
+    return not missing
+
+
+def _md_field(txt, item_name):
+    """`Nome: value` or `**Nome:** value` of a ticket's text, or None."""
+    m = re.search(rf"^\**{re.escape(item_name)}(?::\**|\**:)[ \t]*(.*?)[ \t]*$", txt, re.M | re.I)
+    return m.group(1).strip() if m else None
+
+
+def scratch_tickets(plan):
+    """The tickets of a `.scratch/<feature>/` plan: [{num, arquivo, fase (int or None), status}], by number. `Fase: 1, roteador` is phase 1; `avulso` has none."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(plan, "issues", "*.md"))):
+        if not (m := _FILE_NUM.match(os.path.basename(f))):
+            continue
+        with contextlib.suppress(OSError):
+            txt = open(f, encoding="utf-8").read()
+            fase = re.match(r"\d+", _md_field(txt, "Fase") or _md_field(txt, "Phase") or "")
+            out.append({"num": m.group(1), "arquivo": os.path.realpath(f), "fase": int(fase.group(0)) if fase else None, "status": (_md_field(txt, "Status") or "?").lower()})
+    return sorted(out, key=lambda t: int(t["num"]))
+
+
+def set_scratch_status(path, status):
+    """Rewrites the `**Status:**` line of a scratch ticket (or adds it after the title). The file is the scratch tracker's truth."""
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    new, n = re.subn(r"^(\**Status(?::\**|\**:)[ \t]*).*$", lambda mm: mm.group(1) + status, txt, count=1, flags=re.M | re.I)
+    if not n:
+        head, _, rest = txt.partition("\n")
+        new = f"{head}\n\n**Status:** {status}\n{rest}"
+    _write(path, new)
+
+
+def scratch_roots(extra=()):
+    """Where the `.scratch/` plans live: the given folders, their main checkouts (`.scratch` is gitignored and stays in the main one) and each project's `path:` repo."""
+    found = [*extra, *(_repo_root(x) for x in extra if x)]
+    found += [os.path.realpath(os.path.expanduser(p["repo"][5:])) for p in projects().values() if str(p.get("repo") or "").startswith("path:")]
+    return [r for r in dict.fromkeys(found) if r and os.path.isdir(r)]
+
+
+def _issue_tokens(plan):
+    """The issue numbers a plan folder's name carries: whole tokens of 3+ digits (`failover-2039-x` -> 2039), never a date (`erros-2026-09-28`)."""
+    return set(re.findall(r"\d{3,}", re.sub(r"\d{4}-\d{2}-\d{2}", "", os.path.basename(plan)))) & set(re.split(r"[-_.]", os.path.basename(plan)))
+
+
+def cited_plans(text_value, roots):
+    """The plans (`.scratch/<feature>/` folders with `issues/`) the text points to: a cited `.scratch/<feature>` path, a `Plano:` file, or the issue (`#2039`) in the folder's name."""
+    cands = [os.path.expanduser(p) for p in _PLAN_REF.findall(text_value or "")]
+    if plano := _md_field(text_value or "", "Plano") or _md_field(text_value or "", "Plan"):
+        cands.append(os.path.dirname(os.path.expanduser(plano.strip("`"))))
+    out = [os.path.realpath(c if os.path.isabs(c) else os.path.join(r, c)) for c in cands for r in ([None] if os.path.isabs(c) else roots)]
+    issues = set(_ISSUE_REF.findall(text_value or ""))
+    out += [d for r in roots for d in sorted(glob.glob(os.path.join(r, ".scratch", "*"))) if issues & _issue_tokens(d)]
+    return [d for d in dict.fromkeys(out) if os.path.isdir(os.path.join(d, "issues"))]
+
+
+def scratch_done(plan, events=None):
+    """The scratch tickets of `plan` already delivered, from the file and the log only (so it holds for any cut of the log): Status resolved in the file; an orq ticket
+    linked to it (`scratch:` or the title) closed in the log; a dispatch linked to it (`scratch` in the event or the title) with a `succeeded` worker_done or a delivery;
+    or a delivered dispatch whose title integrates it by number (`#2039: integrar a fase 1 (02, 05, 08)`)."""
+    events = read_events() if events is None else events
+    ts = scratch_tickets(plan)
+    issues = _issue_tokens(plan)
+    by_num = {t["num"].lstrip("0"): t["arquivo"] for t in ts}
+
+    def linked(scratch, title):
+        paths = {os.path.realpath(x) for x in scratch or []} & set(by_num.values())
+        if not paths and (m := _TITLE_TICKET.search(title or "")) and m.group(1) in issues and m.group(2).lstrip("0") in by_num:
+            paths = {by_num[m.group(2).lstrip("0")]}
+        return paths
+
+    done = {t["arquivo"] for t in ts if t["status"] in _SCRATCH_DONE}
+    closed = {e.get("ticket") for e in events if e.get("tipo") == "ticket" and e.get("op") == "fechar"}
+    done |= {p for t in tickets() if t["num"] in closed for p in linked(t.get("scratch") and [t["scratch"]], t["titulo"])}
+    worker_done = {(e.get("dispatch"), e.get("outcome") == "succeeded") for e in events if e.get("tipo") == "worker_done"}
+    verdict = {e.get("dispatch"): e.get("ok") for e in events if e.get("tipo") == "conformidade"}  # the last one counts
+    delivered = {d for d, ok in worker_done if ok} | ({e.get("dispatch") for e in events if e.get("tipo") == "entrega"} - {d for d, ok in worker_done if not ok})
+    delivered -= {d for d, ok in verdict.items() if not ok} | set(_sent_back(events))  # an `entrega` alone: a sha with no worker_done in the log (older ingests)
+    for e in events:
+        if e.get("tipo") != "despacho" or e.get("dispatch") not in delivered:
+            continue
+        title = e.get("titulo") or ""
+        done |= linked(e.get("scratch"), title)
+        if (m := _INTEGRATES.search(title)) and issues & set(_ISSUE_REF.findall(title)):
+            done |= {by_num[n.lstrip("0")] for n in re.findall(r"\d+", m.group(1)) if n.lstrip("0") in by_num}
+    return done
+
+
+def phase_check(text_value, roots, events=None):
+    """For each phase the text cites (`fase 1`, `phase 2`) in each plan it points to: [{plano, fase, faltando: [num]}], only where the plan has tickets of that phase."""
+    out = []
+    phases = sorted({int(n) for n in _PHASE.findall(text_value or "")})
+    for plan in cited_plans(text_value, roots) if phases else []:
+        ts, done = scratch_tickets(plan), None
+        for f in phases:
+            of_phase = [t for t in ts if t["fase"] == f]
+            if not of_phase:
+                continue
+            done = scratch_done(plan, events) if done is None else done
+            out.append({"plano": plan, "fase": f, "faltando": [t["num"] for t in of_phase if t["arquivo"] not in done]})
+    return out
+
+
+def phase_refusal(checks):
+    """The refusal text for the phases with something missing, or None."""
+    bad = [c for c in checks if c["faltando"]]
+    return "; ".join(f"phase {c['fase']} of {c['plano']} is incomplete: missing ticket(s) {', '.join(c['faltando'])}" for c in bad) or None
+
+
+def _declared_phases(events):
+    """[(text, ts)] of what declared a phase integrated: an opened PR that cites it (`fase_declarada`) and a dispatch whose title integrates a phase with a `succeeded` worker_done."""
+    ok = {e.get("dispatch") for e in events if e.get("tipo") == "worker_done" and e.get("outcome") == "succeeded"}
+    out = [(e.get("texto") or "", e.get("ts")) for e in events if e.get("tipo") == "fase_declarada"]
+    out += [(e.get("titulo") or "", e.get("ts")) for e in events if e.get("tipo") == "despacho" and e.get("dispatch") in ok
+            and re.search(r"integr", e.get("titulo") or "", re.I) and _PHASE.search(e.get("titulo") or "")]
+    return out
+
+
+def doctor_scratch(roots=None, events=None):
+    """Scratch tickets still `ready-for-agent` in a phase already declared integrated: {esquecidos: [{plano, fase, ticket, arquivo, entregue}]}. `entregue` (delivered) says
+    whether the delivery exists and only the Status was left behind, or whether the declaration left the ticket out."""
+    events = read_events() if events is None else events
+    roots = scratch_roots([os.getcwd()]) if roots is None else roots
+    found, seen = [], set()
+    for text_value, _ in _declared_phases(events):
+        for plan in cited_plans(text_value, roots):
+            phases = {int(n) for n in _PHASE.findall(text_value)}
+            done = scratch_done(plan, events)
+            for t in scratch_tickets(plan):
+                if t["fase"] in phases and t["status"] == STATUS_NEW and t["arquivo"] not in seen:
+                    seen.add(t["arquivo"])
+                    found.append({"plano": plan, "fase": t["fase"], "ticket": t["num"], "arquivo": t["arquivo"], "entregue": t["arquivo"] in done})
+    return {"esquecidos": found}
+
+
+def doctor_scratch_text(r):
+    if not r["esquecidos"]:
+        return "scratch: no ready-for-agent ticket in a phase declared integrated"
+    return "\n".join(f"scratch {x['ticket']} (phase {x['fase']}) still {STATUS_NEW}: " + (f"delivered, set its Status to resolved: {x['arquivo']}" if x["entregue"]
+                     else f"the phase was declared integrated without it: {x['arquivo']}") for x in r["esquecidos"])
+
+
 # ---------- tickets in files ----------
 
 _FILE_NUM = re.compile(r"^(\d{2,})-.+\.md$")
@@ -7173,7 +7471,7 @@ def read_ticket(path):
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
             "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
-            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None}
+            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None}
 
 
 def _tickets_in_backlog():
@@ -7406,6 +7704,11 @@ def ticket_close(numero, answer):
                         notice = "; ".join(x for x in (notice, f"task {t['task']} was dispatched: check whether the worker is still running (orq agents)") if x)
         except Exception as e:  # noqa: BLE001 - the ticket is already resolved: the task is closed by hand
             notice = "; ".join(x for x in (notice, f"task {t['task']} not closed ({e}): {bind_tip(t['run'])} and orca orchestration task-update --id {t['task']} --status completed") if x)
+    if t.get("scratch"):  # one tracker: the scratch ticket this one was born from closes with it (ticket 201)
+        try:
+            set_scratch_status(t["scratch"], STATUS_CLOSED)
+        except OSError as e:
+            notice = "; ".join(x for x in (notice, f"the scratch {t['scratch']} kept its Status ({e.strerror}): set **Status:** {STATUS_CLOSED} by hand") if x)
     released, notices = _release_dependents(n, before)
     notice = "; ".join(x for x in (notice, *notices) if x)
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": closed_item, **({"aviso": notice} if notice else {}),
@@ -9572,6 +9875,14 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             spec = f"{spec.rstrip()}\n\n{WAITING_BLOCK}\n"
         environment = night_environment() if night_active(_cursor_ro()) else None  # at night the worker comes up with no git prompt (credential, pinentry)
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
+        items, real, scratch = dispatch_conformance(spec, title, scratch_roots([folder]), tk and tk["arquivo"])  # ticket 201: what the delivery must prove
+        if items and spec is not None:
+            spec = f"{spec.rstrip()}\n\n{conformance_block(items, real)}"
+        elif items and tk["arquivo"]:  # the ticket's content is the file: the block goes into it, once
+            with open(tk["arquivo"], encoding="utf-8") as f:
+                txt = f.read()
+            if CONFORMANCE_TITLE not in txt:
+                _write(tk["arquivo"], f"{txt.rstrip()}\n\n{conformance_block(items, real)}")
         trusted = trust_codex(_repo_root(folder) or folder) if agent == "codex" else []  # before worker-start: Codex asks about trust when it comes up
         args = ["worker-start", "--run", run, *(["--task", tk["task"]] if tk else ["--spec", spec, "--task-title", title]),
                 "--agent", agent, "--model", model, "--effort", effort]
@@ -9595,7 +9906,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
               **({"projeto": project} if project else {}),
-              **({"servico": True} if service else {}), **({"direct": direct} if direct else {})}
+              **({"servico": True} if service else {}), **({"direct": direct} if direct else {}),
+              **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     if agent == "codex":
@@ -9603,6 +9915,11 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             trusted += trust_codex(_checkpoint(dispatch)["caminho"])  # the worktree Orca created
         if trusted:
             out["confiadas"] = trusted
+    if tk and scratch and not tk.get("scratch"):  # one tracker: the orq ticket remembers the scratch one, and closing it updates the scratch Status (ticket 201)
+        try:
+            ticket_edit(tk["num"], scratch=scratch[0])
+        except (OSError, ValueError, backlog.BacklogError) as e:
+            out["aviso"] = f"ticket {tk['num']} not linked to {scratch[0]} ({e}): its close will not update the scratch Status"
     if tk and _tickets_in_backlog():  # tasks-axi's `start` is what used to be the header's Status: the item goes to In flight after worker-start
         try:
             backlog.cli(BACKLOG, "start", _item_of_ticket(tk["num"])["id"])
@@ -12462,7 +12779,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
          "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
-         "transcrito": "transcript", "servico": "service", "lembrar": "remind"},
+         "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
     "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink"},
@@ -12767,6 +13084,11 @@ def parser():
     dh.add_argument("--pin", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
     dbk.add_argument("--json", action="store_true")
+    dsc = dc.add_parser("scratch", help="lists the .scratch tickets still ready-for-agent in a phase already declared integrated (writes nothing)")
+    dsc.add_argument("--json", action="store_true")
+    ph = sub.add_parser("phase", aliases=["fase"], help='orq phase "<text>": for each phase the text cites ("#2039 fase 1", ".scratch/<feature> phase 2"), the plan tickets still missing')
+    ph.add_argument("texto", metavar="text")
+    ph.add_argument("--json", action="store_true")
     te = tk.add_parser("edit", aliases=["editar"], help="changes the model, effort, dispatch or wait of a ticket (an empty value removes the field)")
     te.add_argument("numero")
     for k in ("modelo", "despacho", "espera"):
@@ -13147,6 +13469,15 @@ def main(argv=None):
             r = doctor_backlog()
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_backlog_text(r))
             return 1 if r["problemas"] else 0
+        elif a.cmd == "doctor" and a.op == "scratch":
+            r = doctor_scratch()
+            print(json.dumps(r, ensure_ascii=False) if a.json else doctor_scratch_text(r))
+            return 1 if r["esquecidos"] else 0
+        elif a.cmd == "phase":
+            r = phase_check(a.texto, scratch_roots([os.getcwd()]))
+            print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"phase {c['fase']} of {c['plano']}: " + (f"missing {', '.join(c['faltando'])}" if c["faltando"] else "complete")
+                                                                         for c in r) or "no plan with tickets of the cited phase")
+            return 1 if phase_refusal(r) else 0
         elif a.cmd == "doctor" and a.op == "hooks":
             return doctor_hooks(a.pin)
         elif a.cmd == "doctor" and a.op == "old":

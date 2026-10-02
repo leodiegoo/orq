@@ -16693,6 +16693,7 @@ def test_ticket176_live_dispatch_and_recent_worktree_stay_even_if_integrated():
 
 PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, flag and choices value
     ("feito e1 o1 --prova p", "fulfill e1 o1 --proof p"),
+    ("fase t --json", "phase t --json"),
     ("adiar e1 o1 --motivo m", "defer e1 o1 --reason m"),
     ("pend add --id x --tipo acao --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend add --id x --type action --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
     ("pend add --id x --tipo decisao --titulo T", "pend add --id x --type decision --title T"),
@@ -18303,6 +18304,165 @@ def test_ticket184_conflict_with_main_does_not_open_warns_the_coordinator_and_do
     assert "conflict with main" in ev["motivo"] and "src/a.js" in ev["motivo"], ev
     assert "did not open the main PR of task_feat1: conflict with main" in _notices184(a)
     assert _lap184(a) == "" and len([c for c in _log143(a, "git.log") if c[0] == "merge-tree"]) == 1, "warned once, does not repeat"
+# ---- ticket 201: conformance to the spec on delivery, phase completeness on the PR, one tracker for the scratch ----
+
+def _plan201(base, tickets201):
+    """A `.scratch/feat-2039/` plan in `base`: {num: (phase, status)} -> issues/NN-x.md in the scratch format (`**Fase:**`, `**Status:**`). Returns the plan folder."""
+    plan = os.path.join(base, ".scratch", "feat-2039")
+    os.makedirs(os.path.join(plan, "issues"), exist_ok=True)
+    for num, (phase, status) in tickets201.items():
+        with open(os.path.join(plan, "issues", f"{num}-t.md"), "w") as f:
+            f.write(f"# {num}: t\n\n**Status:** {status}\n\n**Fase:** {phase}, roteador.\n\n- [ ] faz {num}\n")
+    return plan
+
+
+def _delivery201(a, body):
+    """An orq ticket delivery (as in 141) whose dispatch recorded two items to prove."""
+    _delivery141(a, body=body, branch="feat/orq-x")
+    a.set("tasks_run_a.json", [{"id": "task_t141", "status": "completed", "dispatch_id": "ctx_term_w1"}])
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "titulo": "orq: teste", "conformidade": ["volta ao worker", "entra na fila"]})
+
+
+def test_ticket201_delivery_without_a_conformance_line_goes_back_to_the_worker_with_the_list():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery201(a, "feito\n\n## Conformance\n\n1. volta `test_volta` (test_orq.py:10)\n2. entra na fila, sem prova\n")
+    assert a.orq("ingest").returncode == 0
+    assert not os.path.exists(os.path.join(a.home, "integrar-fila.json")) or _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"] == [], "incompleta não entra na fila"
+    (ev,) = [e for e in a.events() if e["tipo"] == "conformidade"]
+    assert (ev["ok"], ev["faltando"], ev["dispatch"]) == (False, ["2. entra na fila"], "ctx_term_w1"), ev
+    (dv,) = [e for e in a.events() if e["tipo"] == "devolver"]
+    assert dv["dispatch"] == "ctx_term_w1" and "2. entra na fila" in dv["texto"], dv
+    assert not [e for e in a.events() if e["tipo"] == "entrega_orq"]
+    assert a.orq("ingest").returncode == 0 and len([e for e in a.events() if e["tipo"] == "devolver"]) == 1, "a mesma mensagem não devolve duas vezes"
+
+
+def test_ticket201_complete_delivery_enters_the_integrator_queue():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery201(a, "feito\n\n## Conformance\n\n1. volta `test_volta`\n- 2. fila `test_fila` (test_orq.py:20)\n")
+    assert a.orq("ingest").returncode == 0
+    queue = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in queue] == [("141", "feat/orq-x")], queue
+    (ev,) = [e for e in a.events() if e["tipo"] == "conformidade"]
+    assert (ev["ok"], ev["faltando"]) == (True, []), ev
+    assert not [e for e in a.events() if e["tipo"] == "devolver"]
+
+
+def test_ticket201_conformance_reads_the_final_report_and_asks_for_the_real_entry_point():
+    items = ["liga o monitor no startup"]
+    assert orq_mod.production_behavior("orq: ligar o monitor de saúde no startup") and not orq_mod.production_behavior("orq liga os dois rastreadores")
+    assert orq_mod.conformance_missing(items, True, "## Conformance\n1. `test_x`\n") == [f"{orq_mod.REAL_ENTRY}: no line proves the behavior through the real entry point (server boot or E2E)"]
+    assert orq_mod.conformance_missing(items, True, "## Conformidade\n1. [real entry] `npm run test-app-e2e`: 3 passing\n") == []
+    assert orq_mod.conformance_missing(items, False, "1. `test_x` fora da seção\n") == ["1. liga o monitor no startup"]
+    txt = "# t\n\n- [ ] a\n- [x] b\n\n## Acceptance criteria\n- c\n  - sub, não conta\n- [ ] d\n\n## Answer\n- e\n"
+    assert orq_mod.spec_items(txt) == ["a", "b", "d", "c"], orq_mod.spec_items(txt)
+
+
+def test_ticket201_dispatch_numbers_the_items_of_spec_and_cited_ticket_and_records_them():
+    a = Env(run="run_a")
+    plan = _plan201(a.tmp.name, {"05": (1, "ready-for-agent")})
+    spec = _spec(a, f"# Ticket 05\n\nLeia {plan}/issues/05-t.md.\n\n## Acceptance criteria\n- o monitor liga no startup, teste red→green\n")
+    r = _dispatch(a, spec=spec)
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    sent = arg[arg.index("--spec") + 1]
+    assert orq_mod.CONFORMANCE_TITLE in sent and "1. o monitor liga no startup, teste red→green\n2. faz 05\n" in sent and orq_mod.REAL_ENTRY in sent, sent
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert (ev["conformidade"], ev["entrada_real"], ev["scratch"]) == (["o monitor liga no startup, teste red→green", "faz 05"], True, [os.path.realpath(f"{plan}/issues/05-t.md")]), ev
+
+
+def test_ticket201_dispatched_ticket_born_from_scratch_is_linked_and_its_close_updates_the_scratch_status():
+    a = Env(run="run_a")
+    plan = _plan201(a.tmp.name, {"04": (1, "ready-for-agent")})
+    scratch = os.path.realpath(os.path.join(plan, "issues", "04-t.md"))
+    _new(a, "#2039 fase 1: 04: nasceu do scratch", spec=_spec(a, f"Faz o {scratch}.\n\n## Acceptance criteria\n- x\n"))
+    r = a.orq("despachar", "--run", "run_a", "--ticket", "01", "--modelo", "claude-sonnet-5-5", "--effort", "medium")
+    assert r.returncode == 0, r.stderr
+    txt = _read_text(a, "01")
+    assert f"Scratch: {scratch}" in txt.split("\n## ")[0] and orq_mod.CONFORMANCE_TITLE in txt and "1. x\n2. faz 04\n" in txt, txt
+    assert a.orq("ticket", "fechar", "01", "--answer", "ok").returncode == 0
+    assert "**Status:** resolved" in open(scratch).read(), open(scratch).read()
+
+
+def test_ticket201_a_ticket_cited_for_context_brings_neither_items_nor_a_link():
+    tmp = tempfile.mkdtemp()
+    plan = _plan201(tmp, {"04": (1, "ready-for-agent"), "05": (1, "ready-for-agent")})
+    repro = f"Repro em {plan}/issues/04-t.md.\n\n## Acceptance criteria\n- o doctor lê certo\n"
+    assert orq_mod.dispatch_conformance(repro, "orq: doctor lê errado o scratch") == (["o doctor lê certo"], False, []), "o título não cita o 04"
+    both = f"Ver {plan}/issues/04-t.md e {plan}/issues/05-t.md.\n"
+    assert orq_mod.dispatch_conformance(both, "#2039 ticket 04") == ([], False, []), "dois scratch citados: nenhum é a origem"
+    assert orq_mod._issue_tokens("/r/.scratch/erros-2026-09-28") == set() and orq_mod._issue_tokens("/r/.scratch/failover-2039-impl") == {"2039"}
+    assert not orq_mod.production_behavior("revisar o cronograma das startups")
+
+
+def test_ticket201_after_two_send_backs_the_next_incomplete_delivery_goes_to_the_coordinator():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery201(a, "sem conformidade")
+    _evs(a, *({"tipo": "conformidade", "msg": f"msg_old{n}", "dispatch": "ctx_term_w1", "ok": False, "faltando": ["1. x"], "enviado": True} for n in (1, 2)))
+    assert a.orq("ingest").returncode == 0
+    assert not [e for e in a.events() if e["tipo"] == "devolver"], "não devolve uma terceira vez"
+    (al,) = [e for e in a.events() if e["tipo"] == "alerta" and e.get("alerta") == "conformidade_repetida"]
+    assert al["dispatch"] == "ctx_term_w1" and not [e for e in a.events() if e["tipo"] == "entrega_orq"], al
+
+
+def test_ticket201_inbox_ack_records_the_verdict_and_the_manager_sends_back():
+    tmp = tempfile.mkdtemp()
+    a = Env(ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _box140(a)
+    _delivery201(a, "sem conformidade")
+    payload = {"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "feat/orq-x"}
+    a.inbox(("worker_done", payload))
+    a.set("inbox.json", {"result": {"messages": [{"id": "msg_1", "run_id": "run_a", "type": "worker_done", "subject": "worker_done", "body": "", "sequence": 5, "read": 0,
+                                                    "created_at": "2099-01-01T00:00:00Z", "payload": json.dumps(payload)}]}})
+    assert a.orq("caixa", "run_a", "--ack").returncode == 0
+    (ev,) = [e for e in a.events() if e["tipo"] == "conformidade"]
+    assert ev["ok"] is False and not ev.get("enviado") and not [e for e in a.events() if e["tipo"] == "devolver"], "dentro do hook não devolve"
+    assert a.orq("ingest").returncode == 0
+    assert len([e for e in a.events() if e["tipo"] == "devolver"]) == 1 and [e.get("enviado") for e in a.events() if e["tipo"] == "conformidade"] == [None, True]
+    assert not [e for e in a.events() if e["tipo"] == "entrega_orq"]
+
+
+def test_ticket201_pr_citing_a_phase_with_an_open_ticket_is_refused_and_opens_once_complete():
+    a = _open_pr143()
+    wt = os.path.join(a.tmp.name, "wt")
+    _plan201(wt, {"01": (1, "resolved"), "04": (1, "ready-for-agent"), "12": (2, "ready-for-agent")})
+    body_text = os.path.join(a.tmp.name, "fase.md")
+    open(body_text, "w").write("Fase 1 do #2039.\n\n" + BODY143)
+    r = _open_pr(a, body_text=body_text)
+    assert r.returncode == 1 and "phase 1" in r.stderr and "04" in r.stderr and "12" not in r.stderr, r.stderr
+    assert not [c for c in _log143(a, "git.log") if c[0] == "push"], "recusa antes do push"
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_04", "dispatch": "ctx_04", "titulo": "#2039 fase 1, ticket 04: x"},
+         {"tipo": "worker_done", "dispatch": "ctx_04", "outcome": "succeeded"})
+    r = _open_pr(a, body_text=body_text)
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "fase_declarada"]
+    assert "Fase 1 do #2039" in ev["texto"] and ev["urls"], ev
+
+
+def test_ticket201_pr_of_a_delivery_sent_back_for_conformance_is_refused():
+    a = _open_pr143()
+    _evs(a, {"tipo": "conformidade", "dispatch": "ctx_term_w", "ok": False, "faltando": ["2. entra na fila"]})
+    r = _open_pr(a)
+    assert r.returncode == 1 and "2. entra na fila" in r.stderr, r.stderr
+
+
+def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integrated():
+    a = Env(run="run_a")
+    _neo(a)
+    root = os.path.join(a.tmp.name, "repo")
+    _plan201(root, {"01": (1, "ready-for-agent"), "04": (1, "ready-for-agent"), "05": (1, "resolved"), "12": (2, "ready-for-agent")})
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
+        json.dump({"repo": f"path:{root}"}, f)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "t_i", "dispatch": "ctx_i", "titulo": "#2039: integrar a fase 1 (01, 05)"},
+         {"tipo": "worker_done", "dispatch": "ctx_i", "outcome": "succeeded"})
+    r = a.orq("doctor", "scratch", "--json")
+    assert r.returncode == 1, r.stderr
+    found = [(x["ticket"], x["entregue"]) for x in json.loads(r.stdout)["esquecidos"]]
+    assert found == [("01", True), ("04", False)], found
+    r = a.orq("phase", "#2039 fase 1")
+    assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":
