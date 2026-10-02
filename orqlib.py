@@ -513,12 +513,52 @@ def servico_marcar(dispatch):
     return append_event({"tipo": "servico_marcado", "dispatch": dispatch})
 
 
-def ciclo_feito(dispatch, hash_, nota=None):
+def ciclo_feito(dispatch, hash_, nota=None, extra=None):
     """O worker de serviço terminou um ciclo: grava o evento `ciclo`. Não fala com o Orca (depois do primeiro worker_done ele não tem mais capability).
-    ValueError se o dispatch não foi despachado com --servico."""
+    Dispatch conhecido e ainda não liberado que não era serviço vira serviço aqui (`servico_marcado`): reportar um ciclo já prova que ele é. ValueError se o
+    dispatch é desconhecido ou já foi liberado. `extra` são campos a mais do evento (o `integrar concluir` grava branches e tickets)."""
     if dispatch not in _servicos(read_events()):
-        raise ValueError(f"{dispatch} não é um dispatch de serviço (orq despachar --servico)")
-    return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {})})
+        try:
+            servico_marcar(dispatch)
+        except ValueError:
+            raise ValueError(f"{dispatch} não é um dispatch de serviço (orq despachar --servico)") from None
+    return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {}), **(extra or {})})
+
+
+def integrar_concluir(hash_, branches, dispatch=None):
+    """O `integrar.py` avançou a main por fast-forward para `hash_`: fecha o que o ciclo integrou (ticket 154). Para cada branch que está na fila do integrador:
+    tira o ticket da fila, `ticket_fechar` com o hash no Answer e `liberar` o worker do ticket. Branch fora da fila só entra no ciclo. Grava o `ciclo` do integrador
+    (`dispatch`, ou o serviço de título "integrador" ainda não liberado; sem ele o evento fica sem dispatch, que o Stop ainda lê). Nada aqui é push: ele segue manual.
+    Falha de um passo vira aviso e não impede os outros. Devolve {hash, branches, tickets, avisos}."""
+    fila, eventos = integracao_fila(), read_events()
+    tickets_, avisos = [], []
+    for b in branches:
+        item = next((i for i in fila.values() if i["branch"] == b), None)
+        if not item:
+            continue
+        n = item["ticket"]
+        tickets_.append(n)
+        integrar_fila_rm(n)
+        try:
+            avisos += [x for x in [ticket_fechar(n, f"integrado na main em {hash_}")["aviso"]] if x]
+        except ValueError as e:
+            avisos.append(f"ticket {n}: {e}")
+        liberados = _liberados(read_events())
+        d = next((e["dispatch"] for e in reversed(eventos) if e.get("tipo") == "despacho" and e.get("ticket") == n and e.get("dispatch") and e["dispatch"] not in liberados), None)
+        if not d:
+            avisos.append(f"ticket {n}: nenhum worker a liberar (sem despacho --ticket, ou já liberado)")
+            continue
+        try:
+            avisos += [x for x in [liberar(d).get("aviso")] if x]
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            avisos.append(f"liberar {d}: {e}")
+    d = dispatch or (_despacho_do_integrador(eventos) or {}).get("dispatch")
+    extra = {"branches": list(branches), "tickets": tickets_}
+    if d:
+        ciclo_feito(d, hash_, extra=extra)
+    else:
+        append_event({"tipo": "ciclo", "hash": hash_, **extra})
+    return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": avisos}
 
 
 def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None, limites=None, pausados=None):
@@ -1889,11 +1929,16 @@ def _branch_do_texto(texto):
     return next((b for b in dict.fromkeys(BRANCH_RE.findall(texto)) if any(_git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}") is not None for r in repos)), None)
 
 
+def _despacho_do_integrador(events):
+    """O evento `despacho` do serviço que se chama integrador (o último que não foi liberado), ou None."""
+    servicos, liberados = _servicos(events), _liberados(events)
+    return next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") in servicos and e["dispatch"] not in liberados
+                 and "integrador" in (e.get("titulo") or "").lower()), None)
+
+
 def _terminal_do_integrador(events):
     """O terminal do serviço de despacho que se chama integrador (o último que não foi liberado), ou None."""
-    servicos, liberados = _servicos(events), _liberados(events)
-    d = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") in servicos and e["dispatch"] not in liberados
-              and "integrador" in (e.get("titulo") or "").lower()), None)
+    d = _despacho_do_integrador(events)
     return _terminal_do_dispatch(d.get("run"), d["dispatch"]) if d else None
 
 
@@ -10876,6 +10921,10 @@ def main(argv=None):
     iga.add_argument("ticket")
     igf.add_parser("rm", help="tira o ticket da fila").add_argument("ticket")
     igf.add_parser("lista").add_argument("--json", action="store_true")
+    igc = ig.add_parser("concluir", help="orq integrar concluir --hash <main nova> <branch>...: o que o integrar.py chama depois do fast-forward; fecha fila, ticket e worker e grava o ciclo")
+    igc.add_argument("--hash", required=True)
+    igc.add_argument("--dispatch", help="o dispatch do integrador (padrão: o serviço de título integrador ainda não liberado)")
+    igc.add_argument("branches", nargs="+")
     au = sub.add_parser("auditar-publicacao", help="orq auditar-publicacao <base>..<head>: recusa autor errado, trailer, termo proibido e código sem README antes de publicar a main")
     au.add_argument("revs", nargs="+", help="args do git rev-list; em branch nova: <head> --not --remotes (depois de --)")
     tk = sub.add_parser("ticket", help="tickets em arquivo (ISSUES/NN-slug.md) com a task no Orca").add_subparsers(dest="op", required=True)
@@ -11178,6 +11227,11 @@ def main(argv=None):
             print(json.dumps(servico_marcar(a.dispatch), ensure_ascii=False))
         elif a.cmd == "ciclo":
             print(json.dumps(ciclo_feito(a.dispatch, a.hash, a.nota), ensure_ascii=False))
+        elif a.cmd == "integrar" and a.op == "concluir":
+            r = integrar_concluir(a.hash, a.branches, a.dispatch)
+            print(json.dumps(r, ensure_ascii=False))
+            for x in r["avisos"]:
+                print(f"aviso: {x}", file=sys.stderr)
         elif a.cmd == "integrar" and a.acao == "add":
             print(json.dumps(integrar_fila_add(a.branch, a.ticket), ensure_ascii=False))
         elif a.cmd == "integrar" and a.acao == "rm":

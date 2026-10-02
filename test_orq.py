@@ -10643,6 +10643,7 @@ def _repo_vivo55(branches):
     shutil.copy(os.path.join(AQUI, "scripts", "integrar.py"), os.path.join(vivo, "scripts"))
     open(os.path.join(vivo, "nota.txt"), "w").write("a\nb\nc\n")
     env = {**os.environ, "ORQ_WT_DIR": os.path.join(t, "orq-wt"), "ORQ_TESTES": "true", "ORQ_LOG": os.path.join(t, "orq.log"),
+           "ORQ_HOME": os.path.join(t, "home"), "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_ORCA": "/nao/existe/orca", "ORQ_NO_BG": "1",  # o ciclo do integrador grava no orq: nunca no real
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     g = lambda *a, cwd=vivo: subprocess.run(["git", *a], cwd=cwd, env=env, capture_output=True, text=True, check=True)  # noqa: E731
     g("init", "-q", "-b", "main")
@@ -15262,6 +15263,100 @@ def test_ticket169_nome_que_nao_e_branch_nao_entra_e_avisa_que_faltou_a_branch()
     assert not os.path.exists(os.path.join(a.home, "integrar-fila.json"))
     (ev,) = [e for e in a.events() if e["tipo"] == "entrega" and any("sem branch" in x for x in e["avisos"])]
     assert "141" in ev["avisos"][0], ev
+# ---- ticket 154: o ciclo do integrador fecha o que integrou ----
+
+def _integrado154(a, ticket="07", branch="feat/b1"):
+    """O ticket 07 (task_w1) com o worker entregue (ctx_term_w1) e a branch dele na fila do integrador."""
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], f"{ticket}-do-orq.md"), "w") as f:
+        f.write(f"# {ticket}: orq: teste\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: task_w1\n\n## What to build\n\nx\n")
+    _lib_env(a)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_w1", "dispatch": "ctx_term_w1", "ticket": ticket},
+         {"tipo": "despacho", "run": "run_a", "task": "task_term_int", "dispatch": "ctx_term_int", "titulo": "orq: integrador", "servico": True})
+    assert a.orq("integrar", "fila", "add", branch, ticket).returncode == 0
+
+
+def test_ticket154_concluir_tira_da_fila_fecha_o_ticket_libera_o_worker_e_grava_o_ciclo():
+    a = Amb(run="run_a")
+    _integrado154(a)
+    r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
+    assert r.returncode == 0, r.stderr
+    assert "vazia" in a.orq("integrar", "fila", "lista").stdout
+    txt = _lido(a, "07")
+    assert "Status: resolved" in txt.split("\n## ")[0] and txt.rstrip().endswith("integrado na main em abc1234"), txt
+    (lib,) = [e for e in a.events() if e["tipo"] == "liberar"]
+    assert lib["dispatch"] == "ctx_term_w1", lib
+    (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
+    assert (ev["dispatch"], ev["hash"], ev["branches"], ev["tickets"]) == ("ctx_term_int", "abc1234", ["feat/b1"], ["07"]), ev
+
+
+def test_ticket154_concluir_com_branch_fora_da_fila_so_grava_o_ciclo():
+    a = Amb(run="run_a")
+    _integrado154(a)
+    assert a.orq("integrar", "concluir", "--hash", "abc1234", "feat/outra").returncode == 0
+    assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
+    assert "Status: claimed" in _lido(a, "07") and not [e for e in a.events() if e["tipo"] == "liberar"]
+    (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
+    assert (ev["branches"], ev["tickets"]) == (["feat/outra"], []), ev
+
+
+def test_ticket154_concluir_ticket_ja_fechado_ou_worker_rodando_avisa_e_segue():
+    a = Amb(run="run_a")
+    _integrado154(a)
+    assert a.orq("ticket", "fechar", "07", "--answer", "feito antes").returncode == 0
+    r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
+    assert r.returncode == 0 and "aviso" in r.stderr, r.stderr
+    assert "vazia" in a.orq("integrar", "fila", "lista").stdout, "a fila esvazia mesmo com o ticket já fechado"
+    assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
+
+
+def test_ticket154_ciclo_feito_de_dispatch_conhecido_marca_o_servico_e_grava_o_ciclo():
+    a = Amb(run="run_a")
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_term_int", "dispatch": "ctx_term_int", "titulo": "integrador"})
+    r = a.orq("ciclo", "feito", "--dispatch", "ctx_term_int", "--hash", "abc1234")
+    assert r.returncode == 0, r.stderr
+    tipos = [e["tipo"] for e in a.events() if e["tipo"] in ("servico_marcado", "ciclo")]
+    assert tipos == ["servico_marcado", "ciclo"], tipos
+    assert a.orq("ciclo", "feito", "--dispatch", "ctx_term_int", "--hash", "def5678").returncode == 0
+    assert [e["tipo"] for e in a.events()].count("servico_marcado") == 1, "já é serviço: não marca de novo"
+
+
+def test_ticket154_ciclo_feito_de_dispatch_desconhecido_ou_liberado_continua_recusado():
+    a = Amb(run="run_a")
+    r = a.orq("ciclo", "feito", "--dispatch", "ctx_nao_existe", "--hash", "abc")
+    assert r.returncode == 1 and "serviço" in r.stderr, r.stderr
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_l1", "dispatch": "ctx_term_l1"}, {"tipo": "liberar", "dispatch": "ctx_term_l1", "fechado": True})
+    r = a.orq("ciclo", "feito", "--dispatch", "ctx_term_l1", "--hash", "abc")
+    assert r.returncode == 1 and "serviço" in r.stderr, r.stderr
+    assert not [e for e in a.events() if e["tipo"] in ("servico_marcado", "ciclo")]
+
+
+def _integra154(a, testes):
+    """O ticket 07 na fila, a branch feat/b1 no repositório de teste e o integrador.py rodando com o orq falso do Amb."""
+    _integrado154(a)
+    vivo, env, g = _repo_vivo55({"feat/b1": {"b1.txt": "1\n"}})
+    env = {**env, **{k: v for k, v in a.env.items() if k.startswith(("ORQ_", "FAKE", "ORCA"))}, "ORQ_WT_DIR": env["ORQ_WT_DIR"], "ORQ_TESTES": testes}
+    return subprocess.run([sys.executable, os.path.join(vivo, "scripts", "integrar.py"), "feat/b1"], cwd=vivo, env=env, capture_output=True, text=True), g
+
+
+def test_ticket154_integrar_py_depois_do_fast_forward_fecha_o_que_integrou():
+    a = Amb(run="run_a")
+    r, g = _integra154(a, "true")
+    assert r.returncode == 0, r.stdout + r.stderr
+    hash_ = g("rev-parse", "--short", "HEAD").stdout.strip()
+    assert "vazia" in a.orq("integrar", "fila", "lista").stdout
+    assert f"integrado na main em {hash_}" in _lido(a, "07") and "Status: resolved" in _lido(a, "07")
+    assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
+    (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
+    assert (ev["hash"], ev["branches"], ev["tickets"]) == (hash_, ["feat/b1"], ["07"]), ev
+
+
+def test_ticket154_integrar_py_com_teste_vermelho_nao_fecha_nada():
+    a = Amb(run="run_a")
+    r, g = _integra154(a, "false")
+    assert r.returncode != 0
+    assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
+    assert "Status: claimed" in _lido(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "ciclo")]
 
 
 if __name__ == "__main__":

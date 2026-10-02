@@ -4,6 +4,8 @@
   integrar.py <branch>...     cria ORQ_WT_DIR/integra-<branches> a partir da main, faz o merge de cada branch, roda os testes e avança a main
   integrar.py --avancar <wt>  depois de resolver um conflito (e commitar) na worktree: confere, roda os testes e avança a main
 
+Depois do fast-forward chama `orq integrar concluir`, que fecha o que o ciclo integrou (fila, ticket, worker, ciclo). O push segue manual.
+
 O ~/.claude/orq é repositório e instalação ao mesmo tempo: hooks, orq e painel executam o que está lá. Um merge com conflito aberto nele deixa
 marcadores no orqlib.py e derruba tudo. Aqui o conflito só existe na worktree.
 Variáveis: ORQ_WT_DIR (padrão: ../orq-wt ao lado da instalação), ORQ_TESTES (padrão: os testes do README)."""
@@ -33,6 +35,30 @@ def vivo():
     return r.stdout.split("\n", 1)[0].removeprefix("worktree ")
 
 
+def arquivo_branches(wt):
+    """Onde a worktree guarda as branches que o ciclo integra (dentro do gitdir dela, para o `--avancar` achá-las depois de um conflito)."""
+    return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-branches")
+
+
+def concluir(viva, wt):
+    """Avisa o orq que a main andou. A main já avançou: falha aqui vira aviso, com o comando para repetir à mão."""
+    try:
+        branches = open(arquivo_branches(wt)).read().split()
+    except OSError:
+        branches = []
+    if not branches:
+        return
+    hash_ = git(viva, "rev-parse", "--short", "HEAD").stdout.strip()
+    cmd = [sys.executable, os.path.join(viva, "orq.py"), "integrar", "concluir", "--hash", hash_, *branches]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        print(f"integrar: a main andou, mas o orq não fechou o ciclo ({r.stderr.strip()}); rode `{shlex.join(cmd)}`", file=sys.stderr)
+    else:
+        print(f"integrar: {r.stdout.strip()}")
+        if r.stderr.strip():
+            print(r.stderr.strip(), file=sys.stderr)
+
+
 def avancar(wt):
     viva = vivo()
     ramo = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -50,6 +76,7 @@ def avancar(wt):
     if ff.returncode:
         morrer(f"a main viva não avança por fast-forward (ela andou, ou tem mudança local):\n{ff.stderr.strip()}\n"
                f"traga a main para a worktree (`git -C {shlex.quote(wt)} merge main`), resolva lá e rode `integrar.py --avancar {wt}`")
+    concluir(viva, wt)  # antes de remover a worktree: o arquivo das branches vive no gitdir dela
     git(viva, "worktree", "remove", "--force", wt)
     git(viva, "branch", "-d", ramo)
     print(f"integrar: main em {git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}, worktree removida")
@@ -65,6 +92,8 @@ def integrar(branches):
     r = git(viva, "worktree", "add", "-b", f"integra/{slug}", wt, base)
     if r.returncode:
         morrer(r.stderr.strip())
+    with open(arquivo_branches(wt), "w") as f:
+        f.write("\n".join(branches))
     for b in branches:
         r = git(wt, "merge", "--no-edit", b)
         if r.returncode:
