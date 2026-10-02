@@ -1271,6 +1271,11 @@ def now():
     return os.environ.get("ORQ_AGORA") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # ORQ_AGORA: the tests' simulated clock
 
 
+def now_dt():
+    """`now()` as a datetime: the clock the Stop and the manager's wake-up read, so the night replay (ticket 216) drives them with ORQ_AGORA."""
+    return _dt(now())
+
+
 TIMEOUT_ORCA = float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)  # the tests start one Python process per call and use more (B31)
 
 
@@ -5056,7 +5061,7 @@ def hook_stop(ev, run):
     # an entry with no intake in the turn (same session) or open for more than INTAKE_OLD_MIN always blocks, via _gate_blocks; the others only with `stop_bloqueia`
     if not os.environ.get("ORQ_MATE"):  # the mate's end of turn is not the coordinator's reply to the absent user
         digest_no_stop(ev)
-    events, now_at = read_events(), datetime.now(timezone.utc)
+    events, now_at = read_events(), now_dt()
     without = open_entries(events)
     old_entries = [] if os.environ.get("ORQ_MATE") else obligations_to_chase(events, now_at)
     blocker = None if os.environ.get("ORQ_MATE") else away_blocker(events, now_at)
@@ -6390,7 +6395,7 @@ def type_text_busy(handle, text_value):
 def active_coordinator(now_at=None, minutes_elapsed=None):
     """True if the user's last prompt is newer than `minutes_elapsed` (COORDINATOR_IDLE_MIN): the coordinator has someone there, and typing into it lands in the middle of what they are writing."""
     minutes_elapsed = COORDINATOR_IDLE_MIN if minutes_elapsed is None else minutes_elapsed
-    now_at = now_at or datetime.now(timezone.utc)
+    now_at = now_at or now_dt()
     last_by_header = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts") and not e.get("grupo")), None)  # the mate's does not
     return bool(last_by_header) and (now_at - _dt(last_by_header)).total_seconds() < minutes_elapsed * 60
 
@@ -6444,7 +6449,7 @@ def wake_stopped(now_at=None):
     is stopped at the prompt → types a short notice into it, once per reason every WAKE_REPEAT_MIN. The Stop only runs when the coordinator finishes a turn; without a
     new message there is no turn (ticket 174: the integrator cycle, a service worker without capability, went 5 h with nobody seeing it). Only with away on (ticket 107).
     Coordinator busy or with a draft: nothing is marked and the next tick tries again. A reason that goes away resets the count. Returns the panel lines."""
-    g, now_at = _manager_cfg(), now_at or datetime.now(timezone.utc)
+    g, now_at = _manager_cfg(), now_at or now_dt()
     if not g or not g.get("coordenador") or not away_enabled():
         return []
     events = read_events()
