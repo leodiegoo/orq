@@ -121,6 +121,8 @@ NOTICE_RUN = re.compile(r"orchestration check --run (run_\w+)")
 SUMMARY_REQUEST_S = 60  # a user entry newer than this is the request of `orq summary` itself
 ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao", "devolvida")  # states that appear in "Anda" (Moving) of `orq summary`
 PANEL_ALIVE = "manager-alive"  # the agent manager panel touches this file on every round (painel-agent-manager.sh), outside orq
+PANEL_OK = "manager-ok"  # touched only at the end of a round whose absorb phase finished without error (ticket 229): progress, not just life
+FAILING_ROUNDS = 3  # consecutive failed rounds that open a `gerente_falha` episode
 PANEL_STOPPED_S = 60  # a stamp older than this already warrants a "painel lento" (slow panel) notice; stopped is the limit of panel_limit_s
 PANEL_LIMIT_MIN_S = 90  # the stamp only counts as a stopped panel after this long (or PANEL_ROUNDS_X average rounds, whichever is greater)
 PANEL_ROUNDS_X = 3
@@ -995,6 +997,21 @@ def panel_limit_s(g):
     return max(PANEL_LIMIT_MIN_S, PANEL_ROUNDS_X * _avg_rounds(g))
 
 
+def _failing_rounds_notice(g, now_at=None):
+    """Panel alive but no round finished well for longer than panel_limit_s (ticket 229): the stamp only proves life, `manager-ok` proves progress. Without the
+    ok stamp it warns only after a recorded failure (a fresh install has none yet). A slow round without error stays "slow panel"."""
+    try:
+        ok_age = (now_at or time.time()) - os.path.getmtime(_path(PANEL_OK))
+    except OSError:
+        ok_age = None
+    fails = g.get("falhas_seguidas") or 0
+    if ok_age is None and not fails or ok_age is not None and ok_age <= panel_limit_s(g):
+        return None
+    detail = f" ({g['ultimo_erro']})" if g.get("ultimo_erro") else ""
+    since = f"{int(ok_age // 60)} min" if ok_age is not None else "the start"
+    return f"agent manager alive, but no round finished well for {since}{detail}: no worker notice arrives"
+
+
 def panel_notice(now_at=None):
     """Notice that the agent manager panel has stopped, or None: with the manager attached to this coordinator, Orca's notices go to the manager's
     terminal and only the panel relays them; the `manager-alive` stamp belongs to the panel's shell, so it holds even with orq.py broken (M19)."""
@@ -1006,7 +1023,7 @@ def panel_notice(now_at=None):
     except OSError:
         age = None
     if age is not None and age <= PANEL_STOPPED_S:
-        return None
+        return _failing_rounds_notice(g, now_at)
     ck = _dict(_read_json(_path(PANEL_CHECK)))
     if ck.get("morto") and ck.get("terminal") == g.get("gerente"):
         return (f"the agent manager terminal ({g['gerente']}) vanished from Orca: no worker notice arrives and the worker_done messages stay in the inbox. "
@@ -11886,9 +11903,9 @@ def manager_release(parados):
                 append_event({"tipo": "gerente", "op": "soltar", "terminal": g["gerente"], "run": r, "motivo": reason})
 
 
-def _touches_panel():
+def _touches_panel(name=PANEL_ALIVE):
     """Marks `manager-alive` now: the panel is alive, even in the middle of a slow round (the panel shell only touches it between one round and the next)."""
-    p = _path(PANEL_ALIVE)
+    p = _path(name)
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "a"):
@@ -11905,6 +11922,30 @@ def _write_round(secs):
         _write_json(_path(MANAGER), {**{k: v for k, v in g.items() if k != "run"}, "voltas_s": [*loops[-(REMEMBERED_ROUNDS - 1):], round(secs, 1)]})
 
 
+def round_record(error=None):
+    """Counts a manager round in gerente.json (ticket 229). A failure bumps `falhas_seguidas`, keeps `ultimo_erro` (200 chars) and, at the FAILING_ROUNDS-th
+    in a row, writes one `gerente_falha` event per episode; a good round writes `gerente_recuperado` if an episode was open, zeroes the count and touches
+    `manager-ok`. Returns True when the round was good."""
+    with manager_lock():
+        g = _manager_cfg()
+        if g:
+            n = g.get("falhas_seguidas") or 0
+            rest = {k: v for k, v in g.items() if k not in ("run", "ultimo_erro", "falhas_seguidas")}
+            if error:
+                n += 1
+                _write_json(_path(MANAGER), {**rest, "falhas_seguidas": n, "ultimo_erro": str(error)[:200]})
+                if n == FAILING_ROUNDS:
+                    append_event({"tipo": "gerente_falha", "terminal": g["gerente"], "falhas": n, "erro": str(error)[:200]})
+            else:
+                _write_json(_path(MANAGER), rest)
+                if n >= FAILING_ROUNDS:
+                    append_event({"tipo": "gerente_recuperado", "terminal": g["gerente"]})
+        if not error:
+            _touches_panel(PANEL_OK)
+            _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # the morning card reads here whether the manager did its job
+    return not error
+
+
 def manager_absorb():
     """One round of the agent manager panel, in its terminal: goes through the bound Runs (one `run-use` per Run, Orca binds one per terminal),
     absorbs heartbeat and, when a batch with something else is left over, types into the coordinator a notice in Orca's format, once per batch of
@@ -11915,7 +11956,6 @@ def manager_absorb():
     g = _manager_cfg()
     if not g or g.get("gerente") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return "agent manager off (orq manager bind --terminal <this terminal>, on the coordinator)"
-    _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # the morning card reads here whether the manager was alive
     start_time = time.time()
     _touches_panel()
     bound_run = bool(g["runs"])  # gerente.json from ticket 17 (no runs): the Run is the one bound to the terminal, no rotating
@@ -11924,9 +11964,15 @@ def manager_absorb():
         return "agent manager has no bound Run: run orq manager bind again on the coordinator"
     notices, now_at = _manager_notices(), time.time()
     stuck_items = [r for r in runs if r in notices and 0 <= now_at - notices[r].get("ts", 0) < MANAGER_STUCK_S][:1]
-    line_list, pending_messages = [], {}
+    line_list, pending_messages, round_errors = [], {}, []
     for r in [*stuck_items, *(x for x in runs if x not in stuck_items)]:
-        line, msgs = _absorb_run(r, bound_run)
+        try:
+            line, msgs = _absorb_run(r, bound_run)
+        except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:  # ticket 229: one Run failing doesn't take the other Runs or the next steps down
+            round_errors.append(f"{r}: {type(e).__name__}: {e}")
+            _touches_panel()
+            line_list.append(f"{r}: absorb failed ({type(e).__name__})")
+            continue
         _touches_panel()  # the loop back under heavy load takes over 60 s: the stamp can't wait for the end of it
         seen = set(notices.get(r, {}).get("vistos") or [])
         ids = sorted(str(m.get("id")) for m in msgs) if msgs else []
@@ -12007,6 +12053,7 @@ def manager_absorb():
         log(f"mates dormir: {type(e).__name__}: {e}")
     _touches_panel()
     _write_round(time.time() - start_time)
+    round_record(round_errors[0] if round_errors else None)
     return "\n".join(line_list)
 
 
@@ -12107,13 +12154,17 @@ def manager_serve(loops=None):
             _touches_panel()  # like the panel's shell: the stamp goes out before orq, holds even with orqlib broken
             g = _manager_cfg()
             e = {**env, **({"ORCA_TERMINAL_HANDLE": g["gerente"]} if g else {})}
+            before = _manager_cfg().get("falhas_seguidas") or 0
             try:
                 r = subprocess.run([sys.executable, orq_py, "gerente", "absorver", "--estado"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=300)
                 line = (r.stdout + r.stderr).strip()
+                if r.returncode and (_manager_cfg().get("falhas_seguidas") or 0) <= before:  # the child died before counting itself (import broke, uncaught error)
+                    round_record((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
                 if n % SERVE_DIGEST_ROUNDS == 1:
                     subprocess.run([sys.executable, orq_py, "digest"], stdin=subprocess.DEVNULL, capture_output=True, env=e, timeout=120)
             except (OSError, subprocess.TimeoutExpired) as x:
                 line = f"volta falhou: {type(x).__name__}: {x}"
+                round_record(line)
             _serve_log(f"volta {n} ({time.time() - start_time:.1f} s): " + " | ".join(line.splitlines()))
             end = time.time() + SERVE_LAP_S
             while not stop and (loops is None or n < loops) and time.time() < end:
@@ -13545,6 +13596,8 @@ def main(argv=None):
                 print(line)
                 if a.state:
                     manager_state_write(line)
+                if (_manager_cfg().get("falhas_seguidas") or 0) and _manager_cfg().get("gerente") == os.environ.get("ORCA_TERMINAL_HANDLE"):
+                    return 1  # a failed round (ticket 229): the shell must not touch manager-ok
         elif a.cmd == "resume" and a.paused:
             r = {"gerente": None, "workers": resume_paused(a.run, a.force)}
             print(json.dumps(r, ensure_ascii=False) if a.json else resume_text(r))

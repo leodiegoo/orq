@@ -18465,6 +18465,113 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
     assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
 
 
+
+# ---------- manager alive with failing rounds warns the coordinator (ticket 229) ----------
+
+def _stamp229(a, name, seconds_ago):
+    p = os.path.join(a.home, name)
+    open(p, "w").close()
+    os.utime(p, (time.time() - seconds_ago,) * 2)
+
+
+def _failed_rounds229(a, n, **env):
+    for _ in range(n):
+        r = a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger", **{"FAKE_FAIL": "check", **env})
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+
+
+def _events229(a, kind):
+    return [e for e in a.events() if e["tipo"] == kind]
+
+
+def test_ticket229_alive_manager_whose_rounds_all_fail_warns_the_coordinator():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager(a)
+    _failed_rounds229(a, 1)
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert cfg["falhas_seguidas"] == 1 and "RuntimeError" in cfg["ultimo_erro"] and len(cfg["ultimo_erro"]) <= 200, cfg
+    assert time.time() - os.path.getmtime(os.path.join(a.home, orq_mod.PANEL_ALIVE)) < 5 and not os.path.exists(os.path.join(a.home, orq_mod.PANEL_OK))
+    _stamp229(a, orq_mod.PANEL_OK, 300)
+    ctx = _ctx105(a)
+    assert "alive, but no round finished well for 5 min" in ctx and "RuntimeError" in ctx, ctx
+
+
+def test_ticket229_error_in_one_run_does_not_stop_the_other_run_or_the_rest_of_the_round():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b"]})
+    a.inbox(_hb("lendo"))
+    r = a.orq("gerente", "absorver", FAKE_FAIL_RUN="run_b")
+    assert r.returncode == 1 and "run_b: absorb failed" in r.stdout and "run_a:" in r.stdout, (r.stdout, r.stderr)
+    assert set(a.states().values()) == {"acked"}, "run_a was absorbed after/before run_b failed"
+    assert _read_state(os.path.join(a.home, "gerente.json"))["falhas_seguidas"] == 1
+    assert not os.path.exists(os.path.join(a.home, orq_mod.PANEL_OK)), "a round with a failed Run is not a good round"
+    assert _read_state(os.path.join(a.home, "gerente.json"))["ultimo_erro"].startswith("run_b:")  # the round got to its end (round_record) after the failed Run
+
+
+def test_ticket229_serve_counts_a_child_that_exits_1_and_a_good_round_clears_the_warning():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager(a)
+    code = ("import subprocess, orqlib\n"
+            "class R: returncode = 1; stdout = ''; stderr = 'Traceback\\nImportError: boom'\n"
+            "subprocess.run = lambda *x, **k: R()\n"
+            "orqlib.manager_serve(loops=1)\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=a.env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert cfg["falhas_seguidas"] == 1 and cfg["ultimo_erro"] == "ImportError: boom", cfg
+    _stamp229(a, orq_mod.PANEL_OK, 300)
+    assert "no round finished well" in _ctx105(a)
+    assert a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger").returncode == 0
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert not cfg.get("falhas_seguidas") and "ultimo_erro" not in cfg, cfg
+    assert "no round finished well" not in _ctx105(a) and "agent manager" not in _ctx105(a)
+
+
+def test_ticket229_gerente_falha_once_per_episode_and_recovered_on_the_next_good_round():
+    a = Env(run="run_a")
+    _manager(a)
+    _failed_rounds229(a, 5)
+    assert len(_events229(a, "gerente_falha")) == 1 and not _events229(a, "gerente_recuperado")
+    assert a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger").returncode == 0
+    assert len(_events229(a, "gerente_recuperado")) == 1
+    _failed_rounds229(a, 2)
+    assert len(_events229(a, "gerente_falha")) == 1, "two failures are not an episode"
+    _failed_rounds229(a, 1)
+    assert len(_events229(a, "gerente_falha")) == 2, "a new episode after the recovery"
+
+
+def test_ticket229_slow_round_without_error_stays_slow_panel_not_failing_rounds():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager105(a, loops=[50, 55, 60])
+    _panel_touched(a, 100)  # alive within the limit but past 60 s
+    _stamp229(a, orq_mod.PANEL_OK, 100)
+    ctx = _ctx105(a)
+    assert "slow panel" in ctx and "no round finished well" not in ctx, ctx
+    _panel_touched(a, 5)  # alive fresh, no ok stamp and no recorded failure (fresh install)
+    os.remove(os.path.join(a.home, orq_mod.PANEL_OK))
+    assert "agent manager" not in _ctx105(a)
+
+
+def test_ticket229_panel_shell_touches_manager_ok_only_when_absorb_exits_0():
+    for orq_body, expect_ok in (('[ "$2" = absorb ] && exit 1; [ "$2" = interval ] && echo 1', False), ('[ "$2" = interval ] && echo 1; exit 0', True)):
+        with tempfile.TemporaryDirectory() as t:
+            bin_ = os.path.join(t, "bin")
+            os.makedirs(bin_)
+            for item_name, body_text in (("orq", orq_body), ("clear", ":"), ("sleep", "kill $PPID")):
+                with open(os.path.join(bin_, item_name), "w") as f:
+                    f.write("#!/bin/sh\n" + body_text + "\n")
+                os.chmod(os.path.join(bin_, item_name), 0o755)
+            home = os.path.join(t, "orq")
+            os.makedirs(home)
+            subprocess.run(["sh", os.path.join(HERE, "painel-agent-manager.sh")], env={**os.environ, "PATH": bin_ + os.pathsep + os.environ["PATH"], "ORQ_HOME": home},
+                           capture_output=True, timeout=20)
+            assert os.path.exists(os.path.join(home, "manager-alive"))
+            assert os.path.exists(os.path.join(home, "manager-ok")) is expect_ok
+
 if __name__ == "__main__":
     filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
