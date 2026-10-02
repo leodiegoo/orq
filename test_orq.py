@@ -13517,6 +13517,71 @@ def test_ticket93_hook_session_sem_passagem_ou_com_registro_ilegivel_segue_como_
     assert "Tickets abertos" in _sessao93(a, "codex")
 
 
+# ---------- ticket 90: reconhecer o limite do plano na tela do worker ----------
+# As fixtures usam as frases que o Claude Code grava no transcrito (`system` informational e o texto sintético do assistente, 01/10) e as strings do binário
+# do Codex 0.159 (nenhuma tela de limite do Codex foi capturada: o layout em volta é reconstruído).
+
+def test_ticket90_tela_limite_reconhece_a_do_claude_e_a_do_codex_e_ignora_citacao_e_tela_viva():
+    for f, ag in (("tela-claude-limite-sessao.txt", "claude"), ("tela-claude-limite.txt", "claude"), ("tela-codex-limite.txt", "codex")):
+        assert orq_mod.tela_limite(_tela52(f), ag), f
+    assert "session limit" in orq_mod.tela_limite(_tela52("tela-claude-limite-sessao.txt"), "claude")
+    assert "usage limit" in orq_mod.tela_limite(_tela52("tela-codex-limite.txt"), "codex")
+    for f, ag in (("tela-claude-ocioso.txt", "claude"), ("tela-claude-spinner.txt", "claude"), ("tela-claude-cita-o-limite.txt", "claude"),
+                  ("tela-codex-ocioso.txt", "codex"), ("tela-codex-ocupado.txt", "codex")):
+        assert orq_mod.tela_limite(_tela52(f), ag) is None, f
+    assert orq_mod.tela_limite(None, "claude") is None and orq_mod.tela_limite(_tela52("tela-claude-limite-sessao.txt"), "outro") is None
+    assert orq_mod.tela_limite(_tela52("tela-claude-limite-sessao.txt") + ["✻ Working… (3s · esc to interrupt)"], "claude") is None, "o worker voltou a trabalhar depois do aviso"
+
+
+def _limite90(a, tela, agente="claude"):
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    a.set("workers.json", [_w48("term_w1", agente=agente)])
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ctx_term_w1": {"task": "task_term_w1", "sessao": "sess-w1", "inicio": "2026-09-30T14:00:00Z", "fim": None, "harness": agente}}, open(os.path.join(a.home, "turnos.json"), "w"))
+    a.set("screens.json", {"term_w1": _tela52(tela)})
+
+
+def test_ticket90_agentes_mostra_o_worker_como_limite_nos_dois_harnesses():
+    for tela, ag in (("tela-claude-limite-sessao.txt", "claude"), ("tela-codex-limite.txt", "codex")):
+        a = Amb(run="run_a")
+        _limite90(a, tela, ag)
+        w = next(x for x in json.loads(a.orq("agentes", "--json", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout) if x["dispatch"] == "ctx_term_w1")
+        assert w["estado"] == "limite" and "limit" in w["limite"], w
+        txt = a.orq("agentes", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout
+        assert txt.lstrip().startswith("limite") and "limite do plano" in txt, txt
+        a.set("screens.json", {"term_w1": ["● seguindo"]})
+        w = next(x for x in json.loads(a.orq("agentes", "--json", "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord").stdout) if x["dispatch"] == "ctx_term_w1")
+        assert w["estado"] != "limite", "a tela voltou ao normal"
+
+
+def test_ticket90_gerente_avisa_o_coordenador_do_limite_uma_vez_so():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _limite90(a, "tela-claude-limite-sessao.txt")
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0 and "limite do plano" in r.stdout, r
+    (env,) = _avisos_enviados(a)
+    texto = env[env.index("--text") + 1]
+    assert "task_term_w1" in texto and "session limit" in texto and texto.startswith("orq: worker "), texto
+    a.orq("gerente", "absorver")
+    a.set("screens.json", {"term_w1": ["● seguindo"]})
+    a.orq("gerente", "absorver")
+    a.set("screens.json", {"term_w1": _tela52("tela-claude-limite-sessao.txt")})
+    a.orq("gerente", "absorver")
+    assert len(_avisos_enviados(a)) == 1, "o mesmo dispatch não é avisado de novo"
+    assert [e["dispatch"] for e in a.events() if e["tipo"] == "limite_tela"] == ["ctx_term_w1"]
+
+
+def test_ticket90_coordenador_ocupado_nao_digita_o_aviso_do_limite_e_a_proxima_volta_tenta():
+    a = Amb(ORCA_TERMINAL_HANDLE="term_ger")
+    _limite90(a, "tela-codex-limite.txt", "codex")
+    a.set("busy.json", ["term_coord"])
+    a.orq("gerente", "absorver")
+    assert _avisos_enviados(a) == [] and not [e for e in a.events() if e["tipo"] == "limite_tela"]
+    a.set("busy.json", [])
+    a.orq("gerente", "absorver")
+    assert len(_avisos_enviados(a)) == 1
+
+
 if __name__ == "__main__":
     filtro = sys.argv[1] if len(sys.argv) > 1 else ""
     testes = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filtro in n]

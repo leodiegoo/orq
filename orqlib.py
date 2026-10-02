@@ -79,7 +79,7 @@ PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker par
 TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
-ORDEM_AGENTES = {"travado": 0, "nao_comecou": 1, "parado": 2, "perguntando": 3, "rodando": 4, "aguardando_integracao": 5, "entregue": 6, "servico": 7, "hibernado": 8, "encerrado": 9, "liberado": 10}
+ORDEM_AGENTES = {"travado": 0, "limite": 1, "nao_comecou": 2, "parado": 3, "perguntando": 4, "rodando": 5, "aguardando_integracao": 6, "entregue": 7, "servico": 8, "hibernado": 9, "encerrado": 10, "liberado": 11}
 INICIO_ESPERA_S = float(os.environ.get("ORQ_INICIO_ESPERA_S") or 8)  # quanto o `orq despachar` espera o prompt do spec entrar no worker, antes e depois do Enter
 ID_DISPATCH = re.compile(r"--dispatch-id (ctx_\w+)")  # no preâmbulo de despacho do Orca, nos comandos que o worker roda
 ID_TASK = re.compile(r"Your task ID is: (task_\w+)")
@@ -87,7 +87,7 @@ HB_JANELA_S = 120  # aviso que chega logo depois de um lote de heartbeats absorv
 HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack devolve o próximo lote)
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
 RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do próprio `orq resumo`
-ANDA = ("rodando", "perguntando", "travado", "parado", "nao_comecou", "aguardando_integracao")  # estados que aparecem em "Anda" do `orq resumo`
+ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao")  # estados que aparecem em "Anda" do `orq resumo`
 PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
 PAINEL_PARADO_S = 60  # carimbo mais velho que isto já vale um aviso de "painel lento"; parado é o limite de painel_limite_s
 PAINEL_LIMITE_MIN_S = 90  # o carimbo só vale como painel parado depois de tanto tempo (ou de PAINEL_VOLTAS_X voltas médias, o que for maior)
@@ -132,6 +132,11 @@ PR_VISIVEL_D = 7  # feature com todos os PRs resolvidos há mais que isto sai do
 FLUXOS = ("promocao", "direto")  # promocao: a mesma feature branch abre um PR por ambiente, na ordem; direto: um PR só, para a branch de produção
 BRANCH_SEM_REMOTO = "main"  # a branch padrão quando o remoto não diz qual é (sem origin/HEAD) e o projeto não declara ambientes
 TITULOS_ACAO = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
+# o aviso de limite do plano numa linha do fim da tela. Claude Code 2.1: `You've hit your session limit · resets 6:50pm (…)` e `Usage limit reached · continuing automatically at …`
+# (as frases que ele grava no transcrito); `Weekly limit reached ∙ resets Oct 5, 9am` é a da semana. Codex 0.159 (strings do binário): `You've hit your usage limit. …` e `You're out of credits`.
+# Só vale no começo da linha (menos o enfeite `⎿`/`●`/`■`): a frase citada no meio de um texto do worker não conta.
+TELA_LIMITE_CLAUDE = re.compile(r"^\W*(?:You[\'’]ve hit your [\w -]*limit\b|Usage limit reached\b|(?:Weekly|Session|Opus|Sonnet|\d+-hour) limit reached\b)", re.M)
+TELA_LIMITE_CODEX = re.compile(r"^\W*(?:You[\'’]ve hit your usage limit\b|You[\'’]re out of credits\b|Usage limit reached\b)", re.M)
 TELA_FALHA = ("No conversation found", "command not found")  # o claude --resume não achou a sessão, ou o comando nem existe
 
 
@@ -142,7 +147,7 @@ HARNESS = {
     "claude": {
         "resume": lambda sessao, modelo, effort, msg: ["claude", "--resume", sessao, *(["--model", modelo] if modelo else []),
                                                        "--dangerously-skip-permissions", msg],
-        "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "falha": TELA_FALHA,
+        "tela": {"opcao": TELA_OPCAO, "cursor": "❯", "perguntas": TELA_PERGUNTAS, "espera": TELA_ESPERA, "limite": TELA_LIMITE_CLAUDE, "falha": TELA_FALHA,
                  "pronto": re.compile(r"bypass permissions|\? for shortcuts|esc to interrupt")},  # a caixa do claude está na tela: dá para digitar
         "abrir": lambda modelo, effort, msg: ["claude", *(["--model", modelo] if modelo else []), "--dangerously-skip-permissions", msg],  # o mate (ticket 80)
         # o mate abre sem prompt e o texto é digitado (ticket 80). O que tornava o claude não interativo era o `env ORQ_MATE=…` na frente, não o prompt na linha (ticket 106)
@@ -162,6 +167,7 @@ HARNESS["codex"] = {
     "tela": {"opcao": TELA_OPCAO_CODEX, "cursor": "›", "enter_separado": True,  # o número com Enter no mesmo send não confirma o menu (01/10)
              "perguntas": (("trust", re.compile(r"Trust this folder\?|Do you trust the contents of this directory", re.I)),
                            ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
+             "limite": TELA_LIMITE_CODEX,
              "espera": re.compile(r"\d+\s+background terminals?\s+running", re.I),  # `• Working (9s • esc to interrupt) · 1 background terminal running`
              "falha": ("No saved session found", "command not found")},
     "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: o ultra só nos modelos que o têm (o Orca recusa no Luna)
@@ -466,7 +472,7 @@ def ciclo_feito(dispatch, hash_, nota=None):
     return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": nota} if nota else {})})
 
 
-def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None):
+def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turnos=None, telas=None, perguntas_tela=None, hibernados=None, integracao=None, limites=None):
     """Pura: uma linha por dispatch do worker-list, com o estado (rodando, travado, nao_comecou, parado, perguntando, entregue ou liberado).
 
     Dispatched sem pergunta aberta é `nao_comecou` ou `parado` quando os turnos dos hooks do worker dizem (turno_do_dispatch); senão `travado` quando o
@@ -476,7 +482,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
     `perguntas_tela` é {dispatch: tela_pergunta} dos menus esperando resposta humana no terminal (o worker vira `perguntando`, com a `pergunta` na linha);
     `hibernados` é o cursor.json `hibernados` ({dispatch: {desde, motivo, …}}): o worker vira `hibernado` (terminal fechado de propósito, sessão guardada).
     `integracao` é {ticket: {branch, ticket}} da fila do integrador: o worker do ticket que estaria `travado`, `nao_comecou` ou `parado` vira `aguardando_integracao`
-    (espera conhecida, sem sugestão de steer). O dispatch de serviço (`orq despachar --servico`) entregue vira `servico`, com o último ciclo.
+    (espera conhecida, sem sugestão de steer). `limites` é {dispatch: linha} do aviso de limite do plano na tela (tela_limite): o worker vira `limite`
+    (sem turno até o plano renovar; um menu aberto na tela vale mais). O dispatch de serviço (`orq despachar --servico`) entregue vira `servico`, com o último ciclo.
     """
     sinais, perguntas, detalhes, humanos = ultimos_sinais(events, msgs), perguntas_abertas(msgs), detalhes or {}, _interacao_registrada(events)
     liberados, pausas, telas, nao_iniciou = _liberados(events), interrompidos(events), telas or {}, _nao_iniciou(events)
@@ -506,6 +513,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             estado = "perguntando" if d in perguntas or (perguntas_tela or {}).get(d) else turno if turno in ("nao_comecou", "parado") and not (espera or motivo) else estado  # espera declarada (dentro do prazo ou vencida) vale mais que o turno encerrado (M16)
             if d in nao_iniciou and not (t.get("inicio") or sinal):  # o despachar viu o prompt não entrar: não espera NAO_COMECOU_S
                 estado = "nao_comecou"
+            if (limites or {}).get(d) and estado != "perguntando":
+                estado = "limite"
         else:
             espera = motivo = None
             feito = any(m.get("type") == "worker_done" and _payload(m).get("dispatchId") == d for m in msgs or [])
@@ -522,6 +531,8 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             ag["pergunta"] = perguntas_tela[d]
         if telas.get(d):
             ag["tela"], ag["tela_ts"] = telas[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if (limites or {}).get(d) and w.get("dispatchStatus") == "dispatched":
+            ag["limite"], ag["limite_ts"] = limites[d], agora.strftime("%Y-%m-%dT%H:%M:%SZ")
         if motivo and estado == "travado":
             ag["motivo"] = motivo
         if avisos_entrega.get(d):
@@ -533,7 +544,7 @@ def monta_agentes(workers, msgs, events, agora, detalhes=None, vivos=None, turno
             ag["retido"] = retido
         if d in (hibernados or {}):
             ag.update(estado="hibernado", idade_s=None, hibernado_desde=_dict(hibernados[d]).get("desde"), motivo_hibernado=_dict(hibernados[d]).get("motivo"))
-            for k in ("espera", "pergunta", "tela", "tela_ts", "motivo", "retido"):
+            for k in ("espera", "pergunta", "tela", "tela_ts", "limite", "limite_ts", "motivo", "retido"):
                 ag.pop(k, None)
         out.append(ag)
     return sorted(out, key=lambda a: ORDEM_AGENTES[a["estado"]])
@@ -565,11 +576,11 @@ def reavalia(agentes_, events, agora, turnos=None, integracao=None):
     pausas, out = interrompidos(events), []
     for ag in agentes_:
         ag = dict(ag)
-        if ag.get("estado") in ("entregue", "servico", "rodando", "travado", "nao_comecou", "parado", "aguardando_integracao") and ag.get("dispatch") in liberados:
+        if ag.get("estado") in ("entregue", "servico", "rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao") and ag.get("dispatch") in liberados:
             ag["estado"] = "liberado"  # o orq liberar depois do cache (M13); só existe liberar depois do worker_done, então vale mesmo com cache anterior a ele (B38)
         if ag.get("estado") in ("entregue", "servico") and ag.get("dispatch") in servicos:
             ag["estado"] = "servico"
-        if ag.get("estado") in ("rodando", "travado", "nao_comecou", "parado", "aguardando_integracao"):
+        if ag.get("estado") in ("rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao"):
             h = sinais.get(ag.get("dispatch")) or {}
             if _ts(h.get("ts")) and (not _ts(ag.get("ultimo_heartbeat")) or _ts(h["ts"]) > _ts(ag["ultimo_heartbeat"])):
                 ag["fase"], ag["ultimo_heartbeat"] = h.get("fase"), _z(h["ts"])
@@ -590,6 +601,11 @@ def reavalia(agentes_, events, agora, turnos=None, integracao=None):
                 ag["estado"], ag["idade_s"] = ag["turno"], int((agora - quando).total_seconds())
             elif ag.get("dispatch") in _nao_iniciou(events) and not (ag.get("turno_inicio") or h):
                 ag["estado"] = "nao_comecou"
+            if ag.get("limite") and _ts(ag.get("limite_ts")) and not (_ts(ag.get("ultimo_heartbeat")) and _ts(ag["ultimo_heartbeat"]) > _ts(ag["limite_ts"])) \
+                    and not (_ts(t.get("inicio")) and _ts(t["inicio"]) > _ts(ag["limite_ts"])):  # o aviso lido vale até o worker dar sinal depois dele
+                ag["estado"] = "limite"
+            else:
+                ag.pop("limite", None), ag.pop("limite_ts", None)
         _marca_integracao_e_servico(ag, integracao, tickets_de, servicos)
         out.append(ag)
     return out
@@ -603,12 +619,13 @@ def linha_vivos(events, aberto, agora=None, turnos=None):
     agora = agora or datetime.now(timezone.utc)
     if isinstance((aberto or {}).get("agentes"), list):
         ags = reavalia(aberto["agentes"], events, agora, turnos)
-        vivos = sorted((a for a in ags if a["estado"] in ("travado", "nao_comecou", "parado", "perguntando", "rodando", "aguardando_integracao")), key=lambda a: a.get("prioridade") or 2)
+        vivos = sorted((a for a in ags if a["estado"] in ("travado", "limite", "nao_comecou", "parado", "perguntando", "rodando", "aguardando_integracao")), key=lambda a: a.get("prioridade") or 2)
         sem_liberar = sum(a["estado"] == "entregue" and not a.get("retido") for a in ags)
         itens = []
         for a in vivos[:3]:
             nome = f"{'P' + str(a['prioridade']) + ' ' if a.get('prioridade') else ''}{(a.get('task') or '?')[:9]}… "
             itens.append(nome + (f"TRAVADO há {(a.get('idade_s') or 0) // 60} min" + (f" ({a['motivo']})" if a.get("motivo") else "") if a["estado"] == "travado"
+                                 else "LIMITE do plano" if a["estado"] == "limite"
                                  else f"NÃO COMEÇOU há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "nao_comecou"
                                  else f"parado no prompt há {(a.get('idade_s') or 0) // 60} min" if a["estado"] == "parado" else "pergunta" if a["estado"] == "perguntando"
                                  else f"aguardando integração de {a['integracao']['branch']}" if a["estado"] == "aguardando_integracao"
@@ -829,6 +846,8 @@ def _extra(events, todas, agora, pendencias=None, cursor=None, aberto=None, turn
             partes.append(f"{rotulo}: {a.get('task')} ({detalhe}): " + f'orq steer {a.get("task")} "<ajuste>" --run {a.get("run")}.')
         if len(parados) > 2:
             partes.append(f"+{len(parados) - 2} {rotulo.lower()}.")
+    for a in [a for a in ags if a["estado"] == "limite"][:2]:
+        partes.append(f"Limite do plano: {a.get('task')} ({a.get('limite')}): sem turno até o plano renovar, um steer não chega.")
     alertas = alertas_recentes(events, agora, ags)
     for a in alertas[:2]:
         if a.get("alerta") == "steer_nao_lido":
@@ -2746,6 +2765,7 @@ def _pergunta_aberta(events):
 def telas_avisar():
     """Uma volta do gerente sobre as telas dos workers: prompt de permissão, AskUserQuestion ou "trust this folder" preso no terminal de um worker
     vira uma linha digitada no coordenador, uma vez por menu (evento `pergunta_tela`, com a pergunta e as opções), com o `orq responder-tela` a rodar.
+    O aviso de limite do plano na tela (tela_limite) vira uma linha só por dispatch (evento `limite_tela`): o worker não tem turno, e nenhum steer chega a ele.
     Coordenador ocupado ou com rascunho: nada é digitado e a próxima volta tenta. O menu que sumiu da tela fecha o evento (`pergunta_tela_fim`),
     então o mesmo texto volta a ser avisado se reaparecer. Só lê as telas de quem tem turno nos hooks do worker (Claude Code). Devolve as linhas do painel."""
     g = _gerente_cfg()
@@ -2768,6 +2788,16 @@ def telas_avisar():
             break
         append_event({"tipo": "pergunta_tela", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": w.get("agentTerminalHandle"), "menu": p["tipo"], "texto": p["texto"], "opcoes": p["opcoes"]})
         linhas.append(f"{w.get('taskId')}: pergunta na tela ({p['tipo']}) avisada ao coordenador")
+    avisados = {e.get("dispatch") for e in read_events() if e.get("tipo") == "limite_tela"}
+    for w in ws:
+        d, limite = w["dispatchId"], (lidas.get(w["dispatchId"]) or {}).get("limite")
+        if not limite or d in avisados:
+            continue
+        aviso = f"orq: worker {w.get('taskId')} parou no limite do plano ({limite}). Sem turno até o plano renovar: um steer não chega. Veja com: orq agentes."
+        if avisa_coordenador(g["coordenador"], aviso) not in ("enviado", "adiado"):
+            break
+        append_event({"tipo": "limite_tela", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": w.get("agentTerminalHandle"), "texto": limite})
+        linhas.append(f"{w.get('taskId')}: limite do plano avisado ao coordenador")
     return linhas
 
 
@@ -3014,7 +3044,7 @@ def _estado_de_gente(a):
     """O estado de um worker vivo em texto de gente: a fase que ele declarou, ou o estado sem o jargão do orq."""
     if a["estado"] == "rodando":
         return a.get("fase") or "rodando"
-    return {"travado": "travado", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou", "aguardando_integracao": "aguardando integração",
+    return {"travado": "travado", "limite": "parado no limite do plano", "parado": "parado no prompt", "perguntando": "esperando a sua resposta", "nao_comecou": "não começou", "aguardando_integracao": "aguardando integração",
             "hibernado": f"hibernado desde {_hora_local(a.get('hibernado_desde'))}"}.get(a["estado"], a["estado"])
 
 
@@ -5762,9 +5792,25 @@ def tela_pergunta(linhas, agente="claude"):
     return {"tipo": tipo, "texto": _cita(" ".join(acima), 300), "opcoes": [[int(m.group(2)), m.group(3)] for _, m in bloco]}
 
 
+def tela_limite(linhas, agente="claude"):
+    """A linha do aviso de limite do plano no fim da tela do worker (`You've hit your session limit · resets 6:50pm (…)`), ou None.
+
+    Olha as últimas 15 linhas e junta as linhas do aviso (o Claude põe duas: o limite e o `continuing automatically`). Aviso seguido de `esc to interrupt` (o spinner do Claude e do Codex) é do passado: o worker voltou a trabalhar sozinho
+    quando o plano renovou (o Claude continua sozinho: `continuing automatically at …`)."""
+    padrao = (HARNESS.get(agente) or {}).get("tela", {}).get("limite")
+    tela = [str(l).rstrip() for l in linhas or []][-15:]
+    if not padrao:
+        return None
+    achado = [(i, m) for i, l in enumerate(tela) if (m := padrao.search(l))]
+    if not achado or any("esc to interrupt" in l for l in tela[achado[-1][0] + 1:]):
+        return None
+    return _cita(" — ".join(re.sub(r"^\W+", "", tela[i]) for i, _ in achado), 220)
+
+
 def _ler_telas(ws, detalhes):
-    """{dispatch: {espera, pergunta}} dos workers do Claude Code rodando cuja tela (fim do `terminal read --screen`) mostra shell/monitor ainda em execução
-    (`espera`, o motivo) ou um menu esperando resposta humana (`pergunta`, de tela_pergunta). Só entra quem tem um dos dois.
+    """{dispatch: {espera, pergunta, limite}} dos workers rodando cuja tela (fim do `terminal read --screen`) mostra shell/monitor ainda em execução
+    (`espera`, o motivo), um menu esperando resposta humana (`pergunta`, de tela_pergunta) ou o aviso de limite do plano (`limite`, de tela_limite).
+    Só entra quem tem algum dos três.
 
     Só o refresh, o gerente e o `orq agentes` chamam isto (um read por worker, em paralelo); os hooks de prompt leem o que ficou no cache. Falha de leitura não prova nada.
     """
@@ -5777,8 +5823,8 @@ def _ler_telas(ws, detalhes):
         agente = detalhes[w["dispatchId"]]["agente"]
         espera = HARNESS[agente]["tela"]["espera"]
         m = espera and espera.search("\n".join(map(str, tail[-15:])))
-        achado = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": tela_pergunta(tail, agente)}
-        return w["dispatchId"], achado if m or achado["pergunta"] else None
+        achado = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": tela_pergunta(tail, agente), "limite": tela_limite(tail, agente)}
+        return w["dispatchId"], achado if m or achado["pergunta"] or achado["limite"] else None
     alvo = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (detalhes.get(w.get("dispatchId")) or {}).get("agente") in HARNESS]
     with ThreadPoolExecutor(8) as ex:
         return {d: a for d, a in ex.map(le, alvo) if a}
@@ -5802,7 +5848,7 @@ def agentes(run=None, todos=False, agora=None):
     det = _detalhes(ws)
     lidas = _ler_telas([w for w in ws if w.get("dispatchId") not in hib], det)  # o terminal do hibernado não existe: nada a ler
     ags = monta_agentes(ws, msgs, events, agora, det, vivos, _turnos_ro(), {d: a["espera"] for d, a in lidas.items() if a["espera"]},
-                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]}, hib)
+                        {d: a["pergunta"] for d, a in lidas.items() if a["pergunta"]}, hib, limites={d: a["limite"] for d, a in lidas.items() if a["limite"]})
     nao_lidos = {e.get("dispatch") for e in alertas_recentes(events, agora, ags) if e.get("alerta") == "steer_nao_lido"}
     for a in ags:
         if a["dispatch"] in nao_lidos:
@@ -5828,6 +5874,8 @@ def texto_agentes(ags):
               else f"sem heartbeat (desde {_hora_local(ref)})" if ref and a["estado"] in ("rodando", "travado", "perguntando") else "")
         if a["estado"] == "nao_comecou":
             hb = f"não começou: nenhum turno {a['idade_s'] // 60} min depois do despacho ({_hora_local(a.get('desde'))})"
+        elif a["estado"] == "limite":
+            hb = f"limite do plano: {a['limite']}"
         elif a["estado"] == "parado":
             hb = f"parado no prompt há {a['idade_s'] // 60} min"
         elif a["estado"] == "hibernado":

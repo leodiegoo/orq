@@ -1,0 +1,10 @@
+● Vou rodar a suíte agora.
+
+  ⎿  You've hit your session limit · resets 6:50pm (America/Sao_Paulo)
+
+  Usage limit reached · continuing automatically at 6:50pm · esc to cancel
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
