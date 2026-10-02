@@ -1,7 +1,8 @@
 // Lê os arquivos do ORQ_HOME e monta os blocos da TUI como texto. Só leitura: nada aqui grava nem chama o Orca.
-// O serve (orq gerente serve) grava gerente-estado.json a cada volta com os workers e a máquina; sem ele, os workers vêm do aberto.json.
+// O serve (orq gerente serve) grava manager-state.json a cada volta com os workers e a máquina; sem ele, os workers vêm do open.json.
+// O disco está em inglês (fase 2 da migração); a TUI lê com as chaves pt, como o orq: paraPt troca as chaves e valores pelo mapa do orqlib.py.
 import { existsSync, openSync, readFileSync, readSync, statSync, closeSync } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 type Json = Record<string, any>
 
@@ -9,8 +10,8 @@ export type Bloco = { id: string; titulo: string; linhas: string[] }
 
 export type Estado = {
   agora: number
-  gerente: Json | null // gerente-estado.json
-  vivoMs: number | null // mtime do carimbo gerente-vivo
+  gerente: Json | null // manager-state.json
+  vivoMs: number | null // mtime do carimbo manager-alive
   servePid: number | null // pid escrito no gerente-serve.pid (a trava só o serve sabe; a TUI confia no carimbo)
   aberto: Json | null
   digest: Json | null
@@ -25,6 +26,34 @@ const ESTADO_FRESCO_S = 60
 const ANDA = new Set(["rodando", "perguntando", "travado", "parado", "nao_comecou", "sem_terminal", "aguardando_integracao", "hibernado"])
 const RUIDO = new Set(["intake", "entrada", "heartbeat_absorvido", "gate_aviso"])
 
+type Mapa = { chaves: Record<string, string>; valores: Record<string, Record<string, string>>; arquivos: Record<string, string> }
+
+// o mapa mora só no orqlib.py (CHAVES_PT, VALORES_PT, ARQ_ANTIGO): lido uma vez, do orq ao lado desta pasta
+const MAPA: Mapa = (() => {
+  const orq = join(dirname(import.meta.dir), "..")
+  const py = "import json, orqlib as o; print(json.dumps({'chaves': o.CHAVES_PT, 'valores': o.VALORES_PT, 'arquivos': o.ARQ_ANTIGO}))"
+  const r = Bun.spawnSync(["python3", "-c", py], { cwd: orq, env: { ...process.env, ORQ_NO_BG: "1" } })
+  return JSON.parse(r.stdout.toString())
+})()
+
+export const paraPt = (x: any): any => {
+  if (Array.isArray(x)) return x.map(paraPt)
+  if (x === null || typeof x !== "object") return x
+  const out: Json = {}
+  for (const [k, v] of Object.entries(x)) {
+    const pt = MAPA.chaves[k] ?? k
+    const vs = MAPA.valores[pt]
+    out[pt] = vs && typeof v === "string" ? (vs[v] ?? v) : paraPt(v)
+  }
+  return out
+}
+
+// o nome novo do arquivo, ou o pt enquanto a migração não rodou
+const arq = (home: string, nome: string): string => {
+  const antigo = MAPA.arquivos[nome]
+  return antigo && !existsSync(join(home, nome)) && existsSync(join(home, antigo)) ? join(home, antigo) : join(home, nome)
+}
+
 const lerJson = (p: string): any => {
   try {
     return JSON.parse(readFileSync(p, "utf8"))
@@ -32,6 +61,8 @@ const lerJson = (p: string): any => {
     return null
   }
 }
+
+const lerEstadoJson = (p: string): any => paraPt(lerJson(p))
 
 const mtime = (p: string): number | null => {
   try {
@@ -54,7 +85,7 @@ const fimDoLog = (p: string, bytes = 65536): Json[] => {
   const linhas = buf.toString("utf8").split("\n").slice(tam > bytes ? 1 : 0)
   return linhas.flatMap((l) => {
     try {
-      return l.trim() ? [JSON.parse(l)] : []
+      return l.trim() ? [paraPt(JSON.parse(l))] : []
     } catch {
       return []
     }
@@ -71,14 +102,14 @@ export function lerEstado(home: string, agora = Date.now()): Estado {
   })()
   return {
     agora,
-    gerente: lerJson(join(home, "gerente-estado.json")),
-    vivoMs: mtime(join(home, "gerente-vivo")),
+    gerente: lerEstadoJson(arq(home, "manager-state.json")),
+    vivoMs: mtime(arq(home, "manager-alive")),
     servePid: pid,
-    aberto: lerJson(join(home, "aberto.json")),
-    digest: lerJson(join(home, "digest", "atual.json")),
-    integrar: lerJson(join(home, "integrar-fila.json"))?.itens ?? [],
-    despacho: lerJson(join(home, "fila-despacho.json"))?.itens ?? [],
-    maquinaCfg: lerJson(join(home, "maquina.json")) ?? {},
+    aberto: lerEstadoJson(arq(home, "open.json")),
+    digest: lerJson(join(home, "digest", "atual.json")), // contrato digest-v1: em pt, sem tradução
+    integrar: lerEstadoJson(arq(home, "integrate-queue.json"))?.itens ?? [],
+    despacho: lerEstadoJson(arq(home, "dispatch-queue.json"))?.itens ?? [],
+    maquinaCfg: lerEstadoJson(arq(home, "machine.json")) ?? {},
     eventos: fimDoLog(join(home, "events.jsonl")),
   }
 }
@@ -100,7 +131,7 @@ const corta = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1
 function blocoGerente(e: Estado): Bloco {
   const linhas: string[] = []
   const s = e.vivoMs === null ? null : Math.round((e.agora - e.vivoMs) / 1000)
-  if (s === null) linhas.push("PARADO: sem carimbo gerente-vivo (o gerente não subiu)")
+  if (s === null) linhas.push("PARADO: sem carimbo manager-alive (o gerente não subiu)")
   else if (s > VIVO_S) linhas.push(`PARADO há ${Math.round(s / 60)} min: nenhum aviso de worker chega`)
   else linhas.push(`vivo, última volta há ${s} s` + (fresco(e) && e.servePid ? ` (serve, pid ${e.servePid})` : " (painel no terminal)"))
   if (e.gerente?.terminal) linhas.push(`terminal do vínculo: ${e.gerente.terminal}`)
@@ -110,7 +141,7 @@ function blocoGerente(e: Estado): Bloco {
 
 function workers(e: Estado): { lista: Json[]; fonte: string } {
   if (fresco(e) && Array.isArray(e.gerente!.agentes)) return { lista: e.gerente!.agentes, fonte: "" }
-  return { lista: e.aberto?.agentes ?? [], fonte: e.aberto?.ts ? ` (aberto.json de ${idade(e.aberto.ts, e.agora)} atrás)` : "" }
+  return { lista: e.aberto?.agentes ?? [], fonte: e.aberto?.ts ? ` (open.json de ${idade(e.aberto.ts, e.agora)} atrás)` : "" }
 }
 
 function blocoWorkers(e: Estado): Bloco {

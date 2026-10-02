@@ -1,6 +1,8 @@
 // Fumaça: monta a tela a partir de tui/fixtures num renderer de teste e confere os blocos no quadro.
 import { expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
+import { cpSync, existsSync, mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { lerEstado, montarBlocos } from "../src/dados"
 import { criarTela } from "../src/tela"
@@ -38,6 +40,22 @@ test("it should be a stopped manager when the stamp is old and the state file is
   const e = { ...lerEstado(fixtures, agora + 3600_000), vivoMs: agora - 600_000 }
   const [gerente, workers] = montarBlocos(e)
   expect(gerente.linhas[0]).toStartWith("PARADO há 70 min")
-  expect(workers.titulo).toContain("aberto.json")
+  expect(workers.titulo).toContain("open.json")
   expect(montarBlocos(e)[4].linhas[0]).toStartWith("sem leitura da máquina")
+})
+
+test("it should be the same blocks from the fixtures migrated to english", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "tui-en-"))
+  const home = join(tmp, "orq")
+  cpSync(fixtures, home, { recursive: true })
+  const orca = join(tmp, "orca") // um Orca sem workers vivos: a migração recusa rodar com algum
+  writeFileSync(orca, `#!/bin/sh\necho '{"ok": true, "result": {"workers": [], "scope": {"source": "all"}}}'\n`, { mode: 0o755 })
+  const r = Bun.spawnSync(["python3", join(import.meta.dir, "..", "..", "scripts", "migrar-ingles.py")], {
+    env: { ...process.env, ORQ_HOME: home, ORQ_ORCA: orca, ORQ_NO_BG: "1" },
+  })
+  expect(r.exitCode).toBe(0)
+  expect(existsSync(join(home, "open.json")) && !existsSync(join(home, "aberto.json"))).toBe(true)
+  const pt = montarBlocos({ ...lerEstado(fixtures, agora), vivoMs: agora - 5000 })
+  const en = montarBlocos({ ...lerEstado(home, agora), vivoMs: agora - 5000 })
+  expect(en).toEqual(pt)
 })

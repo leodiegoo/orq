@@ -102,7 +102,7 @@ def secao_prs(cwd):
 
 def secao_entradas():
     try:
-        ev = [json.loads(l) for l in open(orq._path("events.jsonl")) if l.strip()]
+        ev = orq.read_events()
     except Exception:
         return "(events.jsonl ilegível)"
     efeito = {e.get("entrada"): e for e in ev if e.get("tipo") == "intake"}

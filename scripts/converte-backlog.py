@@ -62,7 +62,7 @@ def datas_dos_eventos(caminho):
                     e = json.loads(linha)
                 except ValueError:
                     continue
-                if e.get("tipo") == "ticket" and e.get("op") in ("novo", "fechar") and e.get("ticket") and e.get("ts"):
+                if (e.get("tipo") or e.get("type")) == "ticket" and e.get("op") in ("novo", "fechar") and e.get("ticket") and e.get("ts"):
                     (novo if e["op"] == "novo" else fechou).setdefault(str(e["ticket"]).zfill(2), e["ts"][:10])
     except FileNotFoundError:
         pass

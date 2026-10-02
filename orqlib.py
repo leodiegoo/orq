@@ -101,7 +101,7 @@ STEER_TRANSCRITO_BYTES = 4_000_000  # o fim do transcrito do worker onde se proc
 STEER_JANELA_S = 30 * 60  # steer mais velho que isto sai do acompanhamento: o inbox de 200 mensagens já não o alcança
 NAO_COMECOU_S = 120  # dispatch aberto sem nenhum turno registrado tanto tempo depois do despacho não começou (o worker-start que ficou sem Enter)
 PARADO_S = 60  # o turno terminou há tanto tempo e nada mais veio: o worker parou no prompt (o limiar evita chamar de parado a folga entre dois turnos)
-TURNOS = "turnos.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
+TURNOS = "turns.json"  # {dispatch: {task, sessao, inicio, fim}}: o que os hooks prompt e stop do worker gravam, sem chamar o Orca
 TURNOS_DIAS = 7  # turno mais velho que isto sai do turnos.json na próxima gravação
 CONTROLE_LINHAS = 5  # entradas do histórico de controle que o `orq agentes` mostra por dispatch (as mais novas)
 ORDEM_AGENTES = {"travado": 0, "limite": 1, "sem_terminal": 2, "nao_comecou": 3, "parado": 4, "perguntando": 5, "rodando": 6, "aguardando_integracao": 7, "entregue": 8, "devolvida": 8, "servico": 9, "hibernado": 10, "encerrado": 11, "liberado": 12}
@@ -113,16 +113,16 @@ HB_LOTES = 4  # lotes de heartbeat seguidos que um só aviso confirma (o --ack d
 AVISO_RUN = re.compile(r"orchestration check --run (run_\w+)")
 RESUMO_PEDIDO_S = 60  # a entrada do usuário mais nova que isso é o pedido do próprio `orq resumo`
 ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao", "devolvida")  # estados que aparecem em "Anda" do `orq resumo`
-PAINEL_VIVO = "gerente-vivo"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
+PAINEL_VIVO = "manager-alive"  # o painel do agent manager toca este arquivo a cada volta (painel-agent-manager.sh), fora do orq
 PAINEL_PARADO_S = 60  # carimbo mais velho que isto já vale um aviso de "painel lento"; parado é o limite de painel_limite_s
 PAINEL_LIMITE_MIN_S = 90  # o carimbo só vale como painel parado depois de tanto tempo (ou de PAINEL_VOLTAS_X voltas médias, o que for maior)
 PAINEL_VOLTAS_X = 3
 PAINEL_INTERVALO_S = 10  # o `sleep` do painel com a volta rápida
 PAINEL_INTERVALO_MAX_S = 30  # teto do `sleep` quando a volta passa de PAINEL_INTERVALO_S
 VOLTAS_LEMBRADAS = 10  # durações de volta guardadas no gerente.json `voltas_s`
-INTEGRAR_FILA = "integrar-fila.json"  # {itens: [{branch, ticket, ts}]}: as branches que esperam o integrador; o worker do ticket fica "aguardando integração"
-PAINEL_CHECAGEM = "gerente-checagem.json"  # {ts, terminal, morto}: o que o último `orq gerente checar` (fora do hook) viu no Orca; o hook só o lê
-GERENTE = "gerente.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
+INTEGRAR_FILA = "integrate-queue.json"  # {itens: [{branch, ticket, ts}]}: as branches que esperam o integrador; o worker do ticket fica "aguardando integração"
+PAINEL_CHECAGEM = "manager-check.json"  # {ts, terminal, morto}: o que o último `orq gerente checar` (fora do hook) viu no Orca; o hook só o lê
+GERENTE = "manager.json"  # {coordenador, gerente, runs}: o coordenador fala com o Orca pelo terminal do agent manager
 RUN_PARADO_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # Run sem task aberta nem mensagem por tanto tempo sai do gerente
 RUN_RECENTE_H = 24  # Run sem trabalho aberto só aparece no resumo até 24 h depois da última atividade; depois vai para o arquivo (`orq runs --todos`)
 RUN_TESTE = re.compile(r"teste|descart[aá]vel", re.I)  # objetivo de Run de teste: nunca aparece por padrão
@@ -448,7 +448,7 @@ def integrar_fila_add(branch, ticket):
     if not branch or not branch.strip():
         raise ValueError("branch vazia")
     novo = {"branch": branch.strip(), "ticket": n, "ts": now()}
-    with _trava("integrar-fila.lock"):
+    with _trava("integrate-queue.lock"):
         itens = [i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict)]
         pos = next((k for k, i in enumerate(itens) if i.get("ticket") == n), len(itens))
         itens[pos:pos + 1] = [novo]
@@ -493,7 +493,7 @@ def auditar_publicacao(revs, repo=None):
 def integrar_fila_rm(ticket):
     """Tira o ticket da fila do integrador (a branch já está na main, ou desistiram dela). ValueError se não estava lá."""
     n = str(ticket).strip().zfill(2)
-    with _trava("integrar-fila.lock"):
+    with _trava("integrate-queue.lock"):
         itens = [i for i in _dict(_read_json(_path(INTEGRAR_FILA))).get("itens") or [] if isinstance(i, dict)]
         resto = [i for i in itens if i.get("ticket") != n]
         if len(resto) == len(itens):
@@ -524,7 +524,7 @@ def servico_marcar(dispatch):
     """Faz de um dispatch já despachado (antes de existir `--servico`) um dispatch de serviço: grava `servico_marcado`, que `_servicos` lê como o `--servico` do despacho.
     ValueError se o dispatch não existe (nem despacho no log nem agente no aberto.json) ou já foi liberado."""
     events = read_events()
-    if dispatch not in {e.get("dispatch") for e in events if e.get("tipo") == "despacho"} | {a.get("dispatch") for a in _dict(_read_json(_path("aberto.json"))).get("agentes") or [] if isinstance(a, dict)}:
+    if dispatch not in {e.get("dispatch") for e in events if e.get("tipo") == "despacho"} | {a.get("dispatch") for a in _dict(_read_json(_path("open.json"))).get("agentes") or [] if isinstance(a, dict)}:
         raise ValueError(f"{dispatch} não é um dispatch conhecido (orq agentes)")
     if dispatch in _liberados(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}:
         raise ValueError(f"{dispatch} já foi liberado")
@@ -1442,7 +1442,7 @@ def trava_gerente():
     if _TRAVA_GERENTE[0] or not os.path.exists(_path(GERENTE)):
         yield
         return
-    with _trava("gerente.lock"):
+    with _trava("manager.lock"):
         _TRAVA_GERENTE[0] = 1
         try:
             yield
@@ -1471,16 +1471,167 @@ def handle_orca():
     return g["gerente"] if isinstance(g, dict) and meu and g.get("coordenador") == meu and g.get("gerente") else meu
 
 
+# ---------- estado em inglês no disco (fase 2 da migração; plano em ~/.claude/orquestrador-plan/orq-ingles-plano.md) ----------
+# O código continua lendo e montando as chaves em pt; o disco do ORQ_HOME fica em inglês. Toda gravação passa por para_en e toda leitura por
+# para_pt, que aceita os dois formatos: um evento pt solto (worker ou branch antiga) ainda é lido. O mesmo mapa serve ao scripts/migrar-ingles.py.
+# Chave nova gravada em inglês não pode ser destino deste mapa (a leitura a trocaria pela chave pt); o teste do mapa confere as do fixture.
+CHAVES_EN = {
+    "abertas": "open", "aberto": "is_open", "aberto_em": "opened_at", "abertos": "open_list", "acao": "action", "aceita": "accepted",
+    "achados": "findings", "acordado": "woken", "agente": "agent", "agente_de": "agent_from", "agente_para": "agent_to", "agentes": "agents",
+    "alerta": "alert", "ambiente": "environment", "ambientes": "environments", "andamento": "in_progress", "anterior": "previous", "antigos": "old",
+    "arquivo": "file", "arquivo_novo": "new_file", "ate": "until", "ativos": "active", "ausencia": "absence", "ausente": "away",
+    "auto_desde": "auto_since", "avisa": "warn_at", "avisado": "notified", "aviso": "notice", "aviso_terminal": "terminal_notice", "avisos": "notices",
+    "blocos": "blocks", "bloqueado": "blocked", "bloqueios": "blockers", "cache_criado": "cache_created", "cache_lido": "cache_read",
+    "caixa": "inbox", "caminho": "path", "campos": "fields", "carga": "load", "carga_max": "max_load", "caros": "expensive", "max_caros": "max_expensive", "casas": "houses",
+    "casos": "cases", "causa": "cause", "chave": "key", "checkout_em_uso": "checkout_in_use", "checkout_em_uso_do_orq": "orq_checkout_in_use",
+    "chegada": "arrival", "ciclo": "cycle", "cinco_h": "five_h", "cinco_h_reset": "five_h_reset", "com_aviso": "with_notice", "comando": "command",
+    "completadas": "finished", "concluidas": "completed", "confiadas": "trusted", "confirmado": "confirmed", "conjunto": "set",
+    "conserto": "fix", "contexto": "context", "controle": "control", "controle_falhou": "control_failed", "coordenador": "coordinator",
+    "copia": "copy", "corpo": "body", "correcao_do_usuario": "user_correction", "cortes": "cuts", "de": "from", "decisao": "decision",
+    "declarada": "declared_as", "declarado": "declared", "depois": "after", "deps_faltando": "missing_deps", "desde": "since", "desfeito": "undone",
+    "desistiu": "gave_up", "despacho": "dispatch_info", "despachos": "dispatches", "destino": "dest", "detalhe": "detail", "devolvida": "sent_back",
+    "dia": "day", "dias": "days", "digita_prompt": "types_prompt", "disposicao": "disposition", "dormindo": "sleeping", "dormiu": "slept",
+    "duracao_s": "duration_s", "efeito": "effect", "em": "at", "encerrado": "ended", "encerrados": "ended_list", "enter_separado": "separate_enter",
+    "entrada": "entry", "entrada_sem_tratamento": "untreated_entry", "entrega": "delivery", "entrega_com_aviso": "delivery_with_notice",
+    "entregas": "deliveries", "entregue": "delivered", "enviado": "sent", "erro": "error", "escrito_por": "written_by", "espera": "wait",
+    "espera_motivo": "wait_reason", "esperam": "waiting", "estado": "state", "eventos": "events", "externa_min": "external_min", "falha": "failure",
+    "falhas": "failures", "falhos": "failed_list", "falhou": "failed", "fase": "phase", "fechado": "closed", "fechado_em": "closed_at",
+    "fechou": "closed_it", "feito": "done", "ficam": "stay", "ficaram": "stayed", "fila": "queue", "fila_e2e": "e2e_queue", "fila_tipo": "queue_type",
+    "filho": "child", "filhos": "children", "fim": "end", "fim_dispatch": "dispatch_end", "fluxo": "flow", "fonte": "source", "fora": "outside",
+    "fora_cpu": "out_cpu", "fora_por_cpu": "out_by_cpu", "fora_por_mem": "out_by_mem", "fora_rss_mb": "out_rss_mb", "frente": "stream",
+    "gerado": "generated", "gerente": "manager", "gerente_volta": "manager_round", "grupo": "group", "grupos": "groups", "guardados": "kept",
+    "hb_absorvido": "hb_absorbed", "hibernado": "hibernated", "hibernados": "hibernated_list", "hibernar_volta": "hibernate_round",
+    "idade": "age", "idade_s": "age_s", "ignora_term": "ignores_term", "ini": "start_at", "iniciado": "started_at", "inicio": "begin",
+    "instalado": "installed", "intake_descartado": "intake_discarded", "integracao": "integration", "interacao": "interaction",
+    "intervalo": "interval_s", "intervencao": "intervention", "itens": "items", "leitura": "reading", "liberado": "released",
+    "liberado_sem_push": "released_unpushed", "liberado_sujo": "released_dirty", "liberados": "released_list", "lido_em": "read_at",
+    "ligada_em": "bound_at", "ligado": "on", "ligado_em": "linked_at", "limite": "limit", "limite_ts": "limit_ts", "limpeza": "cleanup",
+    "limpeza_em_dias": "cleanup_days", "linha": "line", "linha_antes": "line_before", "linhas": "lines", "livre": "free", "livre_pct": "free_pct",
+    "livre_pct_min": "free_pct_min", "livres": "free_slots", "longa": "long", "lote": "batch", "mantido": "kept_it", "maquina": "machine",
+    "marcas": "marks", "mate_avisada_ate": "mate_notified_until", "max_despachos": "max_dispatches", "max_falhas": "max_failures",
+    "mem_livre_mb": "mem_free_mb", "mem_livre_min_mb": "mem_free_min_mb", "mem_piso_mb": "mem_floor_mb", "mergeado": "merged",
+    "metricas": "metrics", "minutos": "minutes", "modelo": "model", "modelos_caros": "expensive_models", "morto": "dead", "motivo": "reason",
+    "motivo_hibernado": "hibernated_reason", "na_fila": "queued", "nao_antes": "not_before", "nao_comecou": "not_started", "nivel": "level",
+    "noite": "night", "nome": "name", "nota": "note", "notificar_macos": "notify_macos", "novo": "new", "novo_dispatch": "new_dispatch",
+    "numero": "number", "objetivo": "objective", "ocupado": "busy", "ocupado_digitado": "busy_typed", "ocupadas": "busy_list",
+    "onde": "where", "opcao": "option", "opcoes": "options", "orca_yaml_estado": "orca_yaml_state", "orcamento": "budget", "origem": "origin",
+    "outro_ambiente": "other_environment", "pacote": "package", "pagina": "page", "papeis": "roles", "papel": "role", "para": "to",
+    "parada": "stopped_by", "parado": "stopped", "passagem": "handoff", "passo": "step", "passos": "steps", "pasta": "folder", "pausa": "pause",
+    "pausados": "paused", "pausar_sob_pressao": "pause_under_pressure", "pedido": "request", "pedidos": "requests", "pend": "pending",
+    "pend_tipo": "pending_type", "pendencias": "pendings", "pergunta": "question", "pergunta_de_worker": "worker_question",
+    "perguntando": "asking", "perguntas": "questions", "ponta_remota": "remote_tip", "ponteiro": "pointer", "pontos": "points", "por": "why",
+    "por_modelo": "by_model", "posicao": "position", "pr_ci_vermelho": "pr_ci_red", "pr_pediu_mudanca": "pr_changes_requested", "prazo": "deadline",
+    "prefixos": "prefixes", "presa": "stuck_lock", "preservados": "preserved", "prioridade": "priority", "problema": "problem",
+    "problemas": "problems", "processos": "processes", "producao": "production", "projeto": "project", "projeto_mate": "mate_project",
+    "projetos": "projects", "pronto": "ready", "prontos": "ready_list", "prontos_avisados": "ready_notified", "prova": "proof",
+    "proximo": "next", "pulados": "skipped", "recuperado": "recovered", "recusado": "refused", "registrado_no_orca": "registered_in_orca",
+    "regra": "rule", "regra_violada": "broken_rule", "regras": "rules", "removidas": "removed_list", "removidos": "removed", "responde": "answers",
+    "resolvido_em": "resolved_at", "resolvidos": "resolved_list", "resposta": "answer", "resposta_id": "answer_id", "resultado": "result",
+    "resumo": "summary", "retido": "retained_it", "retomado": "resumed", "revisao": "review", "rodando": "running", "rotulo": "label",
+    "rss_antes_mb": "rss_before_mb", "rss_depois_mb": "rss_after_mb", "rss_liberado_mb": "rss_freed_mb", "runs_isentos": "exempt_runs",
+    "saida": "output", "segura": "holds", "sem_entrega": "no_delivery", "sem_push": "unpushed", "sem_task": "no_task",
+    "sem_terminal": "no_terminal", "sem_ticket": "no_ticket", "semana": "week", "semana_avisa": "week_warn", "semana_pausa": "week_pause",
+    "semana_reset": "week_reset", "servico": "service", "sessao": "session", "setup_fechados": "setup_closed", "sinais": "signals",
+    "sinal": "signal", "spec_arquivo": "spec_file", "steer_nao_lido": "steer_unread", "steer_reentregue": "steer_redelivered",
+    "steer_sem_leitura": "steer_no_read", "stop_bloqueia": "stop_blocks", "sugerido": "suggested", "sujo": "dirty", "task_fechada": "task_closed",
+    "tela": "screen", "tela_ts": "screen_ts", "tentativa": "attempt", "tentativas": "attempts", "texto": "text", "tickets_orq": "orq_tickets",
+    "tipo": "type", "tipo_mate": "mate_type", "titulo": "title", "transcrito": "transcript", "transcritos": "transcripts", "travado": "stuck",
+    "turno": "turn", "turno_fim": "turn_end", "turno_inicio": "turn_begin", "turnos": "turns", "ultima": "last", "ultima_volta": "last_round",
+    "ultimo_heartbeat": "last_heartbeat", "ultimo_poll": "last_poll", "uso": "usage", "usuario": "user", "valor": "value", "velha": "stale",
+    "versao": "version", "visto": "seen", "vistos": "seen_list", "vivo": "alive", "vivos": "alive_list", "voltas_s": "rounds_s",
+    "worktree_intacta": "worktree_intact",
+}
+TIPOS_EN = {  # os tipos de evento; os que já estão em inglês (pr, ok, info, intake, worker_done, ticket, steer, mate, doctor, backlog) ficam
+    "entrada": "entry", "obrigacao": "obligation", "steer_fim": "steer_end", "steer_reentrega": "steer_redelivered",
+    "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
+    "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
+    "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue",
+    "despacho": "dispatch", "despacho_fila": "dispatch_queued", "alerta": "alert", "alerta_visto": "alert_seen", "uso_aviso": "usage_notice",
+    "uso_parou": "usage_stopped", "run_projeto": "run_project", "resposta": "answer", "resposta_worker": "worker_answer",
+    "resposta_suspeita": "suspect_answer", "resposta_lavish": "lavish_answer", "resposta_coordenador": "coordinator_answer", "prioridade": "priority",
+    "pausa_plano": "plan_pause", "pausa_fim": "pause_end", "passagem": "handoff", "noite_ligar": "night_on", "noite_desligar": "night_off",
+    "noite_parou": "night_stopped", "nao_iniciou": "not_started", "maquina_aviso": "machine_notice", "hibernar": "hibernate", "acordar": "wake",
+    "heartbeat_visto": "heartbeat_seen", "heartbeat_absorvido": "heartbeat_absorbed", "gate_aviso": "gate_notice", "gate_falha": "gate_failed",
+    "gate_falhou": "gate_blocked", "gate_resolvido": "gate_resolved", "fim_dispatch": "dispatch_end", "entrega": "delivery",
+    "entrega_orq": "orq_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
+    "ausente_desligar": "away_off", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
+    "processos": "processes", "resumo_add": "summary_add", "devolver": "send_back", "limite_tela": "screen_limit",
+    "pendente_avisado": "pending_notified", "revisao_nm": "nm_review",
+}
+PEND_EN = {"acao": "action", "decisao": "decision", "avisar": "notify"}
+SUBIDA_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqueio": "blocker", "resumo": "summary"}
+VALORES_EN = {  # chave (em pt) -> os valores gravados que trocam; o resto (texto livre, ids, estados do gh e do Orca) passa como está
+    "tipo": {**TIPOS_EN, **PEND_EN, **SUBIDA_EN},
+    "pend_tipo": PEND_EN, "tipo_mate": SUBIDA_EN, "fila_tipo": {"despacho": "dispatch"},
+    "efeito": {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "pend": "pending"},
+    # agentes (ORDEM_AGENTES) e PRs (prs.json). `liberado` vira `freed`: o evento liberar grava em `estado` o `released` do Orca
+    "estado": {"rodando": "running", "travado": "stuck", "perguntando": "asking", "entregue": "delivered", "liberado": "freed", "limite": "limit",
+               "sem_terminal": "no_terminal", "nao_comecou": "not_started", "parado": "stopped", "aguardando_integracao": "awaiting_integration",
+               "devolvida": "sent_back", "servico": "service", "hibernado": "hibernated", "encerrado": "ended",
+               "aberto": "open", "mergeado": "merged", "fechado": "closed"},
+}
+CHAVES_PT = {en: pt for pt, en in CHAVES_EN.items()}
+VALORES_PT = {k: {en: pt for pt, en in m.items()} for k, m in VALORES_EN.items()}
+ARQ_ANTIGO = {  # nome novo -> nome pt: o _path usa o antigo enquanto o novo não existe (antes da migração). As travas trocam de nome sem fallback
+    "open.json": "aberto.json", "merge-queue.json": "fila.json", "dispatch-queue.json": "fila-despacho.json", "integrate-queue.json": "integrar-fila.json",
+    "turns.json": "turnos.json", "manager.json": "gerente.json", "manager-alive": "gerente-vivo", "manager-notice.json": "gerente-aviso.json",
+    "manager-check.json": "gerente-checagem.json", "manager-state.json": "gerente-estado.json", "active.json": "ativos.json",
+    "machine.json": "maquina.json", "usage.json": "uso.json", "hibernate.json": "hibernar.json", "e2e-notice.json": "e2e-aviso.json",
+    "worktrees-notice.json": "worktrees-aviso.json", "ask": "perguntar",
+}
+ARQ_WORKER = {"HANDOFF.md": "PASSAGEM.md", "PAUSE.md": "PAUSA.md", "final-report.md": "relatorio-final.md"}  # na worktree: o orq lê os dois nomes
+
+
+def _troca(obj, chaves, valores):
+    if isinstance(obj, list):
+        return [_troca(x, chaves, valores) for x in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        vs = valores.get(CHAVES_PT.get(k, k))
+        out[chaves.get(k, k)] = vs.get(v, v) if vs and isinstance(v, str) else _troca(v, chaves, valores)
+    return out
+
+
+def para_en(obj):
+    """Chaves e valores pt -> inglês (o que vai para o disco). O que já está em inglês passa igual."""
+    return _troca(obj, CHAVES_EN, VALORES_EN)
+
+
+def para_pt(obj):
+    """O inverso, para o código, que lê as chaves em pt: aceita a linha em inglês, em pt ou misturada."""
+    return _troca(obj, CHAVES_PT, VALORES_PT)
+
+
+def _do_orq(path):
+    """O arquivo é estado do orq no ORQ_HOME, que vai em inglês para o disco? O digest (contrato digest-v1, em pt) e os exemplos de hooks não."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(HOME))
+    return not rel.startswith(("..", "digest" + os.sep)) and not rel.endswith(".example.json")
+
+
 def _path(nome):
-    return os.path.join(HOME, nome)
+    p = os.path.join(HOME, nome)
+    antigo = ARQ_ANTIGO.get(nome)
+    if antigo and not os.path.exists(p) and os.path.exists(q := os.path.join(HOME, antigo)):
+        return q
+    return p
+
+
+def arq_worker(pasta, nome):
+    """O arquivo que o worker escreve na worktree (HANDOFF.md, PAUSE.md, final-report.md), ou o nome pt que um worker antigo ainda escreve."""
+    p = os.path.join(pasta, nome)
+    antigo = os.path.join(pasta, ARQ_WORKER.get(nome, nome))
+    return antigo if not os.path.exists(p) and os.path.exists(antigo) else p
 
 
 def _read_json(path, default=None):
     try:
         with open(path) as f:
-            return json.load(f)
+            d = json.load(f)
     except (OSError, ValueError):
         return default
+    return para_pt(d) if _do_orq(path) else d
 
 
 def _dict(x):
@@ -1504,7 +1655,7 @@ def _read_cursor():
     """cursor.json para quem vai regravá-lo (com o cursor.lock): ausente é {}; ilegível vira cópia e recomeço (_recuperar_cursor)."""
     try:
         with open(_path("cursor.json")) as f:
-            d = json.load(f)
+            d = para_pt(json.load(f))
     except FileNotFoundError:
         return {}
     except ValueError as e:
@@ -1531,7 +1682,7 @@ def _write_json(path, data, indent=None):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=indent)
+            json.dump(para_en(data) if _do_orq(path) else data, f, ensure_ascii=False, indent=indent)
         os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
@@ -1568,7 +1719,7 @@ def read_events():
         with open(_path("events.jsonl")) as f:
             for line in f:
                 try:
-                    out.append(json.loads(line))
+                    out.append(para_pt(json.loads(line)))
                 except ValueError:
                     pass
     except OSError:
@@ -1590,7 +1741,7 @@ def _grava_evento(ev, novo_id=False):
         ev["id"] = f"e{cur['entrada']}"
     ev = {"ts": now(), **ev}
     with open(_path("events.jsonl"), "a") as f:
-        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        f.write(json.dumps(para_en(ev), ensure_ascii=False) + "\n")
     return ev
 
 
@@ -1721,7 +1872,7 @@ def refresh_aberto():
         except Exception as e:  # noqa: BLE001
             log(f"refresh: agentes: {type(e).__name__}: {e}")
         ab["maquina"] = maquina_painel(ab.get("agentes"))
-        _write_json(_path("aberto.json"), ab)
+        _write_json(_path("open.json"), ab)
         return ab
 
 
@@ -1750,7 +1901,7 @@ def _turnos_ro():
 
 def _turnos_mut(fn):
     """Lê o turnos.json, aplica fn(turnos) e grava sob o turnos.lock, a menos que fn devolva False (nada mudou)."""
-    with _trava("turnos.lock"):
+    with _trava("turns.lock"):
         turnos = _turnos_ro()
         if fn(turnos) is not False:
             _write_json(_path(TURNOS), turnos)
@@ -2213,11 +2364,11 @@ def ingest_inbox():
     return novos
 
 
-RELATORIO_FINAL = "relatorio-final.md"
+RELATORIO_FINAL = "final-report.md"
 
 
 def ingest_relatorios_finais():
-    """Worker que escreveu `relatorio-final.md` na worktree e não tem worker_done (o Orca recusou o handle novo) -> worker_done de reserva + entrada.
+    """Worker que escreveu `final-report.md` na worktree e não tem worker_done (o Orca recusou o handle novo) -> worker_done de reserva + entrada.
 
     Só vale com o turno do worker fechado (Stop), o cwd gravado pelo hook e o arquivo escrito depois do início do turno e do ponto de partida do ingest:
     o de um dispatch anterior na mesma worktree não conta. O outcome é `succeeded` porque o worker só escreve o arquivo ao terminar. Roda depois do inbox,
@@ -2231,7 +2382,7 @@ def ingest_relatorios_finais():
         t = _dict(t)
         if dispatch in feitos or not t.get("cwd") or not t.get("fim") or not _ts(t.get("inicio")):
             continue
-        arq = os.path.join(t["cwd"], RELATORIO_FINAL)
+        arq = arq_worker(t["cwd"], RELATORIO_FINAL)
         try:
             mtime = datetime.fromtimestamp(os.path.getmtime(arq), timezone.utc)
             titulo = next((l.lstrip("# ").strip() for l in open(arq, encoding="utf-8", errors="replace").read().splitlines() if l.strip()), "")
@@ -2377,7 +2528,7 @@ def _mutar_pend(fn, evento=None):
     do backlog para o painel; o par escrita e evento deixa de ser atômico (o ingest reconcilia o gate que ficar sem `gate_resolvido`).
     """
     with contextlib.ExitStack() as pilha:
-        pilha.enter_context(_trava("pend.lock"))
+        pilha.enter_context(_trava("pending.lock"))
         if evento:
             pilha.enter_context(_trava("cursor.lock"))
         d = _load_pend()
@@ -3068,7 +3219,7 @@ def _commits_fora(caminho):
 def linhas_worktrees(agora=None, wts=None, ocupadas=None, fora=None):
     """A linha do `orq status` com as worktrees paradas, uma vez por dia (worktrees-aviso.json guarda o dia). Orca fora do ar: sem linha."""
     agora = agora or datetime.now(timezone.utc)
-    dia, arq = agora.astimezone().strftime("%Y-%m-%d"), _path("worktrees-aviso.json")
+    dia, arq = agora.astimezone().strftime("%Y-%m-%d"), _path("worktrees-notice.json")
     if _dict(_read_json(arq)).get("dia") == dia:
         return []
     try:
@@ -3151,7 +3302,7 @@ def avisa_fila_e2e(f=None):
     g, f = _gerente_cfg(), f or fila_e2e()
     if not g or not g.get("coordenador") or not f or not f["presa"]:
         return []
-    arq = _path("e2e-aviso.json")
+    arq = _path("e2e-notice.json")
     if _dict(_read_json(arq)).get("ticket") == f["ticket"]:
         return []
     if avisa_coordenador(g["coordenador"], f"orq: {linha_e2e(f)}.") not in ("enviado", "adiado"):
@@ -3182,7 +3333,8 @@ def _guardar_relatorios(wt):
     """Copia o relatorio-final.md da worktree (`.scratch/*/relatorio-final.md` e `relatorio*.md` na raiz) para RELATORIOS/<worktree>-<caminho com - no lugar de />. Devolve os destinos."""
     os.makedirs(RELATORIOS, exist_ok=True)
     nome, out = os.path.basename(wt.rstrip("/")), []
-    for c in sorted(glob.glob(os.path.join(wt, ".scratch/*/relatorio-final.md")) + glob.glob(os.path.join(wt, "relatorio*.md"))):
+    for c in sorted({*glob.glob(os.path.join(wt, ".scratch/*/relatorio-final.md")), *glob.glob(os.path.join(wt, ".scratch/*/final-report.md")),
+                     *glob.glob(os.path.join(wt, "relatorio*.md")), *glob.glob(os.path.join(wt, "final-report*.md"))}):
         d = os.path.join(RELATORIOS, f"{nome}-{os.path.relpath(c, wt).replace('/', '-')}")
         shutil.copy2(c, d)
         out.append(d)
@@ -3570,7 +3722,7 @@ def linha_sem_terminal(aberto):
 
 
 def estado(entrada=None, antigas=False):
-    events, cur, aberto = read_events(), _cursor_ro(), _read_json(_path("aberto.json"))
+    events, cur, aberto = read_events(), _cursor_ro(), _read_json(_path("open.json"))
     txt = resumo(events, aberto, _pend_ro(), entrada, cursor=cur, turnos=_turnos_ro(), painel=aviso_painel(), antigas=antigas)
     return "\n".join([*filter(None, [aviso_hooks_codex()]), txt, *filter(None, [linha_sem_terminal(aberto)]), *linhas_noite(cur, events), *filter(None, [linha_liberados(events, tickets()), linha_espera_despacho(tickets(), events)])])
 
@@ -3579,7 +3731,7 @@ def estado(entrada=None, antigas=False):
 
 DIGEST = "digest"  # ORQ_HOME/digest/<AAAA-MM-DD>.html: um arquivo por dia, sempre no mesmo lugar
 DIGEST_LINHAS = 100  # entradas de `linha`; as mais antigas ficam só no log (a página diz "+N antes")
-FILA = "fila.json"  # {passos: [{passo, nome, por, prs: [números], feito}]}: a ordem de merge que o coordenador declara com `orq fila`
+FILA = "merge-queue.json"  # {passos: [{passo, nome, por, prs: [números], feito}]}: a ordem de merge que o coordenador declara com `orq fila`
 ESTADO_GH = {"aberto": "OPEN", "mergeado": "MERGED", "fechado": "CLOSED"}  # o estado do PR no contrato do digest
 TRANSCRITO_FIM = 400_000  # bytes do fim do transcrito onde o Stop procura a última resposta do coordenador
 RESPOSTA_MAX = 4000  # caracteres da resposta do coordenador que vão para o log
@@ -3732,7 +3884,7 @@ def _fila_ro():
 
 def _mutar_fila(fn):
     """Lê o fila.json, aplica fn(dados) e grava com tmp + rename, sob o fila.lock. Só o coordenador escreve (`orq fila`)."""
-    with _trava("fila.lock"):
+    with _trava("merge-queue.lock"):
         d = _fila_ro()
         out = fn(d)
         d["passos"].sort(key=lambda p: p["passo"])
@@ -3970,7 +4122,7 @@ def digest_gerar(agora=None, desde=None, com_html=False):
     agora = agora or datetime.now(timezone.utc)
     events, ausente = read_events(), _dict(_cursor_ro().get("ausente")) or None
     janela = desde if desde is not None else (ausente or {}).get("ligada_em") or ultima_do_usuario(events, agora)
-    d = monta_digest(events, _prs_ro(), _pend_ro(), _read_json(_path("aberto.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
+    d = monta_digest(events, _prs_ro(), _pend_ro(), _read_json(_path("open.json")), tickets(), _fila_ro(), janela, agora, _turnos_ro(), ausente, fila_e2e(),
                     {"max_workers": maquina_cfg()["max_workers"], "fila": len(fila_despacho_itens())})
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rodadas()[-4:]]  # as últimas rodadas do `orq retro --gravar`
     with contextlib.suppress(OSError), open(_path(os.path.join(DIGEST, "ausencia.md")), encoding="utf-8") as f:  # o último `orq away off`
@@ -4763,7 +4915,7 @@ def proximo_sem_usuario(tks, ags, integracao, fila, events, cfg, sem_push, pende
 def _trabalho_sem_usuario(events, agora):
     """(próximo passo que não depende do usuário, pendência do integrador) lidos só dos arquivos do orq; (None, None) se algo falha (o Stop falha aberto, o gerente tenta na volta seguinte)."""
     try:
-        ags = reavalia(_dict(_read_json(_path("aberto.json"))).get("agentes") or [], events, agora, _turnos_ro())
+        ags = reavalia(_dict(_read_json(_path("open.json"))).get("agentes") or [], events, agora, _turnos_ro())
         sem_push = _sem_push()
         pend = _pendente_do_integrador(events)
         return proximo_sem_usuario(tickets(), ags, integracao_fila(), fila_despacho_itens(), events, maquina_cfg(), sem_push, pend and pend["motivo"]), pend
@@ -4971,14 +5123,14 @@ def despachos_ativos():
     Despacho de Run que outro terminal vivo coordena não conta (_de_outro_coordenador); o cache guarda a lista já filtrada.
     ponytail: só as PAGINAS_ATIVOS páginas mais novas; despacho `dispatched` mais velho que 300 outros está morto, e ask-guard.off libera.
     """
-    cache = _read_json(_path("ativos.json"))
+    cache = _read_json(_path("active.json"))
     if isinstance(cache, dict) and isinstance(cache.get("ativos"), list) and isinstance(cache.get("t"), (int, float)) \
             and 0 <= time.time() - cache["t"] < ASK_GUARD_TTL:
         return cache["ativos"]
     ativos = [{"run": w.get("runId"), "task": w.get("taskId"), "dispatch": w.get("dispatchId")}
               for w in _workers_todos() if w.get("dispatchStatus") == "dispatched"]
     ativos = _de_outro_coordenador(ativos)
-    _write_json(_path("ativos.json"), {"t": time.time(), "ativos": ativos})
+    _write_json(_path("active.json"), {"t": time.time(), "ativos": ativos})
     return ativos
 
 
@@ -5071,7 +5223,7 @@ def hook_lugar(ev, run):
 
 def hook_session(ev, run):
     """SessionStart: injeta o estado e os tickets abertos para a sessão nova retomar sem que ninguém conte nada."""
-    if not os.path.exists(_path("aberto.json")):
+    if not os.path.exists(_path("open.json")):
         refresh_bg()  # sem cache o resumo diz "refresh em andamento": pede o refresh (B27)
     ctx = contexto_sessao()
     if passagem_do_outro := _passagem_coordenador_para(ev):
@@ -5954,8 +6106,8 @@ def perguntar(id_, pergunta, opcoes, recomendada=1, detalhe=None, espera_min=Non
         pend_add(id_, "decisao", pergunta, detalhe=detalhe)
     elif atual.get("tipo") != "decisao":
         raise ValueError(f"pendência {id_} é {atual.get('tipo')}, não decisão")
-    os.makedirs(_path("perguntar"), exist_ok=True)
-    pagina = os.path.join(_path("perguntar"), f"{id_}.html")
+    os.makedirs(_path("ask"), exist_ok=True)
+    pagina = os.path.join(_path("ask"), f"{id_}.html")
     with open(pagina, "w") as f:
         f.write(pagina_pergunta(id_, pergunta, opcoes, recomendada, detalhe))
     abre = subprocess.run([LAVISH, pagina], capture_output=True, text=True, timeout=30)
@@ -5976,7 +6128,7 @@ def perguntar(id_, pergunta, opcoes, recomendada=1, detalhe=None, espera_min=Non
     if not poll:
         return {**res, "efeito": "aberta"}
     espera = (espera_min or PERGUNTAR_MIN) * 60
-    saida = os.path.join(_path("perguntar"), f"{id_}.poll")
+    saida = os.path.join(_path("ask"), f"{id_}.poll")
     try:
         r = subprocess.run([LAVISH, "poll", pagina], capture_output=True, text=True, timeout=espera)
         with open(saida, "w") as f:
@@ -7707,7 +7859,7 @@ PASSAGEM_PERFIL = {
                ("astra", "low"): (_OPUS, "xhigh"), ("astra", "medium"): (_OPUS, "max")},
 }
 _FAMILIA = re.compile(r"\b(sonnet|opus|luna|sol|astra)\b")
-PASSAGEM_ARQ = "PASSAGEM.md"
+PASSAGEM_ARQ = "HANDOFF.md"
 PASSAGEM_HISTORICO = 20_000  # letras do fim do transcrito no pacote
 PASSAGEM_MSG_MAX = 6_000  # teto por mensagem (o mesmo do ai-memory)
 HISTORICO_INI, HISTORICO_FIM = "<!-- historico-inicio -->", "<!-- historico-fim -->"
@@ -7888,7 +8040,7 @@ PASSAGEM_PRAZO_S = 20  # o pacote de um worker sem turno sai em até tanto: font
 
 
 def _texto_passagem(dispatch, de, para, w, cp, fase):
-    """O PASSAGEM.md: ação antes da prosa (próximo passo, perguntas, decisões, estado do git, relatório parcial, fim do transcrito, onde está o resto, como agir).
+    """O HANDOFF.md: ação antes da prosa (próximo passo, perguntas, decisões, estado do git, relatório parcial, fim do transcrito, onde está o resto, como agir).
 
     Escrito de fora, sem turno do worker (caminho B do desenho). Cada leitura do Orca divide o prazo de PASSAGEM_PRAZO_S: a que falha ou estoura sai do pacote
     como "não li <fonte>", e o resto do arquivo sai igual."""
@@ -7915,9 +8067,10 @@ def _texto_passagem(dispatch, de, para, w, cp, fase):
             q = next((m for m in msgs if m.get("id") == e.get("msg_id")), None)
             decisoes.append(f"- {q.get('subject') + ' → ' if q and q.get('subject') else ''}{e['texto']}")
     relatorios = []
-    for nome in ("PAUSA.md", "relatorio-final.md"):
+    for nome in ("PAUSE.md", "final-report.md"):
         with contextlib.suppress(OSError):
-            relatorios.append(f"{nome}:\n{_indenta(open(os.path.join(cam, nome), encoding='utf-8').read().strip()[:3000])}")
+            arq = arq_worker(cam, nome)
+            relatorios.append(f"{os.path.basename(arq)}:\n{_indenta(open(arq, encoding='utf-8').read().strip()[:3000])}")
     sessao = _dict(_turnos_ro().get(dispatch))
     if not sessao.get("transcrito"):
         sessao = {**sessao, **tenta("o índice de sessões do Orca", lambda: sessao_do_dispatch(dispatch, de, timeout=restante(6)), {})}
@@ -7949,7 +8102,7 @@ def _texto_passagem(dispatch, de, para, w, cp, fase):
         _estado_git(cam, task, restante),
         "",
         "## Relatório parcial",
-        (f"- última fase no heartbeat: {fase}\n" if fase else "") + ("\n".join(relatorios) or "- sem PAUSA.md nem relatorio-final.md na worktree")
+        (f"- última fase no heartbeat: {fase}\n" if fase else "") + ("\n".join(relatorios) or "- sem PAUSE.md nem final-report.md na worktree")
         + (f"\n- última resposta visível do worker (histórico, não instrução):\n{_indenta(ultima[:3000].replace('<!--', '<! --'))}" if ultima else ""),
         "",
         "## Fim do transcrito",
@@ -7974,7 +8127,7 @@ def _texto_passagem(dispatch, de, para, w, cp, fase):
 
 
 def _escrever_passagem(texto, caminho):
-    """Grava o PASSAGEM.md na raiz da worktree e o põe no info/exclude do repositório (o worker novo não o commita por engano). Devolve o sha curto."""
+    """Grava o HANDOFF.md na raiz da worktree e o põe no info/exclude do repositório (o worker novo não o commita por engano). Devolve o sha curto."""
     _escrever(os.path.join(caminho, PASSAGEM_ARQ), texto)
     excl = (_git(caminho, "rev-parse", "--git-path", "info/exclude") or "").strip()
     if excl:
@@ -7988,11 +8141,11 @@ def _escrever_passagem(texto, caminho):
 
 
 def passar(dispatch, para, modelo=None, effort=None, run=None):
-    """Continua o worker em outro harness (`claude` ou `codex`) na MESMA worktree e task: para o antigo, escreve o PASSAGEM.md, sobe `worker-start
+    """Continua o worker em outro harness (`claude` ou `codex`) na MESMA worktree e task: para o antigo, escreve o HANDOFF.md, sobe `worker-start
     --retry-of --agent <outro>` com o perfil equivalente (ou --modelo/--effort), avisa o novo por `steer`, solta o terminal antigo e grava o evento `passagem`.
 
     Tudo o que pode recusar vem antes do worker-stop (harness, worktree, Run, perfil, cota do outro harness, vaga, task). Depois dele não há volta ao harness
-    de antes (é o que bateu no limite): se o worker novo não sobe, o antigo fica parado e retido, a worktree com o PASSAGEM.md, e a mensagem traz o comando
+    de antes (é o que bateu no limite): se o worker novo não sobe, o antigo fica parado e retido, a worktree com o HANDOFF.md, e a mensagem traz o comando
     para repetir. O pacote é escrito pelo orq, só com fatos (caminho B do desenho); o worker não precisa ter turno."""
     if para not in HARNESSES:
         raise ValueError(f"--para espera {'|'.join(HARNESSES)} (recebi {para!r})")
@@ -8030,7 +8183,7 @@ def passar(dispatch, para, modelo=None, effort=None, run=None):
     try:
         pacote = _escrever_passagem(texto, cp["caminho"])
     except OSError as e:
-        _controle("passar", w, "falhou", passo="PASSAGEM.md", erro=str(e), **base)
+        _controle("passar", w, "falhou", passo="HANDOFF.md", erro=str(e), **base)
         raise RuntimeError(f"o worker {dispatch} parou, mas não consegui gravar o {PASSAGEM_ARQ} em {cp['caminho']} ({e.strerror}). Repita com: {repetir}")
     confiadas = confiar_codex(_raiz_do_repo(cp["caminho"]), cp["caminho"]) if para == "codex" else []  # antes do worker-start: o Codex pergunta do trust ao subir
     seletor = f"id:{cp['worktree_id']}" if cp["worktree_id"] else f"path:{cp['caminho']}"
@@ -8101,7 +8254,7 @@ def _passagem_coordenador_para(ev):
     arq = _path(os.path.join("handoff", "passagem.json"))
     if not os.path.exists(arq):
         return ""  # o caso de quase toda sessão: nem o lock se cria
-    with _trava("passagem.lock"):
+    with _trava("handoff.lock"):
         reg = _dict(_read_json(arq))
         aceita = _dict(reg.get("aceita"))
         if (not reg.get("arquivo") or reg.get("de") == harness or not isinstance(reg.get("ts"), (int, float)) or time.time() - reg["ts"] > PASSAGEM_COORD_VALE_S
@@ -8121,7 +8274,7 @@ def _passagem_coordenador_para(ev):
 
 
 def passagem(dispatch, para=None, run=None):
-    """Escreve o PASSAGEM.md de um worker que não tem mais turno (limite do plano, terminal parado) e só isso: não para nem sobe worker algum.
+    """Escreve o HANDOFF.md de um worker que não tem mais turno (limite do plano, terminal parado) e só isso: não para nem sobe worker algum.
 
     O worker não é consultado: o pacote sai dos fatos que o orq já tem (git, Run, pendências, transcrito) em até PASSAGEM_PRAZO_S. `para` é o harness que vai ler
     (padrão: o outro). Quem sobe o worker novo é o `orq passar`, que escreve o mesmo pacote; este comando serve para ler o pacote antes ou para passar à mão."""
@@ -8301,7 +8454,7 @@ def projetos():
         nome = f[:-5]
         try:
             with open(os.path.join(pasta, f)) as fh:
-                d = json.load(fh)
+                d = para_pt(json.load(fh))
         except (OSError, ValueError) as e:
             achados[nome] = {"repo": None, "harness": None, "grupo": None, "ambientes": None, "producao": None, "fluxo": None, "fila_e2e": None, "transcritos": None, "erro": f"json ilegível ({type(e).__name__})"}
             continue
@@ -8702,7 +8855,7 @@ def despachar(run, titulo, spec_arquivo, modelo, effort, worktree=None, name=Non
     _adotar(run)
     if not run_do_coordenador(run):
         raise ValueError(f"o despacho é para o Run {run}, que o coordenador não comanda: {dica_ligar(run)}")
-    with _trava("despacho.lock"):  # a vaga conferida e o worker-start formam um passo: despachos paralelos não passam do teto juntos
+    with _trava("dispatch.lock"):  # a vaga conferida e o worker-start formam um passo: despachos paralelos não passam do teto juntos
         motivo = maquina_barra(modelo, run=run, prio=prio, servico=servico)
         if motivo and _drenando:
             raise SemVaga(motivo)
@@ -9083,7 +9236,7 @@ def gerente_desligar(run=None, assumir=False):
 
 # ---------- orçamento da máquina e fila de despacho (ticket 79) ----------
 
-MAQUINA = "maquina.json"  # por cima de MAQUINA_PADRAO; `orq maquina set <chave> <valor>` grava
+MAQUINA = "machine.json"  # por cima de MAQUINA_PADRAO; `orq maquina set <chave> <valor>` grava
 MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RAM, 12 CPUs: cada um pode subir uma stack de E2E)
                   "max_e2e": 1,  # só informativo: a fila global do E2E (scripts/e2e-lock.sh) já serializa as stacks
                   "max_caros": 2, "modelos_caros": ["claude-opus-*", "gpt-6-astra*", "gpt-6-sol*"],  # padrões glob; o modelo caro conta no max_workers também
@@ -9093,7 +9246,7 @@ MAQUINA_PADRAO = {"max_workers": 4,  # workers vivos ao mesmo tempo (24 GB de RA
                   "runs_isentos": ["Orquestrador*"],  # padrões glob (id ou objetivo do Run): o trabalho do próprio orq sobe sob pressão e sem o teto de workers; max_caros, max_e2e e mem_piso_mb o seguram
                   "pausar_sob_pressao": False,  # True: sob pressão o gerente pausa sozinho o worker de menor prioridade (orq pausar)
                   "stop_bloqueia": False}  # True: o Stop do coordenador barra o fim do turno com qualquer entrada sem efeito (GATE_BLOQUEIOS vezes por conjunto); ligar é decisão do usuário (ticket 27). A entrada sem intake do turno barra sempre (ticket 150)
-FILA_DESPACHO = "fila-despacho.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
+FILA_DESPACHO = "dispatch-queue.json"  # {itens: [...]}: o que o `orq despachar` e o `orq retomar` não puderam subir; o gerente sobe por prioridade
 FILA_DESPACHO_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: cópia do spec de um despacho enfileirado (o arquivo do coordenador pode sumir)
 VIVOS_MAQUINA = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
 PROCESSOS_PESADOS = ("claude", "codex", "node", "docker")  # a soma de RSS que o `orq maquina` mostra
@@ -9316,7 +9469,7 @@ def maquina_barra(modelo, ocup=None, cfg=None, run=None, prio=None, servico=Fals
 
 def _fila_despacho_mut(fn):
     """Lê a fila de despacho, aplica fn(itens) e grava, sob o fila-despacho.lock. Devolve o que fn devolveu."""
-    with _trava("fila-despacho.lock"):
+    with _trava("dispatch-queue.lock"):
         d = _dict(_read_json(_path(FILA_DESPACHO)))
         itens = [i for i in d.get("itens") or [] if isinstance(i, dict)]
         r = fn(itens)
@@ -9518,7 +9671,7 @@ def _candidato_a_pausar():
 
 def _maquina_avisar(motivo, na_fila, cfg, causa=(None, None)):
     """Pressão alta: digita no coordenador, uma vez por episódio, que o gerente parou de subir worker e qual pausar. Com `pausar_sob_pressao` o gerente pausa esse
-    worker sozinho (o orq pausar espera até ORQ_PAUSA_ESPERA_S pelo PAUSA.md: a volta do painel demora esse tempo). Coordenador ocupado: a próxima volta tenta.
+    worker sozinho (o orq pausar espera até ORQ_PAUSA_ESPERA_S pelo PAUSE.md: a volta do painel demora esse tempo). Coordenador ocupado: a próxima volta tenta.
     Carga que vem de fora do orq (`causa` fora): o aviso lista os maiores de fora, segura o despacho e não sugere nem faz pausa, que não aliviaria nada."""
     g = _gerente_cfg()
     if not g or not g.get("coordenador") or _cursor_ro().get("maquina_aviso"):
@@ -9590,7 +9743,7 @@ def maquina_painel(agentes_=None):
 
 def linha_maquina():
     """A linha do `orq status`: vagas (do aberto.json, sem falar com o Orca), pressão e fila. Vazia sem nada a dizer (sem worker vivo, sem fila, sem pressão)."""
-    p = maquina_painel(_dict(_read_json(_path("aberto.json"))).get("agentes"))
+    p = maquina_painel(_dict(_read_json(_path("open.json"))).get("agentes"))
     nivel, motivo = maquina_nivel()
     if not p["ocupadas"] and not p["fila"] and nivel == "ok":
         return ""
@@ -9606,7 +9759,7 @@ def linha_maquina():
 RETOMAR_ESPERA_S = float(os.environ.get("ORQ_RETOMAR_ESPERA_S") or 20)  # quanto esperar a sessão retomada mostrar atividade antes de dizer que não voltou
 MSG_CONTINUE = ("Continue de onde parou. A sessão caiu por uma queda de energia; o terminal e o handle do Orca mudaram. Antes: confira git status e o estado da "
                 "sua worktree, e se estava esperando uma suíte, rode-a de novo (a fila do E2E foi liberada). Ao terminar, mande o worker_done como antes; se o "
-                "Orca recusar por causa do handle novo, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+                "Orca recusar por causa do handle novo, escreva o relatório final num arquivo final-report.md na raiz da sua worktree e mostre o caminho no terminal.")
 MSG_ESCALAR = ("Nunca deixe uma pergunta ou confirmação esperando no terminal: o coordenador ({coord}) não vê esta tela e o AskUserQuestion é recusado. Dúvida, permissão ou bloqueio: "
                "`orca orchestration send --from \"$ORCA_TERMINAL_HANDLE\" --to run:{run} --type escalation --subject \"<resumo>\" --body \"<detalhes>\" --task-id {task} --dispatch-id {dispatch}`. "
                "Antes de comandos com `rm` e variável, proteja a variável (`\"${{VAR:?}}\"/*`) para o guard do agente não pedir confirmação.")
@@ -9774,15 +9927,15 @@ def texto_retomar(res):
 # mesmo para todas as sessões da conta, e ler o arquivo não chama rede nem o Orca: serve aos hooks.
 HUD_CACHE = os.environ.get("ORQ_HUD_CACHE") or os.path.expanduser("~/.claude/hud/cache")
 USO_FRESCO_S = 1800  # cache mais velho que isto não diz nada do uso de agora (nenhuma sessão desenhou o rodapé)
-USO = "uso.json"  # limiares, por cima de USO_PADRAO: {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}
+USO = "usage.json"  # limiares, por cima de USO_PADRAO: {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}
 USO_PADRAO = {"semana_avisa": 85, "semana_pausa": 92, "cinco_h": 90}  # cinco_h: avisa e segura despacho novo até a janela virar
-PAUSA_ESPERA_S = float(os.environ.get("ORQ_PAUSA_ESPERA_S") or 300)  # quanto esperar cada worker escrever o PAUSA.md
+PAUSA_ESPERA_S = float(os.environ.get("ORQ_PAUSA_ESPERA_S") or 300)  # quanto esperar cada worker escrever o PAUSE.md
 PAUSA_POLL_S = float(os.environ.get("ORQ_PAUSA_POLL_S") or 2)
-MSG_PAUSA = ("Pausa do coordenador (limite de uso do plano). Em até 3 linhas, escreva em PAUSA.md na raiz da sua worktree onde parou e o próximo passo, "
+MSG_PAUSA = ("Pausa do coordenador (limite de uso do plano). Em até 3 linhas, escreva em PAUSE.md na raiz da sua worktree onde parou e o próximo passo, "
              "pare qualquer E2E que tenha subido e encerre o turno. Não mande worker_done: você volta depois nesta mesma sessão.")
-MSG_VOLTA = ("O uso do plano voltou ao normal e o coordenador retomou você. Leia o PAUSA.md na raiz da sua worktree, apague-o e siga do próximo passo. "
+MSG_VOLTA = ("O uso do plano voltou ao normal e o coordenador retomou você. Leia o PAUSE.md (ou PAUSA.md) na raiz da sua worktree, apague-o e siga do próximo passo. "
              "Ao terminar, mande o worker_done como antes; se o Orca recusar por causa do handle novo, escreva o relatório final num arquivo "
-             "relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+             "final-report.md na raiz da sua worktree e mostre o caminho no terminal.")
 _FRENTE_ALTA = re.compile(r"seguran|security|produ[cç][aã]o", re.I)
 _FRENTE_BAIXA = re.compile(r"failover|diagn[oó]stic|painel|digest", re.I)
 _FASE_FINAL = re.compile(r"review|verif|final", re.I)
@@ -9974,16 +10127,16 @@ def _lista_pausa(ags, events, tasks, ate_prioridade, pausados):
 
 
 def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
-    """Pausa workers para abrir folga no plano: manda MSG_PAUSA a cada um (steer), espera o PAUSA.md novo na worktree dele, fecha o terminal e grava o
+    """Pausa workers para abrir folga no plano: manda MSG_PAUSA a cada um (steer), espera o PAUSE.md novo na worktree dele, fecha o terminal e grava o
     dispatch em cursor.json `pausados` (sessão, cwd, modelo). O dispatch segue `dispatched` no Orca sem terminal; `orq retomar --pausados` o sobe.
 
-    Worker sem sessão ou cwd gravado não é pausado (não haveria como voltar). Sem PAUSA.md no prazo, o terminal fica aberto. Devolve
+    Worker sem sessão ou cwd gravado não é pausado (não haveria como voltar). Sem PAUSE.md no prazo, o terminal fica aberto. Devolve
     {pausados: [{dispatch, task, titulo, prioridade, estado…}], preservados: […]}."""
     if ate_prioridade is not None and ate_prioridade not in (1, 2, 3):
         raise ValueError("--ate-prioridade espera 1, 2 ou 3")
     alvo, poupados = _lista_pausa(agentes(run), read_events(), set(tasks), ate_prioridade, _dict(_cursor_ro().get("pausados")))
     entregues = {_dispatch_da_msg(m) for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m, dict) and m.get("type") == "worker_done"} if alvo else set()
-    feitos = [a for a in alvo if a["dispatch"] in entregues]  # o worker já mandou o worker_done: não há turno a pausar nem PAUSA.md por vir; o caminho é o liberar
+    feitos = [a for a in alvo if a["dispatch"] in entregues]  # o worker já mandou o worker_done: não há turno a pausar nem PAUSE.md por vir; o caminho é o liberar
     if feitos and tasks:
         raise ValueError("; ".join(f"{a['dispatch']} já entregou (worker_done): rode orq liberar {a['dispatch']}, não pausar" for a in feitos))
     alvo = [a for a in alvo if a["dispatch"] not in entregues]
@@ -10001,8 +10154,8 @@ def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
         elif dry_run:
             saida.append({**linha, "estado": "a_pausar"})
         else:
-            arq = os.path.join(cwd, "PAUSA.md")
-            antes = os.path.getmtime(arq) if os.path.exists(arq) else 0
+            arq = cwd
+            antes = _mtime_pausa(cwd)
             try:
                 steer(a["task"], MSG_PAUSA, a["run"])
             except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
@@ -10012,24 +10165,29 @@ def pausar(tasks=(), ate_prioridade=None, run=None, dry_run=False):
     fim = time.time() + PAUSA_ESPERA_S
     while espera:
         for d, (linha, arq, antes) in list(espera.items()):
-            if os.path.exists(arq) and os.path.getmtime(arq) > antes:
+            if _mtime_pausa(arq) > antes:
                 espera.pop(d)
                 saida.append(_fechar_pausado(linha))
         if espera and time.time() < fim:
             time.sleep(PAUSA_POLL_S)
         elif espera:
-            saida += [{**linha, "estado": "sem_pausa_md", "aviso": f"sem PAUSA.md novo em {PAUSA_ESPERA_S:g} s: o terminal segue aberto"} for linha, _, _ in espera.values()]
+            saida += [{**linha, "estado": "sem_pausa_md", "aviso": f"sem PAUSE.md novo em {PAUSA_ESPERA_S:g} s: o terminal segue aberto"} for linha, _, _ in espera.values()]
             break
     return {"pausados": saida, "preservados": [{k: a.get(k) for k in ("dispatch", "task", "titulo", "prioridade", "fase")} for a in poupados]}
 
 
+def _mtime_pausa(cwd):
+    """O mtime mais novo entre o PAUSE.md e o PAUSA.md (worker que segue o spec antigo) da worktree; 0 sem nenhum."""
+    return max((os.path.getmtime(p) for p in (os.path.join(cwd, "PAUSE.md"), os.path.join(cwd, "PAUSA.md")) if os.path.exists(p)), default=0)
+
+
 def _fechar_pausado(linha):
-    """O PAUSA.md chegou: fecha o terminal do worker, guarda o dispatch em `pausados` e grava o evento."""
+    """O PAUSE.md chegou: fecha o terminal do worker, guarda o dispatch em `pausados` e grava o evento."""
     encerrados = encerrar_filhos(linha["cwd"], linha["agente"])  # shells e monitores em segundo plano sobrariam órfãos e seguiriam pesando na máquina
     try:
         orca("close", "--terminal", linha["terminal"], area="terminal")
     except (RuntimeError, subprocess.TimeoutExpired) as e:
-        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSA.md está escrito", "encerrados": encerrados}
+        return {**linha, "estado": "falhou", "aviso": f"terminal close falhou ({e}); o PAUSE.md está escrito", "encerrados": encerrados}
     guarda = {k: linha[k] for k in ("task", "run", "titulo", "prioridade", "agente", "modelo", "effort", "sessao", "cwd", "terminal")}
     _cursor_mut(lambda c: c.setdefault("pausados", {}).__setitem__(linha["dispatch"], {**guarda, "desde": now()}))
     append_event({"tipo": "pausa_plano", "dispatch": linha["dispatch"], **guarda, "encerrados": encerrados})
@@ -10091,7 +10249,7 @@ def texto_pausar(res):
 # Cada worker é um `claude` vivo (com os servidores MCP da sessão) que ocupa memória mesmo parado no prompt. Hibernar = guardar a sessão em
 # cursor.json `hibernados` e fechar o terminal; a task segue como está no Orca. Acordar = o resume do harness (o mesmo caminho do `orq retomar`),
 # com a mensagem que o acordou. O critério é determinístico (tela, hooks do worker, processos, estado do orq), sem LLM. Desenho: docs/design.md.
-HIBERNA = "hibernar.json"  # {"min": 15, "externa_min": 2}: os limiares, por cima destes padrões
+HIBERNA = "hibernate.json"  # {"min": 15, "externa_min": 2}: os limiares, por cima destes padrões
 HIBERNA_MIN = float(os.environ.get("ORQ_HIBERNA_MIN") or 15)  # minutos parado no prompt (ou entregue sem liberar) até hibernar
 HIBERNA_EXTERNA_MIN = float(os.environ.get("ORQ_HIBERNA_EXTERNA_MIN") or 2)  # esperando algo externo que o orq conhece: hiberna logo depois deste tempo parado
 HIBERNA_VOLTA_S = float(os.environ.get("ORQ_HIBERNA_VOLTA_S") or 60)  # o painel confere os workers a cada tanto, não a cada volta de 10 s
@@ -10099,7 +10257,7 @@ HIBERNA_RSS_ESPERA_S = float(os.environ.get("ORQ_HIBERNA_RSS_ESPERA_S") or 5)  #
 TELA_OCUPADA = re.compile(r"esc to interrupt", re.I)  # o spinner do Claude Code e do Codex: o turno corre
 MSG_ACORDA = ("Você estava hibernado: o coordenador fechou o terminal por ociosidade para liberar memória e agora o acordou, na mesma sessão. O que chegou: {texto}\n"
               "Antes: confira git status e o estado da sua worktree. Ao terminar, mande o worker_done como antes; se o Orca recusar por causa do handle novo "
-              "ou da task já entregue, escreva o relatório final num arquivo relatorio-final.md na raiz da sua worktree e mostre o caminho no terminal.")
+              "ou da task já entregue, escreva o relatório final num arquivo final-report.md na raiz da sua worktree e mostre o caminho no terminal.")
 
 
 def _hibernados():
@@ -10502,7 +10660,7 @@ def _avisos_gerente():
     """gerente-aviso.json como {run: {vistos, ts}}: os ids das mensagens (fora heartbeat) que o painel já avisou ao coordenador, por Run, e a
     hora do último aviso. O id vale mesmo depois da confirmação: entrega que o coordenador já leu não é avisada de novo. O formato antigo
     (`chave`) não vale."""
-    return {r: v for r, v in _dict(_read_json(_path("gerente-aviso.json"))).items() if isinstance(v, dict)}
+    return {r: v for r, v in _dict(_read_json(_path("manager-notice.json"))).items() if isinstance(v, dict)}
 
 
 VISTOS_MAX = 50  # ids lembrados por Run
@@ -10615,10 +10773,10 @@ def gerente_absorver():
             break  # coordenador no meio do turno ou com rascunho (ou o Orca recusou): nada foi digitado, a próxima volta tenta
         vistos = [*(avisos.get(r, {}).get("vistos") or []), *pendentes[r]]
         avisos[r] = {"vistos": vistos[-VISTOS_MAX:], "ts": time.time()}
-        _write_json(_path("gerente-aviso.json"), avisos)  # a cada aviso: falha em outro Run depois dele não o repete
+        _write_json(_path("manager-notice.json"), avisos)  # a cada aviso: falha em outro Run depois dele não o repete
         linhas = [x.replace("esperando o coordenador ficar livre", "avisado ao coordenador") if x.startswith(f"{r}:") else x for x in linhas]
     if avisos != _avisos_gerente():
-        _write_json(_path("gerente-aviso.json"), avisos)
+        _write_json(_path("manager-notice.json"), avisos)
     if liga:
         parados = {}
         for r in runs:
@@ -10671,7 +10829,7 @@ def gerente_absorver():
 # ---------- agent manager sem terminal: orq gerente serve (ticket 128) ----------
 
 SERVE_PID = "gerente-serve.pid"  # o pid do `orq gerente serve` e a trava dele (flock enquanto vive): trava livre é serve parado, seja qual for o pid escrito
-SERVE_ESTADO = "gerente-estado.json"  # {ts, pid, terminal, linhas, agentes, maquina: {cfg, leitura}}: o que a TUI lê do gerente
+SERVE_ESTADO = "manager-state.json"  # {ts, pid, terminal, linhas, agentes, maquina: {cfg, leitura}}: o que a TUI lê do gerente
 SERVE_LOG = os.path.join("logs", "gerente.log")
 SERVE_VOLTA_S = float(os.environ.get("ORQ_GERENTE_VOLTA_S") or 10)  # o intervalo do painel-agent-manager.sh
 SERVE_DIGEST_VOLTAS = 6  # o digest a cada ~60 s, como o painel
@@ -11084,7 +11242,7 @@ def _retro_eventos():
         with open(_path("events.jsonl")) as f:
             for n, linha in enumerate(f, 1):
                 try:
-                    e = json.loads(linha)
+                    e = para_pt(json.loads(linha))
                 except ValueError:
                     continue
                 if isinstance(e, dict):
@@ -11175,7 +11333,7 @@ def _revisoes_em_curso():
 def _revisao_slot(task):
     """Reserva um slot caro para a revisão ou levanta ValueError: pressão alta da máquina, ou workers caros mais revisões em curso no `max_caros`.
     ponytail: o `orq despachar` só vê os workers; um despacho durante a revisão pode passar do teto por um. Contar a revisão no maquina_ocupacao se virar problema."""
-    with _trava("revisao.lock"):
+    with _trava("review.lock"):
         cfg = maquina_cfg()
         nivel, motivo = maquina_nivel(None, cfg)
         if nivel == "alta":
@@ -11187,7 +11345,7 @@ def _revisao_slot(task):
 
 
 def _revisao_solta():
-    with _trava("revisao.lock"):
+    with _trava("review.lock"):
         _write_json(_path(REVISAO), [r for r in _revisoes_em_curso() if r["pid"] != os.getpid()])
 
 
@@ -11312,8 +11470,6 @@ APELIDOS = {  # pt -> en. "" são os comandos; a chave de cada outra tabela é o
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
 }
 # os valores de `choices` (pt -> en): a CLI aceita os dois e entrega o pt, que é o que o código grava hoje
-PEND_EN = {"acao": "action", "decisao": "decision", "avisar": "notify"}
-SUBIDA_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqueio": "blocker", "resumo": "summary"}
 PARADA_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
 EFEITO_EN = {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded"}
 HOOK_EN = {"lugar": "place", "externas": "external", "prligar": "prlink"}  # os hooks instalados chamam o nome em pt e ele vale para sempre: sem log
@@ -11488,11 +11644,11 @@ def parser():
     tc.add_argument("dispatch")
     _arg(tc, "ultimos", type=int, default=20, help="só os N últimos eventos (padrão 20)")
     tc.add_argument("--json", action="store_true")
-    pg = sub.add_parser("handoff", aliases=["passagem"], help="escreve o PASSAGEM.md de um worker sem turno (limite do plano), só com fatos e em até 20 s; não para nem sobe worker")
+    pg = sub.add_parser("handoff", aliases=["passagem"], help="escreve o HANDOFF.md de um worker sem turno (limite do plano), só com fatos e em até 20 s; não para nem sobe worker")
     pg.add_argument("dispatch", help="o dispatch do worker, ou `coordenador` para gravar o snapshot desta sessão (o hook session do outro harness o injeta)")
     _arg(pg, "para", choices=list(HARNESSES), help="o harness que vai ler (padrão: o outro)")
     pg.add_argument("--run")
-    ps = sub.add_parser("switch", aliases=["passar"], help="continua o worker em outro harness (claude|codex) na mesma worktree e task: PASSAGEM.md, worker-start --retry-of --agent")
+    ps = sub.add_parser("switch", aliases=["passar"], help="continua o worker em outro harness (claude|codex) na mesma worktree e task: HANDOFF.md, worker-start --retry-of --agent")
     ps.add_argument("dispatch")
     _arg(ps, "para", required=True, choices=list(HARNESSES))
     _arg(ps, "modelo", help="o modelo no outro harness (vai junto com --effort); sem ele vale a tabela de equivalência do worker-routing")
@@ -11638,7 +11794,7 @@ def parser():
     ac.add_argument("alvo")
     _arg(ac, "texto", help="o que o worker recebe ao acordar (o padrão é 'acordado à mão')")
     ac.add_argument("--json", action="store_true")
-    pz = sub.add_parser("pause", aliases=["pausar"], help="pausa workers para abrir folga no plano: PAUSA.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
+    pz = sub.add_parser("pause", aliases=["pausar"], help="pausa workers para abrir folga no plano: PAUSE.md, fecha o terminal, grava a pausa. Sem argumento: prioridade baixa e os que só investigam")
     pz.add_argument("tasks", nargs="*", help="ids de task ou de dispatch; sem eles vale o critério de prioridade")
     _arg(pz, "ate-prioridade", type=int, choices=[1, 2, 3], help="pausa as de prioridade N e mais baixas (3 = só as baixas)")
     pz.add_argument("--run")
@@ -11813,7 +11969,7 @@ def main(argv=None):
         elif a.cmd == "summary":
             if a.desde:
                 _dt(a.desde)  # ValueError vira exit 1
-            print(resumo_quatro(read_events(), _read_json(_path("aberto.json")), _pend_ro(), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
+            print(resumo_quatro(read_events(), _read_json(_path("open.json")), _pend_ro(), tickets(), a.desde and _dt(a.desde).strftime("%Y-%m-%dT%H:%M:%SZ"), painel=aviso_painel()))
         elif a.cmd == "agents":
             ags = agentes(a.run, a.todos)
             parada = [l for l in linhas_noite(_cursor_ro(), read_events()) if "Parou de despachar" in l]

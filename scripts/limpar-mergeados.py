@@ -25,7 +25,8 @@ ORQ = os.path.join(HOME, ".claude/orq/orq.py")
 ORQ_DIR = os.path.dirname(ORQ)
 RELATORIOS = os.environ.get("ORQ_RELATORIOS") or os.path.join(HOME, ".claude/orquestrador-plan/relatorios")
 # Escritos pelo próprio worker a pedido do orq: não são trabalho do worker (caminhos relativos à raiz da worktree).
-ARTEFATOS_ORQ = ("PAUSA.md", "PASSAGEM.md", "relatorio*.md", ".scratch/*/relatorio-final.md")
+ARTEFATOS_ORQ = ("PAUSE.md", "HANDOFF.md", "final-report*.md", ".scratch/*/final-report.md",
+                 "PAUSA.md", "PASSAGEM.md", "relatorio*.md", ".scratch/*/relatorio-final.md")  # os nomes pt: worker que segue o spec antigo
 
 
 def fluxo_do_repo(repo):

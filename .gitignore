@@ -1,12 +1,22 @@
 # runtime state (ORQ_HOME defaults to this directory)
 events.jsonl
+open.json
+active.json
+cursor.json
+turns.json
+manager.json
+manager-notice.json
+manager-alive
+backup-pt-*/
+ask/
+# the portuguese names, until scripts/migrar-ingles.py renames them
 aberto.json
 ativos.json
-cursor.json
 turnos.json
 gerente.json
 gerente-aviso.json
 gerente-vivo
+perguntar/
 pendencias.json
 ask-guard.off
 *.lock
@@ -42,6 +52,17 @@ gerente.json.antes-*
 *.py-e
 fila-despacho.json
 maquina.json
+merge-queue.json
+e2e-notice.json
+worktrees-notice.json
+dispatch-queue.json
+machine.json
+manager-check.json
+manager-state.json
+usage.json
+hibernate.json
+uso.json
+hibernar.json
 .omc/
 suite_integra.py
 gerente-checagem.json
@@ -53,6 +74,7 @@ tui/node_modules/
 !tui/fixtures/**
 !tui/bun.lock
 integrar-fila.json
+integrate-queue.json
 avisos/
 run-parado.json
 deploy-check.json
