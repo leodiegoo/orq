@@ -800,6 +800,26 @@ If the inbox call fails, the time and ceiling checks still apply and the failure
 
 It matches only in command position, after stripping heredoc bodies and quoted text, so a commit message or an `echo` that mentions `git push` does not trigger it (the same rule as `worker-routing-guard.py`). It reads `cursor.json` and, for the reset, the local git dir; no Orca call. A commit that fails the pre-commit hook stays as it is: the worker repairs what the hook flagged.
 
+**Away policy (ticket 214).** Night mode denies all of the above, while the away Stop hook asks the coordinator to push orq's `main` after the audit and the night of 2026-10-01 merged PRs into `development` and `staging`; the two policies did not fit together. With away on (`cursor.json` `ausente`, with or without night), `hook_external` applies `AWAY_EXTERNAL` instead, a list of what may go out, one line per action and destination, after gnhf's rule that an external action needs an explicit opt-in per destination. Night on without away keeps the deny-everything policy, unchanged. Neither on returns before any git or gh call.
+
+| Line | Verdict | What |
+|---|---|---|
+| `push-feature` | allow | `git push` of a branch that is none of the project's environments |
+| `push-orq-main` | allow | `git push` of orq's production branch when `audit_publication(["<remote>/<dst>..<src>"])` is empty and the folder's main checkout is `ORQ_INSTALL` |
+| `pr-create` | allow | `gh pr create` |
+| `merge-env` | allow | `gh pr merge` into an environment before production |
+| `push-env` | deny | `git push` to any other environment branch (audit red, or the production of a repository that is not orq) |
+| `push-force` | deny | `--force*`, a short cluster with `f`, or a `+refspec` |
+| `push-other` | deny | a flag outside `-u`/`--set-upstream`/`-q`/`-v`/`--progress`, a `:refspec`, or a destination that cannot be told (detached HEAD, outside a repository) |
+| `merge-prod` | deny | `gh pr merge` into production or into a branch that is no environment |
+| `merge-unknown` | deny | `gh pr merge` with no `--base` when `gh pr view <selector> --json baseRefName` fails or takes over 2 s (fail closed) |
+| `workflow` | deny | `gh workflow run` |
+| `no-verify` | deny | `--no-verify` on commit or push, or `commit -n` |
+| `worktree-rm` | deny | `orca worktree rm --force` |
+| `reset` | deny | `git reset --hard` outside a linked worktree |
+
+Each push destination is a refspec (`src:dst`, `HEAD` read as the current branch) or, with none, the current branch. The environments are those of the project whose `repo: path:` holds the folder or its main checkout (`project_flow`); outside every project, the remote's default branch is the only environment and production. `gh pr merge --base X` is taken as given (gh has no such flag and fails on its own, so it cannot widen anything); otherwise the base comes from `gh pr view`. The same command-position rule applies: quoted text and heredoc bodies do not trigger it. A denied command is recorded once with `pending_add("externa-<sha1[:8]>", "acao", ...)`, the command in `comando`; a second identical command finds the id taken and adds nothing, and a failure to write the pending file is logged without lifting the deny. The away report lists it among the open pending items. The reason names the line and `orq pend add`. Limit: `gh pr merge -R <repo>` still reads the environments of the cwd's project.
+
 The pre-push hook closes the other half of the same gap (ticket 139): the coordinator used to audit by hand, before each push of `main`, the author of every new commit, the `Co-Authored-By` trailer, the forbidden terms and the README. `audit_publication(revs)` in `orqlib.py` does it as one function so the hook and the integrator share it: the hook feeds it `remote..local` (or `local --not --remotes` for a new branch), the integrator runs `orq audit-publication <base>..<head>` before the FF. The README rule is per range, not per commit, so a code commit followed by its docs commit passes. Without the private terms file the check warns and skips only the terms.
 
 The same gap is closed earlier, at commit time (ticket 348): a worker once committed as Git's default identity and only `audit-publication` caught it, at the end, after 15 commits. `githooks/pre-commit` reads `git var GIT_AUTHOR_IDENT` and `GIT_COMMITTER_IDENT` (so env overrides and `--author` count) and rejects an email that is not `ORQ_AUTOR`, or, without it, not `*@users.noreply.github.com`. `orq dispatch` copies the repo's effective `user.name`/`user.email` into the new worktree after `worker-start` (`stamp_identity`); a repo with no identity, or a worktree Orca does not report, leaves it untouched.
