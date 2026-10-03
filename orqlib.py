@@ -3362,6 +3362,10 @@ def ingest():
                     total += fn()
             except Exception as e:  # noqa: BLE001
                 log(f"ingest {item_name}: {type(e).__name__}: {e}")
+        try:
+            auto_intake()
+        except Exception as e:  # noqa: BLE001
+            log(f"ingest intake: {type(e).__name__}: {e}")
         return total, gates
 
 
@@ -4778,8 +4782,8 @@ def merge_obligations(i, next_item, tk=None, flow_info=None):
 
 
 def open_obligations(events, entry=None):
-    """The `obligation nova` events with no `done` or `adiada` after them, in the order they were born (of a single entry, with `entry`)."""
-    closed_ids = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") in ("feito", "adiada")}
+    """The `obligation nova` events with no `done`, `adiada` or `repassada` (handed to the mate) after them, in the order they were born (of a single entry, with `entry`)."""
+    closed_ids = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") in ("feito", "adiada", "repassada")}
     return [e for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "nova" and (e.get("entrada"), e.get("chave")) not in closed_ids
             and entry in (None, e.get("entrada"))]
 
@@ -6305,6 +6309,8 @@ def hook_prompt(ev, run):
                             **({"com_aviso": True} if with_notice else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, new_id=True)
     if ONLY_ORQ_COMMAND.match(text_value):  # `/away` and `/away status` ask for no effect: they close on their own
         intake(entry["id"], "conversa", note="orq command")
+    with contextlib.suppress(Exception):  # the notices orq types and the entries it already knows the effect of (ticket 337)
+        auto_intake()
     check_manager_bg()
     ctx = state(entry)
     if not os.environ.get("ORQ_MATE") and (deferred := context_notices()):  # the notice queue belongs to the coordinator
@@ -7566,6 +7572,69 @@ def guard_mate():
     reason = (f"{MARK} the secondmate does not ask the user: raise the decision with `orq mate raise --type decision --text \"<question and options, with the recommended one>\"`; "
               "the answer comes back as `orq ▸ request pN`.")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
+
+
+# ---------- automatic intake (ticket 337) ----------
+
+AUTO_NOTICES = ("orq: machine under pressure",)  # typed by the panel and absent from ORQ_NOTICES: the hook records them as user entries nobody decides on
+AUTO_MATE_TYPES = ("resposta", "resumo")  # what the mate raises to inform; decisao, bloqueio and pr ask the coordinator for something
+MATE_OBLIGATIONS = ("deploy", "proximo")  # what a mate request about a merged PR takes over (check the deploy, open the next base's PR)
+
+
+def _auto_effect(e, ctx):
+    """(effect, note) already known for the open coordinator entry `e`, or None when it asks for a decision. `ctx` is `auto_intake`'s view of the log."""
+    origin = e.get("origem") or "usuario"
+    if origin == "relatorio_worker":
+        if d := ctx["queued"].get(e.get("ref")):
+            return "descartado", f"delivery entered the integrator queue (ticket {d['ticket']}, {d['branch']})"
+        if e.get("ref") in ctx["sent_back"]:
+            return "descartado", "delivery sent back to the worker (conformance): the new report replaces this one"
+    elif origin == "pr" and e.get("ref") in ctx["merged"]:
+        open_ones = open_obligations(ctx["events"], e["id"])
+        if open_ones:
+            number = (re.search(r"#(\d+)", e.get("fonte") or "") or [None, ""])[1]
+            cite = re.compile(rf"\b{e['id']}\b|{re.escape(e['ref'])}|#{number}(?!\d)" if number else rf"\b{e['id']}\b|{re.escape(e['ref'])}")
+            request = next((x for x in ctx["events"] if x.get("tipo") == "mate_pedido" and (x.get("ts") or "") >= (e.get("ts") or "") and cite.search(x.get("texto") or "")), None)
+            taken = [o for o in open_ones if o["chave"] in MATE_OBLIGATIONS] if request else []
+            for o in taken:
+                append_event({"tipo": "obrigacao", "op": "repassada", "entrada": e["id"], "chave": o["chave"], "grupo": request["grupo"], "corr": request["corr"], "auto": True})
+            if not taken or len(taken) < len(open_ones):
+                return None  # what the mate does not take stays with the coordinator, who fulfils or defers it
+            return "conversa", f"obligations handed to mate {request['grupo']} ({request['corr']})"
+        return "conversa", "PR merged; no obligation left for the coordinator"
+    elif origin == "mate" and e.get("tipo_mate") in AUTO_MATE_TYPES and _entry_number(e) <= ctx["told"]:
+        return "conversa", f"mate {e.get('mate')} {e['tipo_mate']} already shown to the coordinator"
+    elif origin == "usuario" and (e.get("texto") or "").lstrip().startswith(AUTO_NOTICES):
+        return "conversa", "machine pressure notice: the manager already holds the dispatches"
+    return None
+
+
+def auto_intake():
+    """Closes with a note, through `intake`, the open coordinator entries whose effect orq already knows (ticket 337): a worker report whose delivery entered the integrator queue or went
+    back to the worker (`descartado`), a merged PR with nothing left for the coordinator, or whose deploy and next-base obligations went to a mate that was asked about it
+    (`conversa`), a mate's answer or summary the manager already showed (`conversa`), and the machine-pressure notice (`conversa`). What asks for a decision stays open: a new
+    user request, a mate's decision or block, a PR it raised. Runs at the end of every ingest and in the prompt hook. Returns how many entries it closed.
+    ponytail: the mate request is matched by the entry id, the PR URL or `#number` in its text; a request that names none of them leaves the entry to the coordinator."""
+    events = read_events()
+    told = _cursor_ro().get("mate_avisada_ate")
+    ctx = {"events": events, "told": told if isinstance(told, int) else 0,
+           "queued": {e["msg"]: e for e in events if e.get("tipo") == "entrega_orq" and e.get("msg")},
+           "sent_back": {e["msg"] for e in events if e.get("tipo") == "conformidade" and e.get("enviado") and e.get("msg")},
+           "merged": {e.get("url") for e in events if e.get("tipo") == "pr" and e.get("op") == "entrou"}}
+    closed_ids = {x.get("entrada") for x in events if x.get("tipo") == "intake"}
+    n = 0
+    for e in events:
+        if e.get("tipo") != "entrada" or not e.get("id") or e["id"] in closed_ids or e.get("grupo"):
+            continue
+        found = _auto_effect(e, ctx)
+        if not found:
+            continue
+        try:
+            intake(e["id"], found[0], note=found[1])
+            n += 1
+        except ValueError as err:
+            log(f"auto intake of {e['id']}: {err}")
+    return n
 
 
 # ---------- comandos ----------

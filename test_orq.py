@@ -21102,6 +21102,111 @@ def test_ticket326_cli_lists_by_default_and_refuses_an_unknown_category():
     assert a.orq("clean", "--closed", "--dry-run").returncode == 0, "the old mode keeps working"
 
 
+# ---- ticket 337: entries whose effect is already known close on their own ----
+
+def _closing337(a, entry):
+    return next((e for e in a.events() if e["tipo"] == "intake" and e["entrada"] == entry), None)
+
+
+def test_ticket337_worker_report_of_a_delivery_that_entered_the_queue_closes_itself():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    report = os.path.join(tmp, "final-report.md")
+    open(report, "w").write("# entregue\n")
+    _delivery141(a, reportPath=report)
+    assert a.orq("ingest").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert entry_event["origem"] == "relatorio_worker"
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "descartado" and "integrator queue" in closing["nota"] and "141" in closing["nota"], closing
+    assert orq_mod.open_entries(a.events()) == [], "o relatório da entrega que entrou na fila não pede nada"
+
+
+def test_ticket337_worker_report_without_queue_entry_and_escalations_stay_open():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    report = os.path.join(tmp, "final-report.md")
+    open(report, "w").write("# entregue\n")
+    _delivery141(a, body="sem branch no texto", reportPath=report)  # no branch: nothing entered the queue
+    _group(a)
+    _mate_alive(a)
+    for kind in ("decisao", "bloqueio"):
+        assert a.orq("mate", "subir", "--tipo", kind, "--texto", "preciso de você", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate").returncode == 0
+    cur = os.path.join(a.home, "cursor.json")
+    d = json.load(open(cur))
+    json.dump({**d, "mate_avisada_ate": 99}, open(cur, "w"))
+    a.prompt("e agora, o que faço?")
+    assert a.orq("ingest").returncode == 0
+    kinds = [(e.get("origem", "usuario"), e.get("tipo_mate")) for e in orq_mod.open_entries(a.events())]
+    assert sorted(kinds, key=str) == sorted([("relatorio_worker", None), ("mate", "decisao"), ("mate", "bloqueio"), ("usuario", None)], key=str), kinds
+
+
+def test_ticket337_pr_entry_closes_when_the_obligations_went_to_the_mate():
+    a = _prs_env()
+    _group(a)
+    _mate_alive(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    e = entry_event["id"]
+    assert set(_find_obligation(a, e)) == {"deploy", "proximo"}
+    assert a.orq("ingest").returncode == 0 and _closing337(a, e) is None, "sem pedido ao mate a entrada continua com o coordenador"
+    assert a.orq("mate", "pedir", "orq", "--texto", "PR #1216 entered development: check the deploy and open the PR for staging").returncode == 0
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, e)
+    assert closing and closing["efeito"] == "conversa" and "mate orq" in closing["nota"], closing
+    assert _find_obligation(a, e) == {}
+    handed = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "repassada"]
+    assert {(x["chave"], x["grupo"], x["corr"]) for x in handed} == {("deploy", "orq", "p1"), ("proximo", "orq", "p1")}, handed
+
+
+def test_ticket337_pr_entry_keeps_obligations_the_mate_does_not_take():
+    a = _prs_env()
+    _group(a)
+    _mate_alive(a)
+    e = _merge_main(a, issue="2045")  # main: deploy, comentario, limpeza
+    assert a.orq("mate", "pedir", "orq", "--texto", "PR #1282 entered main: check the deploy").returncode == 0
+    assert a.orq("ingest").returncode == 0
+    assert _closing337(a, e) is None and set(_find_obligation(a, e)) == {"comentario", "limpeza"}, "o mate leva só o deploy; o resto o coordenador cumpre"
+
+
+def test_ticket337_pr_entry_without_obligations_closes_itself():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "release/outra")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    assert _find_obligation(a, entry_event["id"]) == {}
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "conversa" and closing["nota"], closing
+
+
+def test_ticket337_mate_answer_the_coordinator_read_closes_itself():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.orq("mate", "pedir", "orq", "--texto", "despache o ticket 77")
+    ans = json.loads(a.orq("mate", "subir", "--tipo", "resposta", "--corr", "p1", "--texto", "despachado", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate").stdout)
+    assert a.orq("ingest").returncode == 0 and _closing337(a, ans["id"]) is None, "o coordenador ainda não foi avisado"
+    cur = os.path.join(a.home, "cursor.json")
+    json.dump({**json.load(open(cur)), "mate_avisada_ate": int(ans["id"][1:])}, open(cur, "w"))
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, ans["id"])
+    assert closing and closing["efeito"] == "conversa" and "mate orq" in closing["nota"], closing
+
+
+def test_ticket337_machine_under_pressure_notice_closes_itself_in_the_hook():
+    a = Env()
+    a.prompt("orq: machine under pressure (free memory 1200 MB). The manager stopped starting workers (2 in the dispatch queue).")
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "conversa" and "pressure" in closing["nota"], closing
+    a.prompt("segue o jogo")
+    assert [e["texto"] for e in orq_mod.open_entries(a.events())] == ["segue o jogo"]
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
