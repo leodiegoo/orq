@@ -27,6 +27,7 @@ import time
 import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import backlog
 import cmdnorm
@@ -7371,17 +7372,341 @@ def _asks_help(seg):
     return any(t == "--help" and not toks[k - 1].startswith("-") for k, t in enumerate(toks) if k)
 
 
+EXTERNAL_PUBLICATIONS = "external-publications.json"
+EXTERNAL_PUBLICATION_TTL = "30m"
+
+
+def _external_publication_url(value):
+    """Canonical GitHub issue, PR, or collection-create URL accepted by `orq authorize external`."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "github.com" or parsed.query:
+        return None
+    path = parsed.path.rstrip("/")
+    m = re.fullmatch(r"/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(issues|pull)/(new|[0-9]+)", path, re.I)
+    if not m:
+        return None
+    owner, repo, kind, number = m.groups()
+    if kind.lower() == "issues":
+        return f"https://github.com/{owner.lower()}/{repo.lower()}/issues/{number.lower()}"
+    if kind.lower() == "pull" and number.isdigit():
+        return f"https://github.com/{owner.lower()}/{repo.lower()}/pull/{number.lower()}"
+    return None
+
+
+def _github_repo_slug(value):
+    """Canonical owner/repo from a gh selector or GitHub remote URL."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value.startswith("git@github.com:"):
+        path = value.split(":", 1)[1]
+    elif "@github.com:" in value:
+        path = value.rsplit("@github.com:", 1)[1]
+    elif value.startswith(("https://", "http://", "ssh://")):
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if (parsed.hostname or "").lower() != "github.com":
+            return None
+        path = "/".join(parsed.path.lstrip("/").split("/")[:2])
+    else:
+        path = value
+    path = path.removesuffix(".git").strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", path):
+        return None
+    return path.lower()
+
+
+def _own_github_repo(folder):
+    """The GitHub repo for the source project containing `folder`, from its configured remote."""
+    project = _public_project(folder)
+    config = _dict(projects().get(project)) if project else {}
+    repo = config.get("repo") or ""
+    repo_folder = os.path.realpath(os.path.expanduser(repo[5:])) if repo.startswith("path:") else (_repo_root(folder) or folder)
+    remote = config.get("remote") or "origin"
+    remote_url = _git(repo_folder, "remote", "get-url", remote)
+    return _github_repo_slug(remote_url)
+
+
+def _gh_repo_flag(tokens):
+    for i, token in enumerate(tokens):
+        if token in ("--repo", "-R"):
+            return tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1] else None
+        if token.startswith(("--repo=", "-R=")):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _gh_command_index(tokens):
+    """Top-level gh subcommand after global option/value pairs."""
+    i = 1
+    value_flags = {"--repo", "-R", "--hostname", "--config"}
+    while i < len(tokens):
+        token = tokens[i]
+        if token in value_flags:
+            i += 2
+        elif token.startswith("-"):
+            i += 1
+        else:
+            return i
+    return len(tokens)
+
+
+def _gh_write_descriptor(segment, folder):
+    """Target of a supported GitHub issue/PR mutation, or an unresolved API mutation."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return None
+    if not tokens or os.path.basename(tokens[0]) != "gh":
+        return None
+    command_index = _gh_command_index(tokens)
+    if command_index >= len(tokens):
+        return None
+    top = tokens[command_index]
+    if top == "api":
+        method, endpoint, has_fields = "GET", None, False
+        value_flags = {"-X", "--method", "-H", "--header", "-f", "-F", "--field", "--raw-field", "--input", "--hostname"}
+        i = command_index + 1
+        while i < len(tokens):
+            token = tokens[i]
+            if token in ("-X", "--method"):
+                method = tokens[i + 1].upper() if i + 1 < len(tokens) else ""
+                i += 2
+            elif token.startswith(("-X=", "--method=")):
+                method = token.split("=", 1)[1].upper()
+                i += 1
+            elif token.startswith(("-f=", "-F=", "--field=", "--raw-field=", "--input=")):
+                has_fields = True
+                i += 1
+            elif token.startswith(("-f", "-F")) and token not in ("-f", "-F"):
+                has_fields = True
+                i += 1
+            elif token in value_flags:
+                if token in ("-f", "-F", "--field", "--raw-field"):
+                    has_fields = True
+                elif token == "--input":
+                    has_fields = True
+                i += 2
+            elif token.startswith(("-X", "--method=")) and token != "-X":
+                method = token[2:].upper() if token.startswith("-X") else token.split("=", 1)[1].upper()
+                i += 1
+            elif token.startswith("-"):
+                i += 1
+            else:
+                if endpoint is None:
+                    endpoint = token
+                i += 1
+        if method == "GET" and has_fields:
+            method = "POST"
+        if method not in ("POST", "PATCH"):
+            return None
+        if not endpoint:
+            return {"url": None, "repo": None, "create": False, "action": "gh api write", "unresolved": "the API endpoint is missing"}
+        route = endpoint.split("?", 1)[0]
+        if route.startswith(("https://api.github.com/", "http://api.github.com/")):
+            route = route.split("/", 3)[-1]
+        route = route.lstrip("/")
+        own_repo = _own_github_repo(folder)
+        route = route.replace("{owner}", own_repo.split("/", 1)[0] if own_repo else "{owner}").replace("{repo}", own_repo.split("/", 1)[1] if own_repo else "{repo}")
+        m = re.match(r"repos/([^/]+)/([^/]+)/(issues|pulls)(?:/([0-9]+))?(?:/.*)?$", route, re.I)
+        if not m:
+            repo_match = re.match(r"repos/([^/]+)/([^/]+)(?:/|$)", route, re.I)
+            slug = _github_repo_slug(f"{repo_match.group(1)}/{repo_match.group(2)}") if repo_match else None
+            return {"url": None, "repo": slug, "create": False, "action": f"gh api {method}", "unresolved": "the API endpoint does not identify an exact issue or PR"}
+        owner, repo, kind, number = m.groups()
+        slug = _github_repo_slug(f"{owner}/{repo}")
+        if not slug:
+            return {"url": None, "repo": None, "create": False, "action": f"gh api {method}", "unresolved": "the API endpoint has an invalid repository"}
+        kind = kind.lower()
+        create = not number and method == "POST"
+        if not number and not create:
+            return {"url": None, "repo": slug, "create": False, "action": f"gh api {method}", "unresolved": "the API endpoint does not identify an exact issue or PR"}
+        target_kind = "issues" if kind == "issues" else "pulls"
+        target_path = f"{target_kind}/new" if create else f"{'issues' if kind == 'issues' else 'pull'}/{number}"
+        url = _external_publication_url(f"https://github.com/{slug}/{target_path}")
+        return {"url": url, "repo": slug, "create": create, "action": f"gh api {method}", "unresolved": None if url else "the API endpoint has no supported issue/PR target"}
+
+    if top not in ("issue", "pr"):
+        return None
+    i = command_index + 1
+    while i < len(tokens) and tokens[i] in ("--repo", "-R"):
+        i += 2
+    if i >= len(tokens):
+        return None
+    verb = tokens[i]
+    resource = "issue" if top == "issue" else "pr"
+    if resource == "pr" and verb == "create":
+        repo_value = _gh_repo_flag(tokens)
+        slug = _github_repo_slug(repo_value) if repo_value else None
+        return {"url": None, "repo": slug, "create": False, "source_default": not repo_value, "action": "gh pr create",
+                "unresolved": "PR creation has no exact PR URL to authorize" if repo_value else None}
+    allowed = {"issue": {"comment", "create", "edit"}, "pr": {"comment", "create", "edit", "review"}}
+    if verb not in allowed[resource]:
+        return None
+    create = verb == "create"
+    selector = None if create else (tokens[i + 1] if i + 1 < len(tokens) and not tokens[i + 1].startswith("-") else None)
+    repo_value = _gh_repo_flag(tokens)
+    slug = _github_repo_slug(repo_value) if repo_value else _own_github_repo(folder)
+    if selector and selector.startswith(("https://", "http://")):
+        url = _external_publication_url(selector)
+        parsed_slug = _github_repo_slug(selector)
+        expected_path = "/issues/" if resource == "issue" else "/pull/"
+        if url:
+            selected_number = urlsplit(url).path.partition(expected_path)[2]
+            if not selected_number.isdigit():
+                url = None
+        if url and repo_value and slug and parsed_slug and parsed_slug != slug:
+            url = None
+        return {"url": url, "repo": parsed_slug, "create": False, "action": f"gh {top} {verb}",
+                "unresolved": None if url else "the selector is not a supported issue/PR URL in the selected repository"}
+    if not create and not (selector and selector.isdigit()):
+        return {"url": None, "repo": slug, "create": False, "action": f"gh {top} {verb}", "unresolved": "the exact issue/PR selector is missing or ambiguous"}
+    if not slug:
+        return {"url": None, "repo": None, "create": create, "action": f"gh {top} {verb}", "unresolved": "the target repository is unknown; pass --repo OWNER/REPO"}
+    target_path = "issues/new" if create else ("issues/" if resource == "issue" else "pull/") + selector
+    url = _external_publication_url(f"https://github.com/{slug}/{target_path}")
+    return {"url": url, "repo": slug, "create": create, "action": f"gh {top} {verb}", "unresolved": None if url else "the target is not a supported issue/PR URL"}
+
+
+def _external_publication_targets(ev, cmd):
+    """External GitHub issue/PR mutations in a Bash command; unknown source or target identity fails closed."""
+    folder = ev.get("cwd") or os.getcwd()
+    own_repo = _own_github_repo(folder)
+    targets = []
+    segments = cmdnorm.segments(cmd)
+    for segment in segments:
+        source = segment
+        if len(segments) == 1:
+            try:
+                raw_tokens = shlex.split(cmd)
+                normalized_tokens = shlex.split(segment)
+                if normalized_tokens and os.path.basename(normalized_tokens[0]) == "gh":
+                    gh_index = next((i for i, token in enumerate(raw_tokens) if os.path.basename(token) == "gh"), None)
+                    if gh_index is not None:
+                        source = shlex.join(raw_tokens[gh_index:])
+            except ValueError:
+                pass
+        target = _gh_write_descriptor(source, folder)
+        if not target:
+            continue
+        if target.get("source_default"):
+            continue
+        if target.get("repo") == own_repo and own_repo:
+            continue
+        targets.append(target)
+    return targets
+
+
+def _external_authorization_status(target, consume=False):
+    """Check an exact grant, consuming its single create allowance when requested."""
+    canonical = _external_publication_url(target)
+    if not canonical:
+        return "missing"
+    with _lock("external-publications.lock"):
+        path = _path(EXTERNAL_PUBLICATIONS)
+        data = _dict(_read_json(path, {"authorizations": []}))
+        records = data.get("authorizations") if isinstance(data.get("authorizations"), list) else []
+        record = next((item for item in reversed(records) if isinstance(item, dict) and _external_publication_url(item.get("target_url")) == canonical), None)
+        if not record:
+            return "missing"
+        try:
+            if now_dt() >= _dt(record.get("expires_utc", "")):
+                return "expired"
+        except (TypeError, ValueError):
+            return "expired"
+        is_create = canonical.endswith("/issues/new")
+        if is_create and record.get("create_used"):
+            return "used"
+        if is_create and consume:
+            record["create_used"] = True
+            record["create_used_utc"] = now()
+            _write_json(path, data, indent=2)
+        return "authorized"
+
+
+def _external_authorization_reason(target, status):
+    if status == "expired":
+        return f"authorization for {target} has expired; the coordinator must authorize it again with `orq authorize external {target}`"
+    if status == "used":
+        return f"authorization for {target} already approved one create; the coordinator must authorize it again with `orq authorize external {target}`"
+    return f"no active coordinator authorization for exact target {target}; ask the coordinator to run `orq authorize external {target}`"
+
+
+def _external_publication_denial(targets):
+    if not targets:
+        return None
+    if len(targets) > 1:
+        return "one external issue/PR write per Bash command is required so each coordinator authorization matches one exact target"
+    target = targets[0]
+    if target.get("unresolved") or not target.get("url"):
+        return f"external publication refused: cannot authorize {target.get('action')}: {target.get('unresolved') or 'the exact target is unknown'}"
+    status = _external_authorization_status(target["url"])
+    return None if status == "authorized" else _external_authorization_reason(target["url"], status)
+
+
+def _consume_external_create(targets):
+    for target in targets:
+        if target.get("create"):
+            status = _external_authorization_status(target.get("url"), consume=True)
+            if status != "authorized":
+                return _external_authorization_reason(target.get("url"), status)
+    return None
+
+
+def _parse_external_ttl(value):
+    match = re.fullmatch(r"([0-9]+)([smhd]?)", (value or "").strip().lower())
+    if not match:
+        raise ValueError("--for expects a positive duration such as 30m, 1h or 3600s")
+    amount, unit = int(match.group(1)), match.group(2)
+    seconds = amount * {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    if seconds <= 0:
+        raise ValueError("--for must be a positive duration")
+    return seconds
+
+
+def authorize_external(url, lifetime=EXTERNAL_PUBLICATION_TTL):
+    """Record an exact, expiring external publication grant from the bound coordinator terminal."""
+    terminal = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if not terminal or _manager_cfg().get("coordenador") != terminal:
+        raise ValueError("only the bound coordinator terminal can authorize an external publication")
+    target = _external_publication_url(url)
+    if not target:
+        raise ValueError("target must be a GitHub issue or PR URL, or the repository-scoped /issues/new URL")
+    seconds = _parse_external_ttl(lifetime)
+    expires = (now_dt() + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _lock("external-publications.lock"):
+        path = _path(EXTERNAL_PUBLICATIONS)
+        data = _dict(_read_json(path, {"authorizations": []}))
+        records = data.get("authorizations") if isinstance(data.get("authorizations"), list) else []
+        records.append({"target_url": target, "created_utc": now(), "expires_utc": expires, "granted_by": terminal, "create_used": False})
+        _write_json(path, {"authorizations": records[-1000:]}, indent=2)
+    return {"target_url": target, "expires_utc": expires}
+
+
 def _external_denied(ev, cur):
-    """(policy, what) for the first external action in the Bash of `ev` that the policy in force in `cur` denies, or None. Away on: the AWAY_EXTERNAL line (ticket 214),
-    and any error or alarm while judging a segment denies it as `unjudged`. Night on without away: the NIGHT_EXTERNAL name, everything denied (ticket 39). Neither: None,
-    before any git or gh call. Reads the cursor, the local git, the project files and, for a `gh pr merge` with no `--base`, `gh pr view`."""
+    """(policy, reason) for the first Bash action denied by exact external-publication authorization, published-content, away or night policy.
+
+    External issue/PR writes require a live target grant before the publication-content guard. Away/night policy remains an independent gate; a create grant is consumed only
+    after both gates pass. Away on also records its denied actions as pending items; night without away uses NIGHT_EXTERNAL."""
     cmd = ev.get("tool_input", {}).get("command") if ev.get("tool_name") == "Bash" and isinstance(ev.get("tool_input"), dict) else None
     if not isinstance(cmd, str):
         return None
+    external_targets = _external_publication_targets(ev, cmd)
+    if external := _external_publication_denial(external_targets):
+        return "authorization", external
     if public := _public_external_denial(ev, cmd):
         return "public", public
     away, night = bool(_dict(_dict(cur).get("ausente"))), night_active(cur)
     if not (away or night):
+        if external := _consume_external_create(external_targets):
+            return "authorization", external
         return None
     segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
     if away:
@@ -7403,12 +7728,18 @@ def _external_denied(ev, cur):
                 line = "unjudged"
             if line and AWAY_EXTERNAL[line][0] == "deny":
                 return "away", line
+        if external := _consume_external_create(external_targets):
+            return "authorization", external
         return None
     found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
     if found_item:
         return "night", found_item
     m = next(filter(None, map(_EXT_RESET.search, segs)), None)
-    return ("night", "git reset --hard in the main checkout") if m and _reset_in_main_checkout(ev, m) else None
+    if m and _reset_in_main_checkout(ev, m):
+        return "night", "git reset --hard in the main checkout"
+    if external := _consume_external_create(external_targets):
+        return "authorization", external
+    return None
 
 
 def _park_denied(cmd, line):
@@ -7456,6 +7787,8 @@ def hook_external(ev, run):
     if policy == "night":
         reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
                   "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
+    elif policy == "authorization":
+        reason = f"{MARK} external publication refused: {item_name}. Only the coordinator can record a short-lived exact-target grant with `orq authorize external <URL>`; away mode does not authorize it."
     elif policy == "public":
         reason = f"{MARK} public content refused: {item_name}; referencie a issue/PR do GitHub. Nothing was published."
     else:
@@ -7895,35 +8228,71 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
     return None
 
 
-def _public_external_denial(ev, cmd):
-    """Always-on project publication guard, independent of away/night policy."""
-    segs = cmdnorm.segments(cmd)
-    actions = []
-    for segment in segs:
-        if re.search(r"^gh(?:\s+.*)?\s+(?:pr\s+(?:create|edit)|issue\s+(?:create|comment))\b|^(?:orq|orq\.py)(?:\s+.*)?\s+pr\s+open\b", segment):
-            actions.append((segment, ev.get("cwd") or os.getcwd(), _public_project(ev.get("cwd") or os.getcwd())))
-        elif match := re.match(_EXT_GIT + r"(commit|push)\b", segment):
-            folder = _git_place(ev, match.group(1))
-            actions.append((segment, folder, _public_project(folder)))
-    if not actions:
-        return None
-    if not any(project for _, _, project in actions):
-        return None
-    text = cmd
+def _publication_text(cmd, cwd):
+    """Command text plus contents of explicit body/input files; an unreadable or dynamic payload is not inspectable."""
+    text, files, error = cmd, [], None
     try:
         args = shlex.split(cmd)
     except ValueError:
-        args = []
+        return text, "cannot parse the command body"
+    file_options = {"--body-file", "--input", "-F", "-f", "--field", "--raw-field"}
+    direct_options = {"--body", "-b", "--title"}
     for i, arg in enumerate(args):
-        if arg in ("-F", "--body-file") and i + 1 < len(args):
-            with contextlib.suppress(OSError):
-                text += "\n" + open(os.path.expanduser(args[i + 1])).read()
+        value = args[i + 1] if i + 1 < len(args) else ""
+        if arg in ("--body-file", "--input"):
+            if not value or value == "-":
+                error = "publication body comes from stdin or has no file path"
+            else:
+                files.append(value)
+        elif arg.startswith(("--body-file=", "--input=")):
+            files.append(arg.split("=", 1)[1])
+        elif arg in ("-F", "-f", "--field", "--raw-field"):
+            key, separator, field_value = value.partition("=")
+            if separator and field_value.startswith("@"):
+                files.append(field_value[1:])
+            elif separator and key.lower() in ("body", "title") and re.search(r"[$`]", field_value):
+                error = "publication body contains shell expansion that the hook cannot inspect"
+            elif arg == "-F" and not separator:
+                files.append(value)
+        elif any(arg.startswith(flag + "=") for flag in ("--body", "--title")):
+            if re.search(r"[$`]", arg.split("=", 1)[1]):
+                error = "publication body contains shell expansion that the hook cannot inspect"
+        elif arg in direct_options and re.search(r"[$`]", value):
+            error = "publication body contains shell expansion that the hook cannot inspect"
+    for file_name in dict.fromkeys(files):
+        file_path = os.path.expanduser(file_name)
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(cwd or os.getcwd(), file_path)
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                text += "\n" + f.read()
+        except (OSError, UnicodeDecodeError):
+            error = f"cannot inspect publication body file {file_name}"
+    return text, error
+
+
+def _public_external_denial(ev, cmd):
+    """Always-on project publication guard, independent of away/night policy."""
+    cwd = ev.get("cwd") or os.getcwd()
+    actions = []
+    for segment in cmdnorm.segments(cmd):
+        descriptor = _gh_write_descriptor(segment, cwd)
+        if descriptor:
+            actions.append((segment, cwd, _public_project(cwd), "github"))
+        elif re.search(r"^(?:orq|orq\.py)(?:\s+.*)?\s+pr\s+open\b", segment):
+            actions.append((segment, cwd, _public_project(cwd), "github"))
+        elif match := re.match(_EXT_GIT + r"(commit|push)\b", segment):
+            folder = _git_place(ev, match.group(1))
+            actions.append((segment, folder, _public_project(folder), "git"))
+    if not actions:
+        return None
+    text, body_error = _publication_text(cmd, cwd)
     findings = []
-    for segment, folder, project in actions:
-        if not project:
-            continue
-        git_match = re.match(_EXT_GIT + r"(commit|push)\b", segment)
+    for segment, folder, project, kind in actions:
+        git_match = re.match(_EXT_GIT + r"(commit|push)\b", segment) if kind == "git" else None
         if git_match and git_match.group(2) == "push":
+            if not project:
+                continue
             head = (_git(folder, "branch", "--show-current") or "").strip()
             base = (_git(folder, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}") or "").strip()
             if not base:
@@ -7934,6 +8303,9 @@ def _public_external_denial(ev, cmd):
                     findings.extend(audit_publication([f"{base}..{head}"], folder, checks=("public",)))
                 except Exception as exc:  # fail closed when the publication range cannot be inspected
                     findings.append(f"could not inspect public commits: {exc}")
+            continue
+        if body_error and kind == "github":
+            findings.append(body_error)
             continue
         findings.extend(_public_findings(project, text))
     return "; ".join(findings) if findings else None
@@ -18090,6 +18462,11 @@ def parser():
     hk = sub.add_parser("hook")
     hk.add_argument("kind", type=_value_from_pt(HOOK_EN), choices=list(HOOKS), metavar=_metavar(HOOK_EN, list(HOOKS)))
     hk.add_argument("harness", nargs="?", default="claude", choices=HARNESSES, help="which agent the hook comes from (the default is the one of the hooks installed in Claude)")
+    au = sub.add_parser("authorize", help="explicit coordinator authorization for an external publication")
+    aus = au.add_subparsers(dest="op", required=True)
+    aue = aus.add_parser("external", help="orq authorize external <GitHub issue|PR|/issues/new URL> [--for 30m]: allows one exact target until expiry")
+    aue.add_argument("url")
+    aue.add_argument("--for", dest="lifetime", default=EXTERNAL_PUBLICATION_TTL, help="positive duration: 30m by default; accepts s, m, h or d")
     sub.add_parser("install", aliases=["instalar"], help="wires Claude Code and Codex to this clone: hooks, links, the orq wrapper (idempotent)")
     sub.add_parser("hooks-codex", help="appends the orq hooks to ~/.codex/hooks.json without reordering; then trust them in /hooks")
     i = sub.add_parser("intake")
@@ -18581,6 +18958,9 @@ def main(argv=None):
     try:
         if a.cmd == "intake":
             print(json.dumps(intake(a.entry, a.effect, a.ref, a.run, a.note), ensure_ascii=False))
+        elif a.cmd == "authorize" and a.op == "external":
+            result = authorize_external(a.url, a.lifetime)
+            print(f"authorized external publication to {result['target_url']} until {result['expires_utc']} (one create if the target is /new)")
         elif a.cmd == "fulfill":
             print(json.dumps(obligation_done(a.entry, a.obligation, a.proof), ensure_ascii=False))
         elif a.cmd == "defer":
