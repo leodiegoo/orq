@@ -14366,7 +14366,7 @@ def _worktree_parent(project=None, base_branch=None):
     current_path = current.get("path") if isinstance(current, dict) else None
     project_config = projects().get(project, {}) if project else {}
     project_repo = repo_folder(project_config["repo"]) if project_config.get("repo") else None
-    if project and not project_repo:
+    if project_config.get("repo") and not project_repo:
         return None, f"project {project} repository has no known folder; dispatch continued without a parent"
     expected_root = _repo_root(project_repo) if project_repo else _repo_root(current_path) if current_path else None
     if base_branch:
