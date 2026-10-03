@@ -3202,6 +3202,31 @@ def _orq_delivery(m, p):
     return ev["ticket"]
 
 
+def _release_delivered(m, p, queued):
+    """worker_done `succeeded` whose delivery is already where the coordinator would pick it up -> `release` of the dispatch (ack, release and the terminal closed), without the command by hand (ticket 183).
+
+    The delivery is the orq one that entered the integrator queue (`queued`) or the project one that already has a PR linked to the task (`orq pr abrir`). It does not release a service worker,
+    a returned delivery (the `devolver` is later than the message: it is the old one), a dispatch with an open question, nor one that already has `liberar` in the log (a retained terminal would repeat the release).
+    A failure goes to the log: the coordinator releases by hand.
+    # ponytail: the PR is only looked up when the worker_done is ingested; a PR opened after it is left for `orq liberar` by hand."""
+    d, task = p.get("dispatchId"), p.get("taskId")
+    if p.get("outcome") != "succeeded" or not d or not task:
+        return
+    events = read_events()
+    if d in _services(events) or any(e.get("tipo") == "liberar" and e.get("dispatch") == d for e in events):
+        return
+    if not queued and not any(i["task"] == task for i in _prs_ro()["itens"]):
+        return
+    if any(e.get("tipo") == "devolver" and e.get("dispatch") == d and (_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc)) >= _dt(m["created_at"]) for e in events):
+        return
+    try:
+        if d in open_questions(orca("inbox", "--limit", "200", timeout=20)["messages"]):
+            return
+        release(d, run=m.get("run_id"))
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError, KeyError) as e:
+        log(f"release on its own: worker_done {m['id']} ({d}): {type(e).__name__}: {e}")
+
+
 # ---------- red proof of the new tests (ticket 221) ----------
 RED_TIMEOUT_S = 600  # one deadline for the whole proof, shared by every run (what a file leaves is what the next one has)
 RED_STATE = {"ok": "red on base / green on head", "green_on_base": "green on base (proves nothing)", "red_on_head": "red on head", "unverifiable": "not verifiable"}
@@ -3374,6 +3399,7 @@ def _ingest_msg(m, since, already, titles, send=True):
         return 0
     p = _payload(m)
     _delivery_proof(m, p)
+    queued = None
     try:
         if _delivery_conformance(m, p, send):  # an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
             queued = _orq_delivery(m, p)
@@ -3382,6 +3408,7 @@ def _ingest_msg(m, since, already, titles, send=True):
                 red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
+    _release_delivered(m, p, queued)
     if p.get("reportPath"):
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": m.get("subject") or "", "fonte": f"worker {m.get('subject') or ''}",
                       "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId"), **_run_group(m["run_id"])}, new_id=True)
