@@ -388,7 +388,7 @@ elif cmd == "worker-start":
     if bound is None or (run and run != bound):
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
     open(os.path.join(d, "started.log"), "a").write(json.dumps(a) + "\\n")
-    open(os.path.join(d, "started-env.log"), "a").write(json.dumps({k: os.environ.get(k) for k in ("GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1")}) + "\\n")
+    open(os.path.join(d, "started-env.log"), "a").write(json.dumps({k: os.environ.get(k) for k in ("GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")}) + "\\n")
     if os.environ.get("FAKE_FAIL_START_MODEL") and os.environ["FAKE_FAIL_START_MODEL"] == opt("--model"):
         failure("model not available: " + str(opt("--model")))
     if os.environ.get("FAKE_REQUIRE_NAME") and opt("--worktree") != "current" and not opt("--name") and not opt("--retry-of"):
@@ -7730,16 +7730,20 @@ def test_night_dispatch_passes_the_environment_without_prompt_and_writes_to_the_
     _night(a)
     assert _dispatch(a).returncode == 0
     env = _log(a, "started-env.log")[0]
-    assert {k: v for k, v in env.items() if v} == {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"}, env
-    assert [e for e in a.events() if e["tipo"] == "despacho"][0]["ambiente"] == ["GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]
+    identity = orq_mod.worker_identity_environment(os.getcwd())
+    expected = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false", **identity}
+    assert {k: v for k, v in env.items() if v} == expected, (env, expected)
+    assert [e for e in a.events() if e["tipo"] == "despacho"][0]["ambiente"] == list(expected)
 
 
-def test_dispatch_outside_the_night_does_not_touch_the_environment():
+def test_dispatch_outside_the_night_only_passes_the_project_identity():
     a = Env(run="run_a")
     _no_git_env(a)
     assert _dispatch(a).returncode == 0
-    assert _log(a, "started-env.log")[0]["GIT_CONFIG_COUNT"] is None
-    assert "ambiente" not in [e for e in a.events() if e["tipo"] == "despacho"][0]
+    env = _log(a, "started-env.log")[0]
+    identity = orq_mod.worker_identity_environment(os.getcwd())
+    assert {k: env[k] for k in identity} == identity and env["GIT_CONFIG_COUNT"] is None and env["GIT_TERMINAL_PROMPT"] is None, env
+    assert [e for e in a.events() if e["tipo"] == "despacho"][0]["ambiente"] == list(identity)
 
 
 # ---- away arms the night budget (ticket 213) ----
@@ -7849,7 +7853,9 @@ def test_ticket213_away_dispatch_starts_the_worker_without_git_prompt():
     a.orq("away", "on")
     assert _dispatch(a).returncode == 0
     env = _log(a, "started-env.log")[0]
-    assert {k: v for k, v in env.items() if v} == {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"}, env
+    identity = orq_mod.worker_identity_environment(os.getcwd())
+    expected = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false", **identity}
+    assert {k: v for k, v in env.items() if v} == expected, (env, expected)
 
 
 def test_ticket213_away_hooks_inject_the_budget_rules_and_stay_under_100_ms():
@@ -16480,32 +16486,50 @@ def test_it_should_be_that_the_pre_commit_refuses_an_author_or_committer_outside
     with tempfile.TemporaryDirectory() as t:
         repo, _ = _repo_git(t)
         subprocess.run(["git", "-C", repo, "checkout", "-qb", "feat/x"], check=True)
+        os.makedirs(os.path.join(repo, "scripts"), exist_ok=True)
+        os.symlink(os.path.join(HERE, "scripts", "audiencia-check.py"), os.path.join(repo, "scripts", "audiencia-check.py"))
         env = {**os.environ, "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull, "ORQ_INTEGRADOR": "", "ORQ_TERMOS": os.path.join(t, "nao-existe.txt")}
         run = lambda **e: subprocess.run(["sh", hook], cwd=repo, capture_output=True, text=True, env={**env, **e})  # noqa: E731
         git = lambda *x: subprocess.run(["git", "-C", repo, "config", *x], check=True)  # noqa: E731
         git("user.name", "Leo")
-        git("user.email", "noreply@orq.local")
+        git("user.email", "3345071+leodiegoo@users.noreply.github.com")
         r = run()
-        assert r.returncode == 1 and "git config user.email" in r.stderr and "noreply@orq.local" in r.stderr, r.stderr
-        git("user.email", "1+leo@users.noreply.github.com")
-        assert "not the project's noreply" not in run().stderr  # passes the identity check (the audience script is not in this temp repo)
+        assert r.returncode == 0 and "does not match the project's noreply" not in r.stderr, ("configured identity", r.returncode, r.stderr)
+        for wrong in ("leodiegoo@users.noreply.github.com", "codex@users.noreply.github.com"):
+            r = run(GIT_AUTHOR_EMAIL=wrong)
+            assert r.returncode == 1 and "git config user.email" in r.stderr and "3345071+leodiegoo@users.noreply.github.com" in r.stderr, (wrong, r.returncode, r.stderr)
         r = run(GIT_COMMITTER_EMAIL="x@y.z")  # author fine, committer wrong
         assert r.returncode == 1 and "GIT_COMMITTER_IDENT" in r.stderr, r.stderr
-        assert run(ORQ_AUTOR="2+other@users.noreply.github.com").returncode == 1  # the configured one wins over the pattern
+        git("core.hooksPath", os.path.join(HERE, "githooks"))
+        commit_env = {**env, "GIT_AUTHOR_NAME": "Leo", "GIT_AUTHOR_EMAIL": "3345071+leodiegoo@users.noreply.github.com",
+                      "GIT_COMMITTER_NAME": "Leo", "GIT_COMMITTER_EMAIL": "3345071+leodiegoo@users.noreply.github.com"}
+        def commit(message, **overrides):
+            open(os.path.join(repo, "change"), "a").write(message)
+            subprocess.run(["git", "-C", repo, "add", "change"], check=True, env=commit_env)
+            return subprocess.run(["git", "-C", repo, "commit", "-m", message], capture_output=True, text=True, env={**commit_env, **overrides})
+        rejected = commit("wrong override", GIT_AUTHOR_EMAIL="codex@users.noreply.github.com")
+        assert rejected.returncode == 1 and "GIT_AUTHOR_IDENT" in rejected.stderr, ("rejected commit", rejected.returncode, rejected.stderr)
+        accepted = commit("exact project author")
+        assert accepted.returncode == 0, ("accepted commit", accepted.returncode, accepted.stderr)
 
 
-def test_it_should_be_that_a_dispatch_writes_user_name_and_email_into_the_worker_worktree():
+def test_it_should_be_that_a_dispatch_writes_user_name_and_email_into_claude_and_codex_worktrees():
     a = Env(run="run_a")
     with tempfile.TemporaryDirectory() as t:
         wt = os.path.join(t, "wt")
         subprocess.run(["git", "init", "-q", wt], check=True)
         cfg = os.path.join(t, "gitconfig")
         open(cfg, "w").write("[user]\n\tname = Leo\n\temail = 1+leo@users.noreply.github.com\n")
-        r = a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium",
-                  cwd=t, FAKE_WT=wt, GIT_CONFIG_GLOBAL=cfg)
-        assert r.returncode == 0, r.stderr
-        got = subprocess.run(["git", "-C", wt, "config", "--local", "--get-regexp", "^user\\."], capture_output=True, text=True).stdout
-        assert "user.name Leo" in got and "user.email 1+leo@users.noreply.github.com" in got, got
+        for agent, model in (("claude", "claude-sonnet-5-5"), ("codex", "gpt-5.4")):
+            r = a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", model, "--effort", "medium", "--agente", agent,
+                      cwd=t, FAKE_WT=wt, GIT_CONFIG_GLOBAL=cfg)
+            assert r.returncode == 0, r.stderr
+            got = subprocess.run(["git", "-C", wt, "config", "--local", "--get-regexp", "^user\\."], capture_output=True, text=True).stdout
+            assert "user.name Leo" in got and "user.email 1+leo@users.noreply.github.com" in got, (agent, got)
+            started_env = _log(a, "started-env.log")[-1]
+            assert {k: started_env[k] for k in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")} == {
+                "GIT_AUTHOR_NAME": "Leo", "GIT_AUTHOR_EMAIL": "1+leo@users.noreply.github.com",
+                "GIT_COMMITTER_NAME": "Leo", "GIT_COMMITTER_EMAIL": "1+leo@users.noreply.github.com"}, (agent, started_env)
 
 
 def _publication_repo(t):
