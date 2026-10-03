@@ -5782,6 +5782,28 @@ def test_ticket418_doctor_hooks_shows_stage_timings():
     assert "hook timing:" in r.stdout and "worker_fast_path" in r.stdout and "total" in r.stdout, r.stdout
 
 
+def test_ticket425_hook_timing_history_keeps_only_slow_runs_and_doctor_shows_it():
+    a = Env(run=None)
+    original_home, original_now = orq_mod.HOME, orq_mod.now
+    try:
+        orq_mod.HOME = a.home
+        orq_mod.now = lambda: "2026-10-03T12:34:56Z"
+        for index in range(orq_mod.HOOK_TIMING_HISTORY_LIMIT + 2):
+            orq_mod.save_hook_timings("prompt", {"parse_ms": index, "total_ms": 3001, "box_bytes": 123})
+        orq_mod.save_hook_timings("stop", {"parse_ms": 2, "total_ms": 3000, "box_bytes": 456})
+        saved = json.load(open(os.path.join(a.home, "hook-timings.json")))
+        assert len(saved["history"]) == orq_mod.HOOK_TIMING_HISTORY_LIMIT
+        assert all(item["kind"] == "prompt" and item["at"] == "2026-10-03T12:34:56Z" for item in saved["history"])
+        assert saved["history"][-1]["stages"]["parse_ms"] == orq_mod.HOOK_TIMING_HISTORY_LIMIT + 1
+        assert saved["history"][-1]["box_bytes"] == 123
+        assert "box_bytes" not in saved["history"][-1]["stages"]
+        assert "stop" not in {item["kind"] for item in saved["history"]}
+        lines = orq_mod.hook_timings_text()
+        assert any("slow hook timing:" in line and "box 123 bytes" in line for line in lines), lines
+    finally:
+        orq_mod.HOME, orq_mod.now = original_home, original_now
+
+
 def test_ticket418_install_adds_codex_timeout_without_changing_claude_command():
     t = os.path.realpath(tempfile.mkdtemp())
     clone = _clone124(t)
