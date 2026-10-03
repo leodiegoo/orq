@@ -2240,6 +2240,11 @@ def _no_run(target):
         return
     mine = os.environ.get("ORCA_TERMINAL_HANDLE")
     before = _own_run()
+    owner = None
+    try:
+        owner = (orca("run-show", "--id", target).get("run") or {}).get("coordinator_handle")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError):
+        pass
     orca("run-use", "--id", target, acting_as=mine)
     try:
         yield
@@ -2249,6 +2254,11 @@ def _no_run(target):
                 orca("run-use", "--id", before, acting_as=mine)
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 log(f"run-use back to Run {before}: {type(e).__name__}: {e}")
+        if owner and owner != mine:
+            try:
+                orca("run-use", "--id", target, acting_as=owner)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                log(f"run-use back to Run {target} owner {owner}: {type(e).__name__}: {e}")
 
 
 INBOX_BODY = 160  # characters of a message body in `orq inbox`
