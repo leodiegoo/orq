@@ -548,6 +548,8 @@ A notice often implies work that has nothing to do with the notice being "seen".
 
 An obligation that needs a value it does not have is not created: `comentario` needs an issue (from `orq pr link --issue N` or an `issue: #N` line in the ticket header), `ticket` needs an open ticket, `proximo` needs a next environment. The keys are written as shown (they are data, read as is). Obligations hang on the notice's entry and show in the prompt's extra line until each is closed:
 
+Closing a product ticket with a cited PR that has not entered the project's production branch asks its group mate to create `levar #<PR> até produção` in the mate's own Run, with `Dispatch: manual`, the source ticket cited, and acceptance criteria for production PR entry plus deploy verification. If the group has no active mate, the request stays as an entry for the coordinator. When the linked task's production PR enters, its deploy obligation records the continuation ticket; a successful `deploy_check` closes that ticket. A PR already recorded in production creates no continuation.
+
 ```sh
 orq fulfill e484 comentario --proof "https://github.com/<org>/<repo>/issues/2045#issuecomment-1"
 orq defer e484 deploy --reason "the deploy runs tomorrow"   # creates a "to do later" ticket with the reason
