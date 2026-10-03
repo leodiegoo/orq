@@ -9061,7 +9061,14 @@ def free_terminal(handle):
     try:
         terminal = orca("read", "--terminal", handle, "--screen", "--limit", str(SCREEN_LINES), area="terminal").get("terminal") or {}
     except (RuntimeError, subprocess.TimeoutExpired):
-        return None  # without reading the box: tui-idle already said typing is possible
+        terminal = None
+    if terminal is None:
+        # Without a rendered screen, retain Orca's draft as the conservative signal.
+        try:
+            draft = (orca("read", "--terminal", handle, area="terminal").get("terminal") or {}).get("draft")
+        except (RuntimeError, subprocess.TimeoutExpired):
+            draft = None
+        return "rascunho" if (draft or "").strip() else None
     draft = (terminal.get("draft") or "").strip()
     screen = "\n".join(map(str, terminal.get("tail") or []))
     if "╭" in screen and "╰" in screen:
@@ -9069,8 +9076,8 @@ def free_terminal(handle):
         if input_lines:
             content = input_lines[-1].split(">", 1)
             return "rascunho" if len(content) > 1 and content[1].strip() else None
-    if terminal.get("source") == "screen-unavailable":
-        return None  # do not trust a draft from accumulated output when the rendered screen is unavailable
+    if terminal.get("source") == "screen-unavailable" or not terminal.get("tail"):
+        return "rascunho" if draft else None  # no usable screen: trust Orca's draft
     return "rascunho" if draft else None
 
 
