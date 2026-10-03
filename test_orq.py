@@ -22619,6 +22619,49 @@ def test_ticket183_project_ticket_with_pr_releases_and_without_pr_stays():
 
 
 
+# ---- ticket 385: a product ticket's delivery is looked up in the project's repo ----
+
+def _product385(tmp, body):
+    """Ticket 141 of project `painel` (repo `tmp`, one commit), worker_done with `body`; Orca no longer lists the dispatch worktree and ORQ_REPOS is another repo."""
+    project = _repo_with_branch(tmp)
+    subprocess.run(["git", "-C", project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "the product commit"], check=True)
+    os.makedirs(os.path.join(tmp, "orq"))
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(os.path.join(tmp, "orq")))
+    os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
+    json.dump({"repo": f"path:{project}"}, open(os.path.join(a.home, "projects", "painel.json"), "w"))
+    _delivery141(a, body=body)
+    a.set("workers.json", [{**w, "worktree": ""} if w["handle"] == "term_w1" else w for w in _log_json(a, "workers.json", [])])
+    path = os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md")
+    text = open(path).read().replace("Task:", "Project: painel\nTask:")
+    open(path, "w").write(text)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "ticket": "141", "projeto": "painel", "ts": "2026-10-02T09:00:00Z"})
+    return a, (subprocess.run(["git", "-C", project, "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True).stdout.strip())
+
+
+def _notices385(a):
+    return [n for e in a.events() if e["tipo"] == "entrega" for n in e.get("avisos", [])]
+
+
+def test_ticket385_product_commit_only_in_the_project_repo_is_accepted_and_an_evidence_sha_is_not_the_delivery():
+    with tempfile.TemporaryDirectory() as tmp:
+        a, sha = _product385(tmp, "x")
+        sha = sha if orq_mod.SHA_RE.fullmatch(sha) else None
+        assert sha, "the fixture commit needs a hex id with a letter and a digit"
+        inbox = _log_json(a, "inbox.json", {})
+        inbox["result"]["messages"][0]["body"] = f"commit {sha}; PR 1347 had 522f0393 as evidence"
+        a.set("inbox.json", inbox)
+        assert a.orq("ingest").returncode == 0
+        assert _notices385(a) == [], a.events()
+
+
+def test_ticket385_product_delivery_with_a_branch_does_not_warn_about_the_orq_queue():
+    with tempfile.TemporaryDirectory() as tmp:
+        a, sha = _product385(tmp, "branch feat/x-y commit abc1234def")
+        assert a.orq("ingest").returncode == 0
+        assert not [n for n in _notices385(a) if "integrator queue" in n], _notices385(a)
+        assert not [e for e in a.events() if e["tipo"] in ("integrar_fila", "entrega_orq")]
+
+
 # ---- ticket 356: the manager finds the delivery that nobody carries ----
 
 def _orphan_env(**env):

@@ -3013,13 +3013,14 @@ def _git(repo, *args, timeout=15):
     return r.stdout if r.returncode == 0 else None
 
 
-def check_delivery(text_value, repos, pr_commits=None):
+def check_delivery(text_value, repos, pr_commits=None, shas=None):
     """Warnings from a worker_done's delivery proof: cited commits that exist in none of `repos` and a dirty tree where the commit is.
 
     With no sha in the text there is nothing to prove (empty list). `pr_commits(url)` returns the PR's oids (None: no gh or no answer, and then it does not warn).
+    `shas` replaces the ones in the text (a product ticket's delivery is the dispatch worktree's commit; a sha cited as evidence in the report is not the delivery, ticket 385).
     The warning does not block the worker; it only marks the delivery.
     """
-    shas = list(dict.fromkeys(SHA_RE.findall(text_value or "")))
+    shas = list(dict.fromkeys(SHA_RE.findall(text_value or ""))) if shas is None else shas
     notices, dirty_list = [], []
     for sha in shas:
         where = next((r for r in repos if _git(r, "cat-file", "-e", sha + "^{commit}") is not None), None)
@@ -3068,14 +3069,32 @@ def _already_has_event(type_name, msg):
     return any(e.get("tipo") == type_name and e.get("msg") == msg for e in read_events())
 
 
+def _delivery_project(t, dispatch):
+    """The project (file name) whose repo a product ticket's delivery lives in: the dispatch's `--project`, else the ticket's `Project:`; None for an orq ticket (no project, or one whose repo is orq's own)."""
+    disp = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == dispatch), None) or {}
+    name = disp.get("projeto") or (t or {}).get("projeto")
+    proj = projects().get(name or "")
+    folder = proj and repo_folder(proj["repo"])
+    orq_repos = [os.path.realpath(r) for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]
+    return name if folder and folder not in orq_repos else None
+
+
 def _delivery_proof(m, p):
-    """worker_done with a sha in the text -> `delivery` event with the warnings, if any."""
+    """worker_done with a sha in the text -> `delivery` event with the warnings, if any.
+
+    A product ticket (ticket 385) is looked up in the project's repo and the dispatch worktree: the delivery is the commit the payload names, or the worktree's HEAD; a sha the report only cites as evidence (another PR's) is not."""
     if _already_has_event("entrega", m["id"]):
         return
     text_value = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
-    if not SHA_RE.search(text_value):
+    t = next((t for t in tickets() if t.get("task") == p.get("taskId")), None) if p.get("taskId") else None
+    project, shas, repos = _delivery_project(t, p.get("dispatchId")), None, _worker_repos(m, p)
+    if project:
+        wt = _dispatch_worktree(m.get("run_id"), p.get("dispatchId"))
+        head = p.get("commit") or (wt and (_git(wt, "rev-parse", "HEAD") or "").strip())
+        shas, repos = [head] if head else [], [repo_folder(projects()[project]["repo"]), *repos]
+    elif not SHA_RE.search(text_value):
         return
-    notices = check_delivery(text_value, _worker_repos(m, p), _pr_commits)
+    notices = check_delivery(text_value, repos, _pr_commits, shas)
     if notices:
         append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": notices})
 
@@ -3196,7 +3215,7 @@ def _orq_delivery(m, p):
     if p.get("outcome") != "succeeded" or not p.get("taskId") or _already_has_event("entrega_orq", m["id"]):
         return None
     t = next((t for t in tickets() if t.get("task") == p["taskId"]), None)
-    if not t:
+    if not t or _delivery_project(t, p.get("dispatchId")):  # a product ticket's branch lives in the project's repo: its PR, not the orq queue (ticket 385)
         return None
     text_value = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
     wt = _dispatch_worktree(m.get("run_id"), p.get("dispatchId"))
