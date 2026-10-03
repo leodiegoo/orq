@@ -18522,7 +18522,7 @@ def test_ticket102_m7_move_takes_the_linked_set_to_group_backlog_and_preserves_t
     a.orq("ticket", "fechar", "01", "--answer", "ok")
     r = a.orq("backlog", "mover", "02", "03", "--grupo", "orq")
     assert r.returncode == 0, r.stderr
-    assert json.loads(r.stdout) == {"grupo": "orq", "destino": destination, "tickets": ["t02", "t03"]}
+    assert json.loads(r.stdout) == {"grupo": "orq", "destino": destination, "tickets": ["t02", "t03"], "aviso": "tickets movidos; grupo sem mate aberto, use orq mate abrir orq"}
     assert sorted(_bl_items(a)) == ["avisar-x", "freio-prod", "t01", "t04"]
     side = {i["id"]: i for i in backlog_mod.read_value(destination)}
     assert sorted(side) == ["t02", "t03"] and side["t03"]["bloqueios"] == ["t02"] and side["t02"]["bloqueios"] == [], "a aresta entre os dois ficou; a do bloqueador já Done saiu"
@@ -18531,6 +18531,130 @@ def test_ticket102_m7_move_takes_the_linked_set_to_group_backlog_and_preserves_t
     assert open(os.path.join(os.path.dirname(destination), ".tasks.toml")).read().count("done_keep = 100000") == 1
     (ev,) = [e for e in a.events() if e["tipo"] == "backlog"]
     assert (ev["op"], ev["grupo"], ev["tickets"]) == ("mover", "orq", ["t02", "t03"])
+
+
+def test_ticket437_backlog_move_requests_the_mate_after_the_move_and_warns_without_one():
+    a = _env_tk()
+    destination = _orq_group(a)
+    _new(a, "orq: A")
+    _mate_alive(a)
+    r = a.orq("backlog", "mover", "01", "--grupo", "orq")
+    assert r.returncode == 0, r.stderr
+    result = json.loads(r.stdout)
+    assert result["tickets"] == ["t01"] and "aviso" not in result, result
+    request = next(e for e in a.events() if e.get("tipo") == "mate_pedido")
+    assert request["grupo"] == "orq" and "t01" in request["texto"]
+    assert backlog_mod.read_value(destination)[0]["id"] == "t01"
+
+    # Without a configured/open mate, the durable move still completes and reports how to recover.
+    b = _env_tk()
+    destination = _orq_group(b)
+    _new(b, "orq: B")
+    result = json.loads(b.orq("backlog", "mover", "01", "--grupo", "orq").stdout)
+    assert result["tickets"] == ["t01"] and "orq mate abrir orq" in result.get("aviso", ""), result
+    assert backlog_mod.read_value(destination)[0]["id"] == "t01"
+
+
+def test_ticket437_manager_reopens_dead_mate_only_with_work_and_caps_relaunches():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.orq("mate", "pedir", "orq", "--texto", "trabalhe em t12")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    a.set("screens.json", {"term_ret1": ["⏵⏵ bypass permissions on"]})
+    with InProcess(a):
+        lines = orq_mod.mate_lap()
+    assert any("relaunched" in x for x in lines), lines
+    assert any(e.get("tipo") == "mate_relancado" for e in a.events())
+
+    # Two recorded attempts in the hour block another relaunch and notify the coordinator.
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        for i in range(2):
+            f.write(json.dumps({"tipo": "mate_relancado", "grupo": "orq", "ts": orq_mod.now()}) + "\n")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    cur = _cursor(a)
+    cur["mates"]["orq"]["terminal"] = "term_mate"
+    cur["mates"]["orq"]["morto"] = None
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    with InProcess(a):
+        assert any("limit" in x for x in orq_mod.mate_lap())
+    assert any(e.get("tipo") == "mate_relanco_bloqueado" for e in a.events())
+    # Without work, the existing one-time coordinator warning remains the response.
+    b = Env()
+    _group(b)
+    _mate_alive(b)
+    with open(os.path.join(b.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    b.set("terminals.json", ["term_coord", "term_ger"])
+    with InProcess(b):
+        assert any("went down" in x for x in orq_mod.mate_lap())
+    assert not any(e.get("tipo") == "mate_relancado" for e in b.events())
+
+    # A pending request is not enough when Orca's terminal list cannot prove the mate is gone.
+    c = Env()
+    _group(c)
+    _mate_alive(c)
+    with open(os.path.join(c.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    c.orq("mate", "pedir", "orq", "--texto", "trabalhe em t12")
+    c.set("terminals.json", "broken")
+    with InProcess(c):
+        orq_mod.mate_lap()
+    assert not any(e.get("tipo") == "mate_relancado" for e in c.events())
+
+
+def test_ticket437_sleeping_mate_is_resumed_before_the_backlog_request_is_recorded():
+    a = _env_tk()
+    _orq_group(a)
+    _new(a, "orq: A")
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["⏵⏵ bypass permissions on"]})
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"dormiu": "2026-10-01T12:00:00Z", "sessao": "sess-mate", "cwd": a.home}}}, f)
+    r = a.orq("backlog", "mover", "01", "--grupo", "orq")
+    assert r.returncode == 0, r.stderr
+    events = a.events()
+    assert next(e for e in events if e.get("tipo") == "mate_acordou")
+    request = next(e for e in events if e.get("tipo") == "mate_pedido")
+    assert request["texto"] == "tickets novos no seu backlog: t01"
+    assert events.index(next(e for e in events if e.get("tipo") == "mate_acordou")) < events.index(request)
+
+
+def test_ticket437_failed_relaunch_is_counted_and_logged():
+    a = Env(ORQ_RETOMAR_ESPERA_S="0.1", ORQ_MATE_ESPERA_S="0.1")
+    _group(a)
+    _mate_alive(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.orq("mate", "pedir", "orq", "--texto", "trabalhe em t12")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    a.set("screens.json", {"term_ret1": ["No conversation found with session ID: sess-mate"]})
+    with InProcess(a):
+        lines = orq_mod.mate_lap()
+    assert any("relaunch failed" in x for x in lines), lines
+    failure = next(e for e in a.events() if e.get("tipo") == "mate_relanco_falhou")
+    assert failure["grupo"] == "orq" and "session did not come back" in failure["motivo"]
+
+
+def test_ticket437_unreleased_mate_worker_alone_triggers_relaunch():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.set("screens.json", {"term_ret1": ["⏵⏵ bypass permissions on"]})
+    previous = orq_mod._mate_has_worker
+    orq_mod._mate_has_worker = lambda _mate: True
+    try:
+        with InProcess(a):
+            lines = orq_mod.mate_lap()
+    finally:
+        orq_mod._mate_has_worker = previous
+    assert any("relaunched" in x for x in lines), lines
+    assert any(e.get("tipo") == "mate_relancado" for e in a.events())
 
 
 def test_ticket102_m7_move_refuses_dangling_dependency_ticket_outside_queue_and_group_without_registration():
@@ -21324,6 +21448,7 @@ EVENTOS_LIDOS = {
     "gate_resolvido": "hook_stop wake_stopped", "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped",
     "intake": "hook_stop wake_stopped", "integrate_cycle": "hook_stop wake_stopped", "liberar": "hook_stop wake_stopped",
     "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
+    "mate_relancado": "mate_lap", "mate_relanco_bloqueado": "mate_lap", "mate_relanco_falhou": "mate_lap",
     "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "hook_stop wake_stopped",
     "pendente_avisado": "hook_stop wake_stopped", "pr": "hook_stop wake_stopped", "pr_poll_cego_fim": "hook_stop wake_stopped",
     "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped", "resposta": "hook_stop wake_stopped",
@@ -21363,7 +21488,7 @@ def _reachable(defs, roots):
 
 
 def event_contract(source):
-    """({type: readers} of what hook_stop and wake_stopped compare `tipo` with, {types written by a `{"tipo": ...}` literal reachable from main}) of orqlib's source.
+    """({type: readers} of what hook_stop and wake_stopped compare `tipo` with, plus mate relaunch events read by mate_lap, {types written by a `{"tipo": ...}` literal reachable from main}) of orqlib's source.
     # ponytail: static, by name; a type built at runtime (`{"tipo": kind}`) is not seen, nor is a command the real flow never calls (the replay covers that)."""
     tree = ast.parse(source)
     defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
@@ -21375,6 +21500,11 @@ def event_contract(source):
                 if isinstance(x, ast.Compare) and _reads_type(x.left):
                     for kind in (s for c in x.comparators for s in _type_strings(c)):
                         reads.setdefault(kind, set()).add(root)
+    for x in ast.walk(defs["mate_lap"]):
+        if isinstance(x, ast.Compare) and _reads_type(x.left):
+            for kind in (s for c in x.comparators for s in _type_strings(c)):
+                if kind in ("mate_relancado", "mate_relanco_falhou", "mate_relanco_bloqueado"):
+                    reads.setdefault(kind, set()).add("mate_lap")
     written = {s for name in _reachable(defs, ["main"]) for x in ast.walk(defs[name]) if isinstance(x, ast.Dict)
                for k, v in zip(x.keys, x.values) if k is not None and _type_strings(k) == ["tipo"] for s in _type_strings(v)}
     return reads, written

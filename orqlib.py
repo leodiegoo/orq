@@ -4222,7 +4222,18 @@ def backlog_mover(ticket_numbers, group_name):
                 backlog.cli(BACKLOG, "block", i, "--by", b)
         raise
     append_event({"tipo": "backlog", "op": "mover", "grupo": group_name, "tickets": ids, "destino": destination})
-    return {"grupo": group_name, "destino": destination, "tickets": ids}
+    result = {"grupo": group_name, "destino": destination, "tickets": ids}
+    mate = _dict(_mates().get(group_name))
+    if mate.get("terminal") or mate.get("dormiu"):
+        try:
+            pedido = mate_request(group_name, f"tickets novos no seu backlog: {', '.join(ids)}", deadline=0)
+            if pedido.get("entrega") not in ("enviado", "ocupado"):
+                result["aviso"] = f"tickets movidos, mas o mate não recebeu o pedido; confira com orq mate abrir {group_name}"
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+            result["aviso"] = f"tickets movidos, mas não foi possível avisar o mate ({e}); use orq mate abrir {group_name}"
+    else:
+        result["aviso"] = f"tickets movidos; grupo sem mate aberto, use orq mate abrir {group_name}"
+    return result
 
 
 def pending_edit(id_, **fields):
@@ -8751,8 +8762,33 @@ def mate_lap():
         line_list.append(f"mate {e['mate']}: raise {e['id']} reported to the coordinator")
     live = _alive_terminals()
     for g, m in mates.items():
-        t = _dict(m).get("terminal")
-        if live is None or not t or t in live or _dict(m).get("morto") == t:
+        mate = _dict(m)
+        t = mate.get("terminal") or mate.get("morto")
+        if live is None or not t or t in live:
+            continue
+        pending = any(p["grupo"] == g for p in mate_pending(event_list, mates, now_at))
+        has_worker = _mate_has_worker(mate)
+        if pending or has_worker:
+            attempts = [e for e in event_list if e.get("grupo") == g and (e.get("tipo") == "mate_relancado" or e.get("tipo") == "mate_relanco_falhou")
+                        and (_ts(e.get("ts")) or now_at) >= now_at - timedelta(seconds=3600)]
+            if len(attempts) >= 2:
+                blocked = any(e.get("tipo") == "mate_relanco_bloqueado" and e.get("grupo") == g and e.get("terminal") == t
+                              and (_ts(e.get("ts")) or now_at) >= now_at - timedelta(seconds=3600) for e in event_list)
+                if not blocked and coord_handle and notify_coordinator(coord_handle, f"orq ▸ mate {g} is down with open work; relaunch limit reached (2 per hour). Bring it back manually with: orq mate open {g}") in DELIVERED:
+                    append_event({"tipo": "mate_relanco_bloqueado", "grupo": g, "terminal": t, "tentativas": len(attempts), "motivo": "limite de 2 relançamentos por hora"})
+                    line_list.append(f"mate {g}: relaunch limit reached; coordinator notified")
+                continue
+            try:
+                opened = mate_open(g)
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+                append_event({"tipo": "mate_relanco_falhou", "grupo": g, "terminal": t, "motivo": str(e)[:300]})
+                _mate_mut(g, morto=t)
+                line_list.append(f"mate {g}: relaunch failed ({type(e).__name__})")
+            else:
+                append_event({"tipo": "mate_relancado", "grupo": g, "terminal": t, "novo_terminal": opened.get("terminal")})
+                line_list.append(f"mate {g}: relaunched in {opened.get('terminal')}")
+            continue
+        if mate.get("morto") == t:
             continue
         if coord_handle and notify_coordinator(coord_handle, f"orq ▸ mate {g} went down (terminal {t} vanished from Orca). Bring it back with: orq mate open {g}") in DELIVERED:
             _mate_mut(g, morto=t)
