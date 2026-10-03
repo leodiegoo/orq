@@ -926,6 +926,8 @@ A feature moves through the environments of its project by the same branch: a pu
 
 `orq pr link <task> <url> [--issue N]` registers a request, `orq pr list [--task]` lists them and `orq pr unlink <task> <url>` drops one. An item holds the task, URL, number, base branch, `estado` (`aberto`, `mergeado` or `fechado`), the optional GitHub issue and `avisado`. Linking asks `gh pr view` once for the state and base, but does not need the answer: without it the request enters `aberto` with no base and the poll fills it in. A request that is already merged or closed enters resolved and already announced, because whoever links it knows. One URL belongs to one task. The task id is not checked against Orca, since linking makes no Orca call.
 
+Follow-up sections in the PR body (`Fica para depois`, `Depois do deploy`, `Follow-up`, `Pendente`, `Not done`, `Known gaps`) are read at link time and by `_apply_prs` during polling; explicit inline `Fica para depois:` items are also recognized. Every list item becomes one `mate_pedido` for the group owning the dispatch Run, so the mate creates the continuation ticket in its own Run with `Dispatch: manual` and the PR URL. Items that mention deployment carry the blocker title `levar #<PR> até produção`; other items have no blocker. `pr_followup` events key the URL and normalized item to suppress repeats between linking, polling and `orq mate raise --type pr`. If there is no active mate, an open coordinator entry is recorded instead. A PR without a recognized pending section produces no request.
+
 ```mermaid
 flowchart LR
     G["orq manager absorb<br/>every lap"] --> P["pr_poll()<br/>at most every 120 s"]

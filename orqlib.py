@@ -4341,7 +4341,7 @@ def _pr_gh_list(urls):
     for repo, us in by_repo.items():
         try:
             r = subprocess.run([GH, "pr", "list", "--repo", repo, "--state", "all", "--limit", "300", "--json",
-                                "url,state,mergedAt,mergeCommit,baseRefName,headRefName,title,mergeable,statusCheckRollup"], capture_output=True, text=True, timeout=PR_GH_S)
+                                "url,state,mergedAt,mergeCommit,baseRefName,headRefName,title,body,mergeable,statusCheckRollup"], capture_output=True, text=True, timeout=PR_GH_S)
             listing = json.loads(r.stdout) if r.returncode == 0 else None
         except (subprocess.TimeoutExpired, OSError, ValueError):
             listing = None
@@ -4517,6 +4517,7 @@ def pr_link(task, url, issue=None, tag=None, note=None, head=None):
 
     item = _mutate_prs(add)
     _close_next(item)
+    _request_pr_followups(url, seen_item.get("body"), _run_group(_task_run(read_events(), task)).get("grupo"))
     return item
 
 
@@ -4524,6 +4525,102 @@ def _first_paragraph(text_value, limit=120):
     """The first paragraph of the PR body on one line, cut at `limit` characters."""
     p = " ".join((text_value or "").strip().split("\n\n", 1)[0].split())
     return p if len(p) <= limit else p[: limit - 1].rstrip() + "…"
+
+
+_PR_FOLLOWUP_HEADINGS = ("fica para depois", "depois do deploy", "follow up", "pendente", "not done", "known gaps")
+
+
+def _pr_followup_items(body):
+    """[(item text, depends on deploy)] from explicit PR follow-up headings or an inline "Fica para depois" marker."""
+    def plain(value):
+        return re.sub(r"\s+", " ", re.sub(r"[`*]", "", value)).strip(" \t:-")
+
+    def normalized(value):
+        value = "".join(c for c in unicodedata.normalize("NFKD", value.lower()) if not unicodedata.combining(c))
+        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+    out, active, current = [], False, None
+    for raw in (body or "").splitlines():
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", raw)
+        if heading:
+            title = normalized(plain(heading.group(1)))
+            active = any(title == normalized(label) or title.startswith(normalized(label) + " ") for label in _PR_FOLLOWUP_HEADINGS)
+            current = None
+            continue
+        inline = re.match(r"^\s*(?:[-*+]\s*)?(?:\*\*)?\s*(Fica para depois(?: do deploy)?|Depois do deploy|Follow[- ]?up|Pendente|Not done|Known gaps)\s*:?(?:\*\*)?\s*:?\s*(.*)$", raw, re.I)
+        if inline and inline.group(2).strip():
+            label = normalized(plain(inline.group(1)))
+            item = plain(inline.group(2))
+            out.append((item, "deploy" in label or "deploy" in normalized(item) or "deployment" in normalized(item)))
+            current = None
+            continue
+        if not active:
+            continue
+        bullet = re.match(r"^\s*[-*+]\s+(.+)$", raw)
+        if bullet:
+            item = plain(bullet.group(1))
+            if item:
+                current = len(out)
+                out.append((item, "deploy" in normalized(item) or "deployment" in normalized(item)))
+        elif current is not None and raw.strip():
+            previous, blocked = out[current]
+            out[current] = (plain(previous + " " + raw), blocked or "deploy" in normalized(raw) or "deployment" in normalized(raw))
+    unique, seen = [], set()
+    for item, deploy in out:
+        key = normalized(item)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append((item, deploy))
+    return unique
+
+
+def _request_pr_followups(url, body, group_name=None):
+    """Records one idempotent mate request per explicit PR follow-up, or a coordinator entry when no live mate can take it."""
+    items = _pr_followup_items(body)
+    if not items:
+        return []
+    def item_key(value):
+        normalized = "".join(c for c in unicodedata.normalize("NFKD", value.lower()) if not unicodedata.combining(c))
+        return re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+
+    pr_number = url.rsplit("/", 1)[-1]
+    results = []
+    with _lock("pr-followups.lock"):
+        existing = {(e.get("url"), e.get("item_key")) for e in read_events() if e.get("tipo") == "pr_followup"}
+        for ticket in tickets():
+            ticket_text = _text_of(ticket.get("arquivo") or "")
+            ticket_key = item_key(ticket_text)
+            cites_pr = url in ticket_text or re.search(rf"(?<!\d)#{re.escape(pr_number)}(?!\d)", ticket_text)
+            if cites_pr:
+                existing.update((url, item_key(item)) for item, _ in items if item_key(item) in ticket_key)
+        for item, depends_deploy in items:
+            key = item_key(item)
+            if (url, key) in existing:
+                continue
+            text_value = (f"Create one continuation ticket in your Run for this PR follow-up item: {item}. Cite PR {url} (#{pr_number}); set Dispatch: manual. "
+                          + (f"Blocked by the production continuation ticket \"levar #{pr_number} até produção\" because this item depends on deployment. "
+                             if depends_deploy else "This item has no deployment blocker."))
+            request = None
+            if group_name:
+                try:
+                    request = mate_request(group_name, text_value)
+                except ValueError as error:
+                    log(f"PR #{pr_number} follow-up: mate {group_name} unavailable ({error}); leaving coordinator entry")
+            if request:
+                marker = {"tipo": "pr_followup", "url": url, "item_key": key, "grupo": group_name, "corr": request["corr"],
+                          "depende_deploy": depends_deploy}
+            else:
+                entry = append_event({"tipo": "entrada", "origem": "pr_followup", "texto": text_value, "fonte": f"PR #{pr_number}", "ref": url}, new_id=True)
+                marker = {"tipo": "pr_followup", "url": url, "item_key": key, "entrada": entry["id"], "depende_deploy": depends_deploy}
+            append_event(marker)
+            existing.add((url, key))
+            results.append(marker)
+    return results
+
+
+def _pr_url_in(text_value):
+    match = re.search(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+", text_value or "")
+    return match.group(0) if match else None
 
 
 def queue_auto(item):
@@ -5304,6 +5401,8 @@ def _apply_prs(d, seen, now_at):
     line_list = []
     for i in d["itens"]:
         seen_item = _dict(seen.get(i["url"]))
+        if seen_item.get("body"):
+            _request_pr_followups(i["url"], seen_item["body"], _run_group(_task_run(event_list, i["task"])).get("grupo"))
         new = _gh_state(seen_item)
         if i["estado"] == "aberto" and not new:
             ci = _gh_ci(seen_item, now_at, task_flow(i["task"], event_list))
@@ -8532,8 +8631,14 @@ def mate_raise(type_name, text_value, corr=None, link=None, group_name=None):
         raise ValueError(f"request {corr} does not exist for group {g}: the answer was not written")
     if type_name == "resposta" and not corr:
         raise ValueError("--type answer needs --corr <request>")
-    return append_event({"tipo": "entrada", "origem": "mate", "mate": g, "tipo_mate": type_name, "texto": text_value[:2000], "fonte": f"mate {g}",
-                         **({"corr": corr} if corr else {}), **({"link": link} if link else {})}, new_id=True)
+    entry = append_event({"tipo": "entrada", "origem": "mate", "mate": g, "tipo_mate": type_name, "texto": text_value[:2000], "fonte": f"mate {g}",
+                          **({"corr": corr} if corr else {}), **({"link": link} if link else {})}, new_id=True)
+    if type_name == "pr":
+        url = _pr_url_in(link) or _pr_url_in(text_value)
+        if url:
+            seen_item = _pr_state(url) or {}
+            _request_pr_followups(url, seen_item.get("body"), g)
+    return entry
 
 
 def _mate_command(group_name, cfg, session, cwd=None, was_sleeping=False):
