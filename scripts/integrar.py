@@ -4,7 +4,7 @@
   integrar.py <branch>... [--no-proof REASON]
                               refuses a queued branch whose tip is not the commit its delivery proved (`orq integrate check`), unless --no-proof (alias --sem-prova) gives the reason;
                               creates ORQ_WT_DIR/integra-<branches> from main, merges each branch, runs the tests and advances main
-  integrar.py --avancar <wt>  after resolving a conflict (and committing) in the worktree: checks, runs the tests and advances main
+  integrar.py --avancar <wt>  after resolving a conflict (and committing): merges all remaining saved branches, checks, runs tests and advances main
 
 Before the tests it runs the night replay (test_noite_replay.py, ticket 216) and prints its time; a red replay leaves main where it was and writes a
 `[PENDENTE` line to ciclos.log, which the manager turns into a notice to the coordinator (ticket 137).
@@ -93,6 +93,24 @@ def conflicts_file(wt):
     return os.path.join(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip(), "orq-conflicts")
 
 
+def merge_saved_branches(wt, branches):
+    """Finishes every saved merge before replay, tests or fast-forward; a conflict keeps main untouched for another `--avancar`."""
+    for branch in dict.fromkeys(branches):
+        tip = git(wt, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if tip.returncode:
+            die(f"saved branch {branch} is missing from {wt}; main did not advance")
+        if git(wt, "merge-base", "--is-ancestor", tip.stdout.strip(), "HEAD").returncode == 0:
+            continue
+        merged = git(wt, "merge", "--no-edit", branch)
+        if merged.returncode:
+            unresolved = git(wt, "diff", "--name-only", "--diff-filter=U").stdout
+            if unresolved:
+                with open(conflicts_file(wt), "w") as f:
+                    f.write(unresolved)
+            die(f"conflict integrating saved branch {branch} in {wt} (the live main is untouched):\n"
+                f"{git(wt, 'status', '--short').stdout.strip()}\nresolve there, commit and run `integrar.py --avancar {wt}`")
+
+
 def tests_for(viva, wt):
     """The cycle's test command: the full suite, or the affected tests when the conflict that stopped it touched only LIGHT files."""
     try:
@@ -141,6 +159,11 @@ def advance(wt):
     markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
     if markers:
         die(f"leftover conflict marker:\n{markers}")
+    try:
+        saved_branches = open(branches_file(wt)).read().split()
+    except OSError:
+        saved_branches = []
+    merge_saved_branches(wt, saved_branches)
     replay = os.environ.get("ORQ_REPLAY", "" if os.environ.get("ORQ_TESTES") else REPLAY)
     stage("replay")
     if replay:

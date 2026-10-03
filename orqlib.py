@@ -699,7 +699,7 @@ def _public_project(cwd):
 
 
 def integrate_queue_rm(ticket):
-    """Removes the ticket from the integrator queue (the branch is already on main, or they gave up on it). ValueError if it wasn't there."""
+    """Removes the ticket from the integrator queue after publication, an explicit worker return, or an explicit abandonment. ValueError if it wasn't there."""
     n = str(ticket).strip().zfill(2)
     with _lock("integrate-queue.lock"):
         item_list = [i for i in _dict(_read_json(_path(INTEGRATE_QUEUE_FILE))).get("itens") or [] if isinstance(i, dict)]
@@ -743,12 +743,22 @@ def cycle_done(dispatch, hash_, note=None, extra=None):
     """The service worker finished a cycle: records the `cycle` event. Doesn't talk to Orca (after the first worker_done it no longer has a capability).
     A known, not-yet-released dispatch that wasn't a service becomes one here (`servico_marcado`): reporting a cycle already proves it is. ValueError if the
     dispatch is unknown or was already released. `extra` are extra event fields (`integrate conclude` records branches and tickets)."""
+    extra = extra or {}
+    reported = {i.get("branch"): i for i in extra.get("integrated") or [] if isinstance(i, dict) and i.get("branch")}
+    missing = []
+    for branch in extra.get("branches") or []:
+        recorded = reported.get(branch) or {}
+        tip = _branch_tip_is_ancestor(branch, hash_)
+        if not tip or tip != recorded.get("tip"):
+            missing.append(f"{branch} ({recorded.get('tip') or 'no recorded tip'})")
+    if missing:
+        raise ValueError(f"cycle refused: branch tip is not an ancestor of main at {hash_}: {', '.join(missing)}")
     if dispatch not in _services(read_events()):
         try:
             mark_service(dispatch)
         except ValueError:
             raise ValueError(f"{dispatch} is not a service dispatch (orq dispatch --service)") from None
-    return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": note} if note else {}), **(extra or {})})
+    return append_event({"tipo": "ciclo", "dispatch": dispatch, "hash": hash_, **({"nota": note} if note else {}), **extra})
 
 
 def _open_cwds():
@@ -770,6 +780,16 @@ def _branch_tip(branch):
     """The tip sha of the local `branch` in the first ORQ_REPOS repository that has it, or None."""
     repo = _branch_repo(branch)
     return (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip() or None if repo else None
+
+
+def _branch_tip_is_ancestor(branch, ref):
+    """The recorded tip of `branch` only when that exact tip is an ancestor of `ref` in its repository."""
+    repo = _branch_repo(branch)
+    tip = _branch_tip(branch)
+    target = (_git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") or "").strip() if repo else ""
+    if not repo or not tip or not target or _git(repo, "merge-base", "--is-ancestor", tip, target) is None:
+        return None
+    return tip
 
 
 def integration_registry(events=None):
@@ -1391,7 +1411,7 @@ def integrate_publish(repo=None, ref="origin/main"):
     """Publishes orq's main (ticket 185): the integrator fast-forwards main with the suite green and the push was manual. With main ahead of `ref` it runs `audit_publication`
     on `ref..main`: with reasons it pushes nothing and tells the coordinator; clean, it runs `git push` and records the `publicou` event (hash and range). A push that fails (network,
     hook, timeout) is a notice and the next call retries (the manager lap calls it). One notice per hash and reason. Once main is on `ref` it closes what the integrator queue holds
-    whose branch a cycle recorded at its current tip (`_close_integrated`; the integrator rewrites commits, so ancestry proves nothing), runs `worktrees_clean` and sends a short
+    whose recorded branch tip is an ancestor of published main (`_close_integrated`), runs `worktrees_clean` and sends a short
     summary (cycle, tickets, hash). Never raises. Returns {estado: publicou|em_dia|auditoria|push|sem_origem, hash, intervalo, tickets, avisos}."""
     repo = repo or HOME
     head = (_git(repo, "rev-parse", "--short", BRANCH_NO_REMOTE) or "").strip()
@@ -1409,6 +1429,12 @@ def integrate_publish(repo=None, ref="origin/main"):
         if reasons:
             out["estado"] = "auditoria"
             out["avisos"] += [f"orq main at {head} not published, the audit refused: {r}" for r in reasons]
+            registry = integration_registry()
+            for item in integration_queue().values():
+                tip = _branch_tip(item["branch"])
+                cycle_tip = next((x.get("tip") for x in registry.get(item["branch"], []) if x.get("tip") == tip), None)
+                if cycle_tip and _branch_tip_is_ancestor(item["branch"], ref) is None:
+                    out["avisos"].append(f"branch {item['branch']} (ticket {item['ticket']}) tip {cycle_tip[:8]} is not in published main {ref}; it remains queued")
             _publish_notify(f"{head}:audit", f"orq main at {head} NOT published: the audit refused ({_quote('; '.join(reasons), 300)}). Fix it and run `orq integrate publish`.")
             return out
         try:
@@ -1419,6 +1445,12 @@ def integrate_publish(repo=None, ref="origin/main"):
         if error:
             out["estado"] = "push"
             out["avisos"].append(f"push of orq main at {head} failed: {_quote(error, 300)}")
+            registry = integration_registry()
+            for item in integration_queue().values():
+                tip = _branch_tip(item["branch"])
+                cycle_tip = next((x.get("tip") for x in registry.get(item["branch"], []) if x.get("tip") == tip), None)
+                if cycle_tip and _branch_tip_is_ancestor(item["branch"], ref) is None:
+                    out["avisos"].append(f"branch {item['branch']} (ticket {item['ticket']}) tip {cycle_tip[:8]} is not in published main {ref}; it remains queued")
             _publish_notify(f"{head}:push", f"push of orq main at {head} failed ({_quote(error, 200)}). The next lap tries again.")
             return out
         out["estado"] = "publicou"
@@ -1428,9 +1460,16 @@ def integrate_publish(repo=None, ref="origin/main"):
     else:
         out["estado"] = "em_dia"
     registry = integration_registry()
+    published_main = head if out["estado"] == "publicou" else ref
     for item in integration_queue().values():
         tip = _branch_tip(item["branch"])
-        if tip and any(r["tip"] == tip for r in registry.get(item["branch"], [])):
+        recorded = next((r for r in registry.get(item["branch"], []) if tip and r.get("tip") == tip), None)
+        if not recorded:
+            continue
+        if _branch_tip_is_ancestor(item["branch"], published_main) is None:
+            out["avisos"].append(f"branch {item['branch']} (ticket {item['ticket']}) tip {recorded['tip'][:8]} is not an ancestor of published main {published_main}; it remains queued")
+            continue
+        if recorded:
             out["tickets"].append(item["ticket"])
             out["avisos"] += _close_integrated(item, head)
     if out["estado"] == "publicou":
@@ -1520,15 +1559,29 @@ def integrate_conclude(hash_, branches, dispatch=None):
     audit, push of main and, only after it, closing the tickets (queue, ticket, worker). A branch off the queue only enters the cycle.
     Returns {hash, branches, tickets, avisos, publicacao}."""
     queue, event_list = integration_queue(), read_events()
-    tickets_ = [i["ticket"] for b in branches for i in queue.values() if i["branch"] == b]
+    queue_by_branch = {}
+    for item in queue.values():
+        queue_by_branch.setdefault(item["branch"], []).append(item)
+    tickets_ = [item["ticket"] for branch in branches for item in queue_by_branch.get(branch, [])]
+    merged, integrated, cycle_tickets, notices = [], [], [], []
+    for branch in branches:
+        tip = _branch_tip_is_ancestor(branch, hash_)
+        if tip:
+            merged.append(branch)
+            integrated.append({"branch": branch, "tip": tip, "integrated_into": hash_})
+            cycle_tickets.extend(item["ticket"] for item in queue_by_branch.get(branch, []))
+        else:
+            tickets = ", ".join(item["ticket"] for item in queue_by_branch.get(branch, [])) or "not queued"
+            notices.append(f"branch {branch} (ticket {tickets}) is not an ancestor of main at {hash_}; it remains in the integrator queue")
     d = dispatch or (_integrator_dispatch(event_list) or {}).get("dispatch")
-    extra = {"branches": list(branches), "tickets": tickets_, "integrated": [{"branch": b, "tip": tip, "integrated_into": hash_} for b in branches if (tip := _branch_tip(b))]}
-    if d:
-        cycle_done(d, hash_, extra=extra)
-    else:
-        append_event({"tipo": "ciclo", "hash": hash_, **extra})
+    extra = {"branches": merged, "tickets": cycle_tickets, "integrated": integrated}
+    if merged:
+        if d:
+            cycle_done(d, hash_, extra=extra)
+        else:
+            append_event({"tipo": "ciclo", "hash": hash_, **extra})
     pub = integrate_publish()
-    return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": pub["avisos"], "publicacao": pub["estado"]}
+    return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": [*notices, *pub["avisos"]], "publicacao": pub["estado"]}
 
 
 def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=None, screens=None, screen_questions=None, hibernated=None, integration=None, limits=None, paused=None, working=None):
@@ -3819,20 +3872,22 @@ def _ingest_msg(m, since, already, titles, send=True):
     if m.get("type") != "worker_done" or _dt(m["created_at"]) <= since or m["id"] in already:
         return 0
     p = _payload(m)
-    proof_ok = _delivery_proof(m, p, send)
+    service_dispatch = p.get("dispatchId") in _services(read_events())
+    proof_ok = False if service_dispatch else _delivery_proof(m, p, send)
     queued, delivery_ok = None, True
     try:
-        worktree_ok = _delivery_worktrees(m, p, send)  # a commit outside the dispatch worktrees (ticket 352)
-        delivery_ok = worktree_ok and _delivery_conformance(m, p, send)  # an incomplete delivery went back to the worker: it does not enter the integrator queue (ticket 201)
-        if delivery_ok:
-            ticket = next((t for t in tickets() if t.get("task") == p.get("taskId")), None)
-            is_orq_ticket = bool(ticket and not _delivery_project(ticket, p.get("dispatchId")))
-            if proof_ok or is_orq_ticket:
-                queued = None if _manual_delivery(m, p) else _orq_delivery(m, p, prove_delivery=proof_ok)
-            if proof_ok:
-                _delivery_head_of_worktree(m, p)
-            if proof_ok and queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
-                red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
+        if not service_dispatch:
+            worktree_ok = _delivery_worktrees(m, p, send)  # a commit outside the dispatch worktrees (ticket 352)
+            delivery_ok = worktree_ok and _delivery_conformance(m, p, send)  # an incomplete delivery went back to the worker: it does not enter the integrator queue (ticket 201)
+            if delivery_ok:
+                ticket = next((t for t in tickets() if t.get("task") == p.get("taskId")), None)
+                is_orq_ticket = bool(ticket and not _delivery_project(ticket, p.get("dispatchId")))
+                if proof_ok or is_orq_ticket:
+                    queued = None if _manual_delivery(m, p) else _orq_delivery(m, p, prove_delivery=proof_ok)
+                if proof_ok:
+                    _delivery_head_of_worktree(m, p)
+                if proof_ok and queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
+                    red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         delivery_ok = False
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
@@ -10522,7 +10577,8 @@ def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
     worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
     terminal running the worker's session (the live one, the hibernated one woken, or `claude --resume` in the same worktree when it is gone) and sends the reason to the new dispatch.
-    Records `devolver` with `novo_dispatch` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new dispatch's worker_done).
+    Records `devolver` with `novo_dispatch` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new dispatch's worker_done). If this ticket was
+    waiting in the integrator queue, the explicit return removes that queue entry so the branch belongs to the worker until a new delivery.
     `target` may be a task, dispatch, or branch; a reason that names another known branch is refused with that branch's task. ValueError if the target does not exist in the Run or the worker has no way to receive it."""
     run_ = default_run(run)
     if not run_:
@@ -10585,13 +10641,21 @@ def send_back(target, reason, run=None, achado=False):
             handle, via = r["novo"], "retomado"
         new = _inject_dispatch(run_, t["id"], handle, "completed", f"orq send-back {t['id']} \"<reason>\"")
         ev = append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "novo_dispatch": new, "terminal": handle, "run": run_, "texto": reason, "via": via})  # before the best-effort part: the link is what the checks follow
+        dispatch_tickets = _dispatch_ticket(read_events())
+        ticket = dispatch_tickets.get(d) or dispatch_tickets.get(t["id"])
+        queue_warning = None
         try:
             orca("send", "--run", run_, "--to", f"dispatch:{new}", "--subject", "Delivery sent back", "--body", body_text, "--priority", "high", timeout=10)
+            if ticket and str(ticket).zfill(2) in integration_queue():
+                try:
+                    integrate_queue_rm(ticket)
+                except (OSError, RuntimeError, ValueError) as e:
+                    queue_warning = f"ticket {str(ticket).zfill(2)} still appears in the integrator queue; remove it after checking the returned branch ({e})"
             notice = type_text(handle, _adjustment_notice(handle, reason))
             notice = type_text_busy(handle, _adjustment_notice(handle, reason)) if notice == "ocupado" else notice  # the injected dispatch starts a turn: queue the notice in it
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             notice = f"reason not delivered ({e}): orq steer {t['id']} \"<reason>\""
-        return {**ev, **({"aviso_terminal": notice} if notice not in ("enviado", "ocupado_digitado") else {})}
+        return {**ev, **({"aviso_terminal": notice} if notice not in ("enviado", "ocupado_digitado") else {}), **({"aviso_fila": queue_warning} if queue_warning else {})}
 
 
 def hold(target, reason=None, release=False):

@@ -17487,6 +17487,32 @@ def test_ticket436_missing_commit_keeps_branch_in_queue_without_proof():
     assert not [e for e in a.events() if e.get("tipo") == "prova" and e.get("passo") == "delivery"]
 
 
+def test_ticket470_worker_done_of_integrator_service_never_enters_ticket_delivery_flow():
+    tmp = tempfile.mkdtemp()
+    synthetic = "chore/317-integrator-service-cycle"
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, synthetic))
+    _tk_file(a, "317", "orq: serviço integrador", task="task_integrator")
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_integrator", "dispatch": "ctx_integrator", "ticket": "317",
+             "titulo": "orq: integrador", "servico": True})
+    a.set("workers.json", [{"handle": "term_int", "run": "run_a", "task": "task_integrator", "status": "completed", "terminal": "active", "worktree": "/wt/int"}])
+    a.set("terminals.json", ["term_int", "term_coord"])
+    a.set("inbox.json", {"result": {"messages": [{"id": "msg_integrator", "run_id": "run_a", "type": "worker_done", "subject": "integrator cycle completed",
+                                                     "body": f"cycle completed on {synthetic}", "sequence": 5, "read": 0,
+                                                     "created_at": "2099-01-01T00:00:00Z",
+                                                     "payload": json.dumps({"taskId": "task_integrator", "dispatchId": "ctx_integrator", "outcome": "succeeded", "branch": synthetic})}]}})
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ingest": {"desde": "2000-01-01T00:00:00Z", "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
+
+    r = a.orq("ingest")
+
+    assert r.returncode == 0, r.stderr
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "a service report is not a normal ticket delivery"
+    assert not [e for e in a.events() if e["tipo"] in ("prova", "entrega", "entrega_orq")], a.events()
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_integrator"], "the service report remains recorded"
+    assert not [e for e in a.events() if e["tipo"] == "liberar"] and not _log(a, "released.log") and not _log(a, "close.log")
+    assert not _log(a, "send.log"), "the service report is not forwarded as a ticket delivery"
+
+
 def test_ticket141_worker_done_of_product_ticket_or_without_branch_or_failed_does_not_enter():
     a = Env(run="run_a")
     _delivery141(a, task="task_produto")
@@ -18296,6 +18322,43 @@ def _origin185(a, branch="feat/b1", **author):
     return origin, _git185(a, a.home, "rev-parse", "--short", "main")
 
 
+def _origin470(a):
+    """Three independent ticket branches; main contains and publishes only the first two."""
+    origin = os.path.join(a.tmp.name, "origem-470.git")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True)
+    os.makedirs(a.home, exist_ok=True)
+    _git185(a, a.home, "init", "-q", "-b", "main")
+    open(os.path.join(a.home, "README.md"), "w").write("orq test repository\n")
+    _git185(a, a.home, "add", "README.md")
+    _git185(a, a.home, "commit", "-qm", "chore: base")
+    _git185(a, a.home, "remote", "add", "origin", origin)
+    _git185(a, a.home, "push", "-q", "origin", "main")
+    for branch in ("feat/b1", "feat/b2", "feat/b3"):
+        _git185(a, a.home, "checkout", "-qb", branch, "main")
+        open(os.path.join(a.home, f"{branch.rsplit('/', 1)[-1]}.txt"), "w").write(f"{branch}\n")
+        _git185(a, a.home, "add", "-A")
+        _git185(a, a.home, "commit", "-qm", f"feat: {branch.rsplit('/', 1)[-1]}")
+        _git185(a, a.home, "checkout", "-q", "main")
+    for branch in ("feat/b1", "feat/b2"):
+        _git185(a, a.home, "merge", "--no-ff", "-m", f"merge {branch}", branch)
+    a.env.update({"ORQ_AUTOR": "t@t", "ORQ_TERMOS": os.path.join(a.tmp.name, "sem-termos-470.txt"), "ORQ_REPOS": a.home})
+    return origin, _git185(a, a.home, "rev-parse", "--short", "main")
+
+
+def _integrated470(a):
+    workers = []
+    for ticket, branch in (("07", "feat/b1"), ("08", "feat/b2"), ("09", "feat/b3")):
+        task, dispatch = f"task_w{ticket}", f"ctx_term_w{ticket}"
+        _tk_file(a, ticket, f"orq: branch {branch}", task=task)
+        _evs(a, {"tipo": "despacho", "run": "run_a", "task": task, "dispatch": dispatch, "ticket": ticket, "titulo": f"branch {branch}"})
+        assert a.orq("integrate", "queue", "add", branch, ticket).returncode == 0
+        workers.append({"handle": f"term_w{ticket}", "run": "run_a", "task": task, "dispatch": dispatch, "status": "completed", "terminal": "active", "release": "released"})
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_integrator", "dispatch": "ctx_term_int", "titulo": "orq: integrador", "servico": True})
+    workers.append({"handle": "term_int", "run": "run_a", "task": "task_integrator", "dispatch": "ctx_term_int", "status": "completed", "terminal": "active"})
+    a.set("workers.json", workers)
+    a.set("terminals.json", [w["handle"] for w in workers] + ["term_coord"])
+
+
 def _notices185(a):
     """The notices typed in the coordinator, whole: what went past the `type` cap is in the file the text cites."""
     texts = [e[e.index("--text") + 1] for e in _sent_notices(a)]
@@ -18313,18 +18376,24 @@ def _conclude185(a, hash_):
 def test_ticket154_conclude_records_the_cycle_and_without_origin_closes_nothing():
     a = Env(run="run_a")
     _integrated154(a)
-    r = _conclude185(a, "abc1234")
+    repo = _repo_with_branch(a.tmp.name, "feat/b1")
+    a.env["ORQ_REPOS"] = repo
+    hash_ = _git185(a, repo, "rev-parse", "--short", "main")
+    r = _conclude185(a, hash_)
     assert r.returncode == 0 and "warning" in r.stderr, r.stderr
     assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
     assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "publicou")]
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
-    assert (ev["dispatch"], ev["hash"], ev["branches"], ev["tickets"]) == ("ctx_term_int", "abc1234", ["feat/b1"], ["07"]), ev
+    assert (ev["dispatch"], ev["hash"], ev["branches"], ev["tickets"]) == ("ctx_term_int", hash_, ["feat/b1"], ["07"]), ev
 
 
 def test_ticket154_conclude_with_branch_outside_queue_only_writes_cycle():
     a = Env(run="run_a")
     _integrated154(a)
-    assert a.orq("integrar", "concluir", "--hash", "abc1234", "feat/outra").returncode == 0
+    repo = _repo_with_branch(a.tmp.name, "feat/outra")
+    a.env["ORQ_REPOS"] = repo
+    hash_ = _git185(a, repo, "rev-parse", "--short", "main")
+    assert a.orq("integrar", "concluir", "--hash", hash_, "feat/outra").returncode == 0
     assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
     assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] == "liberar"]
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
@@ -18346,6 +18415,128 @@ def test_ticket185_clean_audit_pushes_main_closes_ticket_releases_worker_and_rec
     (pub,) = [e for e in a.events() if e["tipo"] == "publicou"]
     assert pub["hash"] == hash_ and pub["intervalo"].endswith(f"..{hash_}"), pub
     assert [e["tipo"] for e in a.events() if e["tipo"] in ("ciclo", "publicou")] == ["ciclo", "publicou"]
+
+
+def test_ticket470_conclude_publishes_only_branches_in_main_and_keeps_missing_ticket_queued():
+    a = Env(run="run_a")
+    _integrated470(a)
+    origin, hash_ = _origin470(a)
+
+    r = a.orq("integrate", "conclude", "--hash", hash_, "feat/b1", "feat/b2", "feat/b3")
+
+    result = json.loads(r.stdout)
+    queue = json.loads(a.orq("integrate", "queue", "list", "--json").stdout)
+    assert r.returncode == 0, r.stderr
+    assert [(item["branch"], item["ticket"]) for item in queue] == [("feat/b3", "09")], queue
+    assert _closed185(a, "07") and _closed185(a, "08") and not _closed185(a, "09")
+    assert {event["dispatch"] for event in a.events() if event["tipo"] == "liberar"} == {"ctx_term_w07", "ctx_term_w08"}
+    assert any("feat/b3" in warning and "09" in warning for warning in result["avisos"]), result
+    assert _git185(a, origin, "merge-base", "--is-ancestor", _git185(a, a.home, "rev-parse", "feat/b1"), "main") == ""
+    assert _git185(a, origin, "merge-base", "--is-ancestor", _git185(a, a.home, "rev-parse", "feat/b2"), "main") == ""
+    (cycle,) = [event for event in a.events() if event["tipo"] == "ciclo"]
+    assert cycle["branches"] == ["feat/b1", "feat/b2"] and "feat/b3" not in cycle["branches"], cycle
+
+
+def test_ticket470_cycle_report_refuses_a_branch_tip_outside_main():
+    a = Env(run="run_a")
+    _integrated470(a)
+    _, hash_ = _origin470(a)
+    branches = ["feat/b1", "feat/b2", "feat/b3"]
+    integrated = [{"branch": branch, "tip": _git185(a, a.home, "rev-parse", branch), "integrated_into": hash_} for branch in branches]
+    extra = {"branches": branches, "tickets": ["07", "08", "09"], "integrated": integrated}
+    code = (
+        "import orqlib\n"
+        f"orqlib.cycle_done('ctx_term_int', {hash_!r}, extra={extra!r})\n"
+        "raise SystemExit('accepted an unmerged cycle branch')\n"
+    )
+
+    r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(os.path.abspath(__file__)), env=a.env, capture_output=True, text=True)
+
+    assert r.returncode != 0 and "cycle refused" in r.stderr and "feat/b3" in r.stderr, r.stdout + r.stderr
+    assert not [event for event in a.events() if event["tipo"] == "ciclo"], a.events()
+
+
+def test_ticket470_advance_merges_or_refuses_each_saved_branch_before_concluding():
+    branches = {
+        "um": {"nota.txt": "a\num\nc\n"},
+        "dois": {"nota.txt": "a\ndois\nc\n"},
+        "tres": {"nota.txt": "a\ntres\nc\n"},
+    }
+    alive, env, g = _alive_repo55(branches)
+    integrate = os.path.join(alive, "scripts", "integrar.py")
+    wt = os.path.join(env["ORQ_WT_DIR"], "integra-um-dois-tres")
+    r = subprocess.run([sys.executable, integrate, "um", "dois", "tres"], cwd=alive, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "conflict integrating dois" in r.stderr, r.stdout + r.stderr
+    open(os.path.join(wt, "nota.txt"), "w").write("a\num + dois\nc\n")
+    g("commit", "-qam", "resolve dois", cwd=wt)
+    before = g("rev-parse", "main").stdout.strip()
+
+    partial = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
+
+    assert partial.returncode != 0 and "conflict integrating saved branch tres" in partial.stderr, partial.stdout + partial.stderr
+    assert g("rev-parse", "main").stdout.strip() == before, "main did not advance while saved branch tres was unresolved"
+    events_path = os.path.join(env["ORQ_HOME"], "events.jsonl")
+    events = [json.loads(line) for line in open(events_path)] if os.path.exists(events_path) else []
+    assert not [event for event in events if event.get("type") == "cycle" or event.get("tipo") == "ciclo"], events
+
+    open(os.path.join(wt, "nota.txt"), "w").write("a\num + dois + tres\nc\n")
+    g("commit", "-qam", "resolve tres", cwd=wt)
+    complete = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+    assert open(os.path.join(alive, "nota.txt")).read() == "a\num + dois + tres\nc\n"
+    for branch in branches:
+        g("merge-base", "--is-ancestor", branch, "main")
+    events = [json.loads(line) for line in open(events_path)]
+    cycles = [event for event in events if event.get("type") == "cycle" or event.get("tipo") == "ciclo"]
+    assert len(cycles) == 1, (complete.stdout + complete.stderr, events)
+    (cycle,) = cycles
+    assert cycle["branches"] == ["um", "dois", "tres"], cycle
+
+
+def test_ticket470_returned_conflict_keeps_other_queue_items_until_explicit_send_back():
+    a = Env(run="run_a")
+    branches = {f"b{i:02}": {"nota.txt": f"a\nbranch {i}\nc\n"} for i in range(1, 13)}
+    alive, env, g = _alive_repo55(branches)
+    workers, tasks = [], []
+    for i in range(1, 13):
+        ticket, task, dispatch = f"{i:02}", f"task_w{i:02}", f"ctx_term_w{i:02}"
+        _tk_file(a, ticket, f"orq: branch b{i:02}", task=task)
+        _evs(a, {"tipo": "despacho", "run": "run_a", "task": task, "dispatch": dispatch, "ticket": ticket, "titulo": f"branch b{i:02}"})
+        assert a.orq("integrate", "queue", "add", f"b{i:02}", ticket).returncode == 0
+        workers.append({"handle": f"term_w{i:02}", "run": "run_a", "task": task, "dispatch": dispatch,
+                        "status": "completed", "terminal": "active", "release": "released"})
+        tasks.append({"id": task, "status": "completed", "dispatch_id": dispatch})
+    a.set("workers.json", workers)
+    a.set("terminals.json", [worker["handle"] for worker in workers] + ["term_coord"])
+    a.set("tasks_run_a.json", tasks)
+
+    before = g("rev-parse", "main").stdout.strip()
+    failed = subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "b01", "b02", "b03", "b04"],
+                            cwd=alive, env={**env, "ORQ_HOME": a.home, "ORQ_ORCA": a.bin, "FAKE_DIR": a.fake, "ORQ_ISSUES": a.env["ORQ_ISSUES"],
+                                            "ORQ_REPOS": alive, "ORQ_TESTES": "true"}, capture_output=True, text=True)
+
+    assert failed.returncode != 0 and "conflict" in failed.stdout + failed.stderr, failed.stdout + failed.stderr
+    assert g("rev-parse", "main").stdout.strip() == before
+    assert [item["ticket"] for item in json.loads(a.orq("integrate", "queue", "list", "--json").stdout)] == [f"{i:02}" for i in range(1, 13)]
+    cycles = [event for event in a.events() if event["tipo"] == "integrate_cycle"]
+    (cycle_start,) = [event for event in cycles if event.get("stage") == "merge"]
+    (cycle_end,) = [event for event in cycles if event.get("stage") == "end"]
+    assert cycle_end["outcome"] == "returned" and cycle_start["branches"] == ["b01", "b02", "b03", "b04"], cycles
+
+    for i in range(1, 5):
+        returned = a.orq("send-back", f"task_w{i:02}", "merge conflict: fix this branch before retrying")
+        assert returned.returncode == 0, returned.stderr
+        queue_now = json.loads(a.orq("integrate", "queue", "list", "--json").stdout)
+        assert [item["ticket"] for item in queue_now] == [f"{n:02}" for n in range(i + 1, 13)], (i, queue_now, a.events())
+
+    remaining = json.loads(a.orq("integrate", "queue", "list", "--json").stdout)
+    assert [(item["branch"], item["ticket"]) for item in remaining] == [(f"b{i:02}", f"{i:02}") for i in range(5, 13)], remaining
+    returns = [event for event in a.events() if event["tipo"] == "devolver"]
+    assert [(event["task"], event["texto"]) for event in returns] == [
+        (f"task_w{i:02}", "merge conflict: fix this branch before retrying") for i in range(1, 5)
+    ], returns
+    removed = [event["ticket"] for event in a.events() if event["tipo"] == "integrar_fila" and event.get("op") == "rm"]
+    assert removed == [f"{i:02}" for i in range(1, 5)], removed
 
 
 def test_ticket185_failed_audit_pushes_nothing_closes_nothing_and_tells_the_coordinator_once():
@@ -23766,9 +23957,10 @@ def test_ticket327_conclude_records_each_branch_tip_and_the_main_hash():
     repo = _repo_with_branch(tmp, "feat/b1")
     a = Env(run="run_a", ORQ_REPOS=repo)
     _integrated154(a)
-    assert a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1").returncode == 0
+    hash_ = _sha327(repo, "main")
+    assert a.orq("integrar", "concluir", "--hash", hash_, "feat/b1").returncode == 0
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
-    assert ev["integrated"] == [{"branch": "feat/b1", "tip": _sha327(repo, "feat/b1"), "integrated_into": "abc1234"}], ev
+    assert ev["integrated"] == [{"branch": "feat/b1", "tip": _sha327(repo, "feat/b1"), "integrated_into": hash_}], ev
     assert orq_mod.integration_registry([ev])["feat/b1"][0]["tip"] == _sha327(repo, "feat/b1")
 
 
