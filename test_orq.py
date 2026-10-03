@@ -3878,6 +3878,51 @@ def test_dispatch_new_worktree_passes_on_name_and_base_branch():
     assert ev["worktree"] == "new-top-level" and ev["nome"] == "feat/x"
 
 
+def test_ticket463_dispatch_resolves_a_named_worktree():
+    a = Env(run="run_a")
+    _, worktree = _repo(a.tmp.name)
+    a.set("worktrees.json", [{"path": worktree, "displayName": "worker-wt", "branch": "refs/heads/feat/w", "isMainWorktree": False}])
+
+    r = _dispatch(a, "--worktree", "name:worker-wt")
+
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == f"path:{os.path.realpath(worktree)}", arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["worktree"] == f"path:{os.path.realpath(worktree)}", ev
+
+
+def test_ticket463_dispatch_accepts_an_explicit_worktree_path():
+    a = Env(run="run_a")
+    _, worktree = _repo(a.tmp.name)
+
+    r = _dispatch(a, "--worktree", worktree)
+
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == f"path:{os.path.realpath(worktree)}", arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["worktree"] == f"path:{os.path.realpath(worktree)}", ev
+
+
+def test_ticket463_service_dispatch_refuses_the_live_main_worktree_before_start():
+    a = Env(run="run_a")
+    main, worktree = _repo(a.tmp.name)
+    nested = os.path.join(main, "nested")
+    os.mkdir(nested)
+
+    r = _dispatch(a, "--worktree", "current", "--service", cwd=nested)
+
+    assert r.returncode == 1 and main in r.stderr and "separate worktree" in r.stderr.lower(), r.stderr
+    assert not _log(a, "started.log")
+    assert not [e for e in a.events() if e["tipo"] in ("despacho", "servico_marcado")]
+
+    r = _dispatch(a, "--worktree", "current", "--service", cwd=worktree)
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["servico"] is True and ev["worktree"] == "current", ev
+
+
 def test_ticket442_parent_branch_sets_board_lineage_and_ticket_metadata():
     rows = [{"id": "repo::/wt/feature", "path": "/wt/feature", "branch": "refs/heads/feat/failover", "displayName": "failover"}]
     calls = []

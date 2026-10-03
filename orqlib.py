@@ -14928,6 +14928,58 @@ def _ticket_worktree_status(ticket, status, task=None):
     return _dispatch_worktree_status(event["dispatch"], status, event.get("worktree_path")) if event and event.get("dispatch") else False
 
 
+def _resolve_dispatch_worktree(selector):
+    """Normalize an existing worktree path or Orca display name to `path:<absolute-root>` for worker-start."""
+    if selector in (None, "current", "new-top-level"):
+        return selector, None
+
+    value = str(selector)
+    path = None
+    if value.startswith("path:"):
+        path = value.removeprefix("path:")
+    elif value.startswith("name:"):
+        name = value.removeprefix("name:")
+    else:
+        expanded = os.path.expanduser(value)
+        if os.path.isabs(expanded) or value.startswith(("./", "../", "~/")) or os.path.isdir(expanded):
+            path = value
+        else:
+            name = value
+
+    if path is None:
+        if not name:
+            raise ValueError("--worktree name cannot be empty")
+        rows = [row for row in _orca_worktree_rows()
+                if isinstance(row, dict) and row.get("path") and row.get("hostId", "local") == "local" and not row.get("isArchived")]
+        matches = [row for row in rows if row.get("displayName") == name]
+        if not matches:
+            matches = [row for row in rows if os.path.basename(os.path.normpath(row["path"])) == name]
+        paths = list(dict.fromkeys(os.path.realpath(row["path"]) for row in matches if os.path.isdir(row["path"])))
+        if not paths:
+            raise ValueError(f"--worktree name {name!r} did not match a local Orca worktree")
+        if len(paths) > 1:
+            raise ValueError(f"--worktree name {name!r} is ambiguous; use --worktree path:<path>")
+        path = paths[0]
+
+    path = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        raise ValueError(f"--worktree path does not exist: {path}")
+    root = (_git(path, "rev-parse", "--show-toplevel") or "").strip()
+    if not root:
+        raise ValueError(f"--worktree path is not a Git worktree: {path}")
+    root = os.path.realpath(root)
+    if root != path:
+        raise ValueError(f"--worktree path must name the worktree root: {path} (root: {root})")
+    return f"path:{path}", path
+
+
+def _live_main_worktree(path):
+    """Return the primary checkout root when `path` is anywhere inside it."""
+    worktree_root = (_git(path, "rev-parse", "--show-toplevel") or "").strip()
+    main_root = _repo_root(path)
+    return main_root if worktree_root and main_root and os.path.realpath(worktree_root) == os.path.realpath(main_root) else None
+
+
 def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None, _age_s=0):
     """worker-start (with --model and --effort, which the worker-routing-guard hook requires) + `dispatch_mode` event + entry intake.
 
@@ -14956,13 +15008,24 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         raise ValueError("queue item without a project: the manager does not guess one from its own cwd, "
                          f"dispatch it by hand with {_abandoned_command({'run': run, 'ticket': ticket, 'titulo': title, 'modelo': model, 'effort': effort}).replace('orq dispatch', 'orq dispatch --project <name>', 1)}")
     repo = projects()[project]["repo"] if project else None
+    worktree, selected_worktree_path = _resolve_dispatch_worktree(worktree)
+    target_path = selected_worktree_path or (os.getcwd() if worktree == "current" or (worktree is None and not repo) else None)
+    if service and target_path:
+        main_path = _live_main_worktree(target_path)
+        if main_path:
+            raise ValueError(f"--service cannot target the live main worktree at {main_path}; select a separate worktree")
+    if repo and selected_worktree_path:
+        repo_path = repo_folder(repo)
+        if repo_path and _repo_root(repo_path) != _repo_root(selected_worktree_path):
+            raise ValueError(f"--worktree {selected_worktree_path} is outside project {project} ({repo_path})")
+        repo = None  # the selected existing worktree identifies the repository; --repo is only needed when Orca creates one
     if not agent:  # --agente wins; without it the project's harness holds, and without a project the usual claude
         agent = projects()[project]["harness"] if project else "claude"
     if repo and worktree == "current":
         if explicit_project:
             raise ValueError(f"project {project} starts the worker in a new worktree of its repo: --worktree current would stay in the cwd (Orca only accepts --repo with new-top-level)")
         repo = None  # project found only by the cwd: the current worktree is already of the same repo
-    elif repo:
+    elif repo and selected_worktree_path is None:
         worktree = "new-top-level"
     if project and worktree == "new-top-level" and not base_branch and project_flow(project)["declarado"]:
         base_branch = f"origin/{project_flow(project)['producao']}"  # the project that declares environments is born from production (the work branch only receives code from it)
@@ -15057,7 +15120,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         board_comment = f"Ticket spec: {tk['arquivo']}" if tk else "Coordinator dispatch"
         if parent_note:
             board_comment += f"; {parent_note}"
-        folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
+        folder = (repo_folder(repo) if repo else None) or selected_worktree_path or os.getcwd()  # trust and identity use the selected existing worktree when present
         environment = {**(night_environment() if night_active(_cursor_ro()) else {}), **worker_identity_environment(folder)}
         items, real, scratch = dispatch_conformance(spec, title, scratch_roots([folder]), tk and tk["arquivo"])  # ticket 201: what the delivery must prove
         if items and spec is not None:
@@ -18957,7 +19020,7 @@ def parser():
     _arg(from_, "projeto", help="a file in ORQ_HOME/projects (orq projects); without it the project whose repo contains the cwd applies")
     _arg(from_, "modelo", required=True)
     from_.add_argument("--effort", required=True)
-    from_.add_argument("--worktree", choices=["current", "new-top-level"])
+    from_.add_argument("--worktree", help="current, new-top-level, path:<worktree path>, or name:<Orca worktree name> (bare paths and names also work)")
     from_.add_argument("--name")
     from_.add_argument("--base-branch")
     _arg(from_, "entrada")
