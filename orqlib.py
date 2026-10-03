@@ -525,6 +525,20 @@ def _branch_repo(branch):
     return next((r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r and _git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") is not None), None)
 
 
+def _branch_worktree(repo, branch):
+    """The checkout that owns `branch`, including an orq ticket's separate worktree."""
+    lines = (_git(repo, "worktree", "list", "--porcelain") or "").splitlines()
+    current = None
+    for line in [*lines, ""]:
+        if line.startswith("worktree "):
+            current = line[9:]
+        elif line.startswith("branch refs/heads/") and line[len("branch refs/heads/"):] == branch:
+            return current
+        elif not line:
+            current = None
+    return repo if (_git(repo, "branch", "--show-current") or "").strip() == branch else None
+
+
 def _proof_gap(repo, branch, head):
     """Why the tip of `branch` is not the proven `head` (commits after the proof, or not a descendant of it), or None when it is."""
     tip = (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip()
@@ -3253,7 +3267,7 @@ def check_delivery(text_value, repos, pr_commits=None, shas=None):
 
     With no sha in the text there is nothing to prove (empty list). `pr_commits(url)` returns the PR's oids (None: no gh or no answer, and then it does not warn).
     `shas` replaces the ones in the text (a product ticket's delivery is the dispatch worktree's commit; a sha cited as evidence in the report is not the delivery, ticket 385).
-    The warning does not block the worker; it only marks the delivery.
+    The caller records warnings and returns an unproved delivery before queueing it.
     """
     shas = list(dict.fromkeys(SHA_RE.findall(text_value or ""))) if shas is None else shas
     notices, dirty_list = [], []
@@ -3314,24 +3328,50 @@ def _delivery_project(t, dispatch):
     return name if folder and folder not in orq_repos else None
 
 
-def _delivery_proof(m, p):
+def _delivery_proof(m, p, send=True):
     """worker_done with a sha in the text -> `delivery` event with the warnings, if any.
 
     A product ticket (ticket 385) is looked up in the project's repo and the dispatch worktree: the delivery is the commit the payload names, or the worktree's HEAD; a sha the report only cites as evidence (another PR's) is not."""
-    if _already_has_event("entrega", m["id"]):
-        return
+    previous = next((e for e in reversed(read_events()) if e.get("tipo") == "entrega" and e.get("msg") == m["id"]), None)
+    if previous and (not previous.get("avisos") or previous.get("enviado") or not send):
+        return not previous.get("avisos")
     text_value = f"{m.get('subject') or ''}\n{m.get('body') or ''}"
     t = next((t for t in tickets() if t.get("task") == p.get("taskId")), None) if p.get("taskId") else None
     project, shas, repos = _delivery_project(t, p.get("dispatchId")), None, _worker_repos(m, p)
     if project:
         wt = _dispatch_worktree(m.get("run_id"), p.get("dispatchId"))
         head = p.get("commit") or (wt and (_git(wt, "rev-parse", "HEAD") or "").strip())
-        shas, repos = [head] if head else [], [repo_folder(projects()[project]["repo"]), *repos]
+        shas, repos = [head] if head else [], [*([wt] if wt else []), repo_folder(projects()[project]["repo"]), *repos]
     elif not SHA_RE.search(text_value):
-        return
-    notices = check_delivery(text_value, repos, _pr_commits, shas)
-    if notices:
-        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": notices})
+        return True
+    notices = previous.get("avisos", []) if previous else []
+    if not previous:
+        dirty_repos = repos
+        if not project and t:
+            branch = _orq_wt_branch(t["num"]) or _payload_branch(p.get("branch")) or _text_branch(text_value)
+            if not branch:
+                return True  # without a resolvable branch this delivery cannot enter the queue; _orq_delivery records its manual-repair notice
+            branch_repo = _branch_repo(branch) if branch else None
+            branch_wt = _branch_worktree(branch_repo, branch) if branch_repo else None
+            if branch_wt:
+                dirty_repos = [branch_wt, *[r for r in repos if r != branch_wt]]
+        notices = check_delivery(text_value, dirty_repos, _pr_commits, shas)
+        if notices:
+            append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": notices})
+    if not notices:
+        return True
+    if not t and not project:
+        return True  # an unlinked delivery has no orq queue or product delivery path to gate
+    verdicts = [e for e in read_events() if e.get("tipo") == "entrega" and e.get("dispatch") == p.get("dispatchId") and e.get("enviado")]
+    if send and len(verdicts) < CONFORMANCE_SEND_BACKS:
+        try:
+            send_back(p.get("dispatchId"), "delivery proof failed: " + "; ".join(notices), m.get("run_id"))
+            append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": notices, "enviado": True})
+        except Exception as e:  # noqa: BLE001 - the delivery remains out of the queue; coordinator can return it by hand
+            log(f"delivery proof: {p.get('dispatchId')}: send-back failed ({type(e).__name__}: {e})")
+    elif send:
+        append_event({"tipo": "alerta", "alerta": "entrega_sem_prova_repetida", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m.get("run_id"), "msg": m["id"], "avisos": notices})
+    return False
 
 
 def _push_product_pr(m, p):
@@ -3525,7 +3565,7 @@ def _manual_delivery(m, p):
     return True
 
 
-def _orq_delivery(m, p):
+def _orq_delivery(m, p, prove_delivery=True):
     """worker_done `succeeded` of an orq ticket (the task is the `Task:` of an ISSUES ticket; the product's do not enter) with a branch in the payload or the text ->
     `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `<ORQ_WT>/<ticket>` worktree, the dispatch worktree's current branch and only
     last from the text; an environment branch and a branch outside ORQ_REPOS never enter, if it exists in the orq repository. With no branch: log and `delivery` event with a warning, the coordinator adds it by hand.
@@ -3552,7 +3592,7 @@ def _orq_delivery(m, p):
                       "avisos": [f"delivery of ticket {t['num']} did not enter the integrator queue: {problem}; `orq integrate queue add <branch> {t['num']}` once the branch is right"]})
         return None
     ev = integrate_queue_add(branch, t["num"], head)
-    if head:
+    if head and prove_delivery:
         prove(p["taskId"], "delivery", head, "ok", ticket=t["num"], branch=branch, msg=m["id"])
     notice = f"orq: ticket {t['num']} entered the queue. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
     h = _integrator_terminal(read_events())
@@ -3759,22 +3799,26 @@ def _ingest_msg(m, since, already, titles, send=True):
     if m.get("type") != "worker_done" or _dt(m["created_at"]) <= since or m["id"] in already:
         return 0
     p = _payload(m)
-    _delivery_proof(m, p)
+    proof_ok = _delivery_proof(m, p, send)
     queued, delivery_ok = None, True
     try:
         worktree_ok = _delivery_worktrees(m, p, send)  # a commit outside the dispatch worktrees (ticket 352)
         delivery_ok = worktree_ok and _delivery_conformance(m, p, send)  # an incomplete delivery went back to the worker: it does not enter the integrator queue (ticket 201)
         if delivery_ok:
-            queued = None if _manual_delivery(m, p) else _orq_delivery(m, p)
-            _delivery_head_of_worktree(m, p)
-            if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
+            ticket = next((t for t in tickets() if t.get("task") == p.get("taskId")), None)
+            is_orq_ticket = bool(ticket and not _delivery_project(ticket, p.get("dispatchId")))
+            if proof_ok or is_orq_ticket:
+                queued = None if _manual_delivery(m, p) else _orq_delivery(m, p, prove_delivery=proof_ok)
+            if proof_ok:
+                _delivery_head_of_worktree(m, p)
+            if proof_ok and queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
                 red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         delivery_ok = False
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
-    pushed = _push_product_pr(m, p) if delivery_ok else False
+    pushed = _push_product_pr(m, p) if delivery_ok and proof_ok else False
     if pushed:
-        _release_delivered(m, p, queued)
+        _release_delivered(m, p, queued if proof_ok else None)
     if p.get("reportPath"):
         items = _report_items(p["reportPath"])
         alert = None
