@@ -5825,7 +5825,7 @@ AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:
 
 def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None):
     """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
-    marked `via: away` so `orq hook external` stays inert): the end time, the dispatch cap and the failure breaker. Already on, it keeps the original
+    marked `via: away`): the end time, the dispatch cap and the failure breaker. The budget releases no external action: `hook_external` applies AWAY_EXTERNAL whatever it holds. Already on, it keeps the original
     `ligada_em` and only re-arms the budget. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
     _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
     was = _dict(_cursor_ro().get("ausente"))
@@ -6139,7 +6139,7 @@ def night_lines(cur, events):
     has_stopped = next((e for e in reversed(_since_night(events, night, "noite_parou"))), None)
     cap = night.get("max_despachos")
     spent = f"{len(_since_night(events, night, 'despacho'))}/{cap if cap is not None else '∞'} dispatches, until {_hora_local(night['ate'])}"
-    if night.get("via") == "away":  # away keeps its own rules (ticket 126) and pushes after the audit: only the budget is added
+    if night.get("via") == "away":  # away keeps its own rules (ticket 126) and its external actions follow AWAY_EXTERNAL: only the budget is added
         return ["[orq away] Rules: park decisions with orq pend add (no AskUserQuestion), stop dispatching when the budget runs out.",
                 ("[orq away] Stopped dispatching: " + has_stopped["motivo"] + " (" + str(spent) + "); orq away on --until HH:MM re-arms it.") if has_stopped else ("[orq away] Budget: " + str(spent) + ", " + str(night.get("max_falhas") or NIGHT_FAILURES) + " consecutive failures close it.")]
     return ["[orq night] Rules: no AskUserQuestion (park the decision with orq pend add and carry on with what is independent), no push or merge, "
@@ -6338,7 +6338,7 @@ _EXT_GIT = r"^git((?:\s+-\S+(?:\s+\S+)?)*)\s+"  # the regexes run on one cmdnorm
 _EXT_GH = r"^gh(?:\s+-\S+(?:\s+\S+)?)*\s+"
 NIGHT_EXTERNAL = [  # (what is denied, a regex over a segment of the command)
     ("git push", re.compile(_EXT_GIT + r"push(?![-\w])")),
-    ("gh pr merge", re.compile(_EXT_GH + r"pr\s+merge(?![-\w])")),
+    ("gh pr merge", re.compile(_EXT_GH + r"pr(?:\s+(?:-R|--repo)(?:\s+|=)\S+)*\s+merge(?![-\w])")),  # `-R` also goes between `pr` and `merge`
     ("gh workflow run (deploy)", re.compile(_EXT_GH + r"workflow\s+run(?![-\w])")),
     ("git commit --no-verify", re.compile(_EXT_GIT + r"commit(?![-\w])[^;&|\n]*?\s(?:--no-verify|-[aeiopqsuvz]*n[a-zA-Z]*)(?=\s|$)")),
     ("orca worktree rm --force", re.compile(r"^orca\s+worktree\s+rm(?![-\w])[^;&|\n]*\s(?:--force|-f)(?![-\w])")),
@@ -6346,28 +6346,233 @@ NIGHT_EXTERNAL = [  # (what is denied, a regex over a segment of the command)
 _EXT_RESET = re.compile(_EXT_GIT + r"reset(?![-\w])[^;&|\n]*\s--hard(?![-\w])")
 
 
-def _external_denied(ev, cur):
-    """The name of the external action that the Bash of `ev` would perform with night mode on in `cur`, or None. `git reset --hard` only counts inside a
-    linked worktree (a worker's); on the main checkout it loses everyone's work. Only reads the cursor and, for reset, the local git."""
-    if (ev.get("tool_name") != "Bash" or not isinstance(ev.get("tool_input"), dict) or not isinstance(ev["tool_input"].get("command"), str)
-            or "--help" in ev["tool_input"]["command"]):
-        return None
-    segs = cmdnorm.segments(ev["tool_input"]["command"])
-    found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
-    m = None if found_item else next(filter(None, map(_EXT_RESET.search, segs)), None)
-    night = night_active(cur)
-    if not (found_item or m) or not night or night.get("via") == "away":  # away pushes after the audit (126, 139): only the budget is armed
-        return None
-    if found_item:
-        return found_item
+_NIGHT_RX = dict(NIGHT_EXTERNAL)
+_EXT_PUSH = re.compile(_EXT_GIT + r"push(?![-\w])(.*)")
+_EXT_MERGE = re.compile(_EXT_GH + r"pr((?:\s+(?:-R|--repo)(?:\s+|=)\S+)*)\s+merge(?![-\w])(.*)")
+PR_BASE_TIMEOUT = 1  # seconds for `gh pr view`: the hook's alarm and the harness both stop it at 3 s, and a hook that times out lets the command through
+
+AWAY_EXTERNAL = {  # the away policy (ticket 214), one line per action and destination: what may go out while the user is away. Any other external action is denied
+    "push-feature": ("allow", "git push of a branch that is none of the project's environments"),
+    "push-orq-main": ("allow", "git push of orq's production branch (main) with `orq audit-publication origin/main..main` clean"),
+    "pr-create": ("allow", "gh pr create"),
+    "merge-env-flag": ("allow", "gh pr merge into an environment before production whose `merge_allowed` flag is true in the project file"),
+    "push-env": ("deny", "git push to one of the project's environment branches"),
+    "push-force": ("deny", "git push --force, --force-with-lease or a +refspec"),
+    "push-other": ("deny", "git push with --delete, --all, --mirror, --tags, -c, a :refspec, a glob, a tag, another option or a destination orq cannot tell"),
+    "merge-env": ("deny", "gh pr merge into an environment before production unless the project's `merge_allowed` flag for that base is true"),
+    "merge-prod": ("deny", "gh pr merge into production or into a branch that is none of the project's environments"),
+    "merge-unknown": ("deny", "gh pr merge whose base `gh pr view` did not give within 1 s"),
+    "workflow": ("deny", "gh workflow run (deploy)"),
+    "no-verify": ("deny", "--no-verify on commit or push, or commit -n"),
+    "worktree-rm": ("deny", "orca worktree rm --force"),
+    "reset": ("deny", "git reset --hard outside a worker's linked worktree"),
+    "unjudged": ("deny", "an external action the guard could not judge (an error or the hook's time limit)"),
+}
+_PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress"}
+_MERGE_VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--subject", "-A", "--author-email", "--match-head-commit", "-R", "--repo", "-B", "--base"}
+
+
+def _git_place(ev, git_opts):
+    """The folder a git segment acts on: the event's cwd, moved by a `-C <dir>` among git's global options."""
     d = ev.get("cwd") or os.getcwd()
-    c = GIT_C_PLACE.search(m.group(1) or "")
-    if c:
-        d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
+    c = GIT_C_PLACE.search(git_opts or "")
+    return os.path.join(d, os.path.expanduser(c.group(1).strip("'\""))) if c else d
+
+
+def _reset_in_main_checkout(ev, m):
+    """Does the `git reset --hard` that `m` matched run on a main checkout? A linked worktree (a worker's) and a folder outside a repository do not."""
+    d = _git_place(ev, m.group(1))
     gd, common = ((_git(d, "rev-parse", "--absolute-git-dir", "--git-common-dir") or "").split() + ["", ""])[:2]
-    if not gd or os.path.realpath(gd) != os.path.realpath(os.path.join(d, common)):
-        return None  # outside a repository or in a linked worktree
-    return "git reset --hard in the main checkout"
+    return bool(gd) and os.path.realpath(gd) == os.path.realpath(os.path.join(d, common))
+
+
+def _flow_at(d):
+    """project_flow of the project that holds the folder `d` (or its main checkout); outside every project, the default branch of `d`'s remote is the only environment."""
+    ps = projects()
+    item_name = project_by_folder(ps, os.path.realpath(d)) or project_by_folder(ps, _repo_root(d) or os.path.realpath(d))
+    if item_name:
+        return project_flow(item_name)
+    b = default_branch(d)
+    return {"ambientes": [b], "producao": b}
+
+
+def _away_push(ev, m):
+    """The AWAY_EXTERNAL line of a `git push`: each destination (refspec, or the current branch) is checked against the environments of the project at that folder.
+    Whatever moves the destination out of sight (`-c`/`GIT_CONFIG_*`, a glob, a mirror remote, a push config, a source that is no local branch) is `push-other`."""
+    d = _git_place(ev, m.group(1))
+    try:
+        args = shlex.split(m.group(2), comments=True)
+    except ValueError:
+        return "push-other"
+    if ev.get("_dir_unknown") or re.search(r'[$`]|""', m.group(2)):  # `HEAD:$B`, `ma'i'n` (blanked to `ma""n`): the shell picks the destination, not the text
+        return "push-other"
+    args = _no_redirects(args)
+    flags, pos = [a for a in args if a.startswith("-")], [a for a in args if not a.startswith("-")]
+    if "--no-verify" in flags:
+        return "no-verify"
+    if any(f.startswith("--force") or re.fullmatch(r"-[a-z]*f[a-z]*", f) for f in flags) or any(r.startswith("+") for r in pos[1:]):
+        return "push-force"
+    if (not set(flags) <= _PUSH_FLAGS or re.search(r"(?:^|\s)(?:-c|--config-env|--git-dir|--work-tree|--namespace)\b", m.group(1) or "")
+            or re.search(r"GIT_CONFIG|GIT_DIR|GIT_WORK_TREE|GIT_NAMESPACE", ev["tool_input"]["command"])):
+        return "push-other"
+    remote, head = (pos[0] if pos else "origin"), (_git(d, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+    cfg = dict(line.split(" ", 1) for line in (_git(d, "config", "--get-regexp", r"^(remote\..*\.(push|mirror)|push\.default)$") or "").splitlines() if " " in line)
+    if cfg.get(f"remote.{remote}.mirror", "false") != "false" or not pos[1:] and (f"remote.{remote}.push" in cfg or cfg.get("push.default", "simple") not in ("simple", "current")):
+        return "push-other"
+    flow, line = _flow_at(d), "push-feature"
+    for spec in pos[1:] or ["HEAD"]:
+        src, colon, dst = spec.partition(":")
+        if src == "HEAD" and ev.get("_head_moves"):
+            return "push-other"
+        src = head if src == "HEAD" else re.sub(r"^(?:refs/)?heads/", "", src)
+        dst = re.sub(r"^(?:refs/)?heads/", "", dst) if colon else src
+        if "*" in spec or not src or src == "HEAD" or not dst or dst.startswith("refs/") or _git(d, "show-ref", "--verify", "-q", f"refs/heads/{src}") is None:
+            return "push-other"
+        if dst not in flow["ambientes"]:
+            continue
+        if dst != flow["producao"] or _repo_root(d) != ORQ_INSTALL:
+            return "push-env"
+        try:
+            clean = not audit_publication([f"{remote}/{dst}..{src}"], d)
+        except Exception:  # noqa: BLE001 - an audit that cannot run is not clean
+            clean = False
+        if not clean:
+            return "push-env"
+        line = "push-orq-main"
+    return line
+
+
+def _no_redirects(args):
+    """The tokens without shell redirections: `2>/dev/null`, `> out` (operator and its target), and the `2>` left of a `2>&1` that cmdnorm split at the `&`."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif m := re.match(r"\d*(?:>>?|<)", a):
+            skip = m.end() == len(a) and a[:1] in "<>"  # a bare `>` takes the next token; `2>` alone is the half of a `2>&1`
+        else:
+            out.append(a)
+    return out
+
+
+def _pr_base(d, selector, repo):
+    """The base branch of the PR that `gh pr merge` would merge (the selector, or the branch of `d`), from `gh pr view`. None when gh fails or takes over
+    PR_BASE_TIMEOUT: fail closed, with room for the rest of the hook under its 3 s ceiling."""
+    try:
+        r = subprocess.run([GH, "pr", "view", *([selector] if selector else []), "--json", "baseRefName", *(["--repo", repo] if repo else [])],
+                           cwd=d, capture_output=True, text=True, timeout=PR_BASE_TIMEOUT)
+        return json.loads(r.stdout).get("baseRefName") if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+        return None
+
+
+def _away_merge(ev, m):
+    """The AWAY_EXTERNAL line of a `gh pr merge`: its base comes from `--base`, otherwise from `gh pr view`. Only an environment before production whose `merge_allowed` flag is true passes; production never does."""
+    d = ev.get("cwd") or os.getcwd()
+    args = f"{m.group(1)} {m.group(2)}".split()  # cmdnorm already blanked quotes to `""`, so a token with `"`, `$` or a backtick is the shell's to decide
+    args = args[:next((k for k, a in enumerate(args) if a.startswith("#")), len(args))]
+    if ev.get("_dir_unknown"):
+        return "merge-unknown"
+    opts, selector, i = {}, None, 0
+    while i < len(args):
+        k, eq, v = args[i].partition("=")
+        if k in _MERGE_VALUE_FLAGS:
+            if not eq:
+                i += 1
+                v = args[i] if i < len(args) else ""
+            opts[k] = v
+        elif not k.startswith("-") and selector is None:
+            selector = args[i]
+        i += 1
+    if any(re.search(r'[$`"]', v or "") for v in (selector, opts.get("--base"), opts.get("-B"), opts.get("--repo"), opts.get("-R"))):
+        return "merge-unknown"
+    base = opts.get("--base") or opts.get("-B") or _pr_base(d, selector, opts.get("--repo") or opts.get("-R"))
+    if not base:
+        return "merge-unknown"
+    flow = _flow_at(d)
+    if base not in flow["ambientes"] or base == flow["producao"]:
+        return "merge-prod"
+    return "merge-env-flag" if flow.get("merge_allowed", {}).get(base) is True else "merge-env"
+
+
+def _away_line(seg, ev):
+    """The AWAY_EXTERNAL line of one command segment, or None when it is no external action."""
+    if m := _EXT_PUSH.search(seg):
+        return _away_push(ev, m)
+    if m := _EXT_MERGE.search(seg):
+        return _away_merge(ev, m)
+    for line, item_name in (("workflow", "gh workflow run (deploy)"), ("no-verify", "git commit --no-verify"), ("worktree-rm", "orca worktree rm --force")):
+        if _NIGHT_RX[item_name].search(seg):
+            return line
+    m = _EXT_RESET.search(seg)
+    return "reset" if m and _reset_in_main_checkout(ev, m) else None
+
+
+_KEEPS_HEAD = re.compile(_EXT_GIT + r"(?:status|log|diff|show|fetch|add|commit|rev-parse|tag|push|pull|merge|reset|restore|rm|mv|cherry-pick|"
+                         r"describe|ls-files|grep|blame|show-ref|reflog|shortlog|notes|clean|apply|am|revert|branch(?!\s.*(?:-[a-zA-Z]*[mM]|--move))|"
+                         r"stash(?!\s+branch)|worktree|gc|prune|fsck|count-objects|cat-file|ls-remote|ls-tree|merge-base|name-rev|rev-list|for-each-ref|symbolic-ref\s+(?:-q\s+|--short\s+)*HEAD$)(?![-\w])")
+
+
+def _moves_head(seg):
+    """Can the segment change what HEAD names before a later `git push ... HEAD` runs? An allow list: any git subcommand outside _KEEPS_HEAD, and `gh pr checkout`."""
+    return bool(re.match(_EXT_GIT, seg) and not _KEEPS_HEAD.match(seg)) or bool(re.match(_EXT_GH + r"pr\s+checkout\b", seg))
+
+
+def _asks_help(seg):
+    """Is the segment a `--help` read? Only a whole `--help` token before any `#` comment, and not the value of an option (`-t --help`, `-m --help`): those still run."""
+    toks = seg.split()
+    toks = toks[:next((k for k, t in enumerate(toks) if t.startswith("#")), len(toks))]
+    return any(t == "--help" and not toks[k - 1].startswith("-") for k, t in enumerate(toks) if k)
+
+
+def _external_denied(ev, cur):
+    """(policy, what) for the first external action in the Bash of `ev` that the policy in force in `cur` denies, or None. Away on: the AWAY_EXTERNAL line (ticket 214),
+    and any error or alarm while judging a segment denies it as `unjudged`. Night on without away: the NIGHT_EXTERNAL name, everything denied (ticket 39). Neither: None,
+    before any git or gh call. Reads the cursor, the local git, the project files and, for a `gh pr merge` with no `--base`, `gh pr view`."""
+    cmd = ev.get("tool_input", {}).get("command") if ev.get("tool_name") == "Bash" and isinstance(ev.get("tool_input"), dict) else None
+    if not isinstance(cmd, str):
+        return None
+    away, night = bool(_dict(_dict(cur).get("ausente"))), night_active(cur)
+    if not (away or night):
+        return None
+    segs = [s for s in cmdnorm.segments(cmd) if not _asks_help(s)]
+    if away:
+        subshell = bool(re.search(r"[()]|(?<!\|)\|(?!\|)|(?<![&>])&(?![&>])", cmdnorm.no_text(cmd)))  # parentheses, a pipe or a lone `&` run `cd` in a subshell
+        for seg in segs:
+            if m := re.match(r"(?:cd|pushd)(?:\s+(\S+))?$", seg):  # `cd w && git push`: the push runs in w, not in the event's cwd
+                unknown = subshell or m.group(1) == "-"  # `(cd w) && git push` runs in the cwd: with parentheses, orq cannot tell where it is
+                ev = {**ev, "_dir_unknown": True} if unknown else {**ev, "cwd": os.path.join(ev.get("cwd") or os.getcwd(), os.path.expanduser(m.group(1) or "~"))}
+                continue
+            if re.match(r"popd\b", seg):
+                ev = {**ev, "_dir_unknown": True}
+            if _moves_head(seg):  # the hook runs before the command: HEAD still names the old branch
+                ev = {**ev, "_head_moves": True}
+            if re.match(_EXT_GIT + r"(?:config|remote|branch\s.*(?:-u|--set-upstream-to|--track|-t)\b)", seg):  # the push config orq reads is the one before this runs
+                ev = {**ev, "_dir_unknown": True}
+            try:
+                line = _away_line(seg, ev)
+            except Exception:  # noqa: BLE001 - fail closed while away, the alarm's TimeoutError included
+                line = "unjudged"
+            if line and AWAY_EXTERNAL[line][0] == "deny":
+                return "away", line
+        return None
+    found_item = next((item_name for seg in segs for item_name, rx in NIGHT_EXTERNAL if rx.search(seg)), None)
+    if found_item:
+        return "night", found_item
+    m = next(filter(None, map(_EXT_RESET.search, segs)), None)
+    return ("night", "git reset --hard in the main checkout") if m and _reset_in_main_checkout(ev, m) else None
+
+
+def _park_denied(cmd, line):
+    """Records the command the away policy denied as a user pending item, once per command (its hash is the id), so the away report lists what was tried. Returns the id."""
+    pend_id = "externa-" + hashlib.sha1(cmd.encode()).hexdigest()[:8]
+    try:
+        pending_add(pend_id, "acao", f"away denied ({line}): {cmd.strip().splitlines()[0][:100]}", detail=AWAY_EXTERNAL[line][1], command=cmd)
+    except ValueError:
+        pass  # already recorded: the same command again
+    except Exception as e:  # the deny stands even when the pending file cannot be written
+        log(f"externas: pend add {pend_id}: {e}")
+    return pend_id
 
 
 def _full_suite(cmd):
@@ -6385,12 +6590,12 @@ def _full_suite(cmd):
 
 
 def hook_external(ev, run):
-    """PreToolUse of Bash, in every session (workers included): with night mode on it denies push, PR merge, deploy, commit without hook,
-    `orca worktree rm --force` and `git reset --hard` on the main checkout. The message says to park the work and how to turn it off. When off, nothing changes.
-    Night or not, it warns a worker that runs the whole suite (ticket 328) and any worker_done that leaves with no `orq check-delivery` passing on the current report (ticket 329)."""
+    """PreToolUse of Bash, in every session (workers included). Away on: denies what the AWAY_EXTERNAL table denies, cites its line and records the command as a pending
+    item. Night on without away: denies push, PR merge, deploy, commit without hook, `orca worktree rm --force` and `git reset --hard` on the main checkout. Neither: nothing.
+    In any case it warns a worker that runs the whole suite (ticket 328) and any worker_done that leaves with no `orq check-delivery` passing on the current report (ticket 329)."""
     cur = _cursor_ro()
-    item_name = _external_denied(ev, cur)
-    if not item_name:
+    found = _external_denied(ev, cur)
+    if not found:
         if _dict(cur.get("papeis")).get(ev.get("session_id") or "") == "worker" and _full_suite(_dict(ev.get("tool_input")).get("command") or ""):
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": f"{MARK} the whole test_orq.py takes minutes and competes with the other "
                     "workers for CPU: run `orq test --affected` (the tests your diff touches); the integrator runs the full suite (notice, nothing was blocked)."}}
@@ -6399,8 +6604,15 @@ def hook_external(ev, run):
                 f"{MARK} this worker_done of {d} goes out with no passing `orq check-delivery` on the current report: if the `## Conformance` lines are incomplete, orq sends the delivery back "
                 "and Orca has already revoked this dispatch's capability. Run `orq check-delivery`, fix what it lists, then send the worker_done (notice, nothing was blocked).")}}
         return None
-    reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
-              "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
+    policy, item_name = found
+    if policy == "night":
+        reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
+                  "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
+    else:
+        pend_id = _park_denied(ev["tool_input"]["command"], item_name)
+        reason = (f"{MARK} away mode: line `{item_name}` of the away policy (AWAY_EXTERNAL) denies it: {AWAY_EXTERNAL[item_name][1]}. It is already in the user's pending items "
+                  f"as `{pend_id}`; park any other decision with `orq pend add` and carry on with what is independent. Allowed while away: push of a feature branch, `gh pr create`, "
+                  "`gh pr merge` into an environment before production, push of orq's main once `orq audit-publication origin/main..main` is clean.")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
 
 
@@ -11803,13 +12015,13 @@ def _file_tests(v):
 
 
 def projects():
-    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "erro"}}.
+    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "merge_allowed", "erro"}}.
 
     Fairness between projects in the dispatch queue (ticket 344): `priority_base` (1 to 3: the queue item inherits `min(its priority, priority_base)`), `reserve_slots` (machine slots only
     this project uses while it has work) and `max_slots` (live workers of the project at the same time); each one comes as None when absent or of the wrong type.
 
     Only `repo` is required; a missing `harness` counts as claude and `group_name` only groups the listing. `environments` is the project's ordered list `[{"branch", "production"?}]`
-    (the production one is the one marked, otherwise the last) and `flow` is `promocao` or `direto`; without the `environments` block it comes as None and the remote's default applies
+    (the production one is the one marked, otherwise the last), `merge_allowed` is the away flag `{branch: true}` that lets `gh pr merge` into that environment pass (ticket 322; only a literal `true` counts, default none) and `flow` is `promocao` or `direto`; without the `environments` block it comes as None and the remote's default applies
     (`project_flow`). `e2e_queue` is the folder of the project's E2E queue (`e2e_queue()`; without it the project shows no queue) and `transcritos` the folder of the
     coordinator's transcripts (`transcript_dirs()`; without it the one Claude Code names from `repo: path:` applies). A file that is unreadable, has no `repo`, has a harness orq does not dispatch or has malformed environments stays in the list with `error`
     (`orq projects` shows the reason) and is never chosen on its own."""
@@ -11833,6 +12045,7 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
+                         "merge_allowed": {b: v for b, v in d["merge_allowed"].items() if v is True} if isinstance(d.get("merge_allowed"), dict) else {},
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
                          "tests": _file_tests(d.get("tests")),
@@ -11900,7 +12113,8 @@ def project_flow(item_name):
     environment, the default branch of the repo's remote (the project folder, or the cwd), with a direct flow; `declarado` says which of the two."""
     d = projects().get(item_name) or {}
     if d.get("ambientes") and not d.get("erro"):
-        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False)}
+        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False),
+                "merge_allowed": d["merge_allowed"]}
     default = default_branch((d.get("repo") and repo_folder(d["repo"])) or os.getcwd())
     return {"ambientes": [default], "producao": default, "fluxo": "direto", "declarado": False}
 

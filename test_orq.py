@@ -7322,6 +7322,190 @@ def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
     _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {}})
     assert _external(a, "python3 test_orq.py") is None, "the coordinator and the integrator's script are not warned"
 
+# ---- orq hook externas (away mode, ticket 214) ----
+
+def _away_project(a, merge_allowed=None):
+    """Away mode on and a promotion project (development, staging, main as production) holding the test folder, with the `merge_allowed` flag when given."""
+    os.makedirs(a.home, exist_ok=True)
+    _away_on(a.home)
+    _project(a, "app", {"repo": "path:" + a.tmp.name, "environments": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "production": True}], "flow": "promocao",
+                        **({"merge_allowed": merge_allowed} if merge_allowed is not None else {})})
+
+
+def _pend_ids(a):
+    return [i["id"] for i in json.load(open(os.path.join(a.tmp.name, "pendencias.json")))["itens"]]
+
+
+def _away_repo(a):
+    """A repository inside the project folder with the branches main, staging and feat/x and the tag v1.0; returns its path."""
+    r = os.path.join(a.tmp.name, "app")
+    g = lambda *x: subprocess.run(["git", "-C", r, *x], check=True, capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",  # noqa: E731
+                                                                                             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    os.makedirs(r)
+    g("init", "-q", "-b", "main")
+    g("commit", "-q", "--allow-empty", "-m", "x")
+    g("branch", "staging"), g("tag", "v1.0"), g("checkout", "-q", "-b", "feat/x")
+    return r
+
+
+def test_away_external_denies_merge_into_production_and_force_push_and_allows_the_table():
+    a = Env(run="run_a")
+    _away_project(a, {"development": True, "staging": True})
+    r = _away_repo(a)
+    for cmd, line in (("gh pr merge 12 --base main", "merge-prod"), ("gh pr merge 12 --base feat/y", "merge-prod"), ("gh pr -R acme/app merge 12 --base main", "merge-prod"),
+                      ("git push --force origin feat/x", "push-force"), ("rtk git push --force-with-lease", "push-force"), ("git push origin +feat/x", "push-force"),
+                      ("git push --force origin HEAD:main # --help", "push-force"), ("git push origin main", "push-env"), ("git push origin feat/x:staging", "push-env"),
+                      ("git push origin feat/x:heads/main", "push-env"), ("git push origin feat/x:refs/heads/main", "push-env"), ("git push origin :feat/x", "push-other"),
+                      ("git push --delete origin feat/x", "push-other"), ("git push origin refs/heads/*:refs/heads/*", "push-other"), ("git push origin v1.0", "push-other"),
+                      ("git -c remote.origin.push=+HEAD:refs/heads/main push origin", "push-other"), ("GIT_CONFIG_COUNT=1 git push origin feat/x", "push-other"),
+                      ("git push --no-verify origin feat/x", "no-verify"), ("gh workflow run deploy.yaml", "workflow"), ("git commit -anm x", "no-verify"),
+                      ("orca worktree rm --worktree x --force --run-hooks", "worktree-rm"), ("cd x && git push", "push-other"), ("git checkout main && git push", "push-other"), ("git branch -M main && git push origin HEAD", "push-other"),
+                      ("gh pr checkout 12 && git push", "push-other"), ("gh pr merge 12 --squash -t --help --base main", "merge-prod"),
+                      ("git commit --no-verify -m --help", "no-verify"), ("env -C /x git push --force origin HEAD:main", "push-force"),
+                      (f"env -C {a.tmp.name} git push origin main", "push-other"), ("git --git-dir=/x/.git push origin feat/x", "push-other"),
+                      ("GIT_DIR=/x/.git git push origin feat/x", "push-other"), (f"(cd {r}) && git push origin feat/x", "push-other"),
+                      ("pushd /x && popd && git push origin feat/x", "push-other"), ("git stash branch staging && git push origin HEAD", "push-other"),
+                      ("timeout 60 git push --force origin HEAD:main", "push-force"), ("time -p git push --force origin HEAD:main", "push-force"),
+                      ("nice git push --force origin HEAD:main", "push-force"), ("timeout -s KILL 5 gh pr merge 12 --base main", "merge-prod"),
+                      ("git rebase origin/staging staging && git push origin HEAD", "push-other"), ("git config remote.origin.mirror true && git push origin feat/x", "push-other"),
+                      ("git remote set-url --push origin x && git push origin feat/x", "push-other"), (f"cd {r} | true && git push origin feat/x", "push-other"),
+                      (f"cd {r} & git push origin feat/x", "push-other"), ("git push origin 2>&1 HEAD:main", "push-env"),
+                      ("git push origin 2>&1 --force feat/x", "push-force"), ("git push origin &>log HEAD:main", "push-env"), ("git push origin >&log HEAD:main", "push-env"),
+                      (">/dev/null git push --force origin HEAD:main", "push-force"), ("git status && 2>/dev/null git push origin HEAD:main", "push-env"),
+                      ("true &&>/dev/null git push --force origin HEAD:main", "push-force"), ("> out git push origin HEAD:main", "push-env"),
+                      ("git push origin >|log HEAD:main", "push-env"), (">|log git push --force origin HEAD:main", "push-force"),
+                      ("\\git push --force origin HEAD:main", "push-force"), ("/usr/bin/git push --force origin HEAD:main", "push-force"),
+                      ("/opt/homebrew/bin/gh pr merge 12 --base main", "merge-prod"), ("B=main; git push origin HEAD:$B", "push-other"),
+                      ("git push origin HEAD:ma'i'n", "push-other"), ("gh pr merge 12 --base \"$B\"", "merge-unknown"), ("gh pr merge $PR --squash", "merge-unknown")):
+        out = _external(a, cmd, cwd=r)
+        assert out and out["permissionDecision"] == "deny", cmd
+        assert f"line `{line}`" in out["permissionDecisionReason"] and "orq pend add" in out["permissionDecisionReason"], (cmd, out["permissionDecisionReason"])
+    for cmd in ("git push -u origin feat/x", "git push", "git push origin HEAD", "git push origin feat/x:feat/x", "gh pr create --base development --fill",
+                "gh pr merge 12 --base development --squash", "gh pr merge 12 --base=staging", "git status", "gh pr view 12", "git push --help", f"cd {r} && git push -u origin feat/x", "git add -A && git commit -m x && git push origin HEAD", f"cd {r} || exit 1; git push -u origin feat/x 2>&1", "git push origin feat/x 2>/dev/null", "git push origin feat/x > out.log", 'gh pr merge 12 --base development -t "feat: x" -b "body"'):
+        assert _external(a, cmd, cwd=r) is None, cmd
+    subprocess.run(["git", "-C", r, "config", "push.default", "upstream"], check=True)
+    out = _external(a, "git push", cwd=r)
+    assert out and "line `push-other`" in out["permissionDecisionReason"], "push.default upstream may point anywhere"
+    _night(a)
+    _away_on(a.home)
+    assert _external(a, "gh pr merge 12 --base development", cwd=r) is None, "away on top of night: the table rules"
+
+
+def test_away_external_merge_into_an_environment_is_denied_unless_the_project_flag_allows_that_base():
+    for flag, cmd, line in ((None, "gh pr merge 12 --base development", "merge-env"), (None, "gh pr merge 12 --base staging --squash", "merge-env"),
+                            ({"development": False, "staging": False}, "gh pr merge 12 --base development", "merge-env"),
+                            ({"development": True, "staging": False}, "gh pr merge 12 --base staging", "merge-env"),
+                            ({"development": "true", "staging": 1}, "gh pr merge 12 --base development", "merge-env"),
+                            ({"development": "true", "staging": 1}, "gh pr merge 12 --base staging", "merge-env"),
+                            ({"main": True}, "gh pr merge 12 --base main", "merge-prod"), ({"development": True, "staging": True, "main": True}, "gh pr merge 12 --base main", "merge-prod"),
+                            ({"feat/y": True}, "gh pr merge 12 --base feat/y", "merge-prod"), (["development"], "gh pr merge 12 --base development", "merge-env")):
+        a = Env(run="run_a")
+        _away_project(a, flag)
+        out = _external(a, cmd)
+        assert out and out["permissionDecision"] == "deny", (flag, cmd)
+        assert f"line `{line}`" in out["permissionDecisionReason"], (flag, cmd, out["permissionDecisionReason"])
+    for flag, cmd in (({"development": True}, "gh pr merge 12 --base development --squash"), ({"development": False, "staging": True}, "gh pr merge 12 --base=staging")):
+        a = Env(run="run_a")
+        _away_project(a, flag)
+        assert _external(a, cmd) is None, (flag, cmd)
+    a = Env(run="run_a")  # without --base the base comes from gh, and the flag is read for that base
+    _away_project(a, {"staging": True})
+    _gh(a)
+    _pr(a, PR1, base="staging")
+    _pr(a, PR2, base="development")
+    assert _external(a, f"gh pr merge {PR1} --squash") is None
+    out = _external(a, f"gh pr merge {PR2} --squash")
+    assert out and "line `merge-env`" in out["permissionDecisionReason"]
+
+
+def test_away_external_quoted_text_and_heredoc_do_not_trigger():
+    a = Env(run="run_a")
+    _away_project(a)
+    for cmd in ['git commit -m "fix: never git push --force or gh pr merge --base main"', "echo 'git push origin main'", "git commit -F - <<'EOF'\nfeat: x\ngit push --force\nEOF"]:
+        assert _external(a, cmd) is None, cmd
+
+
+def test_away_external_merge_without_base_asks_gh_and_denies_when_it_fails():
+    a = Env(run="run_a")
+    _away_project(a, {"staging": True})
+    _gh(a)
+    _pr(a, PR1, base="staging")
+    _pr(a, PR2, base="main")
+    assert _external(a, f"gh pr merge {PR1} --squash --delete-branch") is None
+    out = _external(a, f"gh pr merge {PR2} --squash")
+    assert out and "line `merge-prod`" in out["permissionDecisionReason"]
+    out = _external(a, "gh pr merge https://github.com/acme/app/pull/9 -t x")
+    assert out and "line `merge-unknown`" in out["permissionDecisionReason"], "gh failed: fail closed"
+    calls = [json.loads(x) for x in open(os.path.join(a.fake, "gh.log"))]
+    assert calls[0][:3] == ["pr", "view", PR1] and "baseRefName" in calls[0], calls
+
+
+def test_away_external_pushes_orq_main_only_with_a_clean_audit():
+    a = Env(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    _away_on(a.home)
+    t = a.tmp.name
+    origin, repo = os.path.join(t, "origin.git"), os.path.join(t, "orq-clone")
+    terms = os.path.join(t, "termos.txt")
+    open(terms, "w").close()
+    git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    g = lambda *x, **env: subprocess.run(["git", *x], check=True, capture_output=True, env={**git_env, **env})  # noqa: E731
+    g("init", "-q", "--bare", "-b", "main", origin)
+    g("clone", "-q", origin, repo)
+    g("-C", repo, "commit", "-q", "--allow-empty", "-m", "init")
+    g("-C", repo, "push", "-q", "origin", "main")
+    g("-C", repo, "commit", "-q", "--allow-empty", "-m", "feat: clean")
+    a.env.update({"ORQ_INSTALL": repo, "ORQ_AUTOR": "t@t", "ORQ_TERMOS": terms})
+    assert _external(a, "git push origin main", cwd=repo) is None, "orq main with a clean audit"
+    assert _external(a, "git push", cwd=repo) is None, "the current branch is main"
+    g("-C", repo, "commit", "-q", "--allow-empty", "-m", "feat: other author", GIT_AUTHOR_EMAIL="x@x")
+    out = _external(a, "git push origin main", cwd=repo)
+    assert out and "line `push-env`" in out["permissionDecisionReason"], "audit red"
+    a.env["ORQ_INSTALL"] = t
+    g("-C", repo, "reset", "-q", "--hard", "HEAD~1")
+    out = _external(a, "git push origin main", cwd=repo)
+    assert out and "line `push-env`" in out["permissionDecisionReason"], "main of a repository that is not orq"
+
+
+def test_away_external_parks_each_denied_command_once():
+    a = Env(run="run_a")
+    _away_project(a)
+    before = _pend_ids(a)
+    for cmd in ("gh pr merge 12 --base main", "gh pr merge 12 --base main", "git push --force"):
+        _external(a, cmd)
+    new = [i for i in _pend_ids(a) if i not in before]
+    assert len(new) == 2 and all(i.startswith("externa-") for i in new), new
+    item = next(i for i in json.load(open(os.path.join(a.tmp.name, "pendencias.json")))["itens"] if i["id"] == new[0])
+    assert item["tipo"] == "acao" and item["comando"] == "gh pr merge 12 --base main" and "merge-prod" in item["titulo"], item
+    assert new[0] in _external(a, "gh pr merge 12 --base main")["permissionDecisionReason"]
+
+
+def test_away_external_night_budget_armed_by_away_does_not_free_a_merge_into_an_environment():
+    a = Env(run="run_a")
+    _away_project(a)  # no merge_allowed
+    _night(a, via="away", max_despachos=5)  # the budget `away on` arms (ticket 213)
+    _away_on(a.home)
+    for cmd, line in (("gh pr merge 12 --base development --squash", "merge-env"), ("gh pr merge 12 --base main", "merge-prod"), ("gh workflow run deploy.yaml", "workflow")):
+        out = _external(a, cmd)
+        assert out and out["permissionDecision"] == "deny" and f"line `{line}`" in out["permissionDecisionReason"], (cmd, out)
+    assert _external(a, "gh pr create --base development --fill") is None
+    a = Env(run="run_a")
+    _away_project(a, {"development": True})
+    _night(a, via="away", max_despachos=5)
+    _away_on(a.home)
+    assert _external(a, "gh pr merge 12 --base development --squash") is None, "the project flag frees it, the budget does not"
+
+
+def test_night_external_without_away_keeps_denying_everything_and_parks_nothing():
+    a = Env(run="run_a")
+    _night(a)
+    before = _pend_ids(a)
+    for cmd in ("git push -u origin feat/x", "gh pr merge 12 --base development", "gh pr -R acme/app merge 12"):
+        out = _external(a, cmd)
+        assert out and "night mode" in out["permissionDecisionReason"] and "orq night off" in out["permissionDecisionReason"], cmd
+    assert _pend_ids(a) == before
+
+
 def _no_git_env(a, **env):
     """Removes from the test environment the git variables the developer's session may have (GIT_CONFIG_*, GIT_TERMINAL_PROMPT)."""
     for k in [k for k in a.env if k.startswith("GIT_CONFIG_") or k == "GIT_TERMINAL_PROMPT"]:
@@ -7446,11 +7630,15 @@ def test_ticket213_noite_ligar_with_away_on_replaces_the_state_without_duplicati
     assert "noite" not in _cursor(a)
 
 
-def test_ticket213_external_hook_stays_inert_with_only_away_on():
+def test_ticket213_away_on_alone_arms_the_budget_and_the_away_table_still_rules_the_external_actions():
     a = Env(run="run_a")
     a.orq("away", "on")
-    for cmd in EXTERNAL_COMMANDS:
-        assert _external(a, cmd) is None, cmd
+    assert _cursor(a)["noite"]["via"] == "away"
+    for cmd, line in (("gh workflow run deploy.yaml", "workflow"), ("git commit --no-verify -m x", "no-verify"), ("gh pr merge 12 --squash", "merge-unknown"),
+                      ("orca worktree rm --worktree x --force --run-hooks", "worktree-rm")):
+        out = _external(a, cmd)
+        assert out and "away mode" in out["permissionDecisionReason"] and f"line `{line}`" in out["permissionDecisionReason"], (cmd, out)
+    assert _external(a, "gh pr create --fill") is None
 
 
 def test_ticket213_away_dispatch_starts_the_worker_without_git_prompt():

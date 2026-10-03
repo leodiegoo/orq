@@ -277,9 +277,33 @@ orq doctor away            # the preflight alone: turns nothing on, exits 1 on a
 
 With it on: the Stop hook logs each reply and refreshes the digest; the AskUserQuestion guard denies the box and points to `orq pend add --type decision` (park the decision, keep going on what does not depend on it); `orq ask` builds the decision page but returns at once; the manager types notices into the coordinator whenever it is stopped (with it off, only when its prompt box is empty, ticket 182); and the Stop hook blocks the end of a turn (at most 3 times in 30 minutes) while there is work that needs no user. The Stop that ends a turn records `coordenador_parou` (motive `trabalho_esperando`, `esperando_usuario` or `sem_trabalho`, computed from orq's files); the user's next prompt or a notice typed by the manager closes the interval. `orq away off` prints the away report (decisions first; then the coordinator's stops longer than 10 minutes with their motive, and the morning card's dispatch stop reasons, dirty worktrees, unpushed branches and commands to paste) and saves it to `digest/ausencia.md` and `$ORQ_RESUMOS/<date>-ausencia.md` (default `./.scratch/resumos`; the file names keep their Portuguese spelling). A bare `/away` toggles. `statusline.sh` adds `away since HH:MM` to the first HUD line while it is on. See `docs/design.md`, "Digest and away mode".
 
-Away on also arms the night budget, so an unattended night is never unbounded: `--until` defaults to the next 08:00 local, `--max-failures` to 3, and `--max-dispatches` to no cap. `orq dispatch` refuses past the end, at the cap or after N failures in a row, parks "away: stopped dispatching: <reason>" as a decision (once per arming; `orq away off` lists it), and workers start with `GIT_TERMINAL_PROMPT=0` and `commit.gpgsign=false`. `orq away on --until HH:MM` re-arms it; `orq away off` disarms both. The external-action guard stays off under away alone (away pushes after the audit); `orq night on` turns it on.
+Away on also arms the night budget, so an unattended night is never unbounded: `--until` defaults to the next 08:00 local, `--max-failures` to 3, and `--max-dispatches` to no cap. `orq dispatch` refuses past the end, at the cap or after N failures in a row, parks "away: stopped dispatching: <reason>" as a decision (once per arming; `orq away off` lists it), and workers start with `GIT_TERMINAL_PROMPT=0` and `commit.gpgsign=false`. `orq away on --until HH:MM` re-arms it; `orq away off` disarms both. The budget limits dispatches and failures and releases no external action: what may go out under away is decided by the `AWAY_EXTERNAL` table below.
 
-For a bounded unattended stretch without away, night mode adds a budget: `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]`. `orq dispatch` refuses past the end time, at the dispatch ceiling or after N failures in a row; push, PR merge, deploy and `--no-verify` are denied by the external-action guard; `orq night off` frees it. `orq summary --night` prints the morning card.
+For a bounded unattended stretch, night mode adds a budget: `orq night on --until HH:MM [--max-dispatches N] [--max-failures 3]`. `orq dispatch` refuses past the end time, at the dispatch ceiling or after N failures in a row; push, PR merge, deploy and `--no-verify` are denied by the external-action guard (with away also on, its table applies instead); `orq night off` frees it. `orq summary --night` prints the morning card.
+
+#### External-action guard
+
+`orq hook externas` (PreToolUse on Bash, every session, workers included) picks the policy from `cursor.json`. Night mode on without away denies every push, PR merge, deploy and `--no-verify`. Away on applies the `AWAY_EXTERNAL` table in `orqlib.py`, a list of what may go out, one line per action and destination; anything else external is denied:
+
+| Line | Verdict | What |
+|---|---|---|
+| `push-feature` | allow | `git push` of a branch that is none of the project's environments |
+| `push-orq-main` | allow | `git push` of orq's production branch (`main`) when `orq audit-publication origin/main..main` is clean |
+| `pr-create` | allow | `gh pr create` |
+| `merge-env-flag` | allow | `gh pr merge` into an environment before production whose `merge_allowed` flag is `true` in the project file |
+| `push-env` | deny | `git push` to any other environment branch of the project |
+| `push-force` | deny | `git push --force`, `--force-with-lease` or a `+refspec` |
+| `push-other` | deny | `git push --delete`, `--all`, `--mirror`, `--tags`, `-c`, `--git-dir`, a `:refspec`, a glob, a tag, another option, or a destination orq cannot tell (after `popd`, a subshell `cd`, or a `HEAD` push after a command that may switch branch) |
+| `merge-env` | deny | `gh pr merge` into an environment before production (e.g. `development`, `staging`) when the project's `merge_allowed` for that base is not `true`: the default |
+| `merge-prod` | deny | `gh pr merge` into production (e.g. `main`) or into a branch that is no environment |
+| `merge-unknown` | deny | `gh pr merge` with no `--base` whose base `gh pr view` did not give within 1 s |
+| `workflow` | deny | `gh workflow run` (deploy) |
+| `no-verify` | deny | `--no-verify` on commit or push, or `commit -n` |
+| `worktree-rm` | deny | `orca worktree rm --force` |
+| `reset` | deny | `git reset --hard` outside a worker's linked worktree |
+| `unjudged` | deny | an external action the guard could not judge (an error, or the hook's 3 s limit) |
+
+The environments come from the project file that holds the folder (`environments`). Merging into one is the user's: the project file's `merge_allowed` (`{"development": false, "staging": false}`) frees `gh pr merge` per base, only a literal `true` counts, and a project without the key (every existing one) frees none. Production never merges, flag or not; outside every project, the remote's default branch is the only one. The deny reason cites the line, and the command goes to the pending list once (id `externa-<hash>`, type `acao`, the command in `comando`), so the away report lists what was tried. The night budget (`away on` arms it, `night on --until` sets it) and this guard do not replace each other: the budget caps dispatches and failures and never lifts a line of the table; the table says what may go out and never depends on the budget. Neither mode on: nothing changes. See `docs/design.md`, "External-action guard".
 
 ### Reminders (`orq remind`)
 
