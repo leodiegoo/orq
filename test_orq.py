@@ -11976,6 +11976,56 @@ def test_ticket323_group_obligation_shows_in_the_mate_prompt_and_not_in_the_coor
     assert "To do by you" not in (a.prompt(notice).stdout or "")
 
 
+# ---- ticket 339: the merge notice of a group's PR goes to the mate as a request ----
+
+def _group_merge(mate):
+    """The 02/10 case: a PR of a task dispatched by the group's Run enters main; the manager panel runs one round."""
+    a = _group_pr_env(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"runs": ["run_mate"], "turnos": [], "sessao": "sess-mate", "cwd": a.home, **mate}}, "ausente": {"ligada_em": "2026-10-01T12:00:00Z"}}, f)
+    a.set("terminals.json", ["term_ger", "term_coord", *([mate["terminal"]] if mate.get("terminal") else [])])
+    a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    e = _merge_main(a)
+    assert a.orq("gerente", "absorver").returncode == 0
+    return a, e
+
+
+def _mate_text(a):
+    return [_whole_notice(c[c.index("--text") + 1]) for c in _log(a, "send.log") if "--text" in c and c[c.index("--terminal") + 1] != "term_coord"]
+
+
+def test_ticket339_group_pr_merge_asks_the_mate_with_its_obligations_and_the_coordinator_sees_nothing():
+    a, e = _group_merge({"terminal": "term_mate"})
+    (text_value,) = _mate_text(a)
+    assert text_value.startswith("orq ▸ request p1") and "PR #1282 entered main" in text_value and f"Entry {e}" in text_value, text_value
+    for key_name in ("deploy", "comentario", "limpeza"):
+        assert key_name in text_value, (key_name, text_value)
+    assert "quave-one" in text_value and "errors Slack" in text_value and f"orq fulfill {e}" in text_value, text_value
+    assert not _sent_notices(a), "the coordinator is not typed the notice of the group's PR"
+    (p,) = [x for x in a.events() if x.get("tipo") == "mate_pedido"]
+    assert p["grupo"] == "orq" and p["corr"] == "p1", p
+    (closing,) = [x for x in a.events() if x.get("tipo") == "intake" and x.get("entrada") == e]
+    assert closing["efeito"] == "mate" and closing["ref"] == "p1", closing
+    assert orq_mod.open_entries(a.events()) == [] and "To do by you" not in (a.prompt("e agora?").stdout or "")
+    assert f"To do by you: {e} →" in _ctx(a.prompt("e agora?", ORQ_MATE="orq")), "the obligations stay the mate's"
+    assert a.orq("gerente", "absorver").returncode == 0 and len(_mate_text(a)) == 1, "once"
+
+
+def test_ticket339_group_pr_merge_wakes_a_sleeping_mate_instead_of_falling_back_to_the_coordinator():
+    a, e = _group_merge({"terminal": None, "dormiu": "2026-10-01T12:00:00Z"})
+    texts = _mate_text(a)
+    assert len(texts) == 2 and "secondmate of group orq" in texts[0] and texts[1].startswith("orq ▸ request p1") and f"Entry {e}" in texts[1], texts
+    assert not _sent_notices(a) and any(x.get("tipo") == "mate_acordou" for x in a.events())
+
+
+def test_ticket339_group_pr_merge_without_an_open_or_sleeping_mate_stays_with_the_coordinator():
+    a, e = _group_merge({"terminal": None})
+    assert not _mate_text(a) and not any(x.get("tipo") == "mate_pedido" for x in a.events())
+    (notice,) = _sent_notices(a)
+    assert f"Entry {e}" in notice[notice.index("--text") + 1], notice
+
+
 def _mate_requests(a, evs):
     _mate_alive(a)
     with open(os.path.join(a.home, "events.jsonl"), "w") as f:
