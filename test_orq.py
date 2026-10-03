@@ -10150,17 +10150,70 @@ def test_ticket51_dispatch_refuses_above_week_threshold_and_5h_window():
     a = Env(run="run_a")
     _usage51(a, week=93, five_h=10)
     r = _dispatch(a)
-    assert r.returncode == 1 and "plan usage" in r.stderr and "week at 93%" in r.stderr and "orq pause" in r.stderr, r
+    assert r.returncode == 0 and json.loads(r.stdout)["estado"] == "enfileirado" and "week at 93%" in r.stderr, r
     assert not _log(a, "started.log"), "nada foi despachado"
     _usage51(a, week=50, five_h=91)
     r = _dispatch(a)
-    assert r.returncode == 1 and "5 h window at 91%" in r.stderr and "window to turn over" in r.stderr, r
+    assert r.returncode == 0 and json.loads(r.stdout)["estado"] == "enfileirado", r
     assert not _log(a, "started.log")
     _usage51(a, week=90, five_h=89)
     assert _dispatch(a).returncode == 0, "abaixo dos limiares de pausa e de segurar o despacho sai"
     assert not [c for c in _log(a, "calls.log") if c[0] == "worker-start"][:0] and len(_log(a, "started.log")) == 1
 
 
+def test_ticket433_dispatch_queues_usage_holds_and_keeps_priority_exceptions():
+    a = Env(run="run_a")
+    _usage51(a, week=50, five_h=91)
+    held = _dispatch(a)
+    assert held.returncode == 0 and json.loads(held.stdout)["estado"] == "enfileirado", held.stderr or held.stdout
+    (entered,) = [e for e in a.events() if e["tipo"] == "despacho_fila" and e["op"] == "entrou"]
+    assert "plan usage" in entered["motivo"], entered
+    assert not _log(a, "started.log")
+
+    safe = Env(run="run_a")
+    _usage51(safe, week=50, five_h=91)
+    assert _dispatch(safe, "--prioridade", "1").returncode == 0, "P1 passes a 5 h hold"
+    assert len(_log(safe, "started.log")) == 1
+
+    paused = Env(run="run_a")
+    _usage51(paused, week=99, five_h=10)
+    held_p1 = _dispatch(paused, "--prioridade", "1")
+    assert held_p1.returncode == 0 and json.loads(held_p1.stdout)["estado"] == "enfileirado", held_p1.stderr or held_p1.stdout
+    assert not _log(paused, "started.log")
+
+
+def test_ticket433_next_without_user_skips_ticket_held_by_plan_usage():
+    from datetime import datetime, timezone
+    now_at = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    before = orq_mod.plan_usage
+    try:
+        orq_mod.plan_usage = lambda *args, **kwargs: {"semana": 50, "semana_reset": now_at.timestamp() + 3600,
+                                                       "cinco_h": 91, "cinco_h_reset": now_at.timestamp() + 3600}
+        ticket = _tk126("07")
+        result = orq_mod.next_without_user(tks=[ticket], agent_rows=[], integration={}, queue=[], events=[], cfg=orq_mod.machine_cfg(), without_push=0, now_at=now_at)
+        assert "ticket 07" not in (result or "") and "wait" in (result or "") and "10:00" in result, result
+    finally:
+        orq_mod.plan_usage = before
+
+
+def test_ticket433_manager_promotes_usage_held_item_after_window_clears():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    _usage51(a, week=50, five_h=91)
+    queued = _dispatch(a)
+    assert queued.returncode == 0 and json.loads(queued.stdout)["estado"] == "enfileirado", queued.stderr
+    a.orq("away", "on")
+    a.orq("gerente", "absorver")
+    (waiting,) = _read_state(os.path.join(a.home, "fila-despacho.json"))["itens"]
+    assert waiting["falhas"] == 0 and "plan usage" in waiting["motivo"], waiting
+    _usage51(a, week=50, five_h=10)
+    result = a.orq("gerente", "absorver")
+    assert result.returncode == 0, result.stderr
+    assert len(_log(a, "started.log")) == 1
+    events = a.events()
+    assert any(e["tipo"] == "despacho_fila" and e["op"] == "subiu" for e in events), events
+    assert not any(e["tipo"] == "despacho_fila" and e["op"] == "desistiu" for e in events), events
+    assert any("dispatch queue" in env[env.index("--text") + 1] and "started" in env[env.index("--text") + 1] for env in _log(a, "send.log")), _log(a, "send.log")
 def test_ticket51_manager_notifies_coordinator_once_per_level_and_window():
     a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
     _manager(a)
@@ -10329,11 +10382,12 @@ def test_ticket51_orq_pause_respects_swapped_priority():
 def test_ticket51_priority_1_passes_5h_window_but_not_week_pause():
     a = Env(run="run_a")
     _usage51(a, week=50, five_h=95)
-    assert _dispatch(a).returncode == 1
+    held = _dispatch(a)
+    assert held.returncode == 0 and json.loads(held.stdout)["estado"] == "enfileirado"
     assert _dispatch(a, "--prioridade", "1").returncode == 0, "urgente passa pela janela de 5 h"
     _usage51(a, week=95, five_h=10)
     r = _dispatch(a, "--prioridade", "1")
-    assert r.returncode == 1 and "week" in r.stderr, "a pausa da semana vale para todas"
+    assert r.returncode == 0 and json.loads(r.stdout)["estado"] == "enfileirado", "a pausa da semana vale para todas as prioridades"
 
 
 # ---------- ticket 52: question or permission stuck in the worker's terminal ----------
@@ -10694,7 +10748,7 @@ def test_ticket73_dispatch_checks_the_quota_of_the_chosen_harness():
     _usage51(a, week=40, five_h=10)
     _account73(a, codex_week=95)
     r = _dispatch(a, "--agente", "codex", "--modelo", "gpt-6-sol", "--effort", "low")
-    assert r.returncode != 0 and "Codex" in r.stderr and "95%" in r.stderr, r.stderr
+    assert r.returncode == 0 and json.loads(r.stdout)["estado"] == "enfileirado" and "Codex" in r.stderr and "95%" in r.stderr, r
     assert _dispatch(a).returncode == 0, "a cota do Claude segue livre"
     assert len(_log(a, "started.log")) == 1
 
@@ -14872,6 +14926,14 @@ def test_ticket126_stop_with_away_allows_stopping_without_unblocked_work():
     _tk105(a, "91", "Sem modelo", task="task_91")
     _tk105(a, "90", "Bloqueado", is_blocked="93", task="task_90", extra=MODEL105)
     _tk105(a, "89", "Em andamento", status="claimed", task="task_89", extra=MODEL105)
+    assert _stop126(a) == {}
+
+
+def test_ticket433_stop_with_away_allows_stopping_when_only_ticket_is_usage_held():
+    a = Env(run="run_a")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODEL105)
+    a.orq("away", "on")
+    _usage51(a, week=50, five_h=91)
     assert _stop126(a) == {}
 
 

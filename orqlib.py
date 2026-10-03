@@ -7654,13 +7654,26 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
         return stalled
     occupancy = {"vivos": {a["dispatch"]: a.get("modelo") for a in agent_rows if a.get("estado") in ANDA}}
     in_queue = {i.get("ticket") for i in queue}
+    quota_waits = []
     for t in sorted(tks, key=lambda t: (priority_of(events, t["task"], None, t["titulo"]), t["num"])):
         if t["status"] != STATUS_NEW or t["num"] in in_queue or any((by_num.get(b) or {}).get("status") != STATUS_CLOSED for b in t["blocked_by"]):
             continue
         if dispatch_wait(t, integration, events, without_push):
             continue
-        if priority_of(events, t["task"], None, t["titulo"]) < 3 and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"] and not machine_slot(t["modelo"], occupancy, cfg):
+        priority = priority_of(events, t["task"], None, t["titulo"])
+        project = projects().get(t.get("projeto"), {})
+        agent = project.get("harness") or "claude"
+        usage = plan_usage(now_at.timestamp() if isinstance(now_at, datetime) else now_at, agent)
+        level, reason, reset = usage_level(usage, now_at.timestamp() if isinstance(now_at, datetime) else now_at)
+        if level == "pausa" or (level == "segura" and priority != 1):
+            if reset:
+                quota_waits.append((reset, reason))
+            continue
+        if priority < 3 and t["modelo"] and t["effort"] in HARNESS[agent]["efforts"] and not machine_slot(t["modelo"], occupancy, cfg):
             return f"ticket {t['num']} ({_quote(t['titulo'], 50)}) is ready, unblocked and a slot is free: `orq dispatch --ticket {t['num']}`"
+    if quota_waits:
+        reset, _ = min(quota_waits)
+        return f"wait for the plan usage window to turn over at {datetime.fromtimestamp(reset).astimezone().strftime('%H:%M')}"
     if mate_to_open:
         return f"open the mate of group {mate_to_open[0]} ({len(mate_to_open[1])} ready tickets: {', '.join(mate_to_open[1])}): `orq mate open {mate_to_open[0]}`"
     return None
@@ -7730,6 +7743,8 @@ def away_blocker(events, now_at):
     if not away_enabled():
         return None
     next_one, pending = _work_without_user(events, now_at)
+    if next_one and next_one.startswith("wait for the plan usage window"):
+        return None
     cutoff = now_at - timedelta(minutes=AWAY_BLOCKER_MIN)
     if not next_one or sum(e.get("tipo") == "away_bloqueio" and e.get("motivo") == next_one and (_ts(e.get("ts")) or cutoff) > cutoff for e in events) >= AWAY_BLOCKERS:
         return None
@@ -9799,6 +9814,8 @@ def wake_stopped(now_at=None):
         return []
     events = read_events()
     reason, _ = _work_without_user(events, now_at)
+    if reason and reason.startswith("wait for the plan usage window"):
+        reason = None
     if not reason and (old_entries := obligations_to_chase(events, now_at)):
         reason = f"open obligation: {old_entries[0]['entrada']} {old_entries[0]['chave']} ({old_entries[0]['texto']})"
     file_path, ts = _path(WAKE_FILE), now_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -13953,11 +13970,18 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
     if _tickets_in_backlog():
         reconcile_backlog_tasks()
     priority = priority_level or priority_of(read_events(), tk and tk["task"], None, title)
-    usage_check(priority, agent=agent)
     request = _entry_text(entry)
     _adopt(run)
     if not coordinator_run(run):
         raise ValueError(f"the dispatch is for Run {run}, which the coordinator does not command: {bind_tip(run)}")
+    try:
+        usage_check(priority, agent=agent)
+    except ValueError as e:
+        if _draining or not str(e).startswith("plan usage"):
+            raise
+        usage_reason = str(e).split(";", 1)[0].removeprefix("plan usage").lstrip(": ")
+        return _enqueue_dispatch(f"plan usage: {usage_reason}", run, title, spec, model, effort,
+                                 worktree, name, base_branch, entry, tk, priority, agent, project, service)
     with _lock("dispatch.lock"):  # the checked slot and the worker-start form one step: parallel dispatches do not exceed the ceiling together
         reason = machine_bar(model, run=run, priority=priority, service=service, project=project, age_s=_age_s)
         if reason and _draining:
@@ -15165,7 +15189,13 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
     waiting = collections.Counter(_item_project(i) for i in item_list)
     for it in item_list:
         if it.get("nao_antes", 0) > now_at:
-            continue
+            if it.get("uso_motivo") or str(it.get("motivo") or "").startswith("plan usage:"):
+                level, _, _ = usage_level(plan_usage(now_at, it.get("agente") or "claude"), now_at)
+                if level == "pausa" or (level == "segura" and (it.get("prioridade") or 2) != 1):
+                    continue
+            else:
+                continue
+            it["nao_antes"] = 0
         if it["tipo"] == "retomada" and (it["dispatch"] in occupancy["vivos"] or it["dispatch"] not in occupancy["dispatched"]):
             dispatch_queue_rm(it["id"], "saiu", motivo="the dispatch already finished or already came back")
             line_list.append(f"queue: {it['titulo']} left (the dispatch already finished or already came back)")
@@ -15182,7 +15212,7 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
             continue
         try:
             line_list.append(_promoted_from_queue(it))
-            dispatch_queue_rm(it["id"], "subiu")
+            dispatch_queue_rm(it["id"], "subiu", fila_motivo=it.get("uso_motivo") or it.get("motivo"), agente=it.get("agente") or "claude")
             return line_list
         except NoSlot:
             continue
@@ -15195,7 +15225,8 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
                 _notify_abandoned(it, failures, e, cmd)
                 line_list.append(f"queue: {it['titulo']} left the queue after {failures} errors ({e}); dispatch it again by hand")
                 continue
-            _dispatch_queue_mut(lambda xs, it=it, failures=failures, held=held: [x.update(falhas=failures, nao_antes=now_at + WAIT_HELD_S if held else 0)
+            _dispatch_queue_mut(lambda xs, it=it, failures=failures, held=held, e=e: [x.update(falhas=failures, nao_antes=now_at + WAIT_HELD_S if held else 0,
+                                                                                  **({"uso_motivo": str(e)} if str(e).startswith("plan usage") else {}))
                                                                                       for x in xs if x["id"] == it["id"]])
             line_list.append(f"queue: {it['titulo']} is still waiting ({e})")
     return line_list
@@ -15657,6 +15688,16 @@ def usage_notify(now_at=None, agent="claude"):
     g = _manager_cfg()
     if not g or not g.get("coordenador"):
         return []
+    if away_enabled():
+        queue_key = "uso_fila_aviso" if agent == "claude" else f"uso_fila_aviso_{agent}"
+        queued_up = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho_fila" and e.get("op") == "subiu"
+                          and e.get("fila_motivo", "").startswith("plan usage:") and (e.get("agente") or "claude") == agent), None)
+        if queued_up and _cursor_ro().get(queue_key) != queued_up.get("id"):
+            text_value = f"orq: plan usage cleared enough for the dispatch queue; {queued_up.get('titulo') or 'a queued dispatch'} started."
+            if notify_coordinator(g["coordenador"], text_value) in ("enviado", "adiado"):
+                _cursor_mut(lambda c: c.__setitem__(queue_key, queued_up.get("id")))
+                append_event({"tipo": "uso_aviso", "op": "fila", "nivel": "ok", "motivo": text_value, **({"agente": agent} if agent != "claude" else {})})
+                return ["plan usage cleared: queued dispatch started, coordinator notified"]
     level, reason, reset = usage_level(plan_usage(now_at, agent), now_at)
     k = "uso_aviso" if agent == "claude" else f"uso_aviso_{agent}"
     if level in ("ok", "desconhecido"):
@@ -16526,7 +16567,7 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - an unreadable screen doesn't take down the panel; the next loop tries
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round(), *integrate_publish_round(), *integrator_lap()]
+        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *deliver_notices(), *remind_round(), *integrate_publish_round(), *integrator_lap()]
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
@@ -16557,6 +16598,10 @@ def manager_absorb():
         line_list += machine_round()
     except Exception as e:  # noqa: BLE001 - the dispatch queue doesn't take down the panel; the next loop tries
         log(f"fila de despacho: {type(e).__name__}: {e}")
+    try:
+        line_list += [*usage_notify(), *usage_notify(agent="codex")]
+    except Exception as e:  # noqa: BLE001 - a plan notice does not take down the panel; the next loop tries
+        log(f"uso do plano: {type(e).__name__}: {e}")
     try:
         line_list += wake_stopped()
     except Exception as e:  # noqa: BLE001 - the notice to the idle coordinator doesn't take down the panel; the next loop tries
