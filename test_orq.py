@@ -24824,6 +24824,70 @@ def test_ticket397_hook_ask_and_lavish_answer_closing_the_decision_release_the_h
     assert sorted(e["pend"] for e in a.events() if e["tipo"] == "ticket" and e.get("op") == "liberado") == ["dec-ask", "dec-lav"]
 
 
+def test_ticket443_recycle_worktree_checks_safety_resets_and_rotates_lease():
+    tmp = tempfile.TemporaryDirectory()
+    repo = pathlib.Path(tmp.name) / "repo"
+    repo.mkdir()
+    def git(*args):
+        return subprocess.run(["git", *map(str, args)], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.name", "Tester")
+    git("config", "user.email", "tester@example.com")
+    (repo / "tracked").write_text("base\n")
+    git("add", "tracked")
+    git("commit", "-qm", "base")
+    git("branch", "-M", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    base = "refs/remotes/origin/main"
+    wt = repo / "worker"
+    git("worktree", "add", "-b", "worker", str(wt), "main")
+    lease = "old-lease"
+    (wt / ".orq-lease-id").write_text(lease + "\n")
+    exclude = pathlib.Path(git("-C", str(wt), "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = wt / exclude
+    exclude.write_text("/.orq-lease-id\n")
+    with mock.patch.object(orqlib, "_processes", return_value=[{"pid": 91, "ppid": 1, "cwd": str(wt), "args": "node"}]):
+        refused = orqlib.recycle_worktree(str(wt), base, "next", lease)
+    assert not refused["ok"] and "process" in refused["reason"]
+    with mock.patch.object(orqlib, "_processes", return_value=[]):
+        (wt / "tracked").write_text("unintegrated\n")
+        subprocess.run(["git", "-C", str(wt), "add", "tracked"], check=True)
+        subprocess.run(["git", "-C", str(wt), "commit", "-qm", "unintegrated"], check=True)
+        refused = orqlib.recycle_worktree(str(wt), base, "next", lease)
+        assert not refused["ok"] and "unintegrated" in refused["reason"]
+        subprocess.run(["git", "-C", str(wt), "reset", "--hard", base], check=True, capture_output=True)
+
+    (wt / "dirty").write_text("unapproved")
+    refused = orqlib.recycle_worktree(str(wt), base, "next", lease)
+    assert not refused["ok"] and "unapproved" in refused["reason"]
+    (wt / "dirty").unlink()
+
+    (wt / "node_modules").mkdir()
+    (wt / "node_modules" / "keep").write_text("keep")
+    (wt / "web" / ".meteor" / "local" / "db").mkdir(parents=True)
+    (wt / "web" / ".meteor" / "local" / "db" / "data").write_text("discard")
+    (wt / "web" / ".meteor" / "local" / "cache").write_text("keep")
+    (wt / ".worktree.env").write_text("discard")
+    (wt / "outside-ignore").write_text("keep")
+    with open(exclude, "a") as f:
+        f.write("/node_modules/\n/outside-ignore\n/web/.meteor/local/\n/.worktree.env\n")
+    with mock.patch.object(orqlib, "_processes", return_value=[]):
+        done = orqlib.recycle_worktree(str(wt), base, "next", lease)
+    assert done["ok"], done
+    assert subprocess.run(["git", "-C", str(wt), "branch", "--show-current"], capture_output=True, text=True).stdout.strip() == "next"
+    assert (wt / "node_modules" / "keep").exists()
+    assert (wt / "web" / ".meteor" / "local" / "cache").exists()
+    assert not (wt / "web" / ".meteor" / "local" / "db").exists()
+    assert not (wt / ".worktree.env").exists()
+    assert (wt / "outside-ignore").exists()
+    assert done["lease_id"] != lease
+    with mock.patch.object(orqlib, "_processes", return_value=[]):
+        stale = orqlib.recycle_worktree(str(wt), base, "later", lease)
+    assert not stale["ok"] and "lease mismatch" in stale["reason"]
+    tmp.cleanup()
+
+
 def test_ticket397_doctor_backlog_lists_an_orphan_decision_hold_with_the_fix():
     a = _env_tk()
     _new(a, "Um")

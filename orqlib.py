@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import backlog
@@ -16088,6 +16089,81 @@ def terminate_worktree_processes(wt, wait_s=None, owned=None, all_cwd=False):
     if targets or rest:
         append_event({**ev, "op": "encerrar", "encerrados": res["encerrados"], "kill": res["kill"], "lista": _process_list(mine)})
     return res
+
+
+RECYCLE_DISCARD = (".worktree.env", "web/.meteor/local/db", ".scratch/PAUSE.md", ".scratch/HANDOFF.md",
+                   ".scratch/final-report.md", ".scratch/PAUSA.md", ".scratch/PASSAGEM.md",
+                   ".scratch/relatorio-final.md", ".eslintcache")
+RECYCLE_LEASE = ".orq-lease-id"
+
+
+def recycle_worktree(path, base, branch, lease_id=None):
+    """Safely prepare a released linked worktree for its next task; returns its new lease id.
+
+    Every refusal happens before destructive work. A caller must present the current lease id,
+    preventing a delayed release from recycling a worktree already handed to another worker.
+    """
+    root = os.path.realpath(path)
+    if not os.path.isfile(os.path.join(root, ".git")):
+        return {"ok": False, "reason": "not a linked worktree"}
+    lease_path = os.path.join(root, RECYCLE_LEASE)
+    try:
+        current_lease = open(lease_path, encoding="utf-8").read().strip()
+    except OSError:
+        return {"ok": False, "reason": "worktree has no lease"}
+    if not lease_id or lease_id != current_lease:
+        return {"ok": False, "reason": "lease mismatch"}
+    if subprocess.run([GIT, "check-ref-format", "--branch", branch], capture_output=True).returncode:
+        return {"ok": False, "reason": "invalid branch name"}
+    if _git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}") is not None:
+        return {"ok": False, "reason": "branch already exists"}
+    exclude = _git(root, "rev-parse", "--git-path", "info/exclude")
+    if not exclude:
+        return {"ok": False, "reason": "could not locate worktree exclude file"}
+    exclude = exclude.strip()
+    if not os.path.isabs(exclude):
+        exclude = os.path.join(root, exclude)
+    sweep = terminate_worktree_processes(root)
+    if sweep is None or sweep.get("recusado"):
+        return {"ok": False, "reason": "could not verify worktree processes"}
+    procs = _processes(include_all=True)
+    if procs is None or any(p.get("cwd") and _inside(p["cwd"], root) for p in procs):
+        return {"ok": False, "reason": "process remains in worktree"}
+    status = subprocess.run([GIT, "-C", root, "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True)
+    if status.returncode:
+        return {"ok": False, "reason": "could not inspect worktree"}
+    dirty = [line[3:] for line in status.stdout.splitlines() if line]
+    if any(name not in RECYCLE_DISCARD for name in dirty):
+        return {"ok": False, "reason": "worktree has unapproved changes"}
+    if _git(root, "merge-base", "--is-ancestor", "HEAD", base) is None:
+        return {"ok": False, "reason": "worktree has unintegrated commits"}
+    reset = subprocess.run([GIT, "-C", root, "read-tree", "--reset", "-u", base], capture_output=True, text=True)
+    if reset.returncode:
+        return {"ok": False, "reason": "could not reset worktree"}
+    clean = subprocess.run([GIT, "-C", root, "clean", "-fd"], capture_output=True, text=True)
+    if clean.returncode:
+        return {"ok": False, "reason": "could not clean worktree"}
+    for relative in RECYCLE_DISCARD:
+        target = os.path.join(root, relative)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        else:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+    switched = subprocess.run([GIT, "-C", root, "switch", "-c", branch], capture_output=True, text=True)
+    if switched.returncode:
+        return {"ok": False, "reason": "could not create next branch: " + switched.stderr.strip()}
+    new_lease = str(uuid.uuid4())
+    os.makedirs(os.path.dirname(exclude), exist_ok=True)
+    with open(exclude, "a+", encoding="utf-8") as f:
+        f.seek(0)
+        if RECYCLE_LEASE not in f.read().splitlines():
+            f.write(f"\n/{RECYCLE_LEASE}\n")
+    with open(lease_path, "w", encoding="utf-8") as f:
+        f.write(new_lease + "\n")
+    return {"ok": True, "lease_id": new_lease, "branch": branch}
 
 
 def sweep_notices(r, dispatch=None):

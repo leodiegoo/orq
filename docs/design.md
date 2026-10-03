@@ -672,6 +672,10 @@ Limits: the check sees only `orq pr open`; a PR created with `gh pr create` by h
 
 ## Integrating branches outside the live checkout (ticket 55)
 
+### Reusing a released worktree (ticket 443)
+
+`recycle_worktree(path, base, branch, lease_id)` keeps the directory and prepares a linked worktree for a later task. It fails closed in this order: verify the current lease, terminate only worker-owned processes and refuse if any process remains inside, reject tracked or untracked changes outside the fixed discard list, and require `HEAD` to be an ancestor of the base. It then uses `git read-tree --reset -u <base>` and `git clean -fd` (never `-x`), removes only the named discard paths, creates the requested branch, and writes a new UUID lease to ignored `.orq-lease-id`. A stale lease cannot recycle a worktree that has already been assigned again. The function is deliberately not connected to `limpar-mergeados` in this change.
+
 The live clone is the repository and the installation at once: the hooks, `orq` and the manager panel run whatever is checked out there. A `git merge` with open conflicts in it leaves `<<<<<<<` in `orqlib.py`, and then `orq` dies with a `SyntaxError` on every command, every worker's PreToolUse and PostToolUse hooks fail, and the panel and the digest stop.
 
 Two rules, one for each side of that failure:
