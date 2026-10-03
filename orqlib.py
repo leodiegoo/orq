@@ -3849,11 +3849,13 @@ def _pending_to_backlog(item):
 
 
 def _backlog_add(item):
-    """`add` + `hold` of a pending item. Without the hold it would be born without `until_at`: if it fails, the `add` is undone."""
+    """`add` + `hold` of a pending item (and of its ticket, ticket 397). Without the hold it would be born without `until_at`: if it fails, the `add` is undone."""
     title, body_text, (reason, kind, until_at) = _pending_to_backlog(item)
     backlog.cli(BACKLOG, "add", item["id"], title, "--kind", item["tipo"], "--repo", "pend", *(["--body", body_text] if body_text else []))
     try:
         backlog.cli(BACKLOG, "hold", item["id"], "--reason", reason, "--kind", kind, *(["--until", until_at] if until_at else []))
+        if item.get("ticket"):  # ticket 397: the ticket the decision bars goes on hold in the same step
+            backlog.cli(BACKLOG, "hold", f"t{item['ticket']}", "--reason", f"decisão {item['id']}", "--kind", "captain", *(["--until", until_at] if until_at else []))
     except backlog.BacklogError:
         backlog.cli(BACKLOG, "rm", item["id"])
         raise
@@ -4024,7 +4026,24 @@ def _validate_pending(id_, type_name, title, waiting=None, until_at=None, task=N
         raise ValueError("--task only applies to a decision (the gate blocks the task until the answer)")
 
 
-def pending_add(id_, type_name, title, detail=None, workstream=None, link=None, command=None, waiting=None, task=None, until_at=None, run=None):
+def _ticket_to_hold(ticket, type_name):
+    """Ticket 397: `pend add --ticket NN` ties a decision to the ticket it bars. Returns the number; refuses (before anything is written) anything but a decision, a backlog without tickets,
+    an unknown or not queued ticket, and one that is already on hold: the hold of someone else is never overwritten."""
+    if type_name != "decisao":
+        raise ValueError("--ticket only applies to a decision (the hold of the ticket lasts until the answer)")
+    if not (BACKLOG and _tickets_in_backlog()):
+        raise ValueError("--ticket needs the tickets in the backlog (ORQ_BACKLOG and ORQ_BACKLOG_TICKETS)")
+    i = _item_of_ticket(ticket)
+    if not i:
+        raise ValueError(f"ticket {ticket} is not in the backlog")
+    if i["estado"] != "queued":
+        raise ValueError(f"ticket {ticket} is not queued: only a queued ticket can be held back by a decision")
+    if backlog.active_hold(i):
+        raise ValueError(f"ticket {ticket} is already on hold ({i['hold']['motivo']}): release it first (tasks-axi unhold {i['id']})")
+    return i["id"][1:]
+
+
+def pending_add(id_, type_name, title, detail=None, workstream=None, link=None, command=None, waiting=None, task=None, until_at=None, run=None, ticket=None):
     """Appends a user pending item (panel format; `waiting` optional) and records the event.
 
     With `task`, the decision locks the task: creates the gate in Orca, in the task's Run (`run`, otherwise the coordinator's; default_run refuses the manager with
@@ -4032,6 +4051,7 @@ def pending_add(id_, type_name, title, detail=None, workstream=None, link=None, 
     """
     id_, title = (id_ or "").strip(), (title or "").strip()
     _validate_pending(id_, type_name, title, waiting, until_at, task)
+    ticket = _ticket_to_hold(ticket, type_name) if ticket else None
     gate = gate_run = None
     if task:
         run = default_run(run)
@@ -4055,7 +4075,7 @@ def pending_add(id_, type_name, title, detail=None, workstream=None, link=None, 
             if v:
                 item[k] = v
         item["desde"] = datetime.now().date().isoformat()
-        for k, v in (("link", link), ("comando", command), ("espera", waiting), ("ate", until_at), ("gate", gate), ("gate_run", gate_run), ("task", task)):
+        for k, v in (("link", link), ("comando", command), ("espera", waiting), ("ate", until_at), ("gate", gate), ("gate_run", gate_run), ("task", task), ("ticket", ticket)):
             if v:
                 item[k] = v
         item_list.append(item)
@@ -4192,7 +4212,28 @@ def pending_done(id_, answer_text=None, current=_UNKNOWN, confirm=False):
                 log(f"pend done {id_}: {gate_notice(item['gate'], run)}")
                 return {**item, "aviso": gate_notice(item["gate"], run)}
             _resolve_gate(item["gate"], answer_text or "closed without an answer", run)
-    return item
+    return {**item, **_release_ticket_hold(item)} if item.get("ticket") else item
+
+
+def _release_ticket_hold(item):
+    """Ticket 397: the decision `item` closed, so the hold it put on its ticket goes (every path to `pending_done`: hook ask, lavish-answer, pend done). A hold with another reason is
+    left alone. A ticket that is still ready-for-agent enters the dispatch queue by the rule of `_release_dependents`; otherwise it only warns. Never raises: the pending item is already closed,
+    and `doctor backlog` finds a hold that stayed."""
+    n, out = item["ticket"], {}
+    try:
+        i = _item_of_ticket(n)
+        if not (i and i["hold"] and i["hold"]["motivo"] == f"decisão {item['id']}"):
+            return out
+        backlog.cli(BACKLOG, "unhold", i["id"])
+        t = next((x for x in tickets() if x["num"] == n), None)
+        out["ticket_liberado"] = n
+        if t and t["status"] == STATUS_NEW and not t["blocked_by"] and not t.get("role"):
+            fila, notice = _enqueue_released(t, f"decision {item['id']} closed: released {n}")
+            out.update({**({"fila": fila} if fila else {}), **({"ticket_aviso": notice} if notice else {})})
+        append_event({"tipo": "ticket", "op": "liberado", "ticket": n, "pend": item["id"]})
+    except (backlog.BacklogError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+        out["ticket_aviso"] = f"ticket {n}: the hold of decision {item['id']} stayed ({e}): tasks-axi unhold t{n}"
+    return out
 
 
 # ---------- PR linked to the task ----------
@@ -10365,7 +10406,7 @@ def read_ticket(path):
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
             "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
             "projeto": _campo(cab, "Project") or _campo(cab, "Projeto") or None,
-            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None, "wave": None, "role": None}  # waves live only in the backlog (ticket 342)
+            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None, "wave": None, "role": None, "hold": None}  # waves (ticket 342) and holds (ticket 397) live only in the backlog
 
 
 def _tickets_in_backlog():
@@ -10441,6 +10482,8 @@ def _slug(title):
 def dispatch_wait(t, integration, events, without_push):
     """Why the ticket does not enter the dispatch queue on its own, or None. `Despacho: manual[, reason]` never enters; `Espera: integrador empty` only with the
     integrator queue empty and no unpushed commits on main (`without_push`, always read: the integrator does not record the `cycle`)."""
+    if t.get("hold"):  # ticket 397: the tasks-axi hold (a decision that bars the ticket) never enters the queue or the away Stop's next step
+        return f"em hold: {t['hold']['motivo']}"
     d = (t.get("despacho") or "").strip()
     if d.lower().startswith("manual"):  # `Dispatch: manual` (or the old `Despacho:`)
         return f"Dispatch: {d}"
@@ -10849,6 +10892,26 @@ def _ask_model(t, priority):
     return f"{text} (entry {e['id']})"
 
 
+def _released_route(t, priority, events, integration, without_push):
+    """What a released ticket does: (True, None) enters the dispatch queue; (False, notice) stays out (a Despacho/Espera/hold header, no valid Modelo/Effort); P3 never goes up on its own."""
+    waiting = dispatch_wait(t, integration, events, without_push)
+    if waiting and priority < 3:
+        return False, f"ticket {t['num']} (P{priority}) released, outside the dispatch queue ({waiting}): dispatch it with orq dispatch --ticket {t['num']}"
+    if priority < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
+        return True, None
+    return False, _ask_model(t, priority) if priority < 3 else None
+
+
+def _enqueue_released(t, reason):
+    """The one-ticket path of the release (the same rule `_release_dependents` applies): (queue id or None, notice or None)."""
+    events = read_events()
+    priority = priority_of(events, t["task"], None, t["titulo"])
+    to_queue_it, notice = _released_route(t, priority, events, integration_queue(), _no_push())
+    if to_queue_it:
+        return _queue_released(t, reason, priority)
+    return None, notice or f"ticket {t['num']} (P{priority}) released, outside the dispatch queue (P3 never goes up on its own): dispatch it with orq dispatch --ticket {t['num']}"
+
+
 def _queue_released(t, reason, priority):
     """Puts the released ticket in the dispatch queue: (queue id, None), or (None, why it did not enter)."""
     try:
@@ -10920,13 +10983,11 @@ def _release_dependents(n, before=None):
             continue
         priority = priority_of(events, t["task"], None, t["titulo"])
         item = {"ticket": t["num"], "prioridade": priority}
-        waiting = dispatch_wait(t, integration, events, without_push)
-        if waiting and priority < 3:
-            notices.append(f"ticket {t['num']} (P{priority}) released, outside the dispatch queue ({waiting}): dispatch it with orq dispatch --ticket {t['num']}")
-        elif priority < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
+        to_queue_it, notice = _released_route(t, priority, events, integration, without_push)
+        if to_queue_it:
             to_queue.append((priority, t, item))
-        elif priority < 3:
-            notices.append(_ask_model(t, priority))
+        elif notice:
+            notices.append(notice)
         released.append(item)
     batch_max = machine_cfg()["release_batch_max"]  # ticket 344: a close that frees many dependents queues the first ones; the others wait outside the queue until it drops
     to_queue.sort(key=lambda x: (x[0], x[1]["num"]))
@@ -11150,6 +11211,7 @@ def doctor_backlog():
         by_id = {i["id"]: i for i in item_list}
         ids |= {i["id"] for i in item_list}
         tks += [(b, t) for i in item_list if (t := backlog.ticket_of_item(i, by_id, root))]
+    live_pending = {i["id"] for b in backlogs for i in backlog.read_value(b) if i["repo"] == "pend" and i["estado"] != "done"}
     by_run, notices, problems = {}, [], []
     for run in sorted({t["run"] for _, t in tks if t["run"] and t["task"]}):
         try:
@@ -11162,6 +11224,8 @@ def doctor_backlog():
 
     for b, t in tks:
         n, file_path = t["num"], f"TASKS_AXI_FILE={shlex.quote(b)} tasks-axi"
+        if (m := re.fullmatch(r"decisão (\S+)", (t["hold"] or {}).get("motivo", ""))) and m.group(1) not in live_pending:  # ticket 397
+            add_finding(t, f"on hold for decision {m.group(1)}, which is already closed", f"{file_path} unhold t{n}")
         if t["arquivo"] and not os.path.exists(t["arquivo"]):
             add_finding(t, f"the spec {t['arquivo']} does not exist", f"restore the file or point to another one with {file_path} update t{n} --body")
         if not (t["task"] and t["run"]) or t["run"] not in by_run:
@@ -16820,6 +16884,7 @@ def parser():
         _arg(pa, k)
     pa.add_argument("--link")
     pa.add_argument("--task")
+    pa.add_argument("--ticket", help="the queued ticket the decision bars: it goes on hold (tasks-axi) until the decision closes")
     pa.add_argument("--run", help="the Run of the gate task (required with the agent manager on more than one Run)")
     pl = p.add_parser("list", aliases=["lista"], help="the live pending items; --all includes the Later ones")
     _arg(pl, "todas", action="store_true")
@@ -17290,7 +17355,7 @@ def main(argv=None):
             print(json.dumps(defer_obligation(a.entry, a.obligation, a.reason, a.run), ensure_ascii=False))
         elif a.cmd == "pend":
             if a.op == "add":
-                print(json.dumps(pending_add(a.id, a.type_name, a.title, a.detail, a.workstream, a.link, a.command, a.waiting, a.task, a.until_at, a.run), ensure_ascii=False))
+                print(json.dumps(pending_add(a.id, a.type_name, a.title, a.detail, a.workstream, a.link, a.command, a.waiting, a.task, a.until_at, a.run, a.ticket), ensure_ascii=False))
                 _implicit("decisao" if a.type_name == "decisao" else "pend", a.id)
             elif a.op == "list":
                 print("\n".join(pending_list(a.all_listing)) or "no pending items")
@@ -17299,8 +17364,9 @@ def main(argv=None):
             else:
                 done = pending_done(a.id, a.answer_text)
                 print(json.dumps(done, ensure_ascii=False))
-                if done.get("aviso"):
-                    print(f"warning: {done['aviso']}", file=sys.stderr)
+                for w in (done.get("aviso"), done.get("ticket_aviso")):
+                    if w:
+                        print(f"warning: {w}", file=sys.stderr)
         elif a.cmd == "backlog" and a.op == "move":
             if not (a.ticket_numbers and a.group_name):
                 print("backlog move: pass the ticket numbers and --group", file=sys.stderr)

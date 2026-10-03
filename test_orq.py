@@ -23870,6 +23870,108 @@ def test_ticket_399_scout_spec_asks_for_the_action_items_section():
     assert _dispatch(b, spec=_spec(b, "# s\n\nFaça.\n")).returncode == 0
     assert "Itens de ação" not in _log(b, "started.log")[0][_log(b, "started.log")[0].index("--spec") + 1], "ticket de código não leva o bloco"
 
+
+# ---------- ticket 397: a decision bars its ticket with a hold, and closing the decision releases it ----------
+
+def _decision_on(a, ticket="01", id_="dec-x", *extra):
+    return a.orq("pend", "add", "--id", id_, "--tipo", "decisao", "--titulo", "Qual caminho", "--ticket", ticket, *extra)
+
+
+def test_ticket397_held_ticket_leaves_next_step_queue_and_list_and_expired_hold_comes_back():
+    a = _env_tk()
+    _new(a, "Um")
+    _new(a, "Dois", "--blocked-by", "01")
+    bl = a.env["ORQ_BACKLOG"]
+    backlog_mod.cli(bl, "hold", "t02", "--reason", "decisão dec-y", "--kind", "captain")
+    item_list = backlog_mod.read_value(bl)
+    t = backlog_mod.ticket_of_item(next(i for i in item_list if i["id"] == "t02"), {i["id"]: i for i in item_list}, a.tmp.name)
+    assert t["hold"]["motivo"] == "decisão dec-y"
+    base = {"agent_rows": [], "integration": {}, "events": [], "without_push": 0, "cfg": {**orq_mod.machine_cfg(), "max_workers": 2}}
+    held = {**_tk126("07"), "hold": {"motivo": "decisão dec-y", "kind": "captain", "until": None}}
+    assert orq_mod.next_without_user(tks=[held], queue=[], **base) is None, "the Stop must not push a held ticket"
+    assert orq_mod.next_without_user(tks=[{**held, "hold": None}], queue=[], **base) and "07" in orq_mod.next_without_user(tks=[{**held, "hold": None}], queue=[], **base)
+    # list: held shows the reason; released by `until` in the past shows nothing
+    backlog_mod.cli(bl, "hold", "t01", "--reason", "decisão dec-z", "--kind", "captain", "--until", "2999-01-01")
+    assert "01 Um (ready-for-agent) [em hold: decisão dec-z]" in _tk_list(a), _tk_list(a)
+    backlog_mod.cli(bl, "hold", "t01", "--reason", "decisão dec-z", "--kind", "captain", "--until", "2000-01-01")
+    assert "em hold" not in _tk_list(a), "until in the past: the hold already let go"
+    # the close of 01 frees 02, but the hold keeps it out of the dispatch queue
+    out = json.loads(a.orq("ticket", "fechar", "01", "--answer", "feito").stdout)
+    assert [x["ticket"] for x in out["liberados"]] == ["02"] and "fila" not in out["liberados"][0], out
+    assert "02 Dois (ready-for-agent) [em hold: decisão dec-y]" in _tk_list(a)
+
+
+def test_ticket397_pend_add_ticket_holds_it_and_pend_done_releases_into_the_queue():
+    a = _env_tk()
+    _new(a, "Um")
+    r = _decision_on(a)
+    assert r.returncode == 0, r.stderr
+    it = _bl_items(a)
+    assert (it["t01"]["hold"]["motivo"], it["t01"]["hold"]["kind"]) == ("decisão dec-x", "captain")
+    assert backlog_mod.body_meta(it["dec-x"]["corpo"], backlog_mod.META_PENDING)[0]["ticket"] == "01"
+    assert "[em hold: decisão dec-x]" in _tk_list(a)
+    r = a.orq("pend", "done", "dec-x", "--resposta", "A")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["ticket_liberado"] == "01" and out.get("fila"), out
+    assert _bl_items(a)["t01"]["hold"] is None and "em hold" not in _tk_list(a)
+    assert [(e["ticket"], e["pend"]) for e in a.events() if e["tipo"] == "ticket" and e.get("op") == "liberado"] == [("01", "dec-x")]
+
+
+def test_ticket397_pend_done_without_model_only_warns_and_does_not_queue():
+    a = _env_tk()
+    _new(a, "Um")
+    assert a.orq("ticket", "editar", "01", "--modelo", "").returncode == 0
+    assert _decision_on(a).returncode == 0
+    r = a.orq("pend", "done", "dec-x", "--resposta", "A")
+    out = json.loads(r.stdout)
+    assert out["ticket_liberado"] == "01" and "fila" not in out and out["ticket_aviso"], out
+    assert _bl_items(a)["t01"]["hold"] is None
+
+
+def test_ticket397_pend_add_ticket_refuses_a_held_ticket_and_non_decisions_and_writes_nothing():
+    a = _env_tk()
+    _new(a, "Um")
+    bl = a.env["ORQ_BACKLOG"]
+    backlog_mod.cli(bl, "hold", "t01", "--reason", "esperando o banco", "--kind", "external")
+    before = open(bl).read()
+    r = _decision_on(a)
+    assert r.returncode == 1 and "already on hold" in r.stderr and open(bl).read() == before, r.stderr
+    backlog_mod.cli(bl, "unhold", "t01")
+    before = open(bl).read()
+    for kind in ("acao", "avisar"):
+        r = a.orq("pend", "add", "--id", "outra", "--tipo", kind, "--titulo", "X", "--ticket", "01")
+        assert r.returncode == 1 and "only applies to a decision" in r.stderr and open(bl).read() == before, r.stderr
+    r = _decision_on(a, "09")
+    assert r.returncode == 1 and "not in the backlog" in r.stderr and open(bl).read() == before
+
+
+def test_ticket397_hook_ask_and_lavish_answer_closing_the_decision_release_the_hold():
+    a = _env_tk()
+    _new(a, "Um")
+    _new(a, "Dois")
+    assert _decision_on(a, "01", "dec-ask").returncode == 0 and _decision_on(a, "02", "dec-lav").returncode == 0
+    q = [_question("dec-ask", [("A", "x"), ("B", "y")])]
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "A"}))
+    assert r.returncode == 0, r.stderr
+    assert _bl_items(a)["t01"]["hold"] is None and _bl_items(a)["t02"]["hold"]["motivo"] == "decisão dec-lav"
+    r = a.orq("lavish-resposta", _lote(a, [{"id": "L1", "header": "dec-lav", "resposta": "B", "disposicao": "escolha"}]))
+    assert r.returncode == 0, r.stderr
+    assert _bl_items(a)["t02"]["hold"] is None
+    assert sorted(e["pend"] for e in a.events() if e["tipo"] == "ticket" and e.get("op") == "liberado") == ["dec-ask", "dec-lav"]
+
+
+def test_ticket397_doctor_backlog_lists_an_orphan_decision_hold_with_the_fix():
+    a = _env_tk()
+    _new(a, "Um")
+    bl = a.env["ORQ_BACKLOG"]
+    assert _decision_on(a).returncode == 0
+    assert "consistent" in a.orq("doctor", "backlog").stdout, "a live decision is not an orphan"
+    backlog_mod.cli(bl, "done", "dec-x", "--no-prune")  # the decision closed without going through pend done
+    r = a.orq("doctor", "backlog")
+    assert r.returncode == 1 and "on hold for decision dec-x, which is already closed" in r.stdout and f"TASKS_AXI_FILE={bl} tasks-axi unhold t01" in r.stdout, r.stdout
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
