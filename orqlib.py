@@ -10548,12 +10548,12 @@ def ticket_area(text):
     return found
 
 
-def area_blockers(body_text, ts):
-    """{ticket number: sorted shared area} of the open tickets whose area meets the one of `body_text` by intersection (ticket 341). A wave's milestone or join never counts."""
+def area_blockers(body_text, ts, project=None):
+    """{ticket number: sorted shared area} of open tickets in `project` whose area meets `body_text` by intersection (tickets 341, 402). A wave's milestone or join never counts."""
     mine = ticket_area(body_text)
     findings = {}
     for t in ts:
-        if t["status"] == STATUS_CLOSED or t.get("role") or not mine or not t.get("arquivo"):
+        if t["status"] == STATUS_CLOSED or t.get("role") or t.get("projeto") != project or not mine or not t.get("arquivo"):
             continue
         try:
             with open(t["arquivo"], encoding="utf-8") as f:
@@ -10624,10 +10624,11 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
             raise ValueError(f"wave {wave} is closed (its join {w['join']['num']} already closed): put the task in a later wave")
         blockers = list(dict.fromkeys([*blockers, w["milestone"]["num"]]))
         join = w["join"]["num"]
-    by_area = {n: a for n, a in area_blockers(body_text, existing.values()).items() if n not in blockers}  # ticket 341: the same area waits for whoever is already on it
-    blockers += list(by_area)
     target = default_run(run)
-    meta = _meta_ticket(model, effort, dispatch_mode, waiting, dispatch_project(project, target))
+    target_project = dispatch_project(project, target)
+    by_area = {n: a for n, a in area_blockers(body_text, existing.values(), target_project).items() if n not in blockers}  # ticket 341: same project and area waits for whoever is already on it
+    blockers += list(by_area)
+    meta = _meta_ticket(model, effort, dispatch_mode, waiting, target_project)
     if join:  # the wave of the task (ticket 342), after the meta that ticket 315 builds from the target Run
         meta = {**meta, "wave": str(wave)}
     deps, notices = [], [f"waits for {n}: they touch {', '.join(a[:3])} (orq unblock <ticket> --reason \"...\" if the area is only a neighbour)" for n, a in by_area.items()]
