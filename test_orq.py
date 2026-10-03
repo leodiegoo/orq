@@ -24107,6 +24107,25 @@ def test_ticket341_touches_line_declares_the_area_and_unblock_frees_the_ticket()
     assert _bl_items(a)["t02"]["bloqueios"] == []
 
 
+def test_ticket438_backlog_unblock_repairs_pending_orca_task_before_dispatch():
+    a = _env_tk()
+    assert _new(a, "Blocker").returncode == 0
+    assert _new(a, "Unblocked", "--blocked-by", "01").returncode == 0
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "unblock", "t02", "--by", "t01")
+    tasks = _tasks_fake(a)
+    tasks[1].update(status="pending", deps='["task_tk1"]')
+    a.set("tasks_run_a.json", tasks)
+
+    r = a.orq("despachar", "--run", "run_a", "--ticket", "02", "--modelo", SONNET, "--effort", "medium")
+
+    assert r.returncode == 0, r.stderr
+    assert _tasks_fake(a)[1]["status"] == "dispatched", "the task was made ready and then dispatched"
+    updates = _log(a, "updated.log")
+    assert any(x[0] == "task-update" and x[x.index("--id") + 1] == "task_tk2" and x[x.index("--status") + 1] == "ready" for x in updates), updates
+    event = next(e for e in a.events() if e.get("tipo") == "backlog_task" and e.get("ticket") == "02")
+    assert event["op"] == "desbloqueada" and event["task"] == "task_tk2" and event["run"] == "run_a"
+
+
 def test_ticket391_cited_ticket_numbers_and_files_do_not_block_but_blocked_by_and_shared_function_still_do():
     a = _env_tk()
     _new(a, "First", spec=_area_spec(a, "a.md", "Change `_external_denied`; see `plan/issues/318-x.md`."))

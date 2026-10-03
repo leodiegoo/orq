@@ -13797,6 +13797,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
                 spec = f.read()
         except OSError as e:
             raise ValueError(f"could not read {spec_file}: {e.strerror}")
+    if _tickets_in_backlog():
+        reconcile_backlog_tasks()
     priority = priority_level or priority_of(read_events(), tk and tk["task"], None, title)
     usage_check(priority, agent=agent)
     request = _entry_text(entry)
@@ -14822,6 +14824,31 @@ def dispatch_queue_rm(id_, op="removido", **extra):
     return found_item
 
 
+def reconcile_backlog_tasks():
+    """Makes Orca match the ticket backlog before dispatch (ticket 438): `tasks-axi unblock` can remove the last blocker without updating its pending task."""
+    if not _tickets_in_backlog():
+        return []
+    candidates = [t for t in tickets() if t["status"] == STATUS_NEW and not t["blocked_by"] and t.get("task") and t.get("run")]
+    by_run = collections.defaultdict(list)
+    for t in candidates:
+        by_run[t["run"]].append(t)
+    lines = []
+    for run_, rows in by_run.items():
+        try:
+            with _no_run(run_):
+                tasks = orca("task-list", "--run", run_, timeout=20).get("tasks") or []
+                pending = {x.get("id") for x in tasks if x.get("status") == "pending"}
+                for t in rows:
+                    if t["task"] not in pending:
+                        continue
+                    orca("task-update", "--id", t["task"], "--status", "ready", "--run", run_, timeout=20)
+                    append_event({"tipo": "backlog_task", "op": "desbloqueada", "ticket": t["num"], "task": t["task"], "run": run_, "motivo": "backlog has no remaining blockers"})
+                    lines.append(f"ticket {t['num']} task {t['task']} set ready from backlog")
+        except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+            log(f"backlog task reconcile {run_}: {type(e).__name__}: {e}")
+    return lines
+
+
 def dispatch_queue_priority(id_, value):
     """`orq dispatch-queue priority <id> <1-3>`: changes the priority of a queue item, keeping its `ts` (the order is priority, then oldest). The coordinator or the mate that
     owns the item; the event carries the author. The P1 rules (ahead of the queue and the worker ceiling, not the memory floor or the expensive ceiling) are the ones of `machine_bar_item`."""
@@ -14973,6 +15000,7 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
     Fairness between projects (ticket 344): the order is dispatch_queue_items' (priority base, then the projects take turns) and an item whose project is at its `max_slots`, or
     whose free slots another project reserves, stays behind and the next one starts."""
     cfg, now_at = cfg or machine_cfg(), now_at or time.time()
+    reconcile_backlog_tasks()
     if not dispatch_queue_items():
         return []
     occupancy, line_list = machine_occupancy(), []
