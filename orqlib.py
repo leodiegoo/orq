@@ -1975,6 +1975,10 @@ def check_manager_bg(now_at=None):
 def _extra(events, all_listing, now_at, pending_items=None, cursor=None, open_state=None, turns=None, panel=None):
     """The single line for whatever is not a user message: panel stopped, cursor recovered, suspicious or free answer, scout alert and untriaged reports."""
     parts = [panel] if panel else []
+    latest_alarm = next((e for e in reversed(events) if e.get("tipo") == "alarme"), None)
+    if latest_alarm:
+        parts.append(f"[alarm] {latest_alarm.get('motivo')} ({int((latest_alarm.get('idade_s') or 0) // 60)} min): " +
+                     ", ".join(f"{c.get('canal')} {c.get('resultado')}" for c in latest_alarm.get("canais") or []))
     rec = recovered_cursor(cursor, now_at)
     if rec:
         parts.append("[notice] " + recovered_notice(rec))
@@ -9384,11 +9388,19 @@ def free_terminal(handle):
     user draft it would become a mixed prompt: in both cases the caller waits for the next round."""
     try:
         orca("wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", str(IDLE_MS), area="terminal", timeout=IDLE_MS / 1000 + TIMEOUT_ORCA)
-    except (RuntimeError, subprocess.TimeoutExpired):
+    except RuntimeError as e:
+        if "terminal_handle_stale" in str(e):
+            return "sumiu"
+        return "ocupado"
+    except subprocess.TimeoutExpired:
         return "ocupado"
     try:
         terminal = orca("read", "--terminal", handle, "--screen", "--limit", str(SCREEN_LINES), area="terminal").get("terminal") or {}
-    except (RuntimeError, subprocess.TimeoutExpired):
+    except RuntimeError as e:
+        if "terminal_handle_stale" in str(e):
+            return "sumiu"
+        terminal = None
+    except subprocess.TimeoutExpired:
         terminal = None
     if terminal is None:
         # Without a rendered screen, retain Orca's draft as the conservative signal.
@@ -9446,6 +9458,8 @@ def type_text(handle, text_value, valid_while=None):
     except subprocess.TimeoutExpired:
         return "enviado"
     except RuntimeError as e:
+        if "terminal_handle_stale" in str(e):
+            return "sumiu"
         return "ocupado" if "agent_prompt_blocked" in str(e) else "falhou"
     prompt = (res.get("send") or {}).get("prompt") or {}
     if prompt.get("observation") == "supported" and not set(prompt.get("stages") or []) - {"input_accepted"}:
@@ -9461,7 +9475,9 @@ def _turn_screen_without_draft(handle):
     """True with the spinner (`esc to interrupt`, same in both agents) on the screen, no draft in the box and no menu waiting for a human answer."""
     try:
         t = orca("read", "--terminal", handle, "--screen", "--limit", str(SCREEN_LINES), area="terminal").get("terminal") or {}
-    except (RuntimeError, subprocess.TimeoutExpired):
+    except RuntimeError as e:
+        return None if "terminal_handle_stale" in str(e) else False
+    except subprocess.TimeoutExpired:
         return False
     tail = t.get("tail") or []
     return not ((t.get("draft") or "").strip() or any(screen_question(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])))
@@ -9473,17 +9489,23 @@ def type_text_busy(handle, text_value, valid_while=None):
     Only with the spinner on the screen, no draft in the box and no menu waiting for a human answer, in both reads (NOTICE_GAP_S between them, ticket 82):
     in all three cases it returns `ocupado` without typing. Returns `ocupado_digitado`, or `ocupado` if Orca blocked the send (agent_prompt_blocked) or it failed."""
     text_value = _short(text_value, valid_while)
-    if not _turn_screen_without_draft(handle):
+    screen = _turn_screen_without_draft(handle)
+    if screen is None:
+        return "sumiu"
+    if not screen:
         return "ocupado"
     time.sleep(NOTICE_GAP_S)
-    if not _turn_screen_without_draft(handle):
+    screen = _turn_screen_without_draft(handle)
+    if screen is None:
+        return "sumiu"
+    if not screen:
         return "ocupado"
     try:
         orca("send", "--terminal", handle, "--text", text_value, "--enter", area="terminal", timeout=TIMEOUT_ORCA)
     except subprocess.TimeoutExpired:
         return "ocupado_digitado"  # the text may have gone out: repeating would stack
-    except RuntimeError:
-        return "ocupado"
+    except RuntimeError as e:
+        return "sumiu" if "terminal_handle_stale" in str(e) else "ocupado"
     return "ocupado_digitado"
 
 
@@ -9495,13 +9517,108 @@ def active_coordinator(now_at=None, minutes_elapsed=None):
     return bool(last_by_header) and (now_at - _dt(last_by_header)).total_seconds() < minutes_elapsed * 60
 
 
+def _notifica(titulo, texto):
+    """Send a macOS notification without interpolating user text into AppleScript source."""
+    try:
+        result = subprocess.run([os.environ.get("ORQ_OSASCRIPT") or "osascript", "-e", "on run argv", "-e",
+                                 "display notification (item 1 of argv) with title (item 2 of argv) sound name \"default\"", "-e", "end run",
+                                 texto, titulo], capture_output=True, timeout=3, check=False)
+        return "sent" if result.returncode == 0 else f"failed ({result.returncode})"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"failed ({type(e).__name__})"
+
+
 def _notify_mac(text_value):
-    """Native macOS notification for the notice that was not typed; off by default, only with `"notificar_macos": true` in gerente.json (ticket 82)."""
-    if not _manager_cfg().get("notificar_macos"):
-        return
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run([os.environ.get("ORQ_OSASCRIPT") or "osascript", "-e", f"display notification {json.dumps(text_value, ensure_ascii=False)} with title \"orq\""],
-                       capture_output=True, timeout=3, check=False)
+    """Native macOS notification for a notice deferred to the coordinator (ticket 82)."""
+    if _manager_cfg().get("notificar_macos"):
+        _notifica("orq", text_value)
+
+
+ALARM_FILE = "alarme.json"  # {key: last delivery timestamp}; keys absent from current causes are rearmed
+ALARM_MIN = float(os.environ.get("ORQ_ALARME_MIN") or 10)
+ALARM_REPEAT_MIN = float(os.environ.get("ORQ_ALARME_REPETE_MIN") or 60)
+_ALARM_LIVE_UNSET = object()
+
+
+def _alarm_channels(key, reason, age_s):
+    """Deliver an away-mode alarm through macOS and the optional user command, each independently bounded."""
+    if os.environ.get("ORQ_ALARME", "on").lower() == "off":
+        return [{"canal": "all", "resultado": "disabled"}]
+    message = f"orq alarm: {reason} ({int(age_s // 60)} min) [{key}]"
+    results = []
+    mac = _notifica("orq: coordinator needs attention", message)
+    results.append({"canal": "macos", "resultado": mac})
+    command = os.environ.get("ORQ_ALARME_CMD")
+    if command:
+        try:
+            proc = subprocess.run(["sh", "-c", command, "orq-alarm", message], input=message, text=True,
+                                  capture_output=True, timeout=3, check=False)
+            results.append({"canal": "command", "resultado": "sent" if proc.returncode == 0 else f"failed ({proc.returncode})"})
+        except (OSError, subprocess.SubprocessError) as e:
+            results.append({"canal": "command", "resultado": f"failed ({type(e).__name__})"})
+    return results
+
+
+def _alarm_age(ts, now_at):
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return max(0, now_at.timestamp() - ts)
+    stamp = _ts(ts)
+    return max(0, (now_at - stamp).total_seconds()) if stamp else 0
+
+
+def alarms_stuck(now_at=None, live_terminals=_ALARM_LIVE_UNSET):
+    """Raise durable alarms for coordinator work left unseen while away mode is on."""
+    now_at = now_at or now_dt()
+    if not away_enabled():
+        return []
+    minimum_s, repeat_s = ALARM_MIN * 60, ALARM_REPEAT_MIN * 60
+    g = _manager_cfg()
+    if not g or not g.get("coordenador"):
+        return []
+    causes = {}
+    tracked = _dict(_read_json(_path(ALARM_FILE)))
+    live = _alive_terminals() if live_terminals is _ALARM_LIVE_UNSET else live_terminals
+    coord = g.get("coordenador")
+    if live is not None and coord not in live and not active_coordinator(now_at):
+        key = f"sumiu:{coord}"
+        record = _dict(tracked.get(key))
+        since = record.get("desde") or now_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        age = _alarm_age(since, now_at)
+        tracked[key] = {**record, "desde": since}
+        if age >= minimum_s:
+            causes[key] = ("sumiu", age)
+    for run, notice in _manager_notices().items():
+        age = _alarm_age(notice.get("ts"), now_at)
+        if notice.get("vistos") and notice.get("ts") and age >= minimum_s:
+            causes[f"sem leitura:{run}"] = ("sem leitura", age)
+    pending = _cursor_ro().get("avisos") or []
+    if isinstance(pending, list):
+        for i, notice in enumerate(pending):
+            age = _alarm_age(notice.get("ts"), now_at)
+            if age >= minimum_s and (live is not None and coord not in live or not active_coordinator(now_at)):
+                causes[f"fila:{i}"] = ("fila", age)
+    wake_state = _dict(_read_json(_path(WAKE_FILE)))
+    if wake_state.get("avisado") and wake_state.get("desde"):
+        reason, _ = _work_without_user(read_events(), now_at)
+        if not reason and (old := obligations_to_chase(read_events(), now_at)):
+            reason = f"open obligation: {old[0]['entrada']} {old[0]['chave']} ({old[0]['texto']})"
+        age = _alarm_age(wake_state["desde"], now_at)
+        if reason and reason == wake_state.get("motivo") and age >= minimum_s:
+            causes[f"acordar ignorado:{reason}"] = ("acordar ignorado", age)
+    alarm_state = {key: value for key, value in tracked.items() if key in causes or key.startswith("sumiu:") and live is not None and coord not in live and not active_coordinator(now_at)}
+    lines = []
+    for key, (reason, age) in causes.items():
+        previous = alarm_state.get(key)
+        last = _ts(previous.get("ultima")) if isinstance(previous, dict) else _ts(previous)
+        if last and (now_at - last).total_seconds() < repeat_s:
+            continue
+        channels = _alarm_channels(key, reason, age)
+        append_event({"tipo": "alarme", "chave": key, "motivo": reason, "idade_s": int(age), "canais": channels})
+        alarm_state[key] = {**_dict(alarm_state.get(key)), "desde": _dict(alarm_state.get(key)).get("desde") or now_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "ultima": now_at.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        lines.append(f"alarm: {reason} ({int(age // 60)} min; " + ", ".join(f"{c['canal']} {c['resultado']}" for c in channels) + ")")
+    _write_json(_path(ALARM_FILE), alarm_state)
+    return lines
 
 
 def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None, valid_while=None):
@@ -14118,7 +14235,11 @@ def handoff_lines(events, turns, now_at=None):
 
 def status_text(color=False):
     """What `orq status` prints: the state, the open handoffs, the PRs, the worktrees, the E2E queue and the machine."""
-    return "\n".join([*filter(None, [fail_safe.broken_line()]), state(include_old=True), *handoff_lines(read_events(), _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line(), queue_age_line(color=color)])])
+    events = read_events()
+    latest_alarm = next((e for e in reversed(events) if e.get("tipo") == "alarme"), None)
+    alarm = ([f"Alarm: {latest_alarm.get('motivo')} ({int((latest_alarm.get('idade_s') or 0) // 60)} min; " +
+              ", ".join(f"{c.get('canal')} {c.get('resultado')}" for c in latest_alarm.get("canais") or []) + ")"] if latest_alarm else [])
+    return "\n".join([*filter(None, [fail_safe.broken_line()]), state(include_old=True), *alarm, *handoff_lines(events, _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line(), queue_age_line(color=color)])])
 
 
 # ---------- orq iniciar: the coordinator that is already open, in any harness ----------
@@ -16278,6 +16399,9 @@ def manager_absorb():
     notices, now_at = _manager_notices(), time.time()
     stuck_items = [r for r in runs if r in notices and 0 <= now_at - notices[r].get("ts", 0) < MANAGER_STUCK_S][:1]
     line_list, pending_messages, round_errors = [], {}, []
+    live_terminals = _alive_terminals()
+    if live_terminals is not None and g.get("coordenador") not in live_terminals:
+        line_list.append("coordenador sumiu do Orca")
     for r in [*stuck_items, *(x for x in runs if x not in stuck_items)]:
         try:
             line, msgs = _absorb_run(r, bound_run)
@@ -16373,6 +16497,10 @@ def manager_absorb():
         line_list += wake_stopped()
     except Exception as e:  # noqa: BLE001 - the notice to the idle coordinator doesn't take down the panel; the next loop tries
         log(f"acorda parado: {type(e).__name__}: {e}")
+    try:
+        line_list += alarms_stuck(live_terminals=live_terminals)
+    except Exception as e:  # noqa: BLE001 - alarm delivery must not stop the manager loop
+        log(f"alarm: {type(e).__name__}: {e}")
     try:
         line_list += integrator_steer()
     except Exception as e:  # noqa: BLE001 - the steer to the idle integrator doesn't take down the panel; the next loop tries

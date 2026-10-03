@@ -24567,6 +24567,110 @@ def test_ticket397_doctor_backlog_lists_an_orphan_decision_hold_with_the_fix():
     assert r.returncode == 1 and "on hold for decision dec-x, which is already closed" in r.stdout and f"TASKS_AXI_FILE={bl} tasks-axi unhold t01" in r.stdout, r.stdout
 
 
+
+def test_ticket435_stale_coordinator_is_sumiu_for_both_delivery_paths():
+    with mock.patch.object(orqlib, "orca", side_effect=RuntimeError("terminal_handle_stale")):
+        assert orqlib.free_terminal("term_coord") == "sumiu"
+        assert orqlib.type_text("term_coord", "hello") == "sumiu"
+        assert orqlib.type_text_busy("term_coord", "hello") == "sumiu"
+
+
+def test_ticket435_unread_notice_alarm_uses_recorders_and_repeats_then_rearms():
+    with tempfile.TemporaryDirectory() as root:
+        home = os.path.join(root, "orq")
+        os.makedirs(home)
+        mac_log, cmd_log = os.path.join(root, "mac.jsonl"), os.path.join(root, "cmd.txt")
+        mac = os.path.join(root, "osascript")
+        with open(mac, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport json,sys\nopen(%r,'a').write(json.dumps(sys.argv[1:])+'\\n')\n" % mac_log)
+        os.chmod(mac, 0o755)
+        command = f"printf '%s\\n' \"$1\" > {cmd_log}; cat >> {cmd_log}"
+        old = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)
+        now_at = old + timedelta(minutes=11)
+        with mock.patch.multiple(orqlib, HOME=home, ALARM_MIN=10, ALARM_REPEAT_MIN=60), \
+             mock.patch.object(orqlib, "away_enabled", return_value=True), \
+             mock.patch.object(orqlib, "_manager_cfg", return_value={"gerente": "term_manager", "coordenador": "term_coord", "runs": ["run_a"]}), \
+             mock.patch.object(orqlib, "_alive_terminals", return_value={"term_coord", "term_manager"}), \
+             mock.patch.object(orqlib, "_manager_notices", return_value={"run_a": {"vistos": ["msg_1"], "ts": old.timestamp()}}), \
+             mock.patch.object(orqlib, "_cursor_ro", return_value={}), \
+             mock.patch.dict(os.environ, {"ORQ_OSASCRIPT": mac, "ORQ_ALARME_CMD": command, "ORQ_ALARME": "on"}):
+            result = orqlib.alarms_stuck(now_at)
+            assert result == ["alarm: sem leitura (11 min; macos sent, command sent)"], result
+            first = json.loads(open(mac_log).readline()) if os.path.exists(mac_log) else []
+            assert first[-2:] == ["orq alarm: sem leitura (11 min) [sem leitura:run_a]", "orq: coordinator needs attention"], first
+            assert "sem leitura" in open(cmd_log).read(), open(cmd_log).read() if os.path.exists(cmd_log) else "missing"
+            assert orqlib.alarms_stuck(now_at + timedelta(minutes=30)) == []
+            assert orqlib.alarms_stuck(now_at + timedelta(minutes=72)), open(os.path.join(home, "alarme.json")).read() if os.path.exists(os.path.join(home, "alarme.json")) else "missing alarm state"
+            with mock.patch.object(orqlib, "_manager_notices", return_value={}):
+                assert orqlib.alarms_stuck(now_at + timedelta(minutes=73)) == []
+            with mock.patch.object(orqlib, "_manager_notices", return_value={"run_a": {"vistos": ["msg_1"], "ts": old.timestamp()}}):
+                assert orqlib.alarms_stuck(now_at + timedelta(minutes=74)), open(os.path.join(home, "alarme.json")).read() if os.path.exists(os.path.join(home, "alarme.json")) else "missing alarm state"
+
+
+
+
+
+def test_ticket435_sumiu_alarm_waits_ten_minutes_and_live_prompt_has_none():
+    with tempfile.TemporaryDirectory() as root, \
+         mock.patch.multiple(orqlib, HOME=root, ALARM_MIN=10, ALARM_REPEAT_MIN=60), \
+         mock.patch.object(orqlib, "away_enabled", return_value=True), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"gerente": "term_manager", "coordenador": "term_coord", "runs": ["run_a"]}), \
+         mock.patch.object(orqlib, "_manager_notices", return_value={}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={}), \
+         mock.patch.object(orqlib, "_notifica", return_value="sent"), \
+         mock.patch.dict(os.environ, {"ORQ_ALARME": "on", "ORQ_ALARME_CMD": ""}):
+        start = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)
+        assert orqlib.alarms_stuck(start, {"term_manager"}) == []
+        assert orqlib.alarms_stuck(start + timedelta(minutes=9), {"term_manager"}) == []
+        assert orqlib.alarms_stuck(start + timedelta(minutes=11), {"term_manager"})[0].startswith("alarm: sumiu")
+        recent = (start + timedelta(minutes=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with mock.patch.object(orqlib, "read_events", return_value=[{"tipo": "entrada", "origem": "usuario", "ts": recent}]), \
+             mock.patch.object(orqlib, "_alive_terminals", return_value={"term_manager"}):
+            assert orqlib.alarms_stuck(start + timedelta(minutes=12)) == []
+
+
+def test_ticket435_manager_reports_a_vanished_coordinator_terminal():
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    a.set("terminals.json", ["term_ger"])
+    result = a.orq("gerente", "absorver")
+    assert result.returncode == 0 and "coordenador sumiu do Orca" in result.stdout, result.stdout
+
+
+def test_ticket435_notifier_passes_quotes_and_backslashes_as_argv():
+    with tempfile.TemporaryDirectory() as root:
+        log = os.path.join(root, "args.json")
+        script = os.path.join(root, "osascript")
+        with open(script, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport json,sys\nopen(%r,'w').write(json.dumps(sys.argv[1:]))\n" % log)
+        os.chmod(script, 0o755)
+        message = 'The \"prompt\" says \\ leave this alone'
+        with mock.patch.dict(os.environ, {"ORQ_OSASCRIPT": script}):
+            assert orqlib._notifica("alarm title", message) == "sent"
+        args = json.load(open(log))
+        assert args[-2:] == [message, "alarm title"], args
+
+
+
+def test_ticket435_timed_out_macos_alarm_does_not_block_command_channel():
+    with tempfile.TemporaryDirectory() as root:
+        mac = os.path.join(root, "slow-osascript")
+        received = os.path.join(root, "command.txt")
+        with open(mac, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n")
+        os.chmod(mac, 0o755)
+        command = f"cat > {received}"
+        with mock.patch.dict(os.environ, {"ORQ_OSASCRIPT": mac, "ORQ_ALARME_CMD": command, "ORQ_ALARME": "on"}):
+            result = orqlib._alarm_channels("sem leitura:run_a", "sem leitura", 660)
+        assert result == [{"canal": "macos", "resultado": "failed (TimeoutExpired)"}, {"canal": "command", "resultado": "sent"}], result
+        assert "sem leitura" in open(received).read()
+
+
+def test_ticket435_alarm_off_does_not_call_channels_and_records_disabled():
+    with mock.patch.dict(os.environ, {"ORQ_ALARME": "off"}), mock.patch.object(orqlib, "_notifica", side_effect=AssertionError("macOS called")):
+        assert orqlib._alarm_channels("sumiu:term_x", "sumiu", 900) == [{"canal": "all", "resultado": "disabled"}]
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
