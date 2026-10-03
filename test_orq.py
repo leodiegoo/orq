@@ -15618,7 +15618,66 @@ def test_it_should_be_that_an_orq_ticket_spec_gets_the_worktree_block():
         assert r.returncode == 0, r.stderr
     for arg in _log(a, "started.log"):
         spec = arg[arg.index("--spec") + 1]
-        assert spec.count("## orq worktree") == 1 and a.env["ORQ_WT_ROOT"] + "/" in spec and "Never commit on `main`" in spec, spec
+        assert spec.count("## orq worktree") == 1 and "worktree Orca created" in spec and "Never commit on `main`" in spec, spec
+
+
+def _commit_in(path, name):
+    g = lambda *x: subprocess.run(["git", "-C", path, "-c", "user.name=t", "-c", "user.email=t@t", *x], capture_output=True, text=True, check=True).stdout.strip()  # noqa: E731
+    for i in range(50):  # a short sha of only digits is not a sha to SHA_RE
+        open(os.path.join(path, name), "w").write(str(i))
+        g("add", name)
+        g("commit", "-qm", f"{name}{i}")
+        if orq_mod.SHA_RE.fullmatch(g("rev-parse", "--short=7", "HEAD")):
+            break
+    return g("rev-parse", "--short=7", "HEAD")
+
+
+def test_it_should_be_that_a_commit_outside_the_dispatch_worktrees_is_refused_with_the_expected_path():
+    with tempfile.TemporaryDirectory() as t:
+        t = os.path.realpath(t)
+        live, other = os.path.join(t, "dashboard"), os.path.join(t, "outro")
+        for r in (live, other):
+            os.makedirs(r)
+            subprocess.run(["git", "-C", r, "init", "-q", "-b", "main"], check=True)
+            _commit_in(r, "base")
+        orca_wt, listed, stray = (os.path.join(t, n) for n in ("orca", "listed", "stray"))
+        for r, wt in ((live, orca_wt), (other, listed), (live, stray)):
+            subprocess.run(["git", "-C", r, "worktree", "add", "-q", "-b", "b" + os.path.basename(wt), wt], check=True)
+        ok_orca, ok_listed, bad_stray = (_commit_in(w, n) for w, n in ((orca_wt, "f"), (listed, "h"), (stray, "s")))  # distinct files: equal trees would give equal shas
+        subprocess.run(["git", "-C", other, "checkout", "-q", "-b", "worker-branch"], check=True)
+        bad_live = _commit_in(other, "g")  # the worker checked out a branch in the live clone of the other repo and committed there
+        allowed = [orca_wt, listed]
+        assert orq_mod.check_worktrees([ok_orca, ok_listed], allowed, [live, other]) == []
+        assert orq_mod.check_worktrees([bad_live], allowed, [live, other]) == [(bad_live, other, listed)], "expected: the worktree of the same repo"
+        assert orq_mod.check_worktrees([bad_stray], allowed, [live, other]) == [(bad_stray, stray, orca_wt)]
+        sent, before = [], (orq_mod._dispatch_worktree, orq_mod.send_back, orq_mod.read_events, orq_mod.append_event)
+        orq_mod._dispatch_worktree, orq_mod.send_back = lambda run, d: orca_wt, lambda d, reason, run=None: sent.append(reason)
+        orq_mod.read_events, orq_mod.append_event = lambda: [{"tipo": "despacho", "dispatch": "d1", "worktrees": [listed]}], lambda e: None
+        try:
+            msg = lambda sha: ({"id": "m_" + sha, "run_id": "r", "subject": "done", "body": f"commit {sha}"}, {"dispatchId": "d1", "outcome": "succeeded"})  # noqa: E731
+            assert orq_mod._delivery_worktrees(*msg(ok_listed)) is True and not sent
+            assert orq_mod._delivery_worktrees(*msg(bad_live)) is False
+            (reason,) = sent
+            assert f"expected {listed}" in reason and other in reason, reason
+        finally:
+            orq_mod._dispatch_worktree, orq_mod.send_back, orq_mod.read_events, orq_mod.append_event = before
+
+
+def test_it_should_be_that_dispatch_makes_a_worktree_for_each_other_repo_of_the_ticket():
+    with tempfile.TemporaryDirectory() as t:
+        repo = os.path.join(t, "dashboard")
+        os.makedirs(repo)
+        subprocess.run(["git", "-C", repo, "init", "-q", "-b", "main"], check=True)
+        _commit_in(repo, "base")
+        with tempfile.TemporaryDirectory() as wtroot:
+            before, orq_mod.WT_ROOT = orq_mod.WT_ROOT, wtroot
+            try:
+                ((r, wt),) = orq_mod.other_repos_worktrees(f"# t\n\nOther repos: {repo}\n", "352")
+                assert r == os.path.realpath(repo) and wt == os.path.join(wtroot, "352-dashboard") and os.path.isdir(wt)
+                assert orq_mod.other_repos_worktrees("# t\n", "352") == []
+                assert wt in orq_mod.other_repos_block([(r, wt)])
+            finally:
+                orq_mod.WT_ROOT = before
 
 
 def test_it_should_be_that_a_non_orq_ticket_spec_gets_no_worktree_block():
@@ -15634,7 +15693,7 @@ def test_it_should_be_that_dispatching_an_orq_ticket_by_number_appends_the_block
     for _ in range(2):
         a.orq("despachar", "--run", "run_a", "--ticket", "01", "--modelo", "claude-sonnet-5-5", "--effort", "medium", FAKE_FAIL="")
     txt = open(next(os.path.join(a.env["ORQ_ISSUES"], n) for n in os.listdir(a.env["ORQ_ISSUES"]) if n.startswith("01-"))).read()
-    assert txt.count("## orq worktree") == 1 and os.path.join(a.env["ORQ_WT_ROOT"], "01") in txt, txt
+    assert txt.count("## orq worktree") == 1 and "worktree Orca created" in txt, txt
 
 
 def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_not_the_integrator():
