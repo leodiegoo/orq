@@ -4938,6 +4938,23 @@ def _worker_path(res):
     return _deep_get(res, "terminal", "worktreePath") or (wid.split("::", 1)[1] if isinstance(wid, str) and "::" in wid else None)
 
 
+def _worker_branch(res):
+    """The branch reported for a dispatch by `worker-start` or `worker-show`, without a refs prefix."""
+    for value in (_deep_get(res, "terminal", "branch"), _deep_get(res, "worker", "branch"), _deep_get(res, "worktree", "branch")):
+        if isinstance(value, str) and value.strip():
+            return value.strip().removeprefix("refs/heads/").removeprefix("refs/remotes/origin/").removeprefix("origin/")
+    return None
+
+
+def _worker_row_path(worker):
+    """The absolute worktree root stored in a worker-list row."""
+    wid = _deep_get(worker, "resource", "worktreeId") or worker.get("worktreeId")
+    if isinstance(wid, str):
+        path = wid.split("::", 1)[-1]
+        return path if os.path.isabs(path) else None
+    return None
+
+
 def named_task(head, events, prs):
     """The task that owns branch `head` without asking Orca or the network, or None: by the `--name` of the new worktree (with or without the user prefix Orca adds,
     on either side), or by a PR of the same branch that is already linked (the PR to production after the ones to the other environments). Several tasks: the newest."""
@@ -11007,31 +11024,139 @@ def _inject_dispatch(run_, task, handle, restore, repeat):
     return new
 
 
+WORKTREE_MODES = {"current", "new-top-level"}
+
+
+def _worktree_mode(event):
+    """The requested dispatch mode, including records written before paths and modes had separate fields."""
+    mode = event.get("worktree_mode")
+    if mode in WORKTREE_MODES:
+        return mode
+    old = event.get("worktree")
+    return old if old in WORKTREE_MODES else None
+
+
+def _dispatch_worktree_root(event):
+    """The normalized absolute path for a dispatch; modes and other non-path labels never identify a worktree."""
+    for value in (event.get("worktree_path"), event.get("worktree")):
+        if not isinstance(value, str) or not value.strip() or value in WORKTREE_MODES:
+            continue
+        path = os.path.expanduser(value.strip())
+        if os.path.isabs(path):
+            return os.path.normcase(os.path.realpath(path))
+    return None
+
+
+def _dispatch_history(events):
+    """Dispatch records enriched with later durable location migrations, in their original order."""
+    locations = {}
+    for event in events:
+        if event.get("tipo") == "dispatch_location" and event.get("dispatch"):
+            location = locations.setdefault(event["dispatch"], {})
+            location.update({key: event[key] for key in ("worktree", "worktree_path", "branch", "worktree_mode") if event.get(key)})
+    return [{**event, **locations.get(event.get("dispatch"), {})}
+            for event in events if event.get("tipo") == "despacho"]
+
+
 def _superseding_dispatch(events, d):
-    """(dispatch, task) of the latest `despacho` that shares `d`'s worktree and came after it, or None: the worker of a closed or replaced ticket must not be reopened (ticket 388)."""
-    # ponytail: the worktree is the only link between two dispatches of one branch that the log keeps; a `devolver` dispatch is not a `despacho`, so a return never supersedes
-    ds = [e for e in events if e.get("tipo") == "despacho" and e.get("worktree")]
-    i = next((i for i, e in enumerate(ds) if e["dispatch"] == d), None)
-    if i is None:
+    """(dispatch, task) of the latest later dispatch in the same normalized real worktree, or None."""
+    dispatches = [event for event in _dispatch_history(events) if _dispatch_worktree_root(event)]
+    index = next((i for i, event in enumerate(dispatches) if event.get("dispatch") == d), None)
+    if index is None:
         return None
-    later = [e for e in ds[i + 1:] if e["worktree"] == ds[i]["worktree"]]
-    return (later[-1]["dispatch"], later[-1]["task"]) if later else None
+    root = _dispatch_worktree_root(dispatches[index])
+    later = [event for event in dispatches[index + 1:] if _dispatch_worktree_root(event) == root]
+    return (later[-1].get("dispatch"), later[-1].get("task")) if later else None
+
+
+def _migrate_open_dispatches(events, run):
+    """Record real paths and branches for old open dispatches by reconciling their ids with Orca's worker-list and worker-show."""
+    dispatches = {event.get("dispatch"): event for event in _dispatch_history(events) if event.get("dispatch")}
+    try:
+        workers = _all_workers(run)
+    except (RuntimeError, subprocess.TimeoutExpired, KeyError, TypeError):
+        return events
+    for worker in workers:
+        dispatch = worker.get("dispatchId")
+        event = dispatches.get(dispatch)
+        if not event or worker.get("dispatchStatus") != "dispatched":
+            continue
+        path = _dispatch_worktree_root(event)
+        branch = _dispatch_branch(event)
+        if path and branch:
+            continue
+        details = {}
+        try:
+            details = orca("worker-show", "--dispatch", dispatch, timeout=10)
+        except (RuntimeError, subprocess.TimeoutExpired, KeyError, TypeError):
+            pass
+        path = path or _worker_path(details) or _worker_row_path(worker)
+        if not path or not os.path.isabs(path):
+            continue
+        branch = branch or _worker_branch(details)
+        if not branch:
+            branch = (_git(path, "branch", "--show-current") or "").strip() or None
+        location = {"tipo": "dispatch_location", "dispatch": dispatch, "worktree": os.path.realpath(path), "worktree_path": os.path.realpath(path),
+                    "source": "worker-list", **({"worktree_mode": _worktree_mode(event)} if _worktree_mode(event) else {}),
+                    **({"branch": branch} if branch else {})}
+        append_event(location)
+        events = [*events, location]
+        dispatches[dispatch] = {**event, **location}
+    return events
+
+
+def _branch_name(value):
+    """Comparable local branch name from a bare or fully-qualified ref."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().removeprefix("refs/heads/").removeprefix("refs/remotes/origin/").removeprefix("origin/")
 
 
 def _dispatch_branch(event):
-    """Branch recorded for a dispatch, falling back to its worktree's current branch."""
-    if event.get("branch"):
-        return event["branch"]
-    worktree = event.get("worktree")
-    return (_git(worktree, "branch", "--show-current") or "").strip() if worktree else ""
+    """Branch registered for a dispatch, falling back to its real worktree's current branch."""
+    if branch := _branch_name(event.get("branch")):
+        return branch
+    worktree = _dispatch_worktree_root(event)
+    return _branch_name(_git(worktree, "branch", "--show-current") or "") if worktree else ""
+
+
+def _ticket_key(ticket):
+    return str(ticket).strip().zfill(2) if ticket is not None else ""
+
+
+def _send_back_branches(events):
+    """Historical branch owners from dispatch records, orq_delivery records, and integrator queue entries."""
+    dispatches = _dispatch_history(events)
+    by_dispatch = {event["dispatch"]: event for event in dispatches if event.get("dispatch")}
+    by_ticket = {_ticket_key(event.get("ticket")): event for event in dispatches if event.get("ticket")}
+    owners = {}
+
+    def record(branch, dispatch=None, ticket=None):
+        branch = _branch_name(branch)
+        event = by_dispatch.get(dispatch) if dispatch else None
+        if not event and ticket:
+            event = by_ticket.get(_ticket_key(ticket))
+        if not branch or not event or not event.get("task"):
+            return
+        owner = {"id": event["task"], "dispatch_id": event.get("dispatch"), "branch": branch}
+        ticket = ticket or event.get("ticket")
+        if ticket is not None:
+            owner["ticket"] = str(ticket).zfill(2)
+        owners[branch] = owner
+
+    for event in dispatches:
+        record(_dispatch_branch(event), event.get("dispatch"), event.get("ticket"))
+    for event in events:
+        if event.get("tipo") == "entrega_orq":
+            record(event.get("branch"), event.get("dispatch"), event.get("ticket"))
+        elif event.get("tipo") == "integrar_fila" and event.get("op") == "add":
+            record(event.get("branch"), ticket=event.get("ticket"))
+    return owners
 
 
 def _send_back_branch(events, branch):
-    """Latest task/dispatch whose dispatch worktree is on `branch`."""
-    for event in reversed(events):
-        if event.get("tipo") == "despacho" and event.get("task") and _dispatch_branch(event) == branch:
-            return {"id": event["task"], "dispatch_id": event.get("dispatch"), "branch": branch}
-    return None
+    """Latest historical task/dispatch associated with a registered, delivered, or queued branch."""
+    return _send_back_branches(events).get(_branch_name(branch))
 
 
 def send_back(target, reason, run=None, achado=False):
@@ -11047,7 +11172,7 @@ def send_back(target, reason, run=None, achado=False):
     if achado:  # `--achado`: the reason cites a review finding, so it carries the invariant rule
         reason = f"{reason} {INVARIANT_RULE}"
     with _no_run(run_):
-        events = read_events()
+        events = _migrate_open_dispatches(read_events(), run_)
         target_branch = _send_back_branch(events, target)
         tasks = orca("task-list", "--run", run_, timeout=20)["tasks"]
         if target_branch:
@@ -11058,12 +11183,7 @@ def send_back(target, reason, run=None, achado=False):
                 t = {"id": owner, "dispatch_id": worker["dispatchId"]} if worker else target_branch
         else:
             t = next((t for t in tasks if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
-        branches = {}
-        for event in events:
-            if event.get("tipo") == "despacho" and event.get("task"):
-                branch = _dispatch_branch(event)
-                if branch:
-                    branches[branch] = event["task"]
+        branches = _send_back_branches(events)
         if not t:  # task-list zeroes the dispatch_id of the completed task (ticket created with the backlog on); worker-list, which `agents` reads, still links task and dispatch
             t = next(({"id": w["taskId"], "dispatch_id": w["dispatchId"]} for w in _all_workers(run_) if target in (w.get("taskId"), w.get("dispatchId")) and w.get("dispatchId")), None)
         opened = next((e for e in reversed(read_events()) if e.get("tipo") == "devolver" and e.get("novo_dispatch") and target in (e.get("task"), e.get("novo_dispatch"))), None)
@@ -11071,12 +11191,19 @@ def send_back(target, reason, run=None, achado=False):
             t = {"id": opened["task"], "dispatch_id": opened["novo_dispatch"]}
         if not t:
             raise ValueError(f"{target} is neither a task nor a dispatch of Run {run_}")
-        t_branch = target_branch["branch"] if target_branch else next((b for b, task in branches.items() if task == t["id"]), "")
-        cited = next((b for b in branches if b != t_branch and re.search(rf"(?<![\w./-]){re.escape(b)}(?![\w./-])", reason)), None)
+        if not t.get("dispatch_id") and target_branch:
+            newer = _superseding_dispatch(events, target_branch.get("dispatch_id"))
+            ticket_info = f"ticket {target_branch['ticket']}, " if target_branch.get("ticket") else ""
+            superseded_info = f"; dispatch {target_branch.get('dispatch_id')} was superseded by {newer[0]} (task {newer[1]})" if newer else ""
+            raise ValueError(f"branch {target_branch['branch']} identifies {ticket_info}task {target_branch['id']} but its dispatch history is incomplete{superseded_info}")
+        t_branch = target_branch["branch"] if target_branch else next((b for b, owner in branches.items() if owner["id"] == t["id"]), "")
+        cited = next((b for b, owner in branches.items() if owner["id"] != t["id"]
+                      and re.search(rf"(?<![\w./-]){re.escape(b)}(?![\w./-])", reason)), None)
         if cited:
-            raise ValueError(f"reason cites branch {cited}, whose task is {branches[cited]}; target {t['id']} is on {t_branch or 'an unknown branch'}; use `orq send-back {branches[cited]} \"<reason>\"`")
-        if newer := _superseding_dispatch(read_events(), t["dispatch_id"]):  # ticket 388: two workers on one branch, only the latest is reopened
-            raise ValueError(f"dispatch {t['dispatch_id']} was superseded by {newer[0]} (task {newer[1]}) on the same worktree: `orq send-back {newer[1]} \"<reason>\"` reaches the worker that holds the branch")
+            raise ValueError(f"reason cites branch {cited}, whose task is {branches[cited]['id']}; target {t['id']} is on {t_branch or 'an unknown branch'}; use `orq send-back {branches[cited]['id']} \"<reason>\"`")
+        if newer := _superseding_dispatch(events, t["dispatch_id"]):  # ticket 388: two workers on one branch, only the latest is reopened
+            ticket_info = f", ticket {target_branch['ticket']}" if target_branch and target_branch.get("ticket") else ""
+            raise ValueError(f"branch {t_branch or target} belongs to task {t['id']}{ticket_info}, dispatch {t['dispatch_id']}, which was superseded by {newer[0]} (task {newer[1]}) on the same worktree: `orq send-back {newer[1]} \"<reason>\"` reaches the worker that holds the branch")
         d, body_text = t["dispatch_id"], f"The delivery was sent back by the coordinator; redo it and send a new worker_done with this dispatch's command. Reason: {reason}"
         if d in _hibernated():
             r = wake(d, MSG_REDISPATCH)
@@ -13246,7 +13373,8 @@ def _close_setup(dispatch, w, run_id, handle):
     ponytail: a shell that the user opened by hand in that worktree also goes; there is no filter by creator in `terminal list`."""
     dispatch_events = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == dispatch), {})
     wt = ((w.get("resource") or {}).get("worktreeId") or "").split("::", 1)[-1]
-    if not wt.startswith("/") or dispatch_events.get("worktree") in (None, "current"):
+    if (not wt.startswith("/") or _worktree_mode(dispatch_events) == "current"
+            or (_worktree_mode(dispatch_events) is None and not _dispatch_worktree_root(dispatch_events))):
         return [], []
     try:
         line_list = orca("list", "--worktree", f"path:{wt}", "--limit", "100", area="terminal")["terminals"]
@@ -15081,9 +15209,17 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         terminal = next((e.get("id") for e in res.get("effects") or [] if e.get("kind") == "terminal" and e.get("role") == "agent"), None)
         if not (task and dispatch):
             raise RuntimeError(f"worker-start without taskId/dispatchId in the reply: {json.dumps(res)[:300]}")
-        worktree_path = None
+        worktree_details = {}
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError):
-            worktree_path = _worker_path(orca("worker-show", "--dispatch", dispatch, timeout=10))
+            worktree_details = orca("worker-show", "--dispatch", dispatch, timeout=10)
+        worktree_path = _worker_path(res) or _worker_path(worktree_details)
+        if worktree_path and os.path.isabs(worktree_path):
+            worktree_path = os.path.realpath(worktree_path)
+        else:
+            worktree_path = None
+        branch = _worker_branch(res) or _worker_branch(worktree_details)
+        if not branch and worktree_path:
+            branch = (_git(worktree_path, "branch", "--show-current") or "").strip() or None
         _set_worktree_metadata(worktree_path, display_name=display_name, issue=ticket_issue, comment=board_comment,
                                status="in-progress", parent=parent_worktree)
         if terminal:
@@ -15092,11 +15228,11 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             except Exception as e:  # noqa: BLE001 - the tab title is a comfort: failing does not undo the dispatch
                 log(f"despachar: rename do terminal {terminal}: {type(e).__name__}: {e}")
         ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": title, "agente": agent, "modelo": model, "effort": effort, "terminal": terminal,
-              **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
+              "worktree_mode": worktree or "current", **({"worktree": worktree_path, "worktree_path": worktree_path} if worktree_path else {}),
+              **({"branch": branch} if branch else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
               **({"projeto": project} if project else {}),
               **({"parent_worktree": parent_worktree} if parent_worktree else {}), **({"parent_note": parent_note} if parent_note else {}),
-              **({"worktree_path": worktree_path} if worktree_path else {}),
               **({"base_branch": base_branch} if base_branch else {}),
               **({"servico": True} if service else {}), **({"direct": direct} if direct else {}),
               **({"worktrees": [w for _, w in pairs]} if pairs else {}), **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}

@@ -60,7 +60,9 @@ The model does the classifying. The code only checks that a classification was r
 | `answer`, `suspect_answer`, `lavish_answer` | ask hook, `orq lavish-answer` |
 | `heartbeat_absorbed`, `heartbeat_seen` | prompt hook, manager loop, waiter; `heartbeat_absorbed` carries `by`: `manager`, `prompt-hook` or `waiter` (`confirm_batches` takes it from each caller) |
 | `not_started` | `orq dispatch`: the prompt did not land, even after the Enter |
-| `dispatch`, `steer`, `release`, `ticket`, `manager` | the matching commands |
+| `dispatch` | `orq dispatch`: task, run, dispatch id, branch, actual worktree root (`worktree` and `worktree_path`), and requested `worktree_mode` |
+| `steer`, `release`, `ticket`, `manager` | the matching commands |
+| `dispatch_location` | `orq send-back` reconciles an open legacy dispatch from `worker-list`: dispatch, actual worktree root, branch, requested mode, `source: worker-list` |
 | `dispatch_end` | `orq release`: `dispatch`, `reason` (`entregue`, `falhou`, `parou: orçamento`, `parou: decisão pendente`, `parou: limite de uso`, `sem worker_done`, `motivo desconhecido`), `caminho`, `sujo`, `sem_push` |
 | `processes` | `orq release`, `orq clean --closed`, `limpar-mergeados.py`: `op` (`encerrar` or `recusado`), `worktree`, `encerrados` (the worker's processes with `cwd` inside it that got TERM), `kill` (those that only fell to KILL), `lista` (`{pid, comando, cwd}` of what the sweep ended or, with `recusado`, would have), `nao_encerrados` and `restantes` (cwd inside but not below the worker's harness: left alone), `limite` (`ORQ_ENCERRA_MAX`, with `recusado`) |
 | `pr` (`op: ligar/desligar/sem_task/entrou/fechou/avisado`) | `orq pr`, the `prlink` hook, the poll, the manager loop |
@@ -402,6 +404,10 @@ Three commands act on a worker that is running (or, for `end` and `relaunch`, al
 Going back after the stop is limited to what can be brought back. If the requested `--model`/`--effort` does not start, the worker starts with the old profile (`revertido`, the first error in `erro` and in the warning). If nothing starts (`falhou`), the old terminal stays retained for inspection, the worktree is untouched and the error prints `orq relaunch <dispatch> --note '<the note>'`; running it again skips the stop, because the dispatch is already settled. A `worker-start` that times out is never retried, since a second worker would land in the same worktree.
 
 An Orca task keeps its spec, so the note cannot go into it. It goes as the first steer of the new worker (`Relaunched after <dispatch>. What changed: …`), with the usual notice and read check. If that steer or the release of the old dispatch fails, the event still says `ok` and the warning names the command to run.
+
+## Resolving send-back owners from branch history (ticket 531)
+
+`orq dispatch` stores the actual worktree root and branch on each dispatch event; the requested `current` or `new-top-level` mode is a separate field. `_superseding_dispatch` compares normalized absolute worktree roots, so a mode label or a different worktree cannot supersede a dispatch. For open legacy dispatches, `orq send-back` joins `worker-list` entries to dispatch ids and appends a `dispatch_location` event with the recovered root and branch. Branch ownership also folds in `entrega_orq` delivery history and `integrar_fila` additions, which preserves the owner after a worker finishes or an integrator requeues the branch. A true replacement error names the historical task and ticket together with the replacement dispatch and task; the original reason is passed through when the owner is reopened.
 
 ## Handing a worker to the other harness (ticket 87)
 

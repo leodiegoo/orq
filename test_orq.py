@@ -363,7 +363,8 @@ elif cmd in ("worker-show", "worker-release"):
                             "lastHeartbeatAt": None},
                "worker": {"worktreeId": ("repo_1::" + w["worktree"]) if w.get("worktree") else None,
                           "startOptions": {"agent": w.get("agente"), "launch": {"requested": {"model": w.get("modelo", "claude-sonnet-5-5"), "effort": w.get("effort", "high")}}}},
-               "terminal": {"handle": w["handle"], "title": "x", **({"worktreePath": w["worktree"]} if w.get("worktree") else {})}}
+               "terminal": {"handle": w["handle"], "title": "x", **({"worktreePath": w["worktree"]} if w.get("worktree") else {}),
+                            **({"branch": w["branch"]} if w.get("branch") else {})}}
     else:
         # worker-release: released | retained | release_pending | already_released (w["release"]); retained deixa o terminal aberto com o motivo
         open(os.path.join(d, "released.log"), "a").write(json.dumps(a) + "\\n")
@@ -410,6 +411,8 @@ elif cmd == "worker-start":
     new = {"handle": "term_novo%d" % n, "run": run or bound, "task": tid, "status": "dispatched"}
     if os.environ.get("FAKE_WT"):  # worktree que o Orca criou para o worker
         new["worktree"] = os.environ["FAKE_WT"]
+    if os.environ.get("FAKE_BRANCH"):
+        new["branch"] = os.environ["FAKE_BRANCH"]
     if opt("--retry-of"):  # como o Orca real (30/09): a retentativa reaproveita a worktree que o --worktree nomeia e sobe com o perfil pedido
         new.update({"worktree": opt("--worktree", "").split("::", 1)[-1], "modelo": opt("--model"), "effort": opt("--effort"), "agente": opt("--agent")})
     ws.insert(0, new)
@@ -3870,12 +3873,14 @@ def test_dispatch_nonexistent_entry_does_not_dispatch():
 
 def test_dispatch_new_worktree_passes_on_name_and_base_branch():
     a = Env(run="run_a")
-    r = _dispatch(a, "--worktree", "new-top-level", "--name", "feat/x", "--base-branch", "development")
+    r = _dispatch(a, "--worktree", "new-top-level", "--name", "feat/x", "--base-branch", "development",
+                  FAKE_WT="/wt/feat-x", FAKE_BRANCH="refs/heads/feat/x")
     assert r.returncode == 0, r.stderr
     (arg,) = _log(a, "started.log")
     assert arg[arg.index("--worktree") + 1] == "new-top-level" and arg[arg.index("--name") + 1] == "feat/x" and arg[arg.index("--base-branch") + 1] == "development"
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
-    assert ev["worktree"] == "new-top-level" and ev["nome"] == "feat/x"
+    assert ev["worktree"] == "/wt/feat-x" and ev["worktree_path"] == "/wt/feat-x", ev
+    assert ev["worktree_mode"] == "new-top-level" and ev["branch"] == "feat/x" and ev["nome"] == "feat/x", ev
 
 
 def test_ticket442_parent_branch_sets_board_lineage_and_ticket_metadata():
@@ -13517,7 +13522,7 @@ def test_ticket95_dispatch_in_run_with_project_passes_repo_and_new_worktree_and_
     assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
     assert arg[arg.index("--agent") + 1] == "codex", "o harness também vem do projeto do Run"
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
-    assert ev["projeto"] == "p" and ev["worktree"] == "new-top-level", ev
+    assert ev["projeto"] == "p" and ev["worktree_mode"] == "new-top-level" and "worktree" not in ev, ev
 
 
 def test_ticket95_explicit_project_beats_run_project_and_last_run_project_counts():
@@ -24126,6 +24131,86 @@ def test_ticket451_send_back_branch_selects_the_latest_dispatch_for_that_branch(
     events = [{"tipo": "despacho", "task": "task_old", "dispatch": "ctx_old", "branch": "feat/shared"},
               {"tipo": "despacho", "task": "task_new", "dispatch": "ctx_new", "branch": "feat/shared"}]
     assert orqlib._send_back_branch(events, "feat/shared") == {"id": "task_new", "dispatch_id": "ctx_new", "branch": "feat/shared"}
+
+
+def _ticket531_send_back_history(ticket, task, dispatch, branch):
+    a = Env(run="run_a")
+    a.set("tasks_run_a.json", [{"id": task, "status": "completed", "dispatch_id": None},
+                               {"id": "task_464", "status": "dispatched", "dispatch_id": "ctx_464"}])
+    a.set("workers.json", [{"handle": "term_owner", "run": "run_a", "task": task, "dispatch": dispatch, "status": "completed", "worktree": "/wt/owner"},
+                            {"handle": "term_464", "run": "run_a", "task": "task_464", "dispatch": "ctx_464", "status": "dispatched",
+                             "worktree": "/wt/464", "branch": "refs/heads/leodiegoo/t464-mate-request"}])
+    a.set("terminals.json", ["term_owner", "term_464", "term_coord"])
+    _evs(a,
+         {"tipo": "despacho", "run": "run_a", "task": task, "dispatch": dispatch, "ticket": ticket, "worktree": "new-top-level", "terminal": "term_owner"},
+         {"tipo": "entrega_orq", "ticket": ticket, "branch": branch, "dispatch": dispatch},
+         {"tipo": "despacho", "run": "run_a", "task": "task_464", "dispatch": "ctx_464", "ticket": "464", "worktree": "new-top-level", "terminal": "term_464"})
+    return a
+
+
+def _assert_ticket531_send_back_history(ticket, task, dispatch, branch):
+    a = _ticket531_send_back_history(ticket, task, dispatch, branch)
+    reason = f"retry ticket {ticket}"
+    r = a.orq("send-back", branch, reason)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr, a.events())
+    (returned,) = [event for event in a.events() if event["tipo"] == "devolver"]
+    assert (returned["task"], returned["dispatch"]) == (task, dispatch), returned
+    assert returned["texto"] == reason, returned
+    updated = {row["id"]: row for row in json.load(open(os.path.join(a.fake, "tasks_run_a.json")))}
+    assert updated[task]["status"] == "dispatched" and updated[task]["dispatch_id"] != "ctx_464", updated
+    assert updated["task_464"]["status"] == "dispatched" and updated["task_464"]["dispatch_id"] == "ctx_464", updated
+    (location,) = [event for event in a.events() if event.get("tipo") == "dispatch_location" and event.get("dispatch") == "ctx_464"]
+    assert (location["worktree"], location["branch"], location["worktree_mode"]) == \
+        ("/wt/464", "leodiegoo/t464-mate-request", "new-top-level"), location
+
+
+def test_ticket531_send_back_resolves_445_from_delivery_history_without_live_dispatch():
+    _assert_ticket531_send_back_history("445", "task_8fec95222d4a", "ctx_5fac810b3b02", "leodiegoo/orq-affected-fila")
+
+
+def test_ticket531_send_back_resolves_441_from_delivery_history_without_live_dispatch():
+    _assert_ticket531_send_back_history("441", "task_056faf6f3895", "ctx_cb2835b6a5a0", "leodiegoo/orq-ordem-merge-painel")
+
+
+def test_ticket531_send_back_resolves_447_from_delivery_history_without_live_dispatch():
+    _assert_ticket531_send_back_history("447", "task_38273238ce7f", "ctx_e80c7a53a0a3", "leodiegoo/orq-clone-vivo-limpo")
+
+
+def test_ticket531_send_back_resolves_479_from_delivery_history_without_live_dispatch():
+    _assert_ticket531_send_back_history("479", "task_01b184f8e225", "ctx_af40d56c28f2", "leodiegoo/t479-integrator-stall-trigger")
+
+
+def test_ticket531_new_top_level_dispatches_in_different_worktrees_do_not_supersede():
+    events = [{"tipo": "despacho", "task": "task_old", "dispatch": "ctx_old", "worktree": "new-top-level", "worktree_path": "/wt/old"},
+              {"tipo": "despacho", "task": "task_new", "dispatch": "ctx_new", "worktree": "new-top-level", "worktree_path": "/wt/new"}]
+    assert orqlib._superseding_dispatch(events, "ctx_old") is None
+
+
+def test_ticket531_integrator_requeue_branch_resolves_from_queue_and_delivery_history():
+    branch = "requeue/t479-integrator-stall-trigger"
+    a = _ticket531_send_back_history("479", "task_01b184f8e225", "ctx_af40d56c28f2", "leodiegoo/t479-integrator-stall-trigger")
+    _evs(a, {"tipo": "integrar_fila", "op": "add", "ticket": "479", "branch": branch})
+    r = a.orq("send-back", branch, "retry the requeued ticket")
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr, a.events())
+    (returned,) = [event for event in a.events() if event["tipo"] == "devolver"]
+    assert (returned["task"], returned["dispatch"]) == ("task_01b184f8e225", "ctx_af40d56c28f2"), returned
+
+
+def test_ticket531_superseded_branch_diagnostic_names_candidate_owner_and_replacement():
+    a = Env(run="run_a")
+    a.set("tasks_run_a.json", [{"id": "task_01b184f8e225", "status": "completed", "dispatch_id": None},
+                               {"id": "task_replacement", "status": "completed", "dispatch_id": None}])
+    a.set("workers.json", [{"handle": "term_owner", "run": "run_a", "task": "task_01b184f8e225", "dispatch": "ctx_af40d56c28f2", "status": "completed", "worktree": "/wt/owner"}])
+    a.set("terminals.json", ["term_owner", "term_coord"])
+    _evs(a,
+         {"tipo": "despacho", "run": "run_a", "task": "task_01b184f8e225", "dispatch": "ctx_af40d56c28f2", "ticket": "479",
+          "worktree": "/wt/owner", "worktree_path": "/wt/owner", "branch": "leodiegoo/t479-integrator-stall-trigger"},
+         {"tipo": "entrega_orq", "ticket": "479", "branch": "leodiegoo/t479-integrator-stall-trigger", "dispatch": "ctx_af40d56c28f2"},
+         {"tipo": "despacho", "run": "run_a", "task": "task_replacement", "dispatch": "ctx_replacement", "ticket": "464",
+          "worktree": "/wt/owner/../owner", "worktree_path": "/wt/owner/../owner", "branch": "leodiegoo/t464-mate-request"})
+    r = a.orq("send-back", "leodiegoo/t479-integrator-stall-trigger", "retry the delivery")
+    assert r.returncode == 1 and "task_01b184f8e225" in r.stderr and "ticket 479" in r.stderr \
+        and "ctx_replacement" in r.stderr and "task_replacement" in r.stderr, (r.returncode, r.stderr)
 
 
 def test_ticket329_scratch_ticket_of_a_delivery_that_passed_on_the_new_dispatch_counts_as_done():
