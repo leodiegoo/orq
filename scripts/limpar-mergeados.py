@@ -132,6 +132,13 @@ def decide(f):
     return "remove", "merged PR and no pending work"
 
 
+def live_children(worktree, by_id):
+    """Existing Orca child worktrees that must outlive this parent removal attempt."""
+    child_ids = set(worktree.get("childWorktreeIds", []))
+    child_ids.update(w.get("id") for w in by_id.values() if w.get("parentWorktreeId") == worktree.get("id"))
+    return [by_id[c] for c in child_ids if c in by_id and os.path.isdir(by_id[c].get("path", ""))]
+
+
 def decide_orphan(f):
     """Worktree with no merged PR. Only goes if nothing in it is lost: every commit is already in main (cherry with no "+", e.g. cherry-pick), clean tree,
     no live orq worker (`busy` None, no answer from orq, counts as live) and no recent activity (a worktree that was just born has no commit either)."""
@@ -246,6 +253,9 @@ def self_test():
     assert decide_orphan({**orphan, "busy": None})[0] == "skip"  # no answer from orq about workers, when in doubt it doesn't delete
     assert is_kept("prototype/2039-x", ["prototype/*"]) and not is_kept("feat/x", ["prototype/*"])
     assert is_kept("main_bkp_1", ["main_bkp_*"]) and is_kept("feat/plataform-metrics", ["feat/plataform-metrics"])
+    parent = {"id": "parent", "childWorktreeIds": ["child"]}
+    child = {"id": "child", "path": os.path.dirname(__file__)}
+    assert live_children(parent, {"parent": parent, "child": child}) == [child]
     base = dict(branch="feat/a", kind="worktree", kept=False, merged=True, open_head=False, open_base=False,
                 dirty=False, ahead=False, mine=True, on_remote=True, tip_matches=True)
     assert decide(base)[0] == "remove"
@@ -371,6 +381,7 @@ def main():
         wts = []
         add("worktree", "(orca worktree list)", "error", str(e))
     busy = busy_worktrees()
+    by_id = {w.get("id"): w for w in wts if w.get("id")}
     for w in wts:
         if w.get("isMainWorktree") or not w.get("branch"):
             continue
@@ -392,6 +403,10 @@ def main():
                 v, r = decide_orphan(fa)
                 if v == "remove":
                     r += "; branch local apagada junto"
+            child_rows = live_children(w, by_id)
+            if v == "remove" and child_rows:
+                names = ", ".join(c.get("displayName") or c.get("branch") or c["path"] for c in child_rows)
+                v, r = "skip", f"live child worktree(s): {names}"
             stored = []
             if v == "remove" and fa.get("artefatos"):
                 if a.dry_run:
@@ -417,6 +432,11 @@ def main():
                 except Exception as e:  # without orq the cleanup carries on; Orca removes the worktree the same way
                     print(f"limpar-mergeados: worktree processes not terminated: {e}", file=sys.stderr)
             act("worktree", b, v, r, ["orca", "worktree", "rm", "--worktree", f"path:{w['path']}", "--run-hooks"])
+            parent_row = by_id.get(w.get("parentWorktreeId"))
+            lineage = {"parent": (parent_row.get("displayName") or parent_row.get("branch") or parent_row.get("path")) if parent_row else None,
+                       "children": [c.get("displayName") or c.get("branch") or c.get("path") for c in child_rows]}
+            if lineage["parent"] or lineage["children"]:
+                items[-1]["lineage"] = lineage
             if stored:
                 items[-1]["guardados"] = stored
             if v == "remove" and not fa["merged"] and not a.dry_run and items[-1]["action"] == "removed":
@@ -486,6 +506,10 @@ def finish(items, a):
     else:
         for i in items:
             print(f"{i['action']:<12} {i['kind']:<9} {i['name']}  ({i['reason']})")
+            if i.get("lineage", {}).get("parent"):
+                print(f"  └─ parent: {i['lineage']['parent']}")
+            for child in i.get("lineage", {}).get("children", []):
+                print(f"  └─ child: {child}")
         if not items:
             print("nothing to do")
 

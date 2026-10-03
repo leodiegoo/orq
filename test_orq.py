@@ -54,6 +54,7 @@ FAKE = '''#!/usr/bin/env python3
 import base64, json, os, sys, time
 d = os.environ["FAKE_DIR"]
 a = sys.argv[2:]
+area = sys.argv[1]
 cmd = a[0]
 def opt(n, default=None):
     return a[a.index(n) + 1] if n in a else default
@@ -99,6 +100,16 @@ def page_data(item_list):
     return item_list[start_at:end], (base64.b64encode(str(end).encode()).decode() if end < len(item_list) else None)
 def failure(msg):
     print(json.dumps({"ok": False, "error": {"message": msg}})); sys.exit(0)
+if area == "worktree" and cmd in ("list", "current", "set"):
+    if cmd == "list":
+        res = {"worktrees": read_value("worktrees.json", [])}
+    elif cmd == "current":
+        path = os.environ.get("FAKE_CURRENT_WT")
+        res = {"worktree": {"path": path} if path else None}
+    elif cmd == "set":
+        open(os.path.join(d, "worktree-set.log"), "a").write(json.dumps(a) + "\\n")
+        res = {"worktree": {"path": opt("--worktree", "").removeprefix("path:")}}
+    print(json.dumps({"ok": True, "result": res})); sys.exit(0)
 def turno_comeca(dispatch):
     # o hook prompt do worker grava o início do turno em turnos.json (ORQ_HOME); FAKE_INICIO: nunca (o spec não entra) | depois_do_enter (só o Enter submete)
     p = os.path.join(os.environ["ORQ_HOME"], "turnos.json")
@@ -3865,6 +3876,66 @@ def test_dispatch_new_worktree_passes_on_name_and_base_branch():
     assert arg[arg.index("--worktree") + 1] == "new-top-level" and arg[arg.index("--name") + 1] == "feat/x" and arg[arg.index("--base-branch") + 1] == "development"
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
     assert ev["worktree"] == "new-top-level" and ev["nome"] == "feat/x"
+
+
+def test_ticket442_parent_branch_sets_board_lineage_and_ticket_metadata():
+    rows = [{"id": "repo::/wt/feature", "path": "/wt/feature", "branch": "refs/heads/feat/failover", "displayName": "failover"}]
+    calls = []
+
+    def fake_orca(*args, **kwargs):
+        calls.append((args, kwargs))
+        if args[:1] == ("list",):
+            return {"worktrees": rows}
+        if args[:1] == ("current",):
+            return {"worktree": {"path": "/wt/orq"}}
+        return {}
+
+    with mock.patch.object(orq_mod, "orca", side_effect=fake_orca):
+        parent, note = orq_mod._worktree_parent("orq", "origin/feat/failover")
+        assert parent == "/wt/feature" and note is None
+        assert orq_mod._set_worktree_metadata("/wt/442", display_name="442: linhagem", issue=254, comment="Ticket spec: /plan/442.md",
+                                               status="in-progress", parent=parent)
+    args, kwargs = next((args, kwargs) for args, kwargs in calls if args[:1] == ("set",))
+    assert args == ("set", "--worktree", "path:/wt/442", "--display-name", "442: linhagem", "--issue", "254",
+                    "--comment", "Ticket spec: /plan/442.md", "--workspace-status", "in-progress", "--parent-worktree", "path:/wt/feature"), args
+    assert kwargs["area"] == "worktree"
+
+
+def test_ticket442_dispatch_sets_child_parent_display_and_in_progress_on_orca_card():
+    a = Env(run="run_a")
+    r = _dispatch(a, FAKE_WT="/wt/442", FAKE_CURRENT_WT="/wt/coordinator")
+    assert r.returncode == 0, r.stderr
+    calls = _log(a, "worktree-set.log")
+    assert len(calls) == 1, _log(a, "calls.log")
+    (call,) = calls
+    assert call[0] == "set" and call[call.index("--worktree") + 1] == "path:/wt/442", call
+    assert call[call.index("--display-name") + 1] == "Ticket 05", call
+    assert call[call.index("--workspace-status") + 1] == "in-progress", call
+    assert call[call.index("--parent-worktree") + 1] == "path:/wt/coordinator", call
+
+
+def test_ticket442_missing_parent_records_the_reason_and_leaves_worktree_unparented():
+    with mock.patch.object(orq_mod, "_orca_worktree_rows", return_value=[]):
+        with mock.patch.object(orq_mod, "orca", return_value={"worktree": {"path": "/wt/orq"}}):
+            parent, note = orq_mod._worktree_parent("orq", "feat/missing")
+    assert parent is None and "feat/missing" in note
+
+
+def test_ticket442_delivery_and_merge_move_the_worktree_card_through_review_to_completed():
+    calls = []
+
+    def fake_orca(*args, **kwargs):
+        calls.append(args)
+        if args[:1] == ("worker-show",):
+            return {"worker": {"worktreeId": "repo::/wt/442"}}
+        return {}
+
+    events = [{"tipo": "despacho", "ticket": "442", "task": "task_442", "dispatch": "ctx_442"}]
+    with mock.patch.object(orq_mod, "read_events", return_value=events), mock.patch.object(orq_mod, "orca", side_effect=fake_orca):
+        assert orq_mod._ticket_worktree_status("442", "in-review", task="task_442")
+        assert orq_mod._ticket_worktree_status("442", "completed", task="task_442")
+    statuses = [args[args.index("--workspace-status") + 1] for args in calls if args[:1] == ("set",)]
+    assert statuses == ["in-review", "completed"], statuses
 
 
 def test_dispatch_refuses_what_orca_would_refuse_without_creating_task():
@@ -23999,6 +24070,21 @@ def test_ticket327_loose_change_goes_to_review_with_the_reason_and_a_lone_report
         assert os.path.exists(os.path.join(root, "7", "notes.txt")) and os.path.isdir(os.path.join(root, "3")), "loose changes are never removed"
     finally:
         orq_mod.REPORTS = saved
+
+
+def test_ticket442_cleanup_keeps_parent_with_live_child_and_prints_the_tree():
+    repo, root, k = _run327()
+    parent, child = os.path.join(root, "1"), os.path.join(root, "2")
+    rows = [
+        {"id": "repo::/parent", "path": parent, "displayName": "feature", "childWorktreeIds": ["repo::/child"]},
+        {"id": "repo::/child", "path": child, "displayName": "442: ticket", "parentWorktreeId": "repo::/parent", "childWorktreeIds": []},
+    ]
+    with mock.patch.object(orq_mod, "_orca_worktree_rows", return_value=rows):
+        result = orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **k)
+        stays = {os.path.realpath(x["pasta"]): x["motivo"] for x in result["ficaram"]}
+        assert "live child worktree(s): 442: ticket" == stays[os.path.realpath(parent)], stays
+        text_value = orq_mod.worktrees_clean(dry_run=True, repo=repo, root=root, now_at=k["now_at"], backups=k["backups"], busy=k["busy"])
+    assert "tree: feature" in text_value and "└─ 442: ticket" in text_value, text_value
 
 
 def test_ticket327_window_counts_from_the_end_of_the_cycle_not_from_the_birth_of_the_folder():

@@ -891,6 +891,9 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         live = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}  # `retained` and `release_unknown` count as alive
         live |= {str(i["ticket"]).zfill(2) for i in integration_queue().values()}  # a delivery still on the integrator queue is not residue (ticket 326)
     registry, subjects = integration_registry(ev) if registry is None else registry, set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
+    board_rows = _orca_worktree_rows()
+    board_by_id = {x.get("id"): x for x in board_rows if x.get("id")}
+    board_by_path = {os.path.realpath(x["path"]): x for x in board_rows if x.get("path")}
     out, cwds, asked, rewrites = {"removidas": [], "ficaram": [], "revisar": [], "bundle": None}, None, False, []
     folders = [(os.path.join(root, n), n) for n in (sorted(os.listdir(root)) if os.path.isdir(root) else [])]
     folders += [(d, None) for d in _linked_worktrees(repo, root)]
@@ -904,6 +907,15 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         reason = ("loose branch (detached HEAD)" if not branch else "integrator worktree" if item_name == "integracao" or branch.startswith("integra/")
                   else "main branch" if _environment_branch(branch) else "prototype branch" if branch.startswith("prototype/") else "live dispatch for the ticket" if number in live
                   else None)
+        board_row = board_by_path.get(os.path.realpath(d))
+        child_ids = set((board_row or {}).get("childWorktreeIds", []))
+        if board_row:
+            child_ids.update(row["id"] for row in board_rows if row.get("parentWorktreeId") == board_row.get("id"))
+        live_children = [board_by_id.get(child_id) for child_id in child_ids]
+        live_children = [child for child in live_children if child and os.path.isdir(child.get("path", ""))]
+        if not reason and live_children:
+            labels = ", ".join(child.get("displayName") or child.get("branch") or child["path"] for child in live_children)
+            reason = f"live child worktree(s): {labels}"
         if not reason and item_name is None:
             if busy is None and not asked:
                 busy, asked = _busy_or_none(), True
@@ -1354,6 +1366,28 @@ def clean_round(now_at=None):
     return lines
 
 
+def _worktree_lineage_lines(rows):
+    """Compact tree for the cleanup dry-run, using Orca's persisted parent/child links."""
+    by_id = {row.get("id"): row for row in rows if row.get("id")}
+    children = {row.get("id"): [child for child in rows if child.get("id") in set(row.get("childWorktreeIds", [])) | {x.get("id") for x in rows if x.get("parentWorktreeId") == row.get("id")}
+                                  and os.path.isdir(child.get("path", ""))]
+                for row in rows if row.get("id")}
+    roots = [row for row in rows if row.get("id") and not row.get("parentWorktreeId") and children.get(row["id"])]
+    lines = []
+
+    def visit(row, depth, seen):
+        if row["id"] in seen:
+            return
+        name = row.get("displayName") or row.get("branch") or row.get("path")
+        lines.append(f"  {'  ' * depth}{'└─ ' if depth else 'tree: '}{name}")
+        for child in children.get(row["id"], []):
+            visit(child, depth + 1, seen | {row["id"]})
+
+    for row in roots:
+        visit(row, 0, set())
+    return lines
+
+
 def worktrees_clean(dry_run=False, now_at=None, repo=None, root=None, backups=None, busy=None):
     """`orq worktrees clean` (ticket 327): the worktrees and the local branches already in main, with the reason and the size of each one, and what stays (and what needs review) with
     the reason. It is the same plan and the same removal as `orq clean --only worktrees,branches` (events `clean` and `clean_run` for the digest). First line: the totals."""
@@ -1365,9 +1399,10 @@ def worktrees_clean(dry_run=False, now_at=None, repo=None, root=None, backups=No
     gone = plan if result is None else {c: [i for i in result["removed"] if i["categoria"] == c] for c in plan}
     items = [i for c in plan for i in gone[c]]
     stays = [f"  keeps {x['pasta']}: {x['motivo']}" for x in r["ficaram"]] + [f"  keeps {i['alvo']}: {why}" for i, why in (result or {}).get("kept", [])]
+    lineage = _worktree_lineage_lines(_orca_worktree_rows()) if dry_run else []
     return "\n".join([f"{'would remove' if result is None else 'removed'}: {len(gone['worktrees'])} worktree(s), {len(gone['branches'])} branch(es), {clean_human(sum(i['bytes'] for i in items))}; "
                       f"kept: {len(stays)}; review: {len(r['revisar'])}",
-                      *[f"  removes {i['alvo']} ({i['motivo']}; {clean_human(i['bytes'])})" for i in items], *stays,
+                      *lineage, *[f"  removes {i['alvo']} ({i['motivo']}; {clean_human(i['bytes'])})" for i in items], *stays,
                       *[f"  review {x['pasta']}: {x['motivo']}" for x in r["revisar"]]])
 
 
@@ -3894,6 +3929,8 @@ def _ingest_msg(m, since, already, titles, send=True):
     pushed = _push_product_pr(m, p) if delivery_ok and proof_ok else False
     if pushed:
         _release_delivered(m, p, queued if proof_ok else None)
+    if delivery_ok and p.get("outcome") == "succeeded":
+        _dispatch_worktree_status(p.get("dispatchId"), "in-review")
     if p.get("reportPath"):
         items = _report_items(p["reportPath"])
         alert = None
@@ -4739,6 +4776,7 @@ def pr_link(task, url, issue=None, tag=None, note=None, head=None):
         return item
 
     item = _mutate_prs(add)
+    _ticket_worktree_status(None, "completed" if item.get("estado") in ("mergeado", "fechado") else "in-review", task=task)
     _close_next(item)
     _request_pr_followups(url, seen_item.get("body"), _run_group(_task_run(read_events(), task)).get("grupo"))
     return item
@@ -5646,6 +5684,7 @@ def _apply_prs(d, seen, now_at):
         if new == "fechado" and all(x["estado"] == "fechado" for x in d["itens"] if x["task"] == i["task"]):  # all closed without merge: the branch is a cleanup candidate
             append_event({"tipo": "pr", "op": "fechada", "task": i["task"], "branch": i.get("head"), "limpeza_em_dias": CLOSED_DAYS})
         if new == "mergeado" and i["base"] == (FINAL_BASE or task_flow(i["task"], event_list)["producao"]):
+            _ticket_worktree_status(None, "completed", task=i["task"])
             _clean_post_merge(i, seen_item.get("headRefName") or i.get("head"))
         if i["url"] in already:
             i["avisado"] = True
@@ -11790,6 +11829,7 @@ def ticket_close(numero, answer, dropped=None, integrated=False):
     notice = "; ".join(x for x in (notice, *notices) if x)
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": closed_item, **({"aviso": notice} if notice else {}), **({"largado": dropped} if dropped else {}),
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in released]})
+    _ticket_worktree_status(n, "completed", task=t.get("task"))
     if product and not dropped and not integrated:
         _request_production_continuation(t, answer_text, events)
     for o in [o for o in open_obligations(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
@@ -14419,6 +14459,103 @@ def _ticket_project(number):
     return next((t["projeto"] for t in tickets() if t["num"] == n), None)
 
 
+def _orca_worktree_rows():
+    """The worktrees visible to Orca, or an empty list when the board is unavailable."""
+    try:
+        result = orca("list", "--json", area="worktree", timeout=20)
+        return (result.get("worktrees") or result.get("result", {}).get("worktrees") or [])
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError):
+        return []
+
+
+def _worktree_parent(project=None, base_branch=None):
+    """Return (parent path, note). Prefer the worktree holding an explicit base branch; otherwise use the active coordinator worktree in the same repo."""
+    rows = _orca_worktree_rows()
+    current = None
+    try:
+        result = orca("current", "--json", area="worktree", timeout=20)
+        current = result.get("worktree") or result.get("result", {}).get("worktree")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError):
+        pass
+    current_path = current.get("path") if isinstance(current, dict) else None
+    project_config = projects().get(project, {}) if project else {}
+    project_repo = repo_folder(project_config["repo"]) if project_config.get("repo") else None
+    if project_config.get("repo") and not project_repo:
+        return None, f"project {project} repository has no known folder; dispatch continued without a parent"
+    expected_root = _repo_root(project_repo) if project_repo else _repo_root(current_path) if current_path else None
+    if base_branch:
+        wanted = base_branch.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/").removeprefix("origin/")
+        for row in rows:
+            branch = (row.get("branch") or "").removeprefix("refs/heads/").removeprefix("refs/remotes/origin/").removeprefix("origin/")
+            same_repo = not expected_root or _repo_root(row.get("path", "")) == expected_root
+            if branch == wanted and row.get("path") and same_repo:
+                return row["path"], None
+        return None, f"parent branch {wanted} has no Orca worktree; dispatch continued without a parent"
+    if not current_path:
+        return None, "coordinator worktree is unavailable; dispatch continued without a parent"
+    if project_repo:
+        if _repo_root(current_path) != _repo_root(project_repo):
+            return None, f"coordinator worktree is outside project {project}; dispatch continued without a parent"
+    return current_path, None
+
+
+def _ticket_github_issue(text_value, project):
+    """The explicitly cited GitHub issue number, only when its URL names this project's GitHub repository."""
+    if not project:
+        return None
+    repo = projects().get(project, {}).get("repo", "")
+    repo_path = repo_folder(repo) if repo else None
+    remote = (_git(repo_path, "config", "--get", "remote.origin.url") or "").strip() if repo_path else ""
+    match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s.#]+?)(?:\.git)?/issues/(\d+)", text_value or "", re.I)
+    if not match:
+        return None
+    origin = f"{match.group(1)}/{match.group(2)}".lower()
+    remote_match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s.#]+?)(?:\.git)?(?:\s|$)", remote, re.I)
+    if remote_match and origin == f"{remote_match.group(1)}/{remote_match.group(2)}".lower():
+        return int(match.group(3))
+    if remote_match and re.search(r"^(?:GitHub )?Issue:\s*#?(\d+)\s*$", text_value or "", re.I | re.M):
+        return int(re.search(r"^(?:GitHub )?Issue:\s*#?(\d+)\s*$", text_value or "", re.I | re.M).group(1))
+    return None
+
+
+def _set_worktree_metadata(path, *, display_name=None, issue=None, comment=None, status=None, parent=None, no_parent=False):
+    """Write Orca board metadata without letting a board outage undo a successful dispatch."""
+    if not path:
+        return False
+    args = ["set", "--worktree", f"path:{path}"]
+    for flag, value in (("--display-name", display_name), ("--issue", str(issue) if issue else None), ("--comment", comment), ("--workspace-status", status)):
+        if value:
+            args += [flag, value]
+    if parent:
+        args += ["--parent-worktree", f"path:{parent}"]
+    elif no_parent:
+        args += ["--no-parent"]
+    try:
+        orca(*args, area="worktree", timeout=20)
+        return True
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError) as e:
+        log(f"worktree metadata {path}: {type(e).__name__}: {e}")
+        return False
+
+
+def _dispatch_worktree_status(dispatch, status, path=None):
+    """Update a dispatch's Orca board card when its ticket changes phase."""
+    if not path and dispatch:
+        try:
+            path = _worker_path(orca("worker-show", "--dispatch", dispatch, timeout=10))
+        except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError):
+            pass
+    return _set_worktree_metadata(path, status=status) if dispatch else False
+
+
+def _ticket_worktree_status(ticket, status, task=None):
+    """Apply a ticket phase to its newest dispatched worktree, if Orca still knows it."""
+    number = str(ticket).zfill(2) if ticket else None
+    event = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and
+                  ((number and str(e.get("ticket", "")).zfill(2) == number) or (task and e.get("task") == task))), None)
+    return _dispatch_worktree_status(event["dispatch"], status, event.get("worktree_path")) if event and event.get("dispatch") else False
+
+
 def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None, _age_s=0):
     """worker-start (with --model and --effort, which the worker-routing-guard hook requires) + `dispatch_mode` event + entry intake.
 
@@ -14439,6 +14576,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
     """
     if priority_level is not None and priority_level not in (1, 2, 3):
         raise ValueError("--priority expects 1 (high), 2 or 3 (low)")
+    requested_base_branch = base_branch
     project = project or (_ticket_project(ticket) if ticket else None)  # --projeto, then the ticket's `Project:`
     explicit_project = bool(project or (run and run_project(run)))
     project = dispatch_project(project, run, use_cwd=not _draining)  # then the Run's, the cwd's; with none, the dispatch is the usual one
@@ -14541,6 +14679,12 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             if project and projects().get(project, {}).get("commit_autorizado") is True:
                 spec = f"{spec.rstrip()}{commit_permission}"
             spec = f"{spec.rstrip()}\n\n{SPEC_BLOCKS}\n"
+        parent_worktree, parent_note = _worktree_parent(project, requested_base_branch)
+        ticket_issue = _ticket_github_issue(text, project) if tk else None
+        display_name = f"{tk['num']}: {title[:60]}" if tk else title[:80]
+        board_comment = f"Ticket spec: {tk['arquivo']}" if tk else "Coordinator dispatch"
+        if parent_note:
+            board_comment += f"; {parent_note}"
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
         environment = {**(night_environment() if night_active(_cursor_ro()) else {}), **worker_identity_environment(folder)}
         items, real, scratch = dispatch_conformance(spec, title, scratch_roots([folder]), tk and tk["arquivo"])  # ticket 201: what the delivery must prove
@@ -14565,6 +14709,11 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         terminal = next((e.get("id") for e in res.get("effects") or [] if e.get("kind") == "terminal" and e.get("role") == "agent"), None)
         if not (task and dispatch):
             raise RuntimeError(f"worker-start without taskId/dispatchId in the reply: {json.dumps(res)[:300]}")
+        worktree_path = None
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError):
+            worktree_path = _worker_path(orca("worker-show", "--dispatch", dispatch, timeout=10))
+        _set_worktree_metadata(worktree_path, display_name=display_name, issue=ticket_issue, comment=board_comment,
+                               status="in-progress", parent=parent_worktree)
         if terminal:
             try:
                 orca("rename", "--terminal", terminal, "--title", title, area="terminal")
@@ -14573,7 +14722,10 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": title, "agente": agent, "modelo": model, "effort": effort, "terminal": terminal,
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
-              **({"projeto": project} if project else {}), **({"base_branch": base_branch} if base_branch else {}),
+              **({"projeto": project} if project else {}),
+              **({"parent_worktree": parent_worktree} if parent_worktree else {}), **({"parent_note": parent_note} if parent_note else {}),
+              **({"worktree_path": worktree_path} if worktree_path else {}),
+              **({"base_branch": base_branch} if base_branch else {}),
               **({"servico": True} if service else {}), **({"direct": direct} if direct else {}),
               **({"worktrees": [w for _, w in pairs]} if pairs else {}), **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)
