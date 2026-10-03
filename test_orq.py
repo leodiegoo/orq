@@ -12448,6 +12448,76 @@ def test_ticket328_advance_after_a_conflict_only_in_tests_or_docs_runs_the_affec
     r = subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "um"], cwd=alive, env={**env, "ORQ_TESTES": f"echo full > {ran}"}, capture_output=True, text=True)
     assert r.returncode == 0 and open(ran).read() == "full\n", "a cycle without a conflict runs the full suite once, on the final tree"
 
+
+def _queue458(env, branches):
+    os.makedirs(env["ORQ_HOME"], exist_ok=True)
+    items = [{"branch": branch, "ticket": f"{i:02d}", "ts": f"2026-10-03T00:00:{i:02d}Z"} for i, branch in enumerate(branches, 1)]
+    with open(os.path.join(env["ORQ_HOME"], "integrate-queue.json"), "w") as f:
+        json.dump({"items": items}, f)
+
+
+def test_ticket458_integration_batch_max_controls_the_cycle():
+    a = Env()
+    r = a.orq("machine", "--json")
+    assert r.returncode == 0 and json.loads(r.stdout)["config"]["integration_batch_max"] == 5, r.stdout + r.stderr
+    r = a.orq("machine", "set", "integration_batch_max", "2")
+    assert r.returncode == 0 and json.load(open(os.path.join(a.home, "machine.json"))) == {"integration_batch_max": 2}, r.stdout + r.stderr
+    r = a.orq("machine", "set", "integration_batch_max", "0")
+    assert r.returncode != 0, "a cycle limit must be positive"
+
+    branches = [f"feat/b{i}" for i in range(1, 4)]
+    alive, env, g = _alive_repo55({branch: {f"branch-{i}.txt": f"{i}\n"} for i, branch in enumerate(branches, 1)})
+    try:
+        _queue458(env, branches)
+        with open(os.path.join(env["ORQ_HOME"], "machine.json"), "w") as f:
+            json.dump({"integration_batch_max": 2}, f)
+        integrate = os.path.join(alive, "scripts", "integrar.py")
+        r = subprocess.run([sys.executable, integrate, *branches], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        events = [json.loads(line) for line in open(os.path.join(env["ORQ_HOME"], "events.jsonl"))]
+        start = next(e for e in events if e.get("type") == "integrate_cycle" and e.get("stage") == "merge")
+        assert start["branches"] == branches[:2], (start, r.stdout, r.stderr)
+        assert os.path.exists(os.path.join(alive, "branch-1.txt")) and os.path.exists(os.path.join(alive, "branch-2.txt")), r.stdout
+        assert not os.path.exists(os.path.join(alive, "branch-3.txt")), "the branch beyond the configured cap stays queued"
+    finally:
+        shutil.rmtree(os.path.dirname(alive), ignore_errors=True)
+
+
+def test_ticket458_six_queued_branches_bisect_culprit_and_retry_remaining_in_order():
+    branches = [f"feat/b{i}" for i in range(1, 7)]
+    files = {branch: {f"branch-{i}.txt": f"{i}\n"} for i, branch in enumerate(branches, 1)}
+    files[branches[4]]["bad.txt"] = "this branch makes the integration tests fail\n"
+    alive, env, g = _alive_repo55(files)
+    try:
+        _queue458(env, branches)
+        integrate = os.path.join(alive, "scripts", "integrar.py")
+        env = {**env, "ORQ_TESTES": "test ! -e bad.txt"}
+        first = subprocess.run([sys.executable, integrate, *branches], cwd=alive, env=env, capture_output=True, text=True)
+        assert first.returncode != 0, first.stdout + first.stderr
+        assert "feat/b5" in first.stdout + first.stderr and "tests failing" in first.stdout + first.stderr, first.stdout + first.stderr
+        assert not os.path.exists(os.path.join(alive, "branch-1.txt")), "a failed batch does not partially advance main"
+        queue = json.load(open(os.path.join(env["ORQ_HOME"], "integrate-queue.json")))["items"]
+        remaining = ["feat/b1", "feat/b2", "feat/b3", "feat/b4", "feat/b6"]
+        assert [item["branch"] for item in queue] == remaining, queue
+        events = [json.loads(line) for line in open(os.path.join(env["ORQ_HOME"], "events.jsonl"))]
+        start, ended = [e for e in events if e.get("type") == "integrate_cycle" and e.get("stage") == "merge"], [
+            e for e in events if e.get("type") == "integrate_cycle" and e.get("stage") == "end"
+        ]
+        assert start[-1]["branches"] == branches[:5], start
+        assert ended[-1]["outcome"] == "returned" and "feat/b5" in ended[-1]["returned_for"] and "tests failing" in ended[-1]["returned_for"], ended[-1]
+
+        retry = subprocess.run([sys.executable, integrate, *[item["branch"] for item in queue]], cwd=alive,
+                               env={**env, "ORQ_TESTES": "true"}, capture_output=True, text=True)
+        assert retry.returncode == 0, retry.stdout + retry.stderr
+        for i in (1, 2, 3, 4, 6):
+            assert os.path.exists(os.path.join(alive, f"branch-{i}.txt")), f"queued branch {i} was not retried"
+        assert not os.path.exists(os.path.join(alive, "bad.txt")), "only the culprit was returned"
+        events = [json.loads(line) for line in open(os.path.join(env["ORQ_HOME"], "events.jsonl"))]
+        starts = [e for e in events if e.get("type") == "integrate_cycle" and e.get("stage") == "merge"]
+        assert starts[-1]["branches"] == remaining, starts[-1]
+    finally:
+        shutil.rmtree(os.path.dirname(alive), ignore_errors=True)
+
 def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_log():
     t = tempfile.mkdtemp()
     for f in ("orq.py", "precompact.py", "fail_safe.py", "orqpaths.py"):
@@ -18711,8 +18781,10 @@ def test_ticket154_integrate_py_with_red_test_closes_nothing():
     a = Env(run="run_a")
     r, g = _integrate154(a, "false")
     assert r.returncode != 0
-    assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
+    assert json.loads(a.orq("integrar", "fila", "lista", "--json").stdout) == []
     assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "ciclo")]
+    (returned,) = [e for e in a.events() if e["tipo"] == "integrate_cycle" and e.get("stage") == "end"]
+    assert returned["outcome"] == "returned" and "feat/b1" in returned["returned_for"] and "tests failing" in returned["returned_for"], returned
 def _released170(a, title="orq: Passagem escrita"):
     """87 closes and releases 88 (P2, with Modelo/Effort), which enters the dispatch queue; the manager is on and the fleet is empty."""
     _manager(a)

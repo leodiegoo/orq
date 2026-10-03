@@ -17,20 +17,24 @@ only in test_orq.py, README.md or docs/design.md, `--avancar` runs `orq test --a
 Variables: ORQ_WT_DIR (default: ORQ_WT, the .worktrees/ folder of the clone), ORQ_TESTES (default: the README tests), ORQ_TESTES_AFETADOS (the run after a light conflict),
 ORQ_REPLAY (default: the night replay; off when ORQ_TESTES replaces the tests), ORQ_CICLOS_LOG (default: <ORQ_WT_DIR>/integracao/ciclos.log)."""
 import os
+import json
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.dont_write_bytecode = True  # this runs inside the live main: no __pycache__ dirties the tree
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import orqpaths  # noqa: E402
+import orqlib  # noqa: E402
 
 TEST_MAP = os.environ.get("ORQ_TEST_MAP") or os.path.join(orqpaths.PLAN, "test-map.json")
 TESTS = f"python3 test_orq.py --map {shlex.quote(TEST_MAP)} && python3 test_precompact.py"
 LIGHT = {"test_orq.py", "README.md", "docs/design.md"}  # a conflict only in these re-runs the affected tests, not the whole suite (ticket 328)
 REPLAY = "python3 test_noite_replay.py"
+DEFAULT_BATCH_MAX = 5
 
 
 def git(cwd, *args):
@@ -152,8 +156,9 @@ def advance(wt):
     branch = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
     if not branch.startswith("integra/"):
         die(f"{wt} is not an integration worktree (branch {branch or 'detached'})")
+    branches = open(branches_file(wt)).read().split() if os.path.exists(branches_file(wt)) else []
     if not CYCLE:  # `--avancar`: the conflict's cycle ended as returned; this is a new one
-        start_cycle(open(branches_file(wt)).read().split() if os.path.exists(branches_file(wt)) else [])
+        start_cycle(branches)
     if git(wt, "status", "--porcelain").stdout.strip():
         die(f"{wt} has a conflict or uncommitted changes: resolve, commit and run `integrar.py --avancar {wt}`")
     markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
@@ -173,11 +178,12 @@ def advance(wt):
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"[PENDENTE: main did not advance, night replay failed] {time.strftime('%Y-%m-%d %H:%M')} {branch} in {wt}\n")
-            die(f"night replay failing in {wt} ({time.time() - started:.1f} s); main did not advance")
+            return_failed_batch(viva, wt, branches, git(viva, "rev-parse", "HEAD").stdout.strip(),
+                                f"night replay failing in {wt} ({time.time() - started:.1f} s); main did not advance")
         print(f"integrar: night replay ok in {time.time() - started:.1f} s")
     stage("tests")
     if subprocess.run(tests_for(viva, wt), shell=True, cwd=wt).returncode:
-        die(f"tests failing in {wt}; main did not advance")
+        return_failed_batch(viva, wt, branches, git(viva, "rev-parse", "HEAD").stdout.strip(), f"tests failing in {wt}; main did not advance")
     old = git(viva, "rev-parse", "--short", "HEAD").stdout.strip()
     ff = git(viva, "merge", "--ff-only", branch)
     if ff.returncode:
@@ -213,8 +219,136 @@ def check_proof(viva, branches, no_proof):
         print(r.stderr.strip(), file=sys.stderr)
 
 
+def machine_batch_max():
+    """The configured maximum number of queued branches selected for one cycle."""
+    try:
+        value = orqlib.machine_cfg().get("integration_batch_max")
+    except Exception as error:
+        print(f"integrar: could not read machine.json setting ({error}); using the default limit of {DEFAULT_BATCH_MAX}", file=sys.stderr)
+        return DEFAULT_BATCH_MAX
+    if type(value) is not int or value < 1:
+        print(f"integrar: invalid integration_batch_max {value!r}; using the default limit of {DEFAULT_BATCH_MAX}", file=sys.stderr)
+        return DEFAULT_BATCH_MAX
+    return value
+
+
+def integration_queue_items(viva):
+    """The current queue, in its stored order."""
+    cmd = [sys.executable, os.path.join(viva, "orq.py"), "integrate", "queue", "list", "--json"]
+    r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    if r.returncode:
+        return []
+    try:
+        items = json.loads(r.stdout)
+    except ValueError:
+        return []
+    return [item for item in items if isinstance(item, dict) and item.get("branch") and item.get("ticket")]
+
+
+def probe_batch(viva, branches, base, attempt):
+    """Try one branch subset in a detached worktree without moving main or changing the queue."""
+    root = os.path.abspath(os.environ.get("ORQ_WT_DIR") or orqpaths.WT)
+    os.makedirs(root, exist_ok=True)
+    wt = tempfile.mkdtemp(prefix=f".integra-bisect-{os.getpid()}-{attempt}-", dir=root)
+    os.rmdir(wt)
+    added = False
+    try:
+        r = git(viva, "worktree", "add", "--detach", wt, base)
+        if r.returncode:
+            return None, f"could not create a bisection worktree: {(r.stderr or r.stdout).strip()}"
+        added = True
+        for branch in branches:
+            merged = git(wt, "merge", "--no-edit", branch)
+            if merged.returncode:
+                detail = (merged.stderr or merged.stdout).strip().splitlines()
+                return True, f"conflict integrating {branch}" + (f": {detail[-1]}" if detail else "")
+        replay = os.environ.get("ORQ_REPLAY", "" if os.environ.get("ORQ_TESTES") else REPLAY)
+        if replay:
+            result = subprocess.run(replay, shell=True, cwd=wt, capture_output=True, text=True)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                return True, "night replay failed" + (f": {detail[-1]}" if detail else "")
+        result = subprocess.run(tests_for(viva, wt), shell=True, cwd=wt, capture_output=True, text=True)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            return True, "tests failing" + (f": {detail[-1]}" if detail else f" (exit {result.returncode})")
+        return False, "checks passed"
+    finally:
+        if added:
+            removed = git(viva, "worktree", "remove", "--force", wt)
+            if removed.returncode:
+                print(f"integrar: could not remove bisection worktree {wt}: {removed.stderr.strip()}", file=sys.stderr)
+
+
+def isolate_culprit(viva, branches, base, initial_failure):
+    """Bisect a failing batch; return a branch only when one failing half identifies it uniquely."""
+    candidates = list(branches)
+    attempt = 0
+    failure = initial_failure
+    while len(candidates) > 1:
+        middle = len(candidates) // 2
+        left, right = candidates[:middle], candidates[middle:]
+        attempt += 1
+        left_failed, left_reason = probe_batch(viva, left, base, attempt)
+        attempt += 1
+        right_failed, right_reason = probe_batch(viva, right, base, attempt)
+        if left_failed is None or right_failed is None:
+            return None, left_reason if left_failed is None else right_reason
+        if left_failed and not right_failed:
+            candidates, failure = left, left_reason
+        elif right_failed and not left_failed:
+            candidates, failure = right, right_reason
+        else:
+            return None, "bisection did not isolate one failing branch (both halves failed or passed independently)"
+    return candidates[0], failure
+
+
+def remove_cycle_worktree(viva, wt):
+    """Remove a failed batch worktree after its culprit has been returned."""
+    branch = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    removed = git(viva, "worktree", "remove", "--force", wt)
+    if removed.returncode:
+        print(f"integrar: returned branch, but could not remove {wt}: {removed.stderr.strip()}", file=sys.stderr)
+        return
+    if branch.startswith("integra/"):
+        deleted = git(viva, "branch", "-D", branch)
+        if deleted.returncode:
+            print(f"integrar: returned branch, but could not remove integration branch {branch}: {deleted.stderr.strip()}", file=sys.stderr)
+
+
+def return_failed_batch(viva, wt, branches, base, reason, conflicts=None):
+    """Return one isolated queued culprit; if isolation is ambiguous, preserve the worktree for manual resolution."""
+    queue = integration_queue_items(viva)
+    by_branch = {item["branch"]: item for item in queue}
+    if not branches or any(branch not in by_branch for branch in branches):
+        if conflicts is not None:
+            with open(conflicts_file(wt), "w") as f:
+                f.write(conflicts)
+        die(reason)
+    culprit, failure = isolate_culprit(viva, branches, base, reason)
+    if not culprit:
+        if conflicts is not None:
+            with open(conflicts_file(wt), "w") as f:
+                f.write(conflicts)
+        die(f"{reason}\ncould not return one branch: {failure}")
+    item = by_branch[culprit]
+    cmd = [sys.executable, os.path.join(viva, "orq.py"), "integrate", "queue", "rm", str(item["ticket"])]
+    removed = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    if removed.returncode:
+        die(f"{reason}\ncould not return {culprit} from the queue: {removed.stderr.strip() or removed.stdout.strip()}")
+    print(f"integrar: batch failed: {reason}", file=sys.stderr)
+    print(f"integrar: returned {culprit} (ticket {item['ticket']}) after {failure}; the other queued branches stay in their original order")
+    remove_cycle_worktree(viva, wt)
+    end_cycle("returned", f"{culprit}: {failure}")
+    sys.exit(1)
+
+
 def integrate(branches, no_proof=None):
     viva = alive()
+    maximum = machine_batch_max()
+    if len(branches) > maximum:
+        print(f"integrar: selecting the first {maximum} of {len(branches)} branches; the rest stay queued for the next cycle")
+        branches = branches[:maximum]
     check_proof(viva, branches, no_proof)
     clean(viva)
     slug = re.sub(r"[^\w.-]+", "-", "-".join(branches))[:60]
@@ -222,6 +356,7 @@ def integrate(branches, no_proof=None):
     if os.path.exists(wt):
         die(f"{wt} already exists: finish with `integrar.py --avancar {wt}` or remove it with `git worktree remove --force {wt}`")
     base = git(viva, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    base_sha = git(viva, "rev-parse", base).stdout.strip()
     r = git(viva, "worktree", "add", "-b", f"integra/{slug}", wt, base)
     if r.returncode:
         die(r.stderr.strip())
@@ -231,10 +366,10 @@ def integrate(branches, no_proof=None):
     for b in branches:
         r = git(wt, "merge", "--no-edit", b)
         if r.returncode:
-            with open(conflicts_file(wt), "w") as f:
-                f.write(git(wt, "diff", "--name-only", "--diff-filter=U").stdout)
-            die(f"conflict integrating {b} in {wt} (the live main is untouched):\n{git(wt, 'status', '--short').stdout.strip()}\n"
-                   f"resolve there, commit and run `integrar.py --avancar {wt}`")
+            conflicts = git(wt, "diff", "--name-only", "--diff-filter=U").stdout
+            return_failed_batch(viva, wt, branches, base_sha,
+                                f"conflict integrating {b} in {wt} (the live main is untouched):\n{git(wt, 'status', '--short').stdout.strip()}\n"
+                                f"resolve there, commit and run `integrar.py --avancar {wt}`", conflicts)
     advance(wt)
 
 
