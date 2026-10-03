@@ -8171,15 +8171,12 @@ def test_digest_writes_the_v1_contract_at_the_fixed_path():
     assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
     d = json.load(open(r.stdout.splitlines()[0]))
     assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
-    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "features", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
     assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
     assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito", "pronto", "avisos"} and d["fila"][0]["feito"] is False
     assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
         (1216, "development", "OPEN", "feat: base de auth"), (1230, "staging", "OPEN", "feat: base de auth (staging)")], d["fila"][0]["prs"]
     assert d["fila"][0]["prs"][0]["url"] == PR1
-    f = {x["nome"]: x for x in d["features"]}
-    assert (f["Base de auth"]["tag"], f["Base de auth"]["nota"]) == ("segurança", "A regra de auth fica num pacote só.") and f["Tela nova"]["tag"] is None, f
-    assert [x["numero"] for x in f["Base de auth"]["prs"]] == [1216, 1230]
     (pending,) = d["pendencias"]
     assert pending["id"] == "freio-prod" and pending["detalhe"] == "teto por pod ou sem freio" and pending["depois"] is False, pending
     assert d["rodando"] == [{"titulo": "Ticket 47 digest", "estado": "fase-3", "desde": None}], d["rodando"]
@@ -8327,7 +8324,7 @@ def test_digest_empty_generates_the_file_and_the_page_saying_there_is_nothing():
     a = Env(run="run_a")
     a.set("../pendencias.json", {"itens": []})
     d = _json_digest(a)
-    assert (d["fila"], d["features"], d["pendencias"], d["linha"], d["rodando"]) == ([], [], [], [], []), d
+    assert (d["fila"], d["pendencias"], d["linha"], d["rodando"]) == ([], [], [], []), d
     _, h = _html(a)
     assert h.lower().count("nothing") >= 4 and "<!doctype html>" in h.lower(), h[:400]
 
@@ -8529,7 +8526,7 @@ def test_digest_declared_queue_wins_over_the_tickets_one_with_the_real_state_of_
     a.orq("pr", "poll", "--forcar")
     d = _json_digest(a)
     assert [p["feito"] for p in d["fila"]] == [True, False] and d["fila"][0]["prs"][0]["estado"] == "MERGED", d["fila"]
-    assert [x["nome"] for x in d["features"]] == ["Base de auth", "Tela nova"], "features seguem a ordem pelos tickets"
+    assert [x["nome"] for x in d["fila"]] == ["Tela primeiro", "Auth depois"], "a fila declarada prevalece"
     _, h = _html(a)
     assert "Order declared with" in h and h.index("Tela primeiro") < h.index("Auth depois")
 

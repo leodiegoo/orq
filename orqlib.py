@@ -5340,7 +5340,7 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
     """The digest as data in the contract's format (contratos/digest-v1.md) plus what only the page uses. Only orq files: no gh and no Orca.
 
     fila = the order the coordinator declared (`orq queue`); with no declared step, it comes from the order by the tickets' `Blocked by`, one step per
-    feature. features = one group per task with a linked PR. linha = what happened since `since` (the page always shows it; the contract
+    feature. linha = what happened since `since` (the page always shows it; the contract
     file only carries it with away mode on)."""
     by_task = {t["task"]: t for t in ts if t.get("task")}
     by_task_prs = {}
@@ -5358,11 +5358,6 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
                  "proximo": None if done[g["task"]] else pr_next(g["itens"], flow_info[g["task"]]), "ciclo": g["ciclo"]} for n, g in enumerate(order, 1)]
     declared = _declared_steps(queue, prs)
     next_step = _mark_steps(declared or derived, prs)
-    features = []
-    for g in order:
-        tagged_items = [i for i in g["itens"] if i.get("tag") or i.get("nota")]
-        features.append({"tag": next((i["tag"] for i in tagged_items if i.get("tag")), None), "nome": title[g["task"]],
-                         "nota": next((i["nota"] for i in tagged_items if i.get("nota")), ""), "prs": [_pr_contract(i) for i in g["itens"]]})
     today = now_at.astimezone().date()
     pending = [{**i, "depois": bool(pending_after(i, today))} for i in _dict(pending_items).get("itens", []) if isinstance(i, dict)]
     running = sorted(({"titulo": a.get("titulo") or "untitled worker", "estado": _agent_state(a), "desde": a.get("desde"),
@@ -5376,7 +5371,7 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
     if cleaned := clean_summary_line(events, since):  # one line for all the cleaning of the window (ticket 326)
         line = sorted([*line, cleaned], key=lambda x: x["ts"])
     return {"versao": 1, "geradoEm": now_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(away_alias), "desde": _dict(away_alias).get("ligada_em")},
-            "fila": declared or derived, "proximoPasso": next_step, "features": features, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
+            "fila": declared or derived, "proximoPasso": next_step, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
             "tickets_orq": panel_tickets(ts, open_state),
             "pagina": {"data": now_at.astimezone().strftime("%Y-%m-%d"), "gerado": now_at.astimezone().strftime("%H:%M"), "desde": since, "poll": prs.get("ultimo_poll"),
                        "linha_antes": max(0, len(line) - DIGEST_LINES), "declarada": bool(declared),
@@ -5387,7 +5382,7 @@ def digest_json(d):
     """What goes into atual.json: the contract's keys, each step only with its own, and an empty `line` with away mode off."""
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
-            "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
+            "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
             **({"retro": d["retro"]} if d.get("retro") else {})}  # additive: with no recorded round the v1 contract stays as it was
@@ -14876,7 +14871,7 @@ def parser():
     _arg(lf, "linhas-de-teste", action="store_true", help="with --apply: also removes the test lines from events.jsonl, after a backup of the log (the user's approval)")
     lf.add_argument("--dry-run", action="store_true", help="only shows what it would delete (the default of the new mode)")
     lf.add_argument("--json", action="store_true")
-    dg = sub.add_parser("digest", help="writes digest/atual.json (the panel contract): merge queue, features, pending items, what happened and live workers")
+    dg = sub.add_parser("digest", help="writes digest/atual.json (the panel contract): merge queue, pending items, what happened and live workers")
     _arg(dg, "desde", help="ISO timestamp (YYYY-MM-DDTHH:MM:SSZ) instead of the moment away mode turned on or the user's last message")
     dg.add_argument("--html", action="store_true", help="also writes the page digest/<date>.html")
     _arg(dg, "abrir", action="store_true", help="writes the page and opens it in an Orca tab")
