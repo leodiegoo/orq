@@ -8711,6 +8711,80 @@ def _agent_ready(handle, agent, waiting=None):
         time.sleep(1)
 
 
+def _terminal_tail(handle):
+    """The rendered screen of a terminal, or an empty list when Orca has no tail."""
+    return orca("read", "--terminal", handle, "--screen", area="terminal")["terminal"].get("tail") or []
+
+
+def _codex_started(tail):
+    """Codex has left a startup menu and reached its prompt or begun the inline request."""
+    screen = "\n".join(map(str, tail or []))
+    return bool(re.search(r"(?m)^\s*›(?:\s|$)", screen) or re.search(r"\besc to interrupt\b", screen, re.I))
+
+
+def _mate_hooks_action(handle):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", handle.lower())[:40]
+    return f"mate-hooks-{safe}", f"approve hooks in terminal {handle}"
+
+
+def _close_mate_hooks_action(approval, answer):
+    item_id = approval.get("pend")
+    if item_id and any(i.get("id") == item_id for i in _load_pending()["itens"]):
+        pending_done(item_id, answer)
+
+
+def _finish_mate_hooks_approval(group_name, mate, live):
+    """Completes a Codex mate only after its hooks menu closes and the Codex prompt is visible."""
+    approval = _dict(mate.get("aprovacao_hooks"))
+    if not approval:
+        return None
+    handle = approval.get("terminal")
+    if live is None:
+        return "waiting"
+    if handle not in live:
+        try:
+            _close_mate_hooks_action(approval, "terminal closed before hooks approval")
+        except Exception as e:  # noqa: BLE001 — keep the candidate state until its pending action can be reconciled
+            log(f"mate {group_name}: could not close hook approval action: {type(e).__name__}: {e}")
+            return "waiting"
+        _mate_mut(group_name, terminal=None, morto=approval.get("anterior"), aprovacao_hooks=None)
+        append_event({"tipo": "mate", "op": "abrir", "grupo": group_name, "terminal": handle, "retomado": False, "falhou": "terminal closed before hooks approval"})
+        return "closed"
+    try:
+        tail = _terminal_tail(handle)
+    except Exception as e:  # noqa: BLE001 — a failed read is not proof that the user approved the hooks
+        log(f"mate {group_name}: hook approval screen unreadable ({type(e).__name__}: {e})")
+        return "waiting"
+    screen = "\n".join(map(str, tail))
+    if any(f in screen for f in HARNESS["codex"]["tela"]["falha"]):
+        try:
+            orca("close", "--terminal", handle, area="terminal")
+            live.discard(handle)
+            _close_mate_hooks_action(approval, "Codex could not start after hooks review")
+        except Exception as e:  # noqa: BLE001 — leave approval state intact so a later lap can retry
+            log(f"mate {group_name}: could not clear failed hook approval: {type(e).__name__}: {e}")
+            return "waiting"
+        _mate_mut(group_name, terminal=None, morto=approval.get("anterior"), aprovacao_hooks=None)
+        append_event({"tipo": "mate", "op": "abrir", "grupo": group_name, "terminal": handle, "retomado": False, "falhou": "Codex could not start after hooks review"})
+        return "closed"
+    question = screen_question(tail, "codex")
+    if not tail or question or re.search(r"Hooks? need review|hooks? (?:are|is) new or changed", screen, re.I) or not _codex_started(tail):
+        return "waiting"
+    try:
+        _close_mate_hooks_action(approval, "Codex hooks review completed")
+    except Exception as e:  # noqa: BLE001 — do not deliver mate work while the user's action remains unresolved
+        log(f"mate {group_name}: could not close hook approval action: {type(e).__name__}: {e}")
+        return "waiting"
+    _mate_mut(group_name, terminal=handle, morto=None, dormiu=None, aberto_em=now(), aprovacao_hooks=None,
+              **({"cwd": approval["cwd"]} if approval.get("cwd") else {}))
+    append_event({"tipo": "mate", "op": "abrir", "grupo": group_name, "terminal": handle, "retomado": approval.get("retomado", False), "anterior": approval.get("anterior")})
+    if approval.get("dormiu"):
+        append_event({"tipo": "mate_acordou", "grupo": group_name, "terminal": handle, "sessao": mate.get("sessao")})
+    if approval.get("anterior"):
+        append_event({"tipo": "mate_relancado", "grupo": group_name, "terminal": approval["anterior"], "novo_terminal": handle})
+    return "opened"
+
+
 def mate_open(group_name):
     """Opens the group's mate in a new terminal, or resumes it (`--resume` of the session its hooks recorded) if it went down. One live mate per group."""
     cfg = groups().get(group_name)
@@ -8719,6 +8793,14 @@ def mate_open(group_name):
     m, live = _dict(_mates().get(group_name)), _alive_terminals()
     if live is None:
         raise ValueError("Orca did not list the terminals: without knowing whether the mate is alive, nothing was opened")
+    approval = _dict(m.get("aprovacao_hooks"))
+    if approval:
+        if approval.get("terminal") in live:
+            _, action = _mate_hooks_action(approval["terminal"])
+            return {"grupo": group_name, "estado": "aprovacao_pendente", "terminal": approval["terminal"], "acao": action}
+        _close_mate_hooks_action(approval, "terminal closed before hooks approval")
+        _mate_mut(group_name, terminal=None, morto=approval.get("anterior"), aprovacao_hooks=None)
+        m = _dict(_mates().get(group_name))
     if m.get("terminal") in live:
         raise ValueError(f"mate {group_name} is already open in terminal {m['terminal']}")
     cwd = m.get("cwd") or cfg.get("cwd") or next(iter(cfg.get("projetos") or []), None)
@@ -8728,6 +8810,19 @@ def mate_open(group_name):
     # the terminal opens in the group's project, if Orca knows it (it groups the mate with the project on screen): `mate_project`, otherwise the first of the `projects`
     mate_folder = os.path.expanduser(cfg.get("projeto_mate") or next(iter(cfg.get("projetos") or []), "")) or None
     new = _new_terminal(f"mate {group_name}{' (resumed)' if m.get('sessao') else ''}", command, mate_folder and _repo_in_orca(mate_folder))
+    if agent == "codex":
+        tail = _terminal_tail(new)
+        question = screen_question(tail, "codex")
+        if question and question["tipo"] == "hooks":
+            action_id, action = _mate_hooks_action(new)
+            if not any(i.get("id") == action_id for i in _load_pending()["itens"]):
+                pending_add(action_id, "acao", action, detail=f"Codex is stopped at Hooks need review. The manager continues opening mate {group_name} and delivers unanswered requests after the screen closes.")
+            previous = m.get("terminal") or m.get("morto")
+            _mate_mut(group_name, terminal=None, morto=previous,
+                      aprovacao_hooks={"terminal": new, "pend": action_id, "retomado": bool(m.get("sessao")), "anterior": previous,
+                                       "dormiu": bool(m.get("dormiu")), **({"cwd": cwd} if cwd else {})})
+            append_event({"tipo": "mate", "op": "aprovacao_pendente", "grupo": group_name, "terminal": new, "acao": action})
+            return {"grupo": group_name, "estado": "aprovacao_pendente", "terminal": new, "acao": action}
     ok = _agent_ready(new, agent, MATE_WAIT_S) and type_text(new, text_value) == "enviado" if text_value else not m.get("sessao") or _came_back(new, agent)
     if not ok:
         # a session that does not come back, or an agent that did not come up, leaves a shell: the manager would type the request into it. Close it and, if it was a resume, forget the session
@@ -8758,6 +8853,21 @@ def mate_lap():
         return line_list
     coord_handle = (_manager_cfg() or {}).get("coordenador")
     event_list, now_at = read_events(), datetime.now(timezone.utc)
+    if any(_dict(m).get("aprovacao_hooks") for m in mates.values()):
+        approval_live = _alive_terminals()
+        for g, m in mates.items():
+            approval = _dict(_dict(m).get("aprovacao_hooks"))
+            if not approval:
+                continue
+            handle = approval.get("terminal")
+            approval_state = _finish_mate_hooks_approval(g, m, approval_live)
+            if approval_state == "opened":
+                line_list.append(f"mate {g}: opened after hooks approval ({handle})")
+            elif approval_state == "waiting":
+                line_list.append(f"mate {g}: pending approval in terminal {handle}")
+            elif approval_state == "closed":
+                line_list.append(f"mate {g}: hooks terminal closed before approval")
+        mates, event_list, now_at = _mates(), read_events(), datetime.now(timezone.utc)
     for p in mate_pending(event_list, mates, now_at):
         terminal, before = _dict(mates.get(p["grupo"])).get("terminal"), now()
         if p["estado"] == "a_entregar" and terminal and type_text(terminal, _request_text(p["corr"], p["texto"], p["prazo"])) == "enviado":
@@ -8782,6 +8892,8 @@ def mate_lap():
     live = _alive_terminals()
     for g, m in mates.items():
         mate = _dict(m)
+        if mate.get("aprovacao_hooks"):
+            continue
         t = mate.get("terminal") or mate.get("morto")
         if live is None or not t or t in live:
             continue
@@ -8804,8 +8916,12 @@ def mate_lap():
                 _mate_mut(g, morto=t)
                 line_list.append(f"mate {g}: relaunch failed ({type(e).__name__})")
             else:
-                append_event({"tipo": "mate_relancado", "grupo": g, "terminal": t, "novo_terminal": opened.get("terminal")})
-                line_list.append(f"mate {g}: relaunched in {opened.get('terminal')}")
+                if opened.get("estado") == "aprovacao_pendente":
+                    _mate_mut(g, morto=t)
+                    line_list.append(f"mate {g}: pending approval in terminal {opened.get('terminal')}")
+                else:
+                    append_event({"tipo": "mate_relancado", "grupo": g, "terminal": t, "novo_terminal": opened.get("terminal")})
+                    line_list.append(f"mate {g}: relaunched in {opened.get('terminal')}")
             continue
         if mate.get("morto") == t:
             continue
@@ -8852,20 +8968,28 @@ def _mate_has_worker(m, agent_rows=None):
 
 
 def _group_mate(item_name, mates, live, event_list, now_at):
-    """(state, terminal, Runs, unanswered requests) of a group's mate; state "sem mate" (no mate), "caiu" (down), "dormindo" (sleeping), "ocioso há N min" (idle for N min) or "trabalhando" (working)."""
+    """(state, terminal, Runs, unanswered requests) of a group's mate; state "pending approval", "sem mate", "down", "sleeping", "idle for N min" or "working"."""
     m = _dict(mates.get(item_name))
     pending = [p for p in mate_pending(event_list, mates, now_at) if p["grupo"] == item_name]
-    if m.get("dormiu") and not m.get("terminal"):
+    approval = _dict(m.get("aprovacao_hooks"))
+    if approval:
+        state, terminal = "pending approval", approval.get("terminal")
+    elif m.get("dormiu") and not m.get("terminal"):
         state = "sleeping"
+        terminal = m.get("terminal")
     elif not m.get("terminal"):
         state = "no mate"
+        terminal = None
     elif live is None:
         state = "working"  # without Orca's list there is no proof of idleness
+        terminal = m.get("terminal")
     elif m["terminal"] not in live:
         state = "down"
+        terminal = m.get("terminal")
     else:
         state = mate_status(m, now_at, pending, lambda: _mate_has_worker(m))
-    return state, m.get("terminal"), m.get("runs") or [], pending
+        terminal = m.get("terminal")
+    return state, terminal, m.get("runs") or [], pending
 
 
 def groups_text(group_map, mates, live, event_list, now_at):
@@ -8901,7 +9025,8 @@ def mate_proposals(tks, group_map, mates, queue, machine):
     """[(group, [ticket numbers])] of the groups with no mate (neither open nor asleep) that gather `_ready_min` or more ready tickets. Pure."""
     ready = mate_ready(tks, group_map, queue)
     return [(n, ready[n]) for n, cfg in group_map.items()
-            if not _dict(mates.get(n)).get("terminal") and not _dict(mates.get(n)).get("dormiu") and len(ready[n]) >= _ready_min(cfg, machine)]
+            if not _dict(mates.get(n)).get("terminal") and not _dict(mates.get(n)).get("dormiu") and not _dict(mates.get(n)).get("aprovacao_hooks")
+            and len(ready[n]) >= _ready_min(cfg, machine)]
 
 
 def mate_proposal_lap():
@@ -8920,8 +9045,11 @@ def mate_proposal_lap():
             continue
         if group_map[item_name].get("mate_auto") is True:
             try:
-                mate_open(item_name)
-                line_list.append(f"mate {item_name}: opened by mate_auto ({len(nums)} ready tickets)")
+                opened = mate_open(item_name)
+                if opened.get("estado") == "aprovacao_pendente":
+                    line_list.append(f"mate {item_name}: pending approval in terminal {opened['terminal']} (mate_auto, {len(nums)} ready tickets)")
+                else:
+                    line_list.append(f"mate {item_name}: opened by mate_auto ({len(nums)} ready tickets)")
                 done.append(item_name)
                 continue
             except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
@@ -8938,7 +9066,7 @@ def mate_proposal_lap():
 
 
 def mate_lines():
-    """The `orq status` lines: `mate <group>: <state>` per group with a recorded mate (trabalhando (working), ocioso há N min (idle for N min), dormindo (sleeping) or caiu (down),
+    """The `orq status` lines: `mate <group>: <state>` per group with a recorded mate (pending approval, working, idle for N min, sleeping or down),
     terminal, unanswered requests), and `group <name>: N ready (…) | mate alive|sleeping|down|absent` per group, with the proposal to open the mate when it gathers enough."""
     group_map = groups()
     if not group_map:
@@ -8951,7 +9079,7 @@ def mate_lines():
         state, terminal, _, pending = _group_mate(item_name, mates, live, event_list, now_at)
         if terminal or state == "sleeping":
             line_list.append(f"mate {item_name}: {state}" + (f" ({terminal})" if terminal else "") + (f" | requests: {', '.join(p['corr'] + ' ' + p['estado'] for p in pending)}" if pending else ""))
-        kind = {"no mate": "absent", "sleeping": "sleeping", "down": "down"}.get(state, "alive")
+        kind = {"no mate": "absent", "sleeping": "sleeping", "down": "down", "pending approval": "pending approval"}.get(state, "alive")
         nums = ready[item_name]
         line_list.append(f"group {item_name}: {len(nums)} ready" + (f" ({', '.join(nums)})" if nums else "") + f" | mate {kind}"
                          + (f" | propose: orq mate open {item_name}" if kind == "absent" and len(nums) >= _ready_min(cfg, machine) else ""))
@@ -15531,7 +15659,11 @@ def resume(dry_run=False, run=None):
     for g, m in _mates().items():  # the mate that went down comes back through its session (ticket 80); the unanswered request keeps its deadline
         if _dict(m).get("terminal") not in live and _dict(m).get("sessao") and not _dict(m).get("dormiu") and g in groups():  # slept on purpose: only the request wakes it
             try:
-                res.setdefault("mates", []).append({"grupo": g, "estado": "a_retomar"} if dry_run else {**mate_open(g), "estado": "retomado"})
+                if dry_run:
+                    res.setdefault("mates", []).append({"grupo": g, "estado": "a_retomar"})
+                else:
+                    opened = mate_open(g)
+                    res.setdefault("mates", []).append({**opened, "estado": "aprovacao_pendente" if opened.get("estado") == "aprovacao_pendente" else "retomado"})
             except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
                 res.setdefault("mates", []).append({"grupo": g, "estado": "falhou", "aviso": str(e)})
     return res

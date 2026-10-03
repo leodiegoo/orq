@@ -1,0 +1,5 @@
+Hooks need review
+3 hooks are new or changed
+› 1. Review hooks
+  2. Trust all and continue
+  3. Continue without trusting

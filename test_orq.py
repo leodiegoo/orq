@@ -12777,6 +12777,46 @@ def test_ticket413_codex_mate_open_and_resume_bypass_shell_alias():
     assert " ORQ_MATE=orq command codex resume sess-mate -m gpt-6-sol --dangerously-bypass-approvals-and-sandbox" in command, command
 
 
+def test_ticket460_codex_hooks_review_waits_for_approval_before_redelivery():
+    a = Env()
+    _group(a, harness="codex", modelo="gpt-6-sol")
+    a.set("terminals.json", ["term_coord"])
+    hooks_review = open(os.path.join(FIX, "tela-codex-hooks-review.txt"), encoding="utf-8").read().splitlines()
+    a.set("screens.json", {"term_ret1": hooks_review})
+
+    opened = a.orq("mate", "abrir", "orq")
+    assert opened.returncode == 0, opened.stderr
+    result = json.loads(opened.stdout)
+    assert result["estado"] == "aprovacao_pendente" and result["terminal"] == "term_ret1", result
+    with InProcess(a):
+        action = next(i for i in orq_mod._load_pending()["itens"] if i["tipo"] == "acao")
+    assert action["titulo"] == "approve hooks in terminal term_ret1", action
+    action_id = action["id"]
+    assert _cursor(a)["mates"]["orq"].get("terminal") is None
+    groups = a.orq("grupos")
+    assert "mate pending approval (term_ret1" in groups.stdout, groups.stdout
+
+    with open(os.path.join(a.home, "events.jsonl"), "w", encoding="utf-8") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in _request(delivered=None)))
+    with open(os.path.join(a.home, "gerente.json"), "w", encoding="utf-8") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    with InProcess(a):
+        waiting = orq_mod.mate_lap()
+    assert any("pending approval" in line and "term_ret1" in line for line in waiting), waiting
+    assert not _log(a, "send.log")
+    assert orq_mod.mate_pending(a.events(), _cursor(a)["mates"], datetime.now(timezone.utc))[0]["estado"] == "a_entregar"
+
+    a.set("screens.json", {"term_ret1": ["›"]})
+    with InProcess(a):
+        delivered = orq_mod.mate_lap()
+    assert "mate orq: p1 delivered" in delivered, delivered
+    assert _cursor(a)["mates"]["orq"]["terminal"] == "term_ret1"
+    with InProcess(a):
+        assert not any(i.get("id") == action_id for i in orq_mod._load_pending()["itens"])
+    send = _log(a, "send.log")
+    assert len(send) == 1 and "request p1" in send[0][send[0].index("--text") + 1], send
+
+
 def _env_claude(created_items):
     """The `orca terminal create` commands that launch claude or codex behind `env VAR=…`."""
     return [c[c.index("--command") + 1] for c in created_items if re.search(r"\benv\s+\S+=\S*\s.*\b(?:claude|codex)\b", c[c.index("--command") + 1])]
