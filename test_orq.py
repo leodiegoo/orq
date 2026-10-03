@@ -17052,7 +17052,7 @@ def test_ticket171_inbox_with_ack_ingests_worker_done_and_manager_does_not_dupli
                                                     "payload": json.dumps({"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"})}]}})
     r = a.orq("caixa", "run_a", "--ack")
     assert r.returncode == 0, r.stderr
-    queue = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
+    queue = (_read_state(os.path.join(a.home, "integrar-fila.json")) if _state_exists(os.path.join(a.home, "integrar-fila.json")) else {"itens": []})["itens"]
     assert [(i["ticket"], i["branch"]) for i in queue] == [("141", "fix/da-caixa")], queue
     assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_1"]
     assert a.states() == {"msg_1": "acked"}
@@ -17167,13 +17167,20 @@ def test_ticket144_stop_does_not_duplicate_when_coordinator_already_wrote_in_tur
 
 def _delivery141(a, task="task_t141", body="branch feat/orq-x commit abc1234def", outcome="succeeded", **payload):
     """An orq ticket (its Task: is `task`), the integrator (open service) and a new worker_done in the inbox."""
+    if "abc1234def" in body:
+        repo = next((r for r in a.env.get("ORQ_REPOS", "").split(":") if r and os.path.isdir(r)), None)
+        sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True).stdout.strip() if repo else ""
+        if sha and re.fullmatch(r"(?=.*[a-f])(?=.*\d)[0-9a-f]{7,40}", sha):
+            body = body.replace("abc1234def", sha)
     os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
     with open(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"), "w") as f:
         f.write(f"# 141: orq: teste\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: {task}\n\n## What to build\n\nx\n")
     a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
-                           {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": "/wt/141"}])
+                           {"handle": "term_w1", "run": "run_a", "dispatch": "ctx_term_w1", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": "/wt/141"}])
+    a.set("tasks_run_a.json", [{"id": task, "status": "completed", "dispatch_id": "ctx_term_w1"}])
     a.set("terminals.json", ["term_int", "term_w1"])
     _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_term_int", "dispatch": "ctx_term_int", "titulo": "orq: integrador (juntar branches)", "servico": True})
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": task, "dispatch": "ctx_term_w1", "titulo": "orq: teste", "ticket": "141"})
     inbox = {"result": {"messages": [{"id": "msg_141", "run_id": "run_a", "type": "worker_done", "subject": "entregue", "body": body, "sequence": 5, "read": 0,
                                        "created_at": "2099-01-01T00:00:00Z", "payload": json.dumps({"taskId": task, "dispatchId": "ctx_term_w1", "outcome": outcome, **payload})}]}}
     a.set("inbox.json", inbox)
@@ -17192,19 +17199,56 @@ def _repo_with_branch(base, *branches):
 
 def test_ticket141_worker_done_of_orq_ticket_enters_queue_and_notifies_integrator():
     tmp = tempfile.mkdtemp()
-    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
-    _delivery141(a)
+    repo = _repo_with_branch(tmp, "feat/orq-x")
+    sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=7", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, body=f"branch feat/orq-x commit {sha}")
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = repo
+    a.set("workers.json", workers)
     assert a.orq("ingest").returncode == 0
-    queue = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
-    assert [(i["ticket"], i["branch"]) for i in queue] == [("141", "feat/orq-x")], queue
+    queue = (_read_state(os.path.join(a.home, "integrar-fila.json")) if _state_exists(os.path.join(a.home, "integrar-fila.json")) else {"itens": []})["itens"]
+    assert [(i["ticket"], i["branch"]) for i in queue] == [("141", "feat/orq-x")], (queue, a.events(), a.log())
     (send_call,) = _log(a, "send.log")
     assert send_call[:3] == ["send", "--terminal", "term_int"], send_call
     text_value = send_call[send_call.index("--text") + 1]
-    assert "141" in text_value and "feat/orq-x" in text_value and "/wt/141" in text_value and "abc1234d" in text_value and len(text_value) <= 150, text_value
+    assert "141" in text_value and "feat/orq-x" in text_value and repo in text_value and sha[:8] in text_value and len(text_value) <= 150, text_value
     (ev,) = [e for e in a.events() if e["tipo"] == "entrega_orq"]
     assert (ev["ticket"], ev["aviso"]) == ("141", "enviado"), ev
     a.orq("ingest")
     assert len(_log(a, "send.log")) == 1, "o cursor não repete o aviso"
+
+
+def test_ticket436_dirty_ticket_worktree_stays_out_of_integrator_queue_and_returns_to_worker():
+    tmp = tempfile.mkdtemp()
+    repo = os.path.join(tmp, "repo")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    open(os.path.join(repo, "tracked"), "w").write("committed\n")
+    subprocess.run(["git", "-C", repo, "add", "tracked"], check=True)
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", repo, "branch", "feat/orq-x"], check=True)
+    wt = os.path.join(tmp, "ticket-wt")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", wt, "feat/orq-x"], check=True)
+    sha = subprocess.run(["git", "-C", wt, "rev-parse", "--short=7", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    open(os.path.join(wt, "tracked"), "w").write("uncommitted\n")
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, body=f"branch feat/orq-x commit {sha}")
+    assert a.orq("ingest").returncode == 0
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "dirty delivery is not queued"
+    ev = next(e for e in reversed(a.events()) if e.get("tipo") == "entrega" and e.get("msg") == "msg_141")
+    assert "dirty tree" in ev["avisos"][0] and wt in ev["avisos"][0], ev
+    assert any(e.get("tipo") == "devolver" and e.get("dispatch") == "ctx_term_w1" for e in a.events()), (a.events(), a.log())
+
+
+def test_ticket436_missing_commit_does_not_enter_integrator_queue():
+    tmp = tempfile.mkdtemp()
+    repo = _repo_with_branch(tmp, "feat/orq-x")
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, body="branch feat/orq-x commit deadbeef123")
+    assert a.orq("ingest").returncode == 0
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json"))
+    ev = next(e for e in reversed(a.events()) if e.get("tipo") == "entrega" and e.get("msg") == "msg_141")
+    assert "does not exist" in ev["avisos"][0], ev
 
 
 def test_ticket141_worker_done_of_product_ticket_or_without_branch_or_failed_does_not_enter():
@@ -17880,7 +17924,7 @@ def test_ticket169_worktree_branch_wins_over_text_that_quotes_a_file():
     wt = os.path.join(tmp, "wt")
     subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat/x", wt], check=True)
     a = Env(run="run_a", ORQ_REPOS=repo)
-    _delivery141(a, body="atualizei docs/design.md, commit abc1234def")
+    _delivery141(a, body="atualizei docs/design.md, sem commit citado")
     a.set("workers.json", [{"handle": "term_int", "run": "run_a", "status": "completed", "terminal": "active", "desde": _iso(-9000), "agente": "claude", "worktree": "/wt/int"},
                            {"handle": "term_w1", "run": "run_a", "task": "task_t141", "status": "completed", "terminal": "active", "worktree": wt}])
     a.orq("ingest")
@@ -17973,7 +18017,7 @@ def test_ticket175_new_abandoned_writes_ticket_and_run_and_command_has_no_none()
 def test_ticket169_name_that_is_not_branch_does_not_enter_and_notifies_branch_missing():
     tmp = tempfile.mkdtemp()
     a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp))
-    _delivery141(a, body="atualizei docs/design.md, commit abc1234def")
+    _delivery141(a, body="atualizei docs/design.md, sem sha")
     a.orq("ingest")
     assert not _state_exists(os.path.join(a.home, "integrar-fila.json"))
     (ev,) = [e for e in a.events() if e["tipo"] == "entrega" and any("has no branch" in x for x in e["avisos"])]
@@ -21236,6 +21280,9 @@ def test_ticket222_worker_done_records_the_head_in_the_queue_item_and_the_events
     repo, head = _repo222(tempfile.mkdtemp())
     a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery141(a, branch="feat/orq-x", commit=head)
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = repo
+    a.set("workers.json", workers)
     assert a.orq("ingest").returncode == 0
     (item,) = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
     assert item["head"] == head, item
@@ -21252,6 +21299,9 @@ def test_ticket222_worker_done_with_a_commit_that_is_not_in_the_branch_does_not_
     other = _commit222(repo, "x\n", "feat: other work")
     a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery141(a, branch="feat/orq-x", commit=other)
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = repo
+    a.set("workers.json", workers)
     assert a.orq("ingest").returncode == 0
     assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "nome de branch trocado: fica fora da fila"
     (e,) = [e for e in a.events() if e["tipo"] == "entrega" and "wrong branch name" in str(e.get("avisos"))]
@@ -21574,8 +21624,12 @@ def test_ticket221_prove_red_ticket_records_the_event_with_the_head_and_suggests
 
 def test_ticket221_delivery_of_ticket_citing_red_green_starts_the_proof_once():
     tmp = tempfile.mkdtemp()
-    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    repo = _repo_with_branch(tmp, "feat/orq-x")
+    a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery141(a)
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = repo
+    a.set("workers.json", workers)
     with open(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"), "a") as f:
         f.write("\n## Acceptance criteria\n- red→green with a temporary repository\n")
     started, real, env = [], orq_mod.red_proof_bg, dict(os.environ)
@@ -22775,6 +22829,9 @@ def test_ticket337_worker_report_of_a_delivery_that_entered_the_queue_closes_its
     report = os.path.join(tmp, "final-report.md")
     open(report, "w").write("# entregue\n")
     _delivery141(a, reportPath=report)
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = a.env["ORQ_REPOS"]
+    a.set("workers.json", workers)
     assert a.orq("ingest").returncode == 0
     (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada"]
     assert entry_event["origem"] == "relatorio_worker"
@@ -23402,8 +23459,12 @@ def _released183(a):
 
 def test_ticket183_orq_delivery_in_queue_releases_worker_and_closes_terminal():
     tmp = tempfile.mkdtemp()
-    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    repo = _repo_with_branch(tmp, "feat/orq-x")
+    a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery183(a)
+    workers = _log_json(a, "workers.json", [])
+    workers[1]["worktree"] = repo
+    a.set("workers.json", workers)
     assert a.orq("ingest").returncode == 0
     assert [i["ticket"] for i in _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]] == ["141"]
     (ev,) = _released183(a)
