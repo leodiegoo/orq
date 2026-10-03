@@ -23279,6 +23279,22 @@ def test_ticket341_touches_line_declares_the_area_and_unblock_frees_the_ticket()
     assert _bl_items(a)["t02"]["bloqueios"] == []
 
 
+def test_ticket388_send_back_refuses_the_dispatch_a_later_one_replaced_on_the_same_worktree():
+    a = Env()
+    a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"},
+                           {"handle": "term_w9", "run": "run_a", "task": "task_nova", "dispatch": "ctx_9", "status": "completed"}])
+    a.set("terminals.json", ["term_w0", "term_w9", "term_coord"])
+    _steer_env(a)
+    a.set("tasks_run_a.json", [{"id": "task_feita", "status": "completed", "dispatch_id": "ctx_0"}, {"id": "task_nova", "status": "completed", "dispatch_id": "ctx_9"}])
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        for d, t in (("ctx_0", "task_feita"), ("ctx_9", "task_nova")):
+            f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": t, "dispatch": d, "worktree": "/wt/branch"}) + "\n")
+    r = a.orq("devolver", "task_feita", "redo")
+    assert r.returncode != 0 and "superseded by ctx_9" in r.stderr + r.stdout, r.stderr + r.stdout
+    assert not [e for e in a.events() if e["tipo"] == "devolver"], "the replaced dispatch is not reopened"
+    assert a.orq("devolver", "task_nova", "redo").returncode == 0, "the latest one is"
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
