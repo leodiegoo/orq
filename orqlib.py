@@ -14365,7 +14365,10 @@ def _worktree_parent(project=None, base_branch=None):
         pass
     current_path = current.get("path") if isinstance(current, dict) else None
     project_config = projects().get(project, {}) if project else {}
-    expected_root = _repo_root(repo_folder(project_config["repo"])) if project_config.get("repo") else _repo_root(current_path) if current_path else None
+    project_repo = repo_folder(project_config["repo"]) if project_config.get("repo") else None
+    if project and not project_repo:
+        return None, f"project {project} repository has no known folder; dispatch continued without a parent"
+    expected_root = _repo_root(project_repo) if project_repo else _repo_root(current_path) if current_path else None
     if base_branch:
         wanted = base_branch.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/").removeprefix("origin/")
         for row in rows:
@@ -14376,8 +14379,7 @@ def _worktree_parent(project=None, base_branch=None):
         return None, f"parent branch {wanted} has no Orca worktree; dispatch continued without a parent"
     if not current_path:
         return None, "coordinator worktree is unavailable; dispatch continued without a parent"
-    if project:
-        project_repo = repo_folder(projects()[project]["repo"])
+    if project_repo:
         if _repo_root(current_path) != _repo_root(project_repo):
             return None, f"coordinator worktree is outside project {project}; dispatch continued without a parent"
     return current_path, None
