@@ -8171,7 +8171,7 @@ def test_digest_writes_the_v1_contract_at_the_fixed_path():
     assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
     d = json.load(open(r.stdout.splitlines()[0]))
     assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
-    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "features", "pendencias", "linha", "rodando", "tickets_orq"}, set(d)
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "features", "pendencias", "linha", "rodando", "tickets_orq", "idade"}, set(d)
     assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
     assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito", "pronto", "avisos"} and d["fila"][0]["feito"] is False
     assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
@@ -8182,7 +8182,7 @@ def test_digest_writes_the_v1_contract_at_the_fixed_path():
     assert [x["numero"] for x in f["Base de auth"]["prs"]] == [1216, 1230]
     (pending,) = d["pendencias"]
     assert pending["id"] == "freio-prod" and pending["detalhe"] == "teto por pod ou sem freio" and pending["depois"] is False, pending
-    assert d["rodando"] == [{"titulo": "Ticket 47 digest", "estado": "fase-3", "desde": None}], d["rodando"]
+    assert d["rodando"] == [{"titulo": "Ticket 47 digest", "estado": "fase-3", "tipo": "worker", "desde": None}], d["rodando"]
     assert d["linha"] == [], "a linha só existe com o modo ausente ligado"
     assert "task_aaaa" not in json.dumps(d["rodando"]) and "ctx_1" not in json.dumps(d["rodando"]) and "term_1" not in json.dumps(d["rodando"])
 
@@ -19986,7 +19986,7 @@ EVENTOS_LIDOS = {
     "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
     "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
     "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
-    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta": "wake_stopped",
+    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped", "resposta": "wake_stopped",
     "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
     "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
     "clean_run": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
@@ -21435,6 +21435,76 @@ def test_ticket337_machine_under_pressure_notice_closes_itself_in_the_hook():
     assert [e["texto"] for e in orq_mod.open_entries(a.events())] == ["segue o jogo"]
 
 
+# ---------- ticket 345: age of each queue item ----------
+
+def test_ticket345_age_scale_by_kind_and_priority():
+    cfg = {"age_colors": [[5, "warn"], [15, "hot"], [30, "crit"]]}
+    lv = lambda kind, m, p=None: orq_mod.age_level(kind, m, p, cfg)
+    assert [lv("fila", m) for m in (3, 5, 20, 40)] == ["ok", "warn", "hot", "crit"]
+    assert lv("fila", 15, 1) == "crit" and lv("fila", 14, 1) == "hot", "P1 uses half the limits"
+    assert (lv("entrega", 40), lv("entrega", 50), lv("entrega", 90)) == ("warn", "hot", "crit"), "a delivery waits for the integrator: limits x3"
+    assert lv("pendencia", 120) == "warn" and lv("pendencia", 360) == "crit"
+    assert [orq_mod.age_text(m) for m in (0, 14.9, 59, 125)] == ["0 min", "14 min", "59 min", "2 h 05"]
+
+
+def test_ticket345_machine_set_accepts_age_colors_and_refuses_a_bad_one():
+    a = Env()
+    assert a.orq("machine", "set", "age_colors", '[[1,"warn"],[2,"hot"],[3,"crit"]]').returncode == 0
+    assert json.load(open(os.path.join(a.home, "machine.json")))["age_colors"][2] == [3, "crit"]
+    r = a.orq("machine", "set", "age_colors", '[[1,"purple"]]')
+    assert r.returncode != 0 and "does not fit" in r.stderr + r.stdout
+
+
+def _aged_queues(a):
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"itens": [
+        {"id": "fd0001", "tipo": "novo", "titulo": "recente", "prioridade": 2, "ts": "2026-10-02T09:57:00Z"},
+        {"id": "fd0002", "tipo": "novo", "titulo": "velho", "prioridade": 2, "ts": "2026-10-02T09:20:00Z"},
+        {"id": "fd0003", "tipo": "novo", "titulo": "urgente", "prioridade": 1, "ts": "2026-10-02T09:45:00Z"}]}, open(os.path.join(a.home, "dispatch-queue.json"), "w"))
+    json.dump({"itens": [{"branch": "fix/x", "ticket": "07", "ts": "2026-10-02T09:50:00Z"}]}, open(os.path.join(a.home, "integrate-queue.json"), "w"))
+
+
+def test_ticket345_digest_carries_desde_of_each_queue_item_and_the_scale():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _aged_queues(a)
+    d = _json_digest(a)["idade"]
+    assert d["escala"] == [[5, "warn"], [15, "hot"], [30, "crit"]] and d["fatores"]["entrega"] > 1
+    assert [(i["kind"], i["titulo"], i["desde"]) for i in d["filas"]] == [
+        ("fila", "urgente", "2026-10-02T09:45:00Z"), ("fila", "velho", "2026-10-02T09:20:00Z"),
+        ("fila", "recente", "2026-10-02T09:57:00Z"), ("integracao", "ticket 07 fix/x", "2026-10-02T09:50:00Z")], d["filas"]  # each queue in its serving order: the panel sorts by age on request
+    assert d["filas"][0]["prioridade"] == 1 and d["obrigacoes"] == []
+
+
+def test_ticket345_item_that_crosses_the_critical_limit_raises_queue_item_aged_once():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _aged_queues(a)
+    _json_digest(a)
+    _json_digest(a)
+    aged = [e for e in a.events() if e.get("tipo") == "queue_item_aged"]
+    assert sorted(e["titulo"] for e in aged) == ["urgente", "velho"], aged  # 40 min and P1 at 15 min; 10 and 3 min are not there
+    assert len(aged) == 2, "once per item, however many digests run"
+    line = _json_digest(a, "--since", "2026-10-02T00:00:00Z")["linha"]
+    assert not line, "the digest's line stays empty with away mode off, as the contract says"
+
+
+def test_ticket345_status_line_has_the_oldest_age_in_the_scale_color():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    assert "Queues:" not in a.orq("status").stdout
+    _aged_queues(a)
+    out = a.orq("status").stdout
+    assert "Queues: 4 items, the oldest waiting 40 min ▲" in out, out
+
+
+def test_ticket345_status_line_paints_the_oldest_age_with_ansi_only_on_request(monkeypatch=None):
+    fake = [{"kind": "fila", "id": "x", "titulo": "t", "prioridade": 2, "desde": "z", "min": 20.0, "nivel": "hot"}]
+    real, orq_mod.queue_ages = orq_mod.queue_ages, lambda *a, **k: fake
+    try:
+        assert orq_mod.queue_age_line(color=True) == "\x1b[38;5;208mQueues: 1 item, the oldest waiting 20 min\x1b[0m"
+        assert orq_mod.queue_age_line() == "Queues: 1 item, the oldest waiting 20 min"
+    finally:
+        orq_mod.queue_ages = real
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
@@ -21467,3 +21537,4 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
+

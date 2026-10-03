@@ -4,6 +4,7 @@
 import { existsSync, openSync, readFileSync, readSync, readdirSync, statSync, closeSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
+import { idadeTrecho, limitesDo, minutosDesde, type Idade } from "./idade"
 import type { Cor } from "./tema"
 
 type Json = Record<string, any>
@@ -218,6 +219,12 @@ const corta = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1
 
 const seg = (t: string, c?: Cor, b?: boolean): Trecho => ({ t, c, b })
 
+// a escala (machine.json) e os fatores por tipo (digest.idade) são os do orq; sem eles, os padrões
+const idadeDe = (e: Estado, desde: string | null | undefined, tipo: string, prioridade?: number): Idade | undefined => {
+  const min = minutosDesde(desde, e.agora)
+  return min === undefined ? undefined : { min, limites: limitesDo(e.maquinaCfg.age_colors, tipo, prioridade, e.digest?.idade?.fatores) }
+}
+
 function blocoGerente(e: Estado): Bloco {
   const linhas: Linha[] = []
   const s = e.vivoMs === null ? null : Math.round((e.agora - e.vivoMs) / 1000)
@@ -244,7 +251,7 @@ function blocoWorkers(e: Estado): Bloco {
     seg(`${corta(a.titulo ?? a.dispatch ?? "?", 52).padEnd(52)} `),
     seg(`${String(a.modelo ?? "?").padEnd(18)} `, "secundario"),
     seg(`${corta(String(a.fase ?? a.estado) + (a.fase && a.estado !== "rodando" ? ` (${a.estado})` : ""), 36).padEnd(36)} `, COR_ESTADO[a.estado]),
-    seg(idade(a.desde, e.agora), "secundario"),
+    ((i) => (i ? idadeTrecho(i, idade(a.desde, e.agora)) : seg(idade(a.desde, e.agora), "secundario")))(idadeDe(e, a.desde, a.estado === "aguardando_integracao" ? "entrega" : "worker", a.prioridade)),
   ])
   return { id: "workers", titulo: `Workers vivos (${vivos.length})${fonte}`, linhas: linhas.length ? linhas : ["nenhum"] }
 }
@@ -366,14 +373,25 @@ function blocoBacklog(e: Estado, v: Vista, util: number, janela: number): Bloco 
 // uma fila comprida vira os 3 primeiros e a conta do resto: a linha não quebra e o backlog fica com a altura
 const FILA_MAX = 3
 
+type ItemFila = { texto: string; idade?: Idade }
+
 function blocoFilas(e: Estado): Bloco {
   const linhas: Linha[] = []
-  const fila = (nome: string, itens: string[]): Linha => [
+  const fila = (nome: string, itens: ItemFila[]): Linha => [
     seg(`${nome}: `),
-    itens.length ? seg(itens.slice(0, FILA_MAX).join(nome === "despacho" ? "; " : ", ") + (itens.length > FILA_MAX ? ` … +${itens.length - FILA_MAX} (${itens.length})` : ""), "amarelo") : seg("vazia", "verde"),
+    ...(itens.length
+      ? [
+          ...itens.slice(0, FILA_MAX).flatMap((i, k) => [seg((k ? (nome === "despacho" ? "; " : ", ") : "") + i.texto, "amarelo"), ...(i.idade ? [seg(" "), idadeTrecho(i.idade)] : [])]),
+          ...(itens.length > FILA_MAX ? [seg(` … +${itens.length - FILA_MAX} (${itens.length})`, "amarelo")] : []),
+        ]
+      : [seg("vazia", "verde")]),
   ]
-  linhas.push(fila("integrador", e.integrar.map((i) => `${i.ticket ? i.ticket + " " : ""}${i.branch}`)))
-  linhas.push(fila("despacho", e.despacho.map((i) => corta(i.titulo ?? i.id, 40))))
+  const integrar = e.integrar.map((i): ItemFila => ({ texto: `${i.ticket ? i.ticket + " " : ""}${i.branch}`, idade: idadeDe(e, i.ts, "integracao") }))
+  const despacho = e.despacho.map((i): ItemFila => ({ texto: corta(i.titulo ?? i.id, 40), idade: idadeDe(e, i.ts, "fila", i.prioridade) }))
+  const velho = [...integrar, ...despacho].flatMap((i) => (i.idade ? [i.idade] : [])).sort((a, b) => b.min - a.min)[0]
+  if (velho) linhas.push([seg(`fila: ${integrar.length + despacho.length} itens, o mais antigo `), idadeTrecho(velho)])
+  linhas.push(fila("integrador", integrar))
+  linhas.push(fila("despacho", despacho))
   const passos = (e.digest?.fila ?? []).filter((p: Json) => !p.feito)
   linhas.push(passos.length ? "merge:" : [seg("merge: "), seg("nada pendente", "verde")])
   for (const p of passos.slice(0, 5)) {
@@ -389,7 +407,12 @@ function blocoPendencias(e: Estado): Bloco {
     seg(`[${p.tipo}] `, p.tipo === "decisao" ? "roxo" : "amarelo"),
     seg(corta(p.titulo ?? p.id, 90)),
     ...(p.desde ? [seg(`  (desde ${p.desde})`, "secundario")] : []),
+    ...((i) => (i ? [seg("  "), idadeTrecho(i)] : []))(idadeDe(e, p.desde, "pendencia")),
   ])
+  for (const o of (e.digest?.idade?.obrigacoes ?? []).slice(0, 8)) {
+    const i = idadeDe(e, o.desde, "obrigacao")
+    linhas.push([seg("[obrigação] ", "amarelo"), seg(`${o.entrada} ${o.chave}: ${corta(o.texto ?? "", 70)}`), ...(i ? [seg("  "), idadeTrecho(i)] : [])])
+  }
   return { id: "pendencias", titulo: `Pendências do usuário (${pend.length})`, linhas: linhas.length ? linhas : [[seg("nenhuma", "verde")]] }
 }
 

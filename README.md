@@ -151,7 +151,7 @@ Write only what you change; the rest keeps its default:
 }
 ```
 
-Edit the file, or set a key without opening it. `orq machine set` takes the key names of `machine.json` (`max_workers`, `max_e2e`, `max_expensive`, `expensive_models`, `mem_free_min_mb`, `free_pct_min`, `max_load`, `mem_floor_mb`, `exempt_runs`, `pause_under_pressure`, `stop_blocks`); the older Portuguese spellings (`max_caros`, `carga_max`, ...) are accepted too. It refuses an unknown key or a value of the wrong type:
+Edit the file, or set a key without opening it. `orq machine set` takes the key names of `machine.json` (`max_workers`, `max_e2e`, `max_expensive`, `expensive_models`, `mem_free_min_mb`, `free_pct_min`, `max_load`, `mem_floor_mb`, `exempt_runs`, `pause_under_pressure`, `stop_blocks`, `age_colors`); the older Portuguese spellings (`max_caros`, `carga_max`, ...) are accepted too. It refuses an unknown key or a value of the wrong type:
 
 ```sh
 orq machine set max_workers 3
@@ -159,6 +159,18 @@ orq machine set expensive_models '["claude-opus-*"]'   # values are JSON
 ```
 
 What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. A ticket item whose Run belongs to a mate (the coordinator does not command it) is not retried: the manager sends the mate an `orq mate request` with the dispatch command (`orq dispatch --run … --ticket … --model … --effort … --priority … --worktree …`) and the item leaves the queue as `despacho_fila` `op: mate`, not as a giving up; the `mate_pedido` carries the queue item id in `fila`. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|priority <id> <1|2|3>|discard <id> --reason "..."` manages it. `list` shows the task, ticket and owning mate when there are any; `priority` (also `orq priority fdXXXXXX <1|2|3>`) moves the item without losing its entry date, for the coordinator and the mate that owns it.
+
+**How long each item has waited (ticket 345).** Every item of the dispatch queue and of the integrator queue carries the instant it entered (`ts`), and the digest sends it as `desde` under `idade.filas`, with the open obligations under `idade.obrigacoes`. Delivered workers waiting on the integrator, workers and pending items carry `desde` in their own entries. The dashboard counts the age in the browser and refreshes it every 30 s without reloading: "há 14 min", "há 2 h 05". The color never stands alone: the text is always there, and a critical item adds a ▲.
+
+The scale is `age_colors` in `machine.json`, minutes at which an item turns yellow, orange and red; the default is `[[5,"warn"],[15,"hot"],[30,"crit"]]`. Below the first limit the text stays neutral; from there the color blends continuously (not in steps) from yellow through orange to red, in the GitHub palette of the light and dark themes. The limits scale by kind: a P1 item uses half (15 min is already red), a delivery waiting for the integrator three times, an open obligation three times, a pending item twelve times (it tolerates hours). `orq status` prints `Queues: 13 items, the oldest waiting 47 min ▲` (in ANSI color on a terminal, plain with `NO_COLOR` or a pipe), and `orq manager tui` colors the age of each queue, worker and pending line with the same levels (neutral, yellow, orange, red, in the palette's own colors, ▲ and bold once critical).
+
+```sh
+orq machine set age_colors '[[10,"warn"],[30,"hot"],[60,"crit"]]'
+```
+
+An item that crosses the critical limit records one `queue_item_aged` event (once per item, from the manager's lap or the digest, whichever runs first). It shows up in the digest's `linha` as a `sec` entry.
+
+What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|discard <id> --reason "..."` manages it.
 
 ### 2. `projects/<name>.json`: one file per project
 
@@ -324,7 +336,7 @@ Every `launchctl bootout`/`bootstrap` and every `--stop` SIGTERM appends a `laun
 
 `serve` still needs the manager terminal from `orq start` or `orq manager bind`: Orca only accepts a handle that belongs to a terminal it has seen. Two `serve` processes at once is an error.
 
-`orq manager tui` opens a read-only terminal UI ([OpenTUI](https://github.com/sst/opentui), needs Bun) with the manager, the backlog, live workers, the integrator, the queues, pending items, machine load and the latest events. Without Bun it prints the install steps and exits 1.
+`orq manager tui` opens a read-only terminal UI ([OpenTUI](https://github.com/sst/opentui), needs Bun) with the manager, the backlog, live workers, the integrator, the queues (each item with its age in the scale's color), pending items, machine load and the latest events. Without Bun it prints the install steps and exits 1.
 
 The TUI follows the terminal theme. It never paints a background; text and borders come from a light or a dark palette whose colors keep a 4.5:1 contrast or better against the theme background (checked by `bun test`). The theme comes from, in order: `--theme light|dark|auto` or `ORQ_TUI_THEME`, the terminal itself (OSC 11, background color), `COLORFGBG`, the macOS appearance (`defaults read -g AppleInterfaceStyle`), and dark if nothing answers. Force it with `orq manager tui --theme light`, or `ORQ_TUI_THEME=light` in the environment.
 
@@ -468,7 +480,7 @@ A failure is also checked against the tip of the PR's base: when the same check 
 
 ### Digest, summaries, retro
 
-- `orq digest [--since <ts>] [--html] [--open]` writes `$ORQ_HOME/digest/atual.json`, the file a dashboard reads: the merge queue, features, pending items, what happened, live workers and open tickets (each ticket carries `projeto`, the group `orq groups --title` would pick from its title, or null; ticket 193). It reads only orq's own files (no `gh`, no Orca call). The digest and the dashboard's pending list keep their Portuguese keys (contract `digest-v1`).
+- `orq digest [--since <ts>] [--html] [--open]` writes `$ORQ_HOME/digest/atual.json`, the file a dashboard reads: the merge queue, features, pending items, what happened, live workers, the queues' ages (`idade`) and open tickets (each ticket carries `projeto`, the group `orq groups --title` would pick from its title, or null; ticket 193). It reads only orq's own files (no `gh`, no Orca call). The digest and the dashboard's pending list keep their Portuguese keys (contract `digest-v1`).
 - `orq summary [--since <ts>]` prints, on demand, what waits on you, what came in, what is running, what comes next and the decisions made. `orq summary add "<text>" [--project <name>]` appends it to `<project repo>/.scratch/resumos/<date>.md`.
 - `orq retro [--since D] [--until D] [--project FRAGMENT] [--json] [--no-gh] [--no-transcripts] [--save]` counts, with no LLM, the failure signals of a window (default 7 days): dispatches that never started, steers with no proof of reading, workers released dirty, deliveries with no commit, user rules broken in worker transcripts, PRs with a red check. The `orq-retro` skill reads it and proposes at most five changes; each carries a `causa` (`orq` or `projeto`, by what led to the error: orq's briefing/command or the repository) and a class (check, text, calibration or skill `gatilho`, which edits a skill's `description:`). `causa: orq` tickets go to the orq Run, never into the project's AGENTS.md. Nothing is applied without your ok.
 - `orq retro --save` also folds each case into the gap ledger, `$ORQ_HOME/retro/gaps.json`, so a gap that shows up once a week still adds up. `orq retro gaps [--json]` lists it (`open gaps: N`); `orq retro reject <id> --reason T` turns a proposal down until more sessions than today stand behind it; `orq retro accept <id> --ticket N` links the gap to the ticket that answers it, and the gap turns `coberta` when that ticket closes. A gap is a signal, or the broken rule for `regra_violada`; it counts distinct sessions (the same one never counts twice), becomes a proposal with 2, and is forgotten after 90 days without a sighting.

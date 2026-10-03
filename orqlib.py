@@ -5307,6 +5307,8 @@ def _log_line(e, title):
         return {"tipo": "info", "titulo": "Coordinator answered a worker", "detalhe": e["texto"]}
     if type_name in ("resposta", "resposta_lavish") and e.get("resposta"):
         return {"tipo": "ok", "titulo": f"Decision: {e.get('header') or e.get('item') or ''}", "detalhe": e["resposta"]}
+    if type_name == "queue_item_aged":
+        return {"tipo": "sec", "titulo": f"Waiting {age_text(e.get('idade_min') or 0)} in the {e.get('fila')} queue: {_quote(e.get('titulo'), 70)}", "detalhe": ""}
     if type_name == "pend" and e.get("op") == "done" and e.get("resposta"):
         return {"tipo": "ok", "titulo": f"Pending item {e.get('pend')} closed", "detalhe": e["resposta"]}
     return None
@@ -5365,13 +5367,14 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
                          "nota": next((i["nota"] for i in tagged_items if i.get("nota")), ""), "prs": [_pr_contract(i) for i in g["itens"]]})
     today = now_at.astimezone().date()
     pending = [{**i, "depois": bool(pending_after(i, today))} for i in _dict(pending_items).get("itens", []) if isinstance(i, dict)]
-    running = sorted(({"titulo": a.get("titulo") or "untitled worker", "estado": _agent_state(a), "desde": a.get("desde"),
+    running = sorted(({"titulo": a.get("titulo") or "untitled worker", "estado": _agent_state(a), "tipo": "entrega" if a.get("estado") == "aguardando_integracao" else "worker",
+                       "desde": (_dict(a.get("integracao")).get("ts") if a.get("estado") == "aguardando_integracao" else None) or a.get("desde"),  # a delivery's age counts from the integrator queue, not from the worker's start
                        **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
                       for a in reassess(_dict(open_state).get("agentes") or [], events, now_at, turns) if a.get("estado") in (*ANDA, "hibernado")), key=lambda r: r.get("prioridade") or 2)  # highest first
     if machine:  # the slots and the dispatch queue (ticket 79): one extra key, `running` still holds only workers and the E2E queue
         machine = {**machine, "ocupadas": sum(not r["estado"].startswith("hibernated") for r in running), "livres": max(machine["max_workers"] - sum(not r["estado"].startswith("hibernated") for r in running), 0)}
     if e2e:  # the E2E queue is one extra line in `running`: `stuck_lock` when it does not move
-        running.append({"titulo": e2e_line(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
+        running.append({"titulo": e2e_line(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "tipo": "worker", "desde": None})
     line = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= since and (x := _log_line(e, title))]
     if cleaned := clean_summary_line(events, since):  # one line for all the cleaning of the window (ticket 326)
         line = sorted([*line, cleaned], key=lambda x: x["ts"])
@@ -5388,7 +5391,7 @@ def digest_json(d):
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
             "features": d["features"], "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
-            "tickets_orq": d["tickets_orq"],
+            "tickets_orq": d["tickets_orq"], "idade": d["idade"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
             **({"retro": d["retro"]} if d.get("retro") else {})}  # additive: with no recorded round the v1 contract stays as it was
 
@@ -5443,10 +5446,15 @@ def digest_generate(now_at=None, since=None, with_html=False):
     The window of `line` and of the page: `since`, otherwise the moment away mode turned on, otherwise the user's last message. No network: the
     PRs' state is whatever the poll (`orq pr poll`, the manager panel) left in prs.json."""
     now_at = now_at or datetime.now(timezone.utc)
+    age_alerts()  # on the orq clock (ORQ_AGORA in tests), not on the digest's
     events, away_alias = read_events(), _dict(_cursor_ro().get("ausente")) or None
     window = since if since is not None else (away_alias or {}).get("ligada_em") or last_from_user(events, now_at)
     d = build_digest(events, _prs_ro(), _pending_ro(), _read_json(_path("open.json")), tickets(), _queue_ro(), window, now_at, _turns_ro(), away_alias, e2e_queue(),
                     {"max_workers": machine_cfg()["max_workers"], "fila": len(dispatch_queue_items())})
+    cfg = machine_cfg()
+    d["idade"] = {"escala": cfg["age_colors"], "fatores": AGE_FACTOR,  # the panel and the TUI draw the same scale from these
+                  "filas": [{k: i[k] for k in ("kind", "id", "titulo", "prioridade", "desde")} for i in queue_ages(now_at, cfg)],
+                  "obrigacoes": [{"entrada": o["entrada"], "chave": o["chave"], "texto": o.get("texto"), "desde": o.get("ts")} for o in open_obligations(events)]}
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rounds()[-4:]]  # the latest rounds of `orq retro --write_out`
     with contextlib.suppress(OSError), open(_path(os.path.join(DIGEST, "ausencia.md")), encoding="utf-8") as f:  # the last `orq away off`
         d["ausencia"] = f.read().rstrip().splitlines()
@@ -11915,9 +11923,9 @@ def handoff_lines(events, turns, now_at=None):
     return [f"Open handoffs ({len(item_list)}): " + "; ".join(_lim(item_list, 3, str)) + " — check the terminal of the new worker"] if item_list else []
 
 
-def status_text():
+def status_text(color=False):
     """What `orq status` prints: the state, the open handoffs, the PRs, the worktrees, the E2E queue and the machine."""
-    return "\n".join([*filter(None, [fail_safe.broken_line()]), state(include_old=True), *handoff_lines(read_events(), _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line()])])
+    return "\n".join([*filter(None, [fail_safe.broken_line()]), state(include_old=True), *handoff_lines(read_events(), _turns_ro()), *pr_lines(), *worktree_lines(), *mate_lines(), *filter(None, [e2e_line(e2e_queue()), machine_line(), queue_age_line(color=color)])])
 
 
 # ---------- orq iniciar: the coordinator that is already open, in any harness ----------
@@ -12132,6 +12140,7 @@ MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB o
                   "runs_isentos": ["Orquestrador*"],  # glob patterns (Run id or objective): orq's own work comes up under pressure and without the worker ceiling; max_caros, max_e2e and mem_piso_mb hold it back
                   "pausar_sob_pressao": False,  # True: under pressure the manager on its own pauses the lowest-priority worker (orq pausar)
                   "mate_ready_min": 3,  # ready tickets that match a group with no mate before orq proposes opening it (the group's `mate_ready_min` wins)
+                  "age_colors": [[5, "warn"], [15, "hot"], [30, "crit"]],  # minutes of waiting where a queue item turns yellow, orange and red (ticket 345); AGE_FACTOR stretches them per kind, P1 halves them
                   "stop_bloqueia": False}  # True: the coordinator's Stop blocks the end of the turn with any entry that has no effect (GATE_BLOCKERS times per set); turning it on is the user's decision (ticket 27). An entry with no intake in the turn always blocks (ticket 150)
 DISPATCH_QUEUE = "dispatch-queue.json"  # {itens: [...]}: what `orq dispatch_worker` and `orq resume` could not bring up; the manager brings it up by priority
 DISPATCH_QUEUE_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: copy of the spec of a queued dispatch (the coordinator's file may vanish)
@@ -12139,6 +12148,62 @@ MACHINE_ALIVE = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
 HEAVY_PROCESSES = ("claude", "codex", "node", "docker")  # the sum of RSS that `orq machine` shows
 WAIT_HELD_S = 300  # a queue item held back by plan usage or night mode is only retried after this
 QUEUE_FAILURES = 3  # manager attempts with an error before the item leaves the queue
+
+
+# ---------- how long each queue item has waited (ticket 345) ----------
+
+AGE_LEVELS = ("warn", "hot", "crit")  # the names `age_colors` can use; below the first limit the level is "ok" (neutral)
+AGE_FACTOR = {"fila": 1, "integracao": 1, "worker": 1, "entrega": 3, "obrigacao": 3, "pendencia": 12}  # per kind, times the age_colors limits: a delivery waits for the integrator, a pending item for the user (hours are normal)
+AGE_ANSI = {"ok": "", "warn": "33", "hot": "38;5;208", "crit": "31"}  # the terminal's yellow, orange and red; the panel and the TUI draw the same scale in hex
+
+
+def age_level(kind, minutes, priority=None, cfg=None):
+    """ok, warn, hot or crit for an item of this kind that has waited `minutes`. P1 uses half the limits."""
+    k = AGE_FACTOR.get(kind, 1) * (0.5 if priority == 1 else 1)
+    return next((name for limit, name in sorted(((cfg or machine_cfg())["age_colors"]), reverse=True) if minutes >= limit * k), "ok")
+
+
+def age_text(minutes):
+    """"14 min", "2 h 05"."""
+    m = int(minutes)
+    return f"{m} min" if m < 60 else f"{m // 60} h {m % 60:02d}"
+
+
+def queue_ages(now_at=None, cfg=None):
+    """The dispatch queue and then the integrator queue, each in the order it will be served, with the age of each item: [{kind, id, titulo, prioridade, desde, min, nivel}]."""
+    now_at, cfg = now_at or _dt(now()), cfg or machine_cfg()
+    found = [("fila", i["id"], i.get("titulo") or i["id"], i.get("prioridade"), i.get("ts")) for i in dispatch_queue_items() if i.get("id")]
+    found += [("integracao", f"{i['ticket']}@{i.get('ts')}", f"ticket {i['ticket']} {i.get('branch') or ''}".strip(), None, i.get("ts")) for i in integration_queue().values()]
+    out = []
+    for kind, id_, title, priority, since in found:
+        with contextlib.suppress(AttributeError, ValueError):
+            minutes = max((now_at - _dt(since)).total_seconds() / 60, 0)
+            out.append({"kind": kind, "id": id_, "titulo": title, "prioridade": priority, "desde": since, "min": minutes, "nivel": age_level(kind, minutes, priority, cfg)})
+    return out
+
+
+def queue_age_line(now_at=None, color=False):
+    """"Queues: 13 items, the oldest waiting 47 min" (in the scale's color with `color`), or empty with nothing waiting."""
+    ages = queue_ages(now_at)
+    if not ages:
+        return ""
+    old = max(ages, key=lambda i: i["min"])
+    txt = f"Queues: {len(ages)} item{'s' if len(ages) != 1 else ''}, the oldest waiting {age_text(old['min'])}{' ▲' if old['nivel'] == 'crit' else ''}"
+    return f"\x1b[{AGE_ANSI[old['nivel']]}m{txt}\x1b[0m" if color and AGE_ANSI[old["nivel"]] else txt
+
+
+def age_alerts(now_at=None, cfg=None):
+    """An item that crosses the critical limit gets one `queue_item_aged` event (it also goes to the digest's line). Returns what it recorded, one text per item."""
+    crit = [i for i in queue_ages(now_at, cfg) if i["nivel"] == "crit"]
+    if not crit:
+        return []
+    seen = {e.get("item") for e in read_events() if e.get("tipo") == "queue_item_aged"}
+    lines = []
+    for i in crit:
+        if i["id"] not in seen:
+            append_event({"tipo": "queue_item_aged", "item": i["id"], "fila": i["kind"], "titulo": i["titulo"], "idade_min": int(i["min"])})
+            lines.append(f"{i['titulo']} has waited {age_text(i['min'])} in the {i['kind']} queue")
+    return lines
 
 
 class NoSlot(Exception):
@@ -12150,6 +12215,8 @@ def _machine_kind_ok(default, v):
         return isinstance(v, bool)
     if isinstance(default, (int, float)):
         return isinstance(v, (int, float)) and not isinstance(v, bool)
+    if default and isinstance(default[0], list):  # age_colors: [[minutes, level], ...]
+        return isinstance(v, list) and bool(v) and all(isinstance(x, list) and len(x) == 2 and isinstance(x[0], (int, float)) and not isinstance(x[0], bool) and x[1] in AGE_LEVELS for x in v)
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
 
@@ -12628,13 +12695,14 @@ def _machine_notify(reason, in_queue, cfg, cause=(None, None)):
 def machine_round():
     """The dispatch queue work in one round of the agent manager panel: high pressure notifies the coordinator and only the exempt Run starts; otherwise it starts one item that fits."""
     cfg = machine_cfg()
+    aged = age_alerts(cfg=cfg)
     reading = machine_read()
     level, reason = machine_level(reading, cfg)
     if level == "alta":
-        return _machine_notify(reason, len(dispatch_queue_items()), cfg, machine_cause(reading, cfg)) + drain_dispatch(cfg, only_exempt=True)
+        return aged + _machine_notify(reason, len(dispatch_queue_items()), cfg, machine_cause(reading, cfg)) + drain_dispatch(cfg, only_exempt=True)
     if _cursor_ro().get("maquina_aviso"):
         _cursor_mut(lambda c: c.pop("maquina_aviso", None))
-    return drain_dispatch(cfg)
+    return aged + drain_dispatch(cfg)
 
 
 def machine_text(cfg=None, reading=None, occupancy=None):
@@ -15336,7 +15404,7 @@ def main(argv=None):
             add = install_codex_hooks(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex.hooks.example.json"))
             print("\n".join([*(f"added: {ev} group {g}" for ev, g in add), codex_hooks_notice() or "orq hooks trusted in Codex"]))
         elif a.cmd == "status":
-            print(status_text())
+            print(status_text(color=sys.stdout.isatty() and "NO_COLOR" not in os.environ))
         elif a.cmd == "start":
             print(start(a.agent, a.run, a.objective, a.take_over))
         elif a.cmd == "summary" and a.op == "add":
