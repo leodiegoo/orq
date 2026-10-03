@@ -17814,6 +17814,13 @@ def _g176(repo, *a):
     subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
 
 
+def _commit176(folder, subject, name=None, *flags):
+    """A commit with a patch of its own (`git cherry` takes empty commits for equivalent ones), named `subject`; `name` is the file it adds."""
+    open(os.path.join(folder, name or subject), "w").write(subject)
+    _g176(folder, "add", "-A")
+    _g176(folder, "commit", "-q", *flags, "-m", subject)
+
+
 def _scenario176():
     """repo with origin; worktrees: pronta (contained), fora (commit outside origin/main), suja (dirty), integracao (integra/x)."""
     tmp = tempfile.mkdtemp()
@@ -17824,9 +17831,8 @@ def _scenario176():
     root = os.path.join(tmp, "orq-wt")
     for item_name, b in (("1", "feat/pronta"), ("2", "feat/fora"), ("3", "feat/suja"), ("integracao", "integra/x")):
         _g176(repo, "worktree", "add", "-q", "-b", b, os.path.join(root, item_name))
-    _g176(os.path.join(root, "1"), "commit", "-q", "--allow-empty", "-m", "a")
-    _g176(os.path.join(root, "3"), "commit", "-q", "--allow-empty", "-m", "c")
-    _g176(os.path.join(root, "2"), "commit", "-q", "--allow-empty", "-m", "b")
+    for item_name, subject in (("1", "a"), ("3", "c"), ("2", "b")):
+        _commit176(os.path.join(root, item_name), subject)
     _g176(repo, "merge", "-q", "--ff-only", "feat/pronta")
     _g176(repo, "merge", "-q", "--no-edit", "feat/suja")
     _g176(repo, "push", "-q", "origin", "main")
@@ -17878,7 +17884,7 @@ def _rewrite176(**kw):
     """scenario + worktree 4 (feat/reescrita) with a commit of subject "a" that origin/main has under a different hash."""
     repo, root = _scenario176()
     _g176(repo, "worktree", "add", "-q", "-b", "feat/reescrita", os.path.join(root, "4"), "main~2")
-    _g176(os.path.join(root, "4"), "commit", "-q", "--allow-empty", "--date=2000-01-01T00:00:00", "-m", "a")  # outra data: hash diferente, mesmo assunto
+    _commit176(os.path.join(root, "4"), "a", "a-rewritten", "--date=2000-01-01T00:00:00")  # another date and patch: a different hash, the same subject
     return repo, root, _k176(repo, resolved_tickets={"04"}, **kw)
 
 
@@ -21824,6 +21830,198 @@ def test_ticket329_accept_delivery_lets_a_mate_checked_delivery_through_and_reco
     r = a.orq("accept-delivery", "ctx_term_w1", "--by", "mate-orq", "--summary", "again")
     assert r.returncode == 1 and "nothing to accept" in r.stderr, r.stderr
     assert a.orq("accept-delivery", "ctx_term_w1", "--by", " ", "--summary", "x").returncode == 1
+
+
+# ---- ticket 327: the registry of the integrator's cycles proves a branch is in main ----
+
+def _stamp327(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _sha327(repo, ref):
+    return subprocess.run(["git", "-C", repo, "rev-parse", ref], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _scenario327():
+    """_scenario176 (1 contained, 2 outside main, 3 dirty, integracao) plus worktrees whose branch the integrator took with a rewritten patch: 5 (the conflict was resolved by hand in
+    main), 6 (recorded, then a new commit), 7 (recorded, a loose file), 8 (recorded, only a final-report.md loose), and 9 (cherry-picked into main under another hash, no record).
+    Returns repo, root and `cycle(at)`: the cycle events that recorded 5-8 at the time `at` (5-8's tips as they were when recorded)."""
+    repo, root = _scenario176()
+    recorded = []
+    for n, b in (("5", "feat/merge-reescrito"), ("6", "feat/devolvida"), ("7", "feat/suja-integrada"), ("8", "feat/so-relatorio")):
+        _g176(repo, "worktree", "add", "-q", "-b", b, os.path.join(root, n), "main")
+        _commit176(os.path.join(root, n), f"w{n}", f"f{n}")
+        tip = _sha327(repo, b)
+        open(os.path.join(repo, f"f{n}"), "w").write(f"w{n}+resolved")  # main has the same file with the integrator's resolution: another patch
+        _g176(repo, "add", "-A")
+        _g176(repo, "commit", "-q", "-m", f"integrate {n}")
+        recorded.append({"branch": b, "tip": tip, "integrated_into": _sha327(repo, "main")[:7]})
+    _commit176(os.path.join(root, "6"), "after-the-cycle", "g6")  # the worker returned and added work after the cycle
+    open(os.path.join(root, "7", "notes.txt"), "w").write("x")
+    open(os.path.join(root, "8", "final-report.md"), "w").write("report")
+    _g176(repo, "worktree", "add", "-q", "-b", "feat/cherry", os.path.join(root, "9"), "main")
+    _commit176(os.path.join(root, "9"), "w9", "f9")
+    _commit176(repo, "other9", "o9")  # main moved on: the cherry-pick gets another parent, so another hash
+    _g176(repo, "cherry-pick", "feat/cherry")
+    return repo, root, lambda at: [{"tipo": "ciclo", "ts": _stamp327(at), "hash": recorded[-1]["integrated_into"], "branches": [r["branch"] for r in recorded], "integrated": recorded}]
+
+
+def _events327(registry):
+    """The cycle events that give `registry` back (one per branch)."""
+    return [{"tipo": "ciclo", "ts": _stamp327(r["ts"]), "hash": r["into"], "branches": [b], "integrated": [{"branch": b, "tip": r["tip"], "integrated_into": r["into"]}]}
+            for b, rs in registry.items() for r in rs]
+
+
+def _run327(cycle_ago_h=30, **kw):
+    repo, root, cycle = _scenario327()
+    k = _k176(repo, **kw)
+    k["registry"] = orq_mod.integration_registry(cycle(k["now_at"] - cycle_ago_h * 3600))
+    k["busy"] = set()
+    return repo, root, k
+
+
+def _branches327(repo):
+    return subprocess.run(["git", "-C", repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+
+
+def test_ticket327_conclude_records_each_branch_tip_and_the_main_hash():
+    tmp = tempfile.mkdtemp()
+    repo = _repo_with_branch(tmp, "feat/b1")
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _integrated154(a)
+    assert a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1").returncode == 0
+    (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
+    assert ev["integrated"] == [{"branch": "feat/b1", "tip": _sha327(repo, "feat/b1"), "integrated_into": "abc1234"}], ev
+    assert orq_mod.integration_registry([ev])["feat/b1"][0]["tip"] == _sha327(repo, "feat/b1")
+
+
+def test_ticket327_branch_merged_with_rewritten_commits_goes_by_the_registry_with_a_bundle_first():
+    repo, root, k = _run327()
+    assert "feat/merge-reescrito" in _branches327(repo) and subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", "feat/merge-reescrito", "main"]).returncode != 0, "the tip is not an ancestor"
+    r = orq_mod.clean_orq_worktrees(repo, root, **k)
+    by = {os.path.basename(x["pasta"]): x for x in r["removidas"]}
+    assert by["5"]["via"] == "registro" and "orq cycle" in by["5"]["motivo"] and by["5"]["bytes"] > 0, by
+    assert by["9"]["via"] == "cherry" and by["1"]["via"] == "contida", by
+    assert not os.path.exists(os.path.join(root, "5")) and not os.path.exists(os.path.join(root, "9")) and {"feat/merge-reescrito", "feat/cherry", "feat/pronta"}.isdisjoint(_branches327(repo))
+    heads = subprocess.run(["git", "bundle", "list-heads", r["bundle"]], capture_output=True, text=True, cwd=repo).stdout
+    assert "refs/heads/feat/merge-reescrito" in heads and "refs/heads/feat/cherry" in heads and "feat/pronta" not in heads, heads
+
+
+def test_ticket327_branch_without_a_cycle_or_with_work_after_it_stays_with_the_reason():
+    repo, root, k = _run327()
+    r = orq_mod.clean_orq_worktrees(repo, root, **k)
+    stays = {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}
+    assert "commit outside" in stays["2"] and "no cycle of the integrator recorded it" in stays["2"], stays  # never integrated
+    assert "commit outside" in stays["6"] and "feat/devolvida" in _branches327(repo) and os.path.isdir(os.path.join(root, "6")), stays  # recorded, then returned
+    assert not {"2", "6"} & {os.path.basename(x["pasta"]) for x in r["removidas"]}
+
+
+def test_ticket327_loose_change_goes_to_review_with_the_reason_and_a_lone_report_does_not_hold_the_folder():
+    repo, root, k = _run327()
+    saved = orq_mod.REPORTS
+    orq_mod.REPORTS = os.path.join(os.path.dirname(repo), "relatorios")
+    try:
+        dry = orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **k)
+        assert os.path.isdir(os.path.join(root, "8")) and not os.path.exists(orq_mod.REPORTS), "the dry run touches nothing"
+        review = {os.path.basename(x["pasta"]): x["motivo"] for x in dry["revisar"]}
+        assert sorted(review) == ["3", "7"] and "uncommitted changes" in review["7"], review
+        r = orq_mod.clean_orq_worktrees(repo, root, **k)
+        assert "8" in [os.path.basename(x["pasta"]) for x in r["removidas"]] and os.path.isfile(os.path.join(orq_mod.REPORTS, "8-final-report.md"))
+        assert os.path.exists(os.path.join(root, "7", "notes.txt")) and os.path.isdir(os.path.join(root, "3")), "loose changes are never removed"
+    finally:
+        orq_mod.REPORTS = saved
+
+
+def test_ticket327_window_counts_from_the_end_of_the_cycle_not_from_the_birth_of_the_folder():
+    repo, root, k = _run327(cycle_ago_h=2)
+    r = orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **k)
+    stays = {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}
+    assert stays["5"] == "integration cycle concluded less than 24 h ago" and "5" not in [os.path.basename(x["pasta"]) for x in r["removidas"]], stays
+    repo, root, k = _run327(cycle_ago_h=30, now_at=time.time() + 3600)  # the folders were born less than 24 h before: the cycle is what counts
+    r = orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **k)
+    assert "5" in [os.path.basename(x["pasta"]) for x in r["removidas"]], r
+
+
+def test_ticket327_cycle_from_before_the_record_proves_a_branch_with_no_newer_commit():
+    repo, root, k = _run327()
+    _g176(repo, "worktree", "add", "-q", "-b", "feat/antiga", os.path.join(root, "10"), "main")
+    _commit176(os.path.join(root, "10"), "w10", "f10")
+    _g176(repo, "worktree", "add", "-q", "-b", "feat/antiga-com-trabalho", os.path.join(root, "11"), "main")
+    _commit176(os.path.join(root, "11"), "w11", "f11")
+    main_hash = _sha327(repo, "main")[:7]
+    old = [{"tipo": "ciclo", "ts": _stamp327(time.time() + 60), "hash": main_hash, "branches": ["feat/antiga"]},  # no `integrated`: an old cycle, after the commit
+           {"tipo": "ciclo", "ts": "2000-01-01T00:00:00Z", "hash": main_hash, "branches": ["feat/antiga-com-trabalho"]}]  # before the commit
+    k["registry"] = orq_mod.integration_registry(old)
+    r = orq_mod.clean_orq_worktrees(repo, root, **k)
+    assert "10" in [os.path.basename(x["pasta"]) for x in r["removidas"]] and "feat/antiga" not in _branches327(repo)
+    assert "11" in [os.path.basename(x["pasta"]) for x in r["ficaram"]] and "feat/antiga-com-trabalho" in _branches327(repo)
+
+
+def test_ticket327_orca_worktree_outside_the_root_goes_unless_a_worker_is_in_it_or_orq_does_not_answer():
+    repo, root, k = _run327()
+    orca_dir = os.path.join(os.path.dirname(repo), "orca")
+    path = os.path.join(orca_dir, "orq-feature")
+    _g176(repo, "worktree", "add", "-q", "-b", "leodiegoo/orq-feature", path, "main")
+    _commit176(path, "wf", "ff")
+    open(os.path.join(repo, "ff"), "w").write("wf+resolved")
+    _g176(repo, "add", "-A")
+    _g176(repo, "commit", "-q", "-m", "integrate feature")
+    tip = _sha327(repo, "leodiegoo/orq-feature")
+    k["registry"] = orq_mod.integration_registry([{"tipo": "ciclo", "ts": _stamp327(k["now_at"] - 30 * 3600), "hash": _sha327(repo, "main")[:7], "branches": ["leodiegoo/orq-feature"],
+                                                  "integrated": [{"branch": "leodiegoo/orq-feature", "tip": tip, "integrated_into": _sha327(repo, "main")[:7]}]}])
+    stays = lambda r: {os.path.basename(x["pasta"]): x["motivo"] for x in r["ficaram"]}.get("orq-feature")
+    assert stays(orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **{**k, "busy": {path}})) == "live worker in the worktree"
+    saved = orq_mod._busy_or_none
+    orq_mod._busy_or_none = lambda: None
+    try:
+        assert "did not answer" in stays(orq_mod.clean_orq_worktrees(repo, root, dry_run=True, **{**k, "busy": None}))
+    finally:
+        orq_mod._busy_or_none = saved
+    r = orq_mod.clean_orq_worktrees(repo, root, **k)
+    assert "orq-feature" in [os.path.basename(x["pasta"]) for x in r["removidas"]] and not os.path.exists(path) and "leodiegoo/orq-feature" not in _branches327(repo)
+
+
+def test_ticket327_dry_run_lists_reason_and_size_of_the_removable_and_the_reason_of_the_kept_and_apply_leaves_only_the_alive_and_the_unintegrated():
+    repo, root, k = _run327()
+    saved = (orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT, orq_mod.REPORTS)
+    home = os.path.join(os.path.dirname(repo), "home")
+    os.makedirs(home)
+    orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT, orq_mod.REPORTS = home, os.path.join(home, "plan"), root, os.path.join(home, "relatorios")
+    try:
+        for ev in _events327(k["registry"]):
+            orq_mod.append_event(ev)
+        before = subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.splitlines()
+        text = orq_mod.worktrees_clean(dry_run=True, now_at=k["now_at"], repo=repo, root=root, busy=set())
+        assert subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.splitlines() == before, "dry run removes nothing"
+        head, *lines = text.splitlines()
+        assert head.startswith("would remove: 4 worktree(s)") and "review: 2" in head, text
+        removes = [l for l in lines if l.startswith("  removes")]
+        assert len(removes) == 4 and all(re.search(r"\((branch .+); \d+ (B|KB|MB)\)$", l) for l in removes), removes
+        assert any(l.startswith("  keeps") and "/2:" in l and "has a commit" in l for l in lines) and any(l.startswith("  review") and "/7:" in l for l in lines), text
+        text = orq_mod.worktrees_clean(now_at=k["now_at"], repo=repo, root=root, busy=set())
+        assert text.startswith("removed: 4 worktree(s)"), text
+        left = sorted(os.path.basename(l.split()[0]) for l in subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.splitlines())
+        assert left == sorted(["repo", "2", "3", "6", "7", "integracao"]), left  # only the unintegrated, the loose ones and the integrator's
+        (run_event,) = [e for e in orq_mod.read_events() if e.get("tipo") == "clean_run"]
+        assert dict(run_event["quantos"])["worktrees"] == 4 and run_event["bytes"] > 0, run_event
+        assert "Cleaned 4 worktrees" in orq_mod.clean_summary_line(orq_mod.read_events(), "2000-01-01T00:00:00Z")["titulo"]
+    finally:
+        orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT, orq_mod.REPORTS = saved
+
+
+def test_ticket327_manager_cleans_after_each_new_integrator_cycle_and_the_digest_counts_it():
+    w = _World326()
+    try:
+        orq_mod.HOME = w.repo  # orq's home is its clone: the repository `clean_round` cleans
+        orq_mod._cursor_mut(lambda c: c.__setitem__("ausente", {"desde": "2026-10-02T10:00:00Z"}))  # away mode holds the daily size tier; the cycle clean runs anyway
+        assert not [l for l in orq_mod.clean_round(w.now_at) if "cycle" in l], "no cycle yet"
+        orq_mod.append_event({"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/pronta"], "tickets": []})
+        lines = orq_mod.clean_round(w.now_at + 60)
+        assert any(l.startswith("clean (cycle): removed") for l in lines) and not os.path.exists(os.path.join(w.root, "1")), lines
+        assert not [l for l in orq_mod.clean_round(w.now_at + 120) if "cycle" in l], "one clean per cycle"
+        assert "worktrees" in orq_mod.clean_summary_line(w.events(), "2000-01-01T00:00:00Z")["titulo"]
+    finally:
+        w.restore()
 
 
 if __name__ == "__main__":

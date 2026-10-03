@@ -662,70 +662,177 @@ def _birth(folder):
     return getattr(st, "st_birthtime", st.st_mtime)
 
 
-def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, now_at=None, resolved_tickets=None, live=None, backups=None):
-    """Removes orq's `<root>/<ticket>` worktrees already published in `ref` (tickets 176 and the decision that followed it). The integrator fast-forwards main and the push is
-    manual, so nobody else removed them. Stays, with the reason: the integrator's worktree (`integra/*`, `integration`), a loose-branch one, a ticket one with a live
-    dispatch (not released: running, delivered or returned), one created less than 24 h ago, one with an uncommitted change (new file included) and one with a process inside.
-    Branch contained in `ref` (`merge-base --is-ancestor`): `git worktree remove` + `git branch -d`. Branch with a rewritten hash: only if the ticket is resolved AND every commit
-    of it has one with the same subject in `ref`; before, the refs go to a dated bundle in `backups` (verified), and then `worktree remove` + `branch -D`.
-    Never `--force` nor `rm -rf`. `resolved_tickets` and `live` are sets of ticket numbers (default: the tickets with Status resolved; the unreleased dispatches).
-    Returns {removidas: [{pasta, branch, via}], ficaram: [{pasta, motivo}], bundle}; with `dry_run` nothing is removed or recorded."""
+def _branch_tip(branch):
+    """The tip sha of the local `branch` in the first ORQ_REPOS repository that has it, or None."""
+    repo = _branch_repo(branch)
+    return (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip() or None if repo else None
+
+
+def integration_registry(events=None):
+    """{branch: [{tip, into, ts}]} of what the integrator's cycles took into main (ticket 327). The `integrated` list of a cycle event is the record; a cycle from before it
+    (`branches` only) counts with `tip` None: the proof then is that the branch has no commit newer than the cycle. Newest entry first."""
+    out = {}
+    for e in events if events is not None else read_events():
+        if e.get("tipo") != "ciclo":
+            continue
+        at, tips = (_ts(e.get("ts")) or datetime.fromtimestamp(0, timezone.utc)).timestamp(), {i.get("branch"): i for i in e.get("integrated") or [] if isinstance(i, dict)}
+        for b in e.get("branches") or []:
+            out.setdefault(b, []).append({"tip": (tips.get(b) or {}).get("tip"), "into": (tips.get(b) or {}).get("integrated_into") or e.get("hash"), "ts": at})
+    return {b: sorted(v, key=lambda x: -x["ts"]) for b, v in out.items()}
+
+
+INTEGRATION_VIA = {"contida": "tip is an ancestor of {ref}", "registro": "integrated by an orq cycle into main at {into}", "cherry": "every commit has a patch-equivalent in main"}
+
+
+def integration_proof(repo, branch, ref="origin/main", registry=None):
+    """How `branch` is known to be in main, or None. {via, into, since}: `contida` (tip is an ancestor of `ref`); `registro` (an integrator cycle recorded this tip, or, for a cycle
+    from before the record, the branch has no commit newer than the cycle, and the cycle's main hash is in main) with `since` the cycle's time; `cherry` (`git cherry` has no `+`:
+    each commit has a patch-equivalent in main). `since` is also set on `contida` and `cherry` when a cycle recorded the branch. A rewritten merge (`--reset-author`, a conflict resolved, a batch) leaves the tip outside main, and only the last two prove it."""
+    tip = (_git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}") or "").strip()
+    if not tip:
+        return None
+    registry = integration_registry() if registry is None else registry
+    cycle = (registry.get(branch) or [{}])[0].get("ts")  # when a cycle last took this branch: the 24 h window starts there, whichever proof holds
+    if _git(repo, "merge-base", "--is-ancestor", tip, ref) is not None:
+        return {"via": "contida", "into": None, "since": cycle}
+    stamp = (_git(repo, "log", "-1", "--format=%ct", tip) or "").strip()
+    for r in registry.get(branch, []):
+        if (r["tip"] == tip if r["tip"] else stamp.isdigit() and int(stamp) <= r["ts"]) and r["into"] and _git(repo, "merge-base", "--is-ancestor", r["into"], BRANCH_NO_REMOTE) is not None:
+            return {"via": "registro", "into": r["into"], "since": r["ts"]}
+    cherry = _git(repo, "cherry", BRANCH_NO_REMOTE, tip)
+    if cherry is not None and not any(l.startswith("+") for l in cherry.splitlines()):
+        return {"via": "cherry", "into": None, "since": cycle}
+    return None
+
+
+REPORT_GLOBS = (".scratch/*/relatorio-final.md", ".scratch/*/final-report.md", "relatorio*.md", "final-report*.md")  # what `_store_reports` copies
+
+
+def _loose_changes(d):
+    """The `git status` lines of worktree `d` that are not an untracked orq report (those are copied to RELATORIOS, so they do not hold the folder back); None if git failed."""
+    st = _git(d, "status", "--porcelain", "-uall")
+    return None if st is None else [l for l in st.splitlines() if not (l.startswith("?? ") and any(
+        fnmatch.fnmatchcase(path := l[3:].strip('"'), g) and (g.startswith(".scratch/") or "/" not in path) for g in REPORT_GLOBS))]
+
+
+def _reports_saved(d):
+    """Copies the worktree's loose reports to RELATORIOS and deletes the originals (`git worktree remove` refuses a folder with an untracked file, and never gets --force). False if a copy failed."""
+    try:
+        sources = _report_files(d)
+        _store_reports(d)
+        for c in sources:
+            os.remove(c)
+        return True
+    except OSError:
+        return False
+
+
+def _busy_or_none():
+    """`busy_worktrees()` (the paths with a live worker), or None when Orca does not answer."""
+    try:
+        return busy_worktrees()
+    except Exception as e:  # noqa: BLE001
+        log(f"worktrees clean: orq busy: {type(e).__name__}: {e}")
+        return None
+
+
+def _linked_worktrees(repo, root):
+    """The linked worktrees of `repo` that sit outside `root` (the Orca ones, `~/orca/workspaces/<project>/<name>`): [path]. The main checkout is not one."""
+    out, inside = [], os.path.realpath(root) + os.sep
+    for l in (_git(repo, "worktree", "list", "--porcelain") or "").splitlines()[1:]:
+        if l.startswith("worktree ") and not os.path.realpath(l[9:]).startswith(inside) and os.path.exists(os.path.join(l[9:], ".git")):
+            out.append(l[9:])
+    return out
+
+
+def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, now_at=None, resolved_tickets=None, live=None, backups=None, busy=None, registry=None):
+    """Removes the worktrees of `repo` whose branch is already in main (tickets 176 and 327): orq's `<root>/<ticket>` ones and the Orca ones outside `root`. `integration_proof` says
+    how a branch got in: tip contained in `ref`, an integrator cycle that recorded it (`registro`, the cycle's time starts the 24 h window) or every commit patch-equivalent in main
+    (`cherry`); a rewritten hash is also accepted when the ticket is resolved AND every commit has a subject in `ref` (`assunto`). The push is manual, so nobody else removed them.
+    Stays, with the reason: the integrator's worktree (`integra/*`, `integracao`), a loose-branch or `prototype/` one, a ticket one with a live dispatch (not released: running, delivered
+    or returned), an Orca one with a live worker (`busy`, the paths `orq busy` gives; None asks Orca, and no answer keeps them; `registry` is `integration_registry()`), one inside the 24 h after its cycle (after its birth when no
+    cycle proves it), one with an uncommitted change (new file included: it also goes to `revisar`) and one with a process inside. A branch not contained in `ref` has its refs in a dated
+    bundle (verified) before `worktree remove` + `branch -D`. Never `--force` nor `rm -rf`. `resolved_tickets` and `live` are sets of ticket numbers (default: the tickets with Status
+    resolved; the unreleased dispatches). Returns {removidas: [{pasta, branch, via, motivo, bytes}], ficaram: [{pasta, motivo}], revisar: [{pasta, branch, motivo}], bundle}; with
+    `dry_run` nothing is removed or recorded."""
     repo = repo or HOME
     root = root or WT_ROOT
     backups = backups or os.path.join(PLAN, "backups")
     now_at = now_at if now_at is not None else time.time()
+    ev = read_events()
     if resolved_tickets is None:
         resolved_tickets = {t["num"] for t in tickets() if t["status"] == STATUS_CLOSED}
     if live is None:
-        ev = read_events()
         lib = _released(ev) | {e.get("dispatch") for e in ev if e.get("tipo") == "liberar" and e.get("estado") in ("released", "already_released")}
         live = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}  # `retained` and `release_unknown` count as alive
         live |= {str(i["ticket"]).zfill(2) for i in integration_queue().values()}  # a delivery still on the integrator queue is not residue (ticket 326)
-    subjects = set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
-    out, cwds, rewrites = {"removidas": [], "ficaram": [], "bundle": None}, None, []
-    for item_name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-        d = os.path.join(root, item_name)
+    registry, subjects = integration_registry(ev) if registry is None else registry, set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
+    out, cwds, asked, rewrites = {"removidas": [], "ficaram": [], "revisar": [], "bundle": None}, None, False, []
+    folders = [(os.path.join(root, n), n) for n in (sorted(os.listdir(root)) if os.path.isdir(root) else [])]
+    folders += [(d, None) for d in _linked_worktrees(repo, root)]
+    for d, item_name in folders:
         if not os.path.exists(os.path.join(d, ".git")):
             continue
-        number = (item_name[1:] if item_name.startswith("t") else item_name).zfill(2)
+        number = ((item_name[1:] if item_name.startswith("t") else item_name).zfill(2) if item_name else None)
         branch = (_git(d, "branch", "--show-current") or "").strip()
+        proof = integration_proof(repo, branch, ref, registry) if branch and not _environment_branch(branch) and not branch.startswith("integra/") else None
+        since = proof["since"] if proof and proof["since"] else None
         reason = ("loose branch (detached HEAD)" if not branch else "integrator worktree" if item_name == "integracao" or branch.startswith("integra/")
-                  else "main branch" if _environment_branch(branch) else "live dispatch for the ticket" if number in live
-                  else "created less than 24 h ago" if now_at - _birth(d) < 86400 else None)
-        contained = not reason and _git(repo, "merge-base", "--is-ancestor", branch, ref) is not None
-        if not reason and not contained:
+                  else "main branch" if _environment_branch(branch) else "prototype branch" if branch.startswith("prototype/") else "live dispatch for the ticket" if number in live
+                  else None)
+        if not reason and item_name is None:
+            if busy is None and not asked:
+                busy, asked = _busy_or_none(), True
+            reason = ("orq busy did not answer: a worker may be inside" if busy is None
+                      else "live worker in the worktree" if os.path.realpath(d) in {os.path.realpath(p) for p in busy} else None)
+        if not reason:
+            reason = (f"integration cycle concluded less than 24 h ago" if since is not None and now_at - since < 86400
+                      else "created less than 24 h ago" if since is None and now_at - _birth(d) < 86400 else None)
+        via = proof["via"] if proof else None
+        if not reason and not proof:
             subs = (_git(repo, "log", "--format=%s", f"{ref}..{branch}") or "?").splitlines()
-            if number not in resolved_tickets:
-                reason = f"{branch} has a commit outside {ref} and the ticket is not resolved"
+            if number is None or number not in resolved_tickets:
+                reason = f"{branch} has a commit outside {ref}, no cycle of the integrator recorded it, and the ticket is not resolved" if number is not None else f"{branch} has a commit outside {ref} and no cycle of the integrator recorded it"
             elif not all(x in subjects for x in subs):
                 reason = f"{branch} has a commit with no matching subject in {ref}"
-        if not reason and ((st := _git(d, "status", "--porcelain")) is None or st.strip()):
-            reason = "uncommitted changes"
+            else:
+                via = "assunto"
+        dirty = False
+        if not reason and ((loose := _loose_changes(d)) is None or loose):
+            reason, dirty = "uncommitted changes", True
         if not reason:
             cwds = _open_cwds() if cwds is None else cwds
             real = os.path.realpath(d)
             reason = "process inside the folder" if any(c == real or c.startswith(real + os.sep) for c in cwds) else None
         if reason:
             out["ficaram"].append({"pasta": d, "motivo": reason})
+            if dirty:
+                out["revisar"].append({"pasta": d, "branch": branch, "motivo": f"{branch}: {reason}; the integration is proven by `{via or 'a'}` but the loose change is not in main"})
         else:
-            out["removidas"].append({"pasta": d, "branch": branch, "via": "contida" if contained else "assunto"})
+            motivo = (f"branch {branch} already in {ref} (contida)" if via == "contida" else f"branch {branch} {INTEGRATION_VIA[via].format(ref=ref, into=proof and proof['into'])}" if proof
+                      else f"branch {branch}: ticket resolved and every commit has a subject in {ref} (assunto)")
+            saved = bool((_git(d, "status", "--porcelain", "-uall") or "").strip())  # only reports are loose (`_loose_changes`): copied to RELATORIOS before the folder goes
+            out["removidas"].append({"pasta": d, "branch": branch, "via": via, "motivo": motivo + ("; its report goes to relatorios first" if saved else ""), "bytes": _size_of(d), "relatorios": saved})
     if dry_run:
         return out
-    rewrites = [x for x in out["removidas"] if x["via"] == "assunto"]
-    if rewrites:
+    rewrites = [x for x in out["removidas"] if x["via"] != "contida"]
+    need = [x["branch"] for x in rewrites if (_git(repo, "rev-list", "-1", f"{ref}..{x['branch']}") or "").strip()]
+    if need:
         os.makedirs(backups, exist_ok=True)
         bundle = os.path.join(backups, f"orq-wt-{time.strftime('%Y-%m-%d', time.localtime(now_at))}.bundle")
         if os.path.exists(bundle):
             bundle = bundle[:-7] + time.strftime("-%H%M%S", time.localtime(now_at)) + ".bundle"
-        ok = subprocess.run(["git", "-C", repo, "bundle", "create", bundle, *[x["branch"] for x in rewrites]], capture_output=True).returncode == 0 \
+        ok = subprocess.run(["git", "-C", repo, "bundle", "create", bundle, *need, f"^{ref}"], capture_output=True).returncode == 0 \
             and subprocess.run(["git", "-C", repo, "bundle", "verify", bundle], capture_output=True).returncode == 0
         out["bundle"] = bundle if ok else None
     for x in list(out["removidas"]):
-        if x["via"] == "assunto" and not out["bundle"]:
+        if x["via"] != "contida" and x["branch"] in need and not out["bundle"]:
             reason = "backup bundle failed: nothing removed"
+        elif x["relatorios"] and not _reports_saved(x["pasta"]):
+            reason = "could not copy its report to relatorios: nothing removed"
         elif _git(repo, "worktree", "remove", x["pasta"]) is None:
             reason = "git worktree remove refused"
-        elif _git(repo, "branch", "-D" if x["via"] == "assunto" else "-d", x["branch"]) is None:
+        elif _git(repo, "branch", "-d" if x["via"] == "contida" else "-D", x["branch"]) is None:
             reason = f"folder removed, but git branch refused {x['branch']}"
         else:
             continue
@@ -745,7 +852,7 @@ CLEAN_FILE = "clean.json"  # same keys as CLEAN_DEFAULTS; machine.json takes the
 CLEAN_SAFE = ("notices", "state")  # the manager applies these every hour; CLEAN_SIZE once a day, outside away mode and without machine pressure
 CLEAN_SIZE = ("worktrees", "branches", "integra", "backups", "claude")
 CLEAN_CATEGORIES = (*CLEAN_SAFE, *CLEAN_SIZE, "test-lines")  # test-lines is only listed: `orq clean --test-lines --apply` is the user's approval
-CLEAN_STAMPS = "clean-run.json"  # {safe, size}: when the manager last ran each tier
+CLEAN_STAMPS = "clean-run.json"  # {safe, size, last_cycle}: when the manager last ran each tier, and the last integrator cycle it cleaned after
 CLEAN_TEST_IDS = {"task": {"x"}, "run": {"x", "run_a"}, "terminal": {"term_x"}}  # what the suites that leaked into the real events.jsonl wrote (ticket 326, 02/10)
 NOTICE_CONDITIONS = {  # `valid_while` of a notice in avisos/: the notice is valid while the function answers True; unknown names count as valid (the age still expires it)
     "e2e_stuck": lambda: bool((e2e_queue() or {}).get("presa")),
@@ -873,9 +980,9 @@ def _clean_state(now_at, cfg):
     return out
 
 
-def _clean_worktrees(now_at, repo, root, backups):
-    r = clean_orq_worktrees(repo, root, dry_run=True, now_at=now_at, backups=backups)
-    return [_clean_item("worktrees", x["pasta"], f"branch {x['branch']} already in origin/main ({x['via']})", now_at, _birth(x["pasta"]), branch=x["branch"], via=x["via"]) for x in r["removidas"]]
+def _clean_worktrees(now_at, repo, root, backups, r=None):
+    r = r or clean_orq_worktrees(repo, root, dry_run=True, now_at=now_at, backups=backups)
+    return [_clean_item("worktrees", x["pasta"], x["motivo"], now_at, _birth(x["pasta"]), size=x["bytes"], branch=x["branch"], via=x["via"]) for x in r["removidas"]]
 
 
 def _clean_integra(now_at, cfg, repo, root):
@@ -905,19 +1012,23 @@ def _local_branches(repo):
 
 
 def _clean_branches(now_at, repo, ref=None):
-    """Local branches whose tip is already in `ref`. Not: main/environment branches, one checked out in a worktree, one at the very tip of `ref` (a branch a worker just
-    created), one on the integrator queue."""
+    """Local branches already in main (`integration_proof`: tip contained in `ref`, recorded by an integrator cycle, or every commit patch-equivalent). Not: main/environment branches,
+    one checked out in a worktree, one at the very tip of `ref` (a branch a worker just created), one on the integrator queue, one whose cycle ended less than 24 h ago."""
     ref = ref or BRANCH_NO_REMOTE
     if _git(repo, "rev-parse", "--verify", "-q", ref) is None:
         return []
     tip = (_git(repo, "rev-parse", ref) or "").strip()
     queued = {i["branch"] for i in integration_queue().values()}
-    out = []
+    registry, out = integration_registry(), []
     for b, sha, worktree in _local_branches(repo):
-        if b == ref or _environment_branch(b) or worktree or sha == tip or b in queued or _git(repo, "merge-base", "--is-ancestor", b, ref) is None:
+        if b == ref or _environment_branch(b) or worktree or sha == tip or b in queued or b.startswith("prototype/"):
+            continue
+        proof = integration_proof(repo, b, ref, registry)
+        if not proof or (proof["since"] and now_at - proof["since"] < 86400):
             continue
         stamp = (_git(repo, "log", "-1", "--format=%ct", b) or "0").strip()
-        out.append(_clean_item("branches", b, f"already integrated into {ref}", now_at, int(stamp) if stamp.isdigit() else None, size=0, sha=sha))
+        out.append(_clean_item("branches", b, f"already integrated into {ref}" if proof["via"] == "contida" else f"integrated into {ref}: " + INTEGRATION_VIA[proof["via"]].format(ref=ref, into=proof["into"]),
+                               now_at, int(stamp) if stamp.isdigit() else None, size=0, sha=sha, via=proof["via"]))
     return out
 
 
@@ -964,7 +1075,7 @@ def _clean_test_lines(now_at):
                         size=sum(len(l) + 1 for _, l in lines))] if lines else []
 
 
-def _clean_bundle(repo, branches, backups, now_at, ref):
+def clean_bundle(repo, branches, backups, now_at, ref):
     """Bundle of the commits of `branches` that `ref` does not have (verified). Nothing to bundle when all of them are in `ref`: returns (None, True). (path, ok)."""
     branches = [b for b in branches if (_git(repo, "log", "--format=%H", "-1", f"{ref}..{b}") or "").strip()]
     if not branches:
@@ -1015,7 +1126,7 @@ def clean_apply(plan, now_at=None, repo=None, root=None, backups=None, approve_t
                 _remove_path(p)
         done(item)
     for item in plan.get("integra", []):
-        bundle, ok = _clean_bundle(repo, [item["branch"]], backups, now_at, BRANCH_NO_REMOTE)
+        bundle, ok = clean_bundle(repo, [item["branch"]], backups, now_at, BRANCH_NO_REMOTE)
         if not ok or _git(repo, "worktree", "remove", item["alvo"]) is None:
             kept.append((item, "backup bundle failed" if not ok else "git worktree remove refused"))
         elif _git(repo, "branch", "-D", item["branch"]) is None:
@@ -1029,12 +1140,14 @@ def clean_apply(plan, now_at=None, repo=None, root=None, backups=None, approve_t
             (done({**item, **({"bundle": r["bundle"]} if r["bundle"] else {})}) if item["alvo"] in gone else kept.append((item, "no longer eligible")))
     for item in plan.get("branches", []):
         b = item["alvo"]
-        if (_git(repo, "rev-parse", b) or "").strip() != item["sha"] or _git(repo, "merge-base", "--is-ancestor", b, BRANCH_NO_REMOTE) is None:
+        if (_git(repo, "rev-parse", b) or "").strip() != item["sha"] or not integration_proof(repo, b, BRANCH_NO_REMOTE):
             kept.append((item, "branch moved since the listing"))
-        elif _git(repo, "branch", "-D", b) is None:  # -D: `-d` judges against HEAD; the ancestry in main was just checked
+        elif item.get("via") not in (None, "contida") and not (bundle := clean_bundle(repo, [b], backups, now_at, BRANCH_NO_REMOTE))[1]:
+            kept.append((item, "backup bundle failed"))
+        elif _git(repo, "branch", "-D", b) is None:  # -D: `-d` judges against HEAD; the proof in main was just checked
             kept.append((item, "git branch refused"))
         else:
-            done(item)
+            done({**item, **({"bundle": bundle[0]} if item.get("via") not in (None, "contida") and bundle[0] else {})})
     for item in plan.get("test-lines", []) if approve_test_lines else []:
         with _lock("cursor.lock"):
             os.makedirs(backups, exist_ok=True)
@@ -1107,7 +1220,31 @@ def clean_round(now_at=None):
         result = clean_apply(clean_plan(now_at, only=cats), now_at)
         if result["removed"]:
             lines.append(f"clean ({tier}): removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}")
+    cycle = max((e["ts"] for e in read_events() if e.get("tipo") == "ciclo" and e.get("ts")), default=None)
+    if cycle and cycle > (stamps.get("last_cycle") or ""):  # the end of an integrator cycle: what it integrated, and what older cycles left, goes now (ticket 327)
+        stamps["last_cycle"] = cycle
+        _write_json(_path(CLEAN_STAMPS), stamps)
+        result = clean_apply(clean_plan(now_at, only=("worktrees", "branches")), now_at)
+        if result["removed"]:
+            lines.append(f"clean (cycle): removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}")
     return lines
+
+
+def worktrees_clean(dry_run=False, now_at=None, repo=None, root=None, backups=None, busy=None):
+    """`orq worktrees clean` (ticket 327): the worktrees and the local branches already in main, with the reason and the size of each one, and what stays (and what needs review) with
+    the reason. It is the same plan and the same removal as `orq clean --only worktrees,branches` (events `clean` and `clean_run` for the digest). First line: the totals."""
+    now_at = time.time() if now_at is None else now_at
+    repo, root, backups = repo or HOME, root or WT_ROOT, backups or os.path.join(PLAN, "backups")
+    r = clean_orq_worktrees(repo, root, dry_run=True, now_at=now_at, backups=backups, busy=busy)
+    plan = {"worktrees": _clean_worktrees(now_at, repo, root, backups, r), "branches": _clean_branches(now_at, repo)}
+    result = None if dry_run else clean_apply(plan, now_at, repo, root, backups)
+    gone = plan if result is None else {c: [i for i in result["removed"] if i["categoria"] == c] for c in plan}
+    items = [i for c in plan for i in gone[c]]
+    stays = [f"  keeps {x['pasta']}: {x['motivo']}" for x in r["ficaram"]] + [f"  keeps {i['alvo']}: {why}" for i, why in (result or {}).get("kept", [])]
+    return "\n".join([f"{'would remove' if result is None else 'removed'}: {len(gone['worktrees'])} worktree(s), {len(gone['branches'])} branch(es), {clean_human(sum(i['bytes'] for i in items))}; "
+                      f"kept: {len(stays)}; review: {len(r['revisar'])}",
+                      *[f"  removes {i['alvo']} ({i['motivo']}; {clean_human(i['bytes'])})" for i in items], *stays,
+                      *[f"  review {x['pasta']}: {x['motivo']}" for x in r["revisar"]]])
 
 
 def integrate_conclude(hash_, branches, dispatch=None):
@@ -1141,7 +1278,7 @@ def integrate_conclude(hash_, branches, dispatch=None):
             with contextlib.suppress(ValueError, RuntimeError, subprocess.TimeoutExpired, OSError):
                 release(x)
     d = dispatch or (_integrator_dispatch(event_list) or {}).get("dispatch")
-    extra = {"branches": list(branches), "tickets": tickets_}
+    extra = {"branches": list(branches), "tickets": tickets_, "integrated": [{"branch": b, "tip": tip, "integrated_into": hash_} for b in branches if (tip := _branch_tip(b))]}
     if d:
         cycle_done(d, hash_, extra=extra)
     else:
@@ -4665,12 +4802,16 @@ def _clean_post_merge(i, branch):
     append_event({"tipo": "pr", "op": "limpeza", "task": i["task"], "url": i["url"], "branch": branch, "repo": repo})
 
 
+def _report_files(wt):
+    return sorted({*glob.glob(os.path.join(wt, ".scratch/*/relatorio-final.md")), *glob.glob(os.path.join(wt, ".scratch/*/final-report.md")),
+                   *glob.glob(os.path.join(wt, "relatorio*.md")), *glob.glob(os.path.join(wt, "final-report*.md"))})
+
+
 def _store_reports(wt):
     """Copies the worktree's relatorio-final.md (`.scratch/*/report-final.md` and `report*.md` at the root) to RELATORIOS/<worktree>-<path with - in place of />. Returns the destinations."""
     os.makedirs(REPORTS, exist_ok=True)
     item_name, out = os.path.basename(wt.rstrip("/")), []
-    for c in sorted({*glob.glob(os.path.join(wt, ".scratch/*/relatorio-final.md")), *glob.glob(os.path.join(wt, ".scratch/*/final-report.md")),
-                     *glob.glob(os.path.join(wt, "relatorio*.md")), *glob.glob(os.path.join(wt, "final-report*.md"))}):
+    for c in _report_files(wt):
         d = os.path.join(REPORTS, f"{item_name}-{os.path.relpath(c, wt).replace('/', '-')}")
         shutil.copy2(c, d)
         out.append(d)
@@ -15325,8 +15466,8 @@ def parser():
     te.add_argument("--map", help="the test map to read (default: plan/test-map.json)")
     te.add_argument("--dry-run", action="store_true", help="prints the commands instead of running them")
     te.add_argument("names", nargs="*")
-    wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the ORQ_WT worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
-    wl.add_parser("clean", aliases=["limpar"], help="removes the ORQ_WT worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
+    wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the worktrees and branches already in main").add_subparsers(dest="op", required=True)
+    wl.add_parser("clean", aliases=["limpar"], help="removes the worktrees and local branches already in main (a tip an integrator cycle recorded, or patch-equivalent commits, counts); --dry-run lists them with reason and size, and what stays").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: refuses a wrong author, trailer, forbidden term and code without a README before publishing main")
     au.add_argument("revs", nargs="+", help="git rev-list args; on a new branch: <head> --not --remotes (after --)")
     tk = sub.add_parser("ticket", help="tickets as files (ISSUES/NN-slug.md) with the task in Orca").add_subparsers(dest="op", required=True)
@@ -15768,9 +15909,7 @@ def main(argv=None):
         elif a.cmd == "test":
             return run_tests(a.affected, a.base, a.jobs, a.names, a.map, a.dry_run)
         elif a.cmd == "worktrees":
-            r = clean_orq_worktrees(dry_run=a.dry_run)
-            print(f"{'would remove' if a.dry_run else 'removed'}: {len(r['removidas'])}; kept: {len(r['ficaram'])}" + (f"; bundle {r['bundle']}" if r["bundle"] else ""))
-            print("\n".join([f"  removes {x['pasta']} ({x['branch']})" for x in r["removidas"]] + [f"  keeps {x['pasta']}: {x['motivo']}" for x in r["ficaram"]]))
+            print(worktrees_clean(a.dry_run))
         elif a.cmd == "audit-publication":
             reasons = audit_publication(a.revs)
             print("\n".join(f"audit-publication: {m}" for m in reasons), file=sys.stderr)
