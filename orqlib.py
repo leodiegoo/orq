@@ -15634,25 +15634,60 @@ def _duration(s):
     return f"{s // 86400}d{s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h{s % 3600 // 60:02d}m"
 
 
+def _usage_projection(usage, now_at):
+    """Add a linear end-of-window projection when at least 10% of the window elapsed."""
+    if not usage:
+        return None
+    result = dict(usage)
+    for name, duration in (("semana", 7 * 86400), ("cinco_h", 5 * 3600)):
+        used, reset = usage.get(name), usage.get(f"{name}_reset")
+        projected = exhausted = None
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and isinstance(reset, (int, float)) and reset > now_at:
+            elapsed = duration - (reset - now_at)
+            if elapsed >= duration * .1:
+                projected = used * duration / elapsed
+                if projected > 100 and used > 0:
+                    exhausted = now_at + (100 - used) * elapsed / used
+        result[f"{name}_projecao"] = round(projected, 1) if projected is not None else None
+        result[f"{name}_esgota"] = exhausted
+    return result
+
+
 def usage_level(usage, now_at=None):
     """(level, reason, reset): `pause` (week above the pause threshold) and `segura` (5 h above the threshold) refuse dispatch, `avisa` only warns, `ok` or
     `desconhecido` (no fresh frame) do nothing. `reset` is that of the window that decided, so the notice applies once per window."""
     if not usage:
         return "desconhecido", None, None
     now_at = now_at or time.time()
+    projected_usage = _usage_projection(usage, now_at)
     cfg = {**DEFAULT_USAGE, **{k: v for k, v in _dict(_read_json(_path(USAGE))).items() if k in DEFAULT_USAGE and isinstance(v, (int, float))}}
 
     def txt(item_name, threshold):
         r = usage[f"{item_name}_reset"]
-        return f"{'week' if item_name == 'semana' else '5 h window'} at {usage[item_name]:g}% (threshold {threshold:g}%)" + (f", turns over in {_duration(r - now_at)}" if r else "")
+        window = 'week' if item_name == 'semana' else '5 h window'
+        projection = projected_usage[f"{item_name}_projecao"]
+        exhaustion = projected_usage[f"{item_name}_esgota"]
+        detail = f", turns over in {_duration(r - now_at)}" if r else ""
+        if projection is not None:
+            detail += f", projected {projection:g}% at reset"
+        if exhaustion is not None:
+            detail += f", exhausts around {datetime.fromtimestamp(exhaustion).strftime('%H:%M')}"
+        return f"{window} at {usage[item_name]:g}% (threshold {threshold:g}%)" + detail
 
     s, c = usage["semana"], usage["cinco_h"]
     if s is not None and s >= cfg["semana_pausa"]:
+        if projected_usage["semana_projecao"] is not None and projected_usage["semana_projecao"] <= 100:
+            return "avisa", txt("semana", cfg["semana_pausa"]), usage["semana_reset"]
         return "pausa", txt("semana", cfg["semana_pausa"]), usage["semana_reset"]
     if c is not None and c >= cfg["cinco_h"]:
+        if projected_usage["cinco_h_projecao"] is not None and projected_usage["cinco_h_projecao"] <= 100:
+            return "avisa", txt("cinco_h", cfg["cinco_h"]), usage["cinco_h_reset"]
         return "segura", txt("cinco_h", cfg["cinco_h"]), usage["cinco_h_reset"]
     if s is not None and s >= cfg["semana_avisa"]:
         return "avisa", txt("semana", cfg["semana_avisa"]), usage["semana_reset"]
+    if any(projected_usage[f"{name}_esgota"] is not None for name in ("semana", "cinco_h")):
+        name = next(name for name in ("semana", "cinco_h") if projected_usage[f"{name}_esgota"] is not None)
+        return "avisa", txt(name, cfg["semana_avisa"] if name == "semana" else cfg["cinco_h"]), usage[f"{name}_reset"]
     return "ok", None, None
 
 
@@ -18485,10 +18520,24 @@ def main(argv=None):
                 f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}){f' [{_item_project(i)}]' if _item_project(i) else ''}"
                 f"{''.join(f' {k} {i[k]}' for k in ('task', 'ticket', 'mate') if i.get(k))} since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
         elif a.cmd == "usage":
-            u = plan_usage(agent=a.agent)
+            u = _usage_projection(plan_usage(agent=a.agent), time.time())
             level, reason, _ = usage_level(u)
-            print(json.dumps({"uso": u, "nivel": level, "motivo": reason}, ensure_ascii=False) if a.json else
-                  f"{level}" + (f": {reason}" if reason else "") + (f" (week {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (no fresh HUD frame)"))
+            if a.json:
+                print(json.dumps({"uso": u, "nivel": level, "motivo": reason}, ensure_ascii=False))
+            else:
+                details = []
+                for name, label in (("semana", "week"), ("cinco_h", "5 h")):
+                    if u and u[name] is not None:
+                        detail = f"{label} {u[name]}%"
+                        projected = u[f"{name}_projecao"]
+                        if projected is not None:
+                            detail += f", projected {projected:g}% at reset"
+                        exhaustion = u[f"{name}_esgota"]
+                        if exhaustion is not None:
+                            detail += f", exhausts around {datetime.fromtimestamp(exhaustion).strftime('%H:%M')}"
+                        details.append(detail)
+                print(f"{level}" + (f": {reason}" if reason else "") +
+                      (f" ({'; '.join(details)})" if details else " (no fresh HUD frame)"))
         elif a.cmd == "audit-answers":
             print(audit_answers(a.session), end="")
         elif a.cmd == "retro" and a.op == "citations":
