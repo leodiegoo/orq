@@ -17,6 +17,7 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 import time
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16381,6 +16382,98 @@ def _audit(repo, env, g, msg="feat: x", file_path=("f", "y"), **commit_env):
     g("add", "-A", "--", file_path[0])
     g("commit", "-qm", msg, **commit_env)
     return subprocess.run([sys.executable, os.path.join(HERE, "orq.py"), "auditar-publicacao", f"{base}..HEAD"], cwd=repo, capture_output=True, text=True, env=env)
+
+
+def test_ticket421_global_public_rules_apply_without_project_settings_and_allow_specific_lines():
+    with mock.patch.object(orqlib, "projects", return_value={"plain": {}}):
+        assert orqlib._public_findings("plain", "release mentions dbq")
+        assert orqlib._public_findings("plain", "docs mention plan/local.md")
+        assert orqlib._public_findings("plain", "docs mention .scratch/local.md")
+        assert not orqlib._public_findings("plain", "release ready")
+    with mock.patch.object(orqlib, "projects", return_value={"orq": {"publico_proibido": {"allow": ["ticket"]}}}):
+        assert not orqlib._public_findings("orq", "ticket 421 is documented")
+        assert orqlib._public_findings("orq", "dbq is internal")
+
+
+def test_ticket421_external_guard_checks_every_publication_command_and_body_file():
+    commands = [
+        'gh pr create --title "fix: dbq leak" --body clean',
+        'gh pr edit 7 --body "contains dbq"',
+        'gh pr edit 7 --title "docs: dbq leak" --body clean',
+        'gh pr create --title clean --body-file BODYFILE',
+        'gh issue create --title clean --body "contains dbq"',
+        'gh issue comment 7 --body "contains dbq"',
+        'git commit -m "docs: dbq leak"',
+        'git commit -F BODYFILE',
+        'orq pr open feature --title "docs: dbq leak" --body body.md',
+    ]
+    with tempfile.TemporaryDirectory() as folder:
+        body_file = os.path.join(folder, "BODYFILE")
+        pathlib.Path(body_file).write_text("public line includes dbq")
+        commands[3] = commands[3].replace("BODYFILE", body_file)
+        commands[7] = commands[7].replace("BODYFILE", body_file)
+        with mock.patch.object(orqlib, "_public_project", return_value="plain"), mock.patch.object(orqlib, "_public_forbidden", return_value=([("dbq", re.compile(r"dbq", re.I))], [])):
+            for command in commands:
+                assert orqlib._public_external_denial({"cwd": folder}, command), command
+        with mock.patch.object(orqlib, "_public_project", side_effect=lambda path: "plain" if path == "/repo" else None), \
+             mock.patch.object(orqlib, "_public_forbidden", return_value=([("dbq", re.compile(r"dbq", re.I))], [])):
+            assert orqlib._public_external_denial({"cwd": "/elsewhere"}, 'git -C /repo commit -m "docs: dbq"')
+
+
+def test_ticket421_pr_open_and_delivery_check_refuse_the_same_project_rule():
+    with tempfile.TemporaryDirectory() as folder:
+        body = os.path.join(folder, "body.md")
+        pathlib.Path(body).write_text("## Summary\nmentions dbq")
+        with mock.patch.object(orqlib, "_public_project", return_value="plain"), mock.patch.object(orqlib, "_public_findings", return_value=["mentions dbq: matches /dbq/"]), \
+             mock.patch.object(orqlib, "_worktrees_by_branch", return_value={}), mock.patch.object(orqlib, "_branch_ref", return_value="feature"):
+            try:
+                orqlib.pr_open("feature", "docs: update", body, cwd=folder)
+            except ValueError as exc:
+                assert "public content refused" in str(exc) and "mentions dbq" in str(exc)
+            else:
+                raise AssertionError("pr_open allowed prohibited content")
+            events = [{"tipo": "despacho", "dispatch": "ctx_abc"}]
+            with mock.patch.object(orqlib, "read_events", return_value=events), mock.patch.object(orqlib, "_own_dispatch", return_value="ctx_abc"), \
+                 mock.patch.object(orqlib, "_origin_of", return_value=lambda value: value), mock.patch.object(orqlib, "_report_text", return_value="mentions dbq"), \
+                 mock.patch.object(orqlib, "append_event", return_value={}), mock.patch.object(orqlib, "_report_hash", return_value="hash"):
+                result = orqlib.check_delivery_report(cwd=folder)
+            assert not result["ok"] and any("mentions dbq" in item for item in result["faltando"]), result
+
+
+def test_ticket421_push_guard_checks_outgoing_commit_message_and_docs():
+    with mock.patch.object(orqlib, "_public_project", return_value="plain"), \
+         mock.patch.object(orqlib, "_git", side_effect=["feature", "origin/main"]), \
+         mock.patch.object(orqlib, "audit_publication", return_value=["abc1234 docs: dbq leak"]):
+        assert "abc1234" in orqlib._public_external_denial({"cwd": "/repo"}, "git push origin feature")
+
+
+def test_ticket421_publication_audit_checks_commit_messages_and_added_documentation():
+    with tempfile.TemporaryDirectory() as folder:
+        repo, env, g = _publication_repo(folder)
+        base = g("rev-parse", "HEAD")
+        os.makedirs(os.path.join(repo, "docs"))
+        pathlib.Path(repo, "docs", "design.md").write_text("internal term: dbq\n")
+        g("add", "docs/design.md")
+        g("commit", "-qm", "docs: update")
+        with mock.patch.object(orqlib, "_public_project", return_value="plain"):
+            findings = orqlib.audit_publication([f"{base}..HEAD"], repo, checks=("public",))
+        assert findings and "dbq" in findings[0], findings
+        base = g("rev-parse", "HEAD")
+        pathlib.Path(repo, "f").write_text("clean\n")
+        g("add", "f")
+        g("commit", "-qm", "docs: references dbq")
+        with mock.patch.object(orqlib, "_public_project", return_value="plain"):
+            findings = orqlib.audit_publication([f"{base}..HEAD"], repo, checks=("public",))
+        assert findings and "dbq" in findings[0], findings
+
+
+def test_ticket421_pretool_hook_denies_with_matching_line_and_github_hint():
+    a = Env(run="run_a")
+    ev = {"tool_name": "Bash", "tool_input": {"command": 'gh pr create --title "docs: dbq"'}, "session_id": "s1", "cwd": a.tmp.name}
+    with mock.patch.object(orqlib, "_public_external_denial", return_value="docs: dbq: matches /dbq/"):
+        out = orqlib.hook_external(ev, None)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert "docs: dbq" in out["permissionDecisionReason"] and "issue/PR do GitHub" in out["permissionDecisionReason"]
 
 
 def test_it_should_be_that_a_clean_commit_passes_the_publication_audit():

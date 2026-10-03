@@ -195,6 +195,10 @@ The easy way is `orq project add <path|url>`, which writes it. By hand:
   "flow": "promocao",
   "e2e_queue": "~/.cache/my-app-e2e/queue",
   "deploy_check": "my-deploy-status --env {base} --commit {sha}",
+  "publico_proibido": {
+    "patterns": ["re:\\bdbq\\b", "re:\\borq\\b", "re:\\bOrca\\b", "re:\\bticket \\d{2,4}\\b", "re:\\bt\\d{3}\\b", "re:\\b(?:task|ctx|run)_\\w+", "plan/", ".scratch/"],
+    "allow": ["E2E ticket"]
+  },
   "caminhos_ui": ["web/app/**"],
   "tests": ["**/*.unit-test.js"]
 }
@@ -208,6 +212,7 @@ Step by step:
 4. `environments` is the ordered list of the project's branches; the one marked `production` is production (the last one when none is marked). `flow` is `"promocao"` when the same feature branch opens one PR into each environment in order, or `"direto"` for a single PR into production (the flow values keep their Portuguese spelling). With no `environments` block the project has one environment, the remote's default branch, and the direct flow. A malformed block makes the file show as invalid in `orq projects`. Nothing in orq names `development`, `staging` or `main`: `orq pr`, `orq queue`, the digest, the merge obligations and the base of new worktrees all read this block.
 5. `e2e_queue` is the folder of the project's E2E queue (one `<order>-<pid>` ticket per arrival; `~` is expanded). `orq status`, the digest and the stuck-queue notice read it. Without the key there is no queue line. `E2E_LOCK_DIR` forces one folder.
 6. `deploy_check` is optional: a command with `{base}` (the environment the PR entered), `{sha}` (its merge commit) and `{orq}` (orq's clone) that tells orq whether a deploy finished. See [Notice obligations](#notice-obligations).
+Optional publication guard: `publico_proibido` adds project-specific `patterns` (literal strings, or regexes prefixed with `re:`) and `allow` exceptions to the global rules in `machine.json`. Every project, including newly added ones, blocks the standard internal names, local task/ticket ids, `plan/` and `.scratch/` in PR/issue text, commit messages, documentation/ADR push diffs, `orq pr open` and `orq check-delivery`. A match blocks with the offending line and asks you to reference the GitHub issue/PR. `allow_by_project` in `machine.json` or `allow` in a project file exempts legitimate domain terms; the default exceptions cover orq's own docs and dbq's name.
 7. `transcripts` is optional: the folder where Claude Code keeps the coordinator's transcripts (`orq audit-answers`). Without it, the folder Claude Code names after the `repo: path:`.
 8. `orca` holds overrides for the generated `orca.yaml` (see [Projects](#projects)).
 9. `tests` is optional: the globs of the unit-test files `orq prove-red` looks for in a branch (`["**/*.unit-test.js"]`), or `{"globs": [...], "command": "cd web && npx jest ../{file}"}` to also set the command (`{file}` is the test file). Without it: `test_*.py` for orq's own tickets, `**/*.unit-test.js` for a product's.

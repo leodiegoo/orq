@@ -583,6 +583,7 @@ def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "re
     else:
         print(f"audit-publication: no {listing}, forbidden-terms check skipped", file=sys.stderr)
     reasons, files_set, first_code = [], set(), None
+    public_project = _public_project(repo) if repo and "public" in checks else None
     for sha in git("rev-list", "--reverse", *revs).split():
         an, ae, cn, ce, msg = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha).split("\0", 4)
         findings = [f"author {an} <{ae}> and committer {cn} <{ce}> must be <{expected}> (git commit --amend --reset-author, or git rebase --exec 'git commit --amend --no-edit --reset-author')"
@@ -592,6 +593,13 @@ def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "re
         added_text = "\n".join(l[1:] for l in git("show", "--format=", "--unified=0", sha).splitlines() if l.startswith("+") and not l.startswith("+++"))
         findings += [f"forbidden term /{t.pattern}/ in the diff or the message" for t in terms if t.search(msg) or t.search(added_text)]
         changed_files = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).split())
+        if "public" in checks and public_project:
+            public_text = msg
+            doc_files = [f for f in changed_files if re.search(r"(?:^|/)(?:docs?/|adr[s]?/|architecture/)|(?:^|/)ADR(?:s)?/", f, re.I) or re.search(r"(?:^|/)[^/]*ADR[^/]*$", f, re.I)]
+            for doc in doc_files:
+                doc_diff = git("show", "--format=", "--unified=0", sha, "--", doc)
+                public_text += "\n" + "\n".join(line[1:] for line in doc_diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
+            reasons += [f"{sha[:7]} {msg.splitlines()[0] if msg.strip() else ''}: {finding}" for finding in _public_findings(public_project, public_text)]
         if "readme" in checks and first_code is None and changed_files & {"orqlib.py", "orq.py"}:
             first_code = sha
         files_set |= changed_files
@@ -599,6 +607,60 @@ def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "re
     if "readme" in checks and first_code and "README.md" not in files_set:
         reasons.append(f"{first_code[:7]}: changes orqlib.py/orq.py and no commit in the range touches README.md (document the change)")
     return reasons
+
+
+def _public_forbidden(project):
+    """Compile machine-wide publication rules plus this project's additions and exceptions."""
+    global_rules = machine_cfg().get("publico_proibido") or {}
+    project_rules = (projects().get(project) or {}).get("publico_proibido") if project else None
+    project_rules = project_rules if isinstance(project_rules, dict) else {}
+    patterns = [x for group in (global_rules.get("patterns"), project_rules.get("patterns")) if isinstance(group, list) for x in group]
+    scoped = global_rules.get("allow_by_project", {})
+    scoped = scoped.get(project, []) if isinstance(scoped, dict) else []
+    local = project_rules.get("allow", [])
+    allow = [x for group in (scoped, local) if isinstance(group, list) for x in group]
+    rules, invalid = [], []
+    for value in patterns:
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            rules.append((value[3:] if value.startswith("re:") else value,
+                          re.compile(value[3:] if value.startswith("re:") else re.escape(value), re.I)))
+        except re.error as exc:
+            invalid.append(f"invalid publico_proibido pattern {value!r}: {exc}")
+    rules.extend((message, re.compile(r"(?s).*")) for message in invalid)
+    return rules, [x for x in allow if isinstance(x, str)]
+
+
+def _public_findings(project, text):
+    rules, allow = _public_forbidden(project)
+    if not rules:
+        return []
+    findings = []
+    for line in (text or "").splitlines() or [text or ""]:
+        allowed = False
+        for value in allow:
+            if not value:
+                continue
+            try:
+                matcher = re.compile(value[3:] if value.startswith("re:") else re.escape(value), re.I)
+            except re.error:
+                continue
+            if matcher.search(line):
+                allowed = True
+                break
+        if allowed:
+            continue
+        for source, pattern in rules:
+            if pattern.search(line):
+                findings.append(f"{line.strip()}: matches /{source}/; referencie a issue/PR do GitHub")
+                break
+    return findings
+
+
+def _public_project(cwd):
+    ps = projects()
+    return project_by_folder(ps, os.path.realpath(cwd or os.getcwd())) or project_by_folder(ps, _repo_root(cwd or os.getcwd()) or os.path.realpath(cwd or os.getcwd()))
 
 
 def integrate_queue_rm(ticket):
@@ -4689,6 +4751,9 @@ def pr_open(target, title, body_text=None, environments=None, cwd=None, no_proof
                 raise ValueError(f"no --body and no {FINAL_REPORT} on {ref}: pass --body FILE or --report FILE")
         text_value = pr_body_from_report(report_text)
         notices = check_body(text_value)
+    if project := _public_project(repo):
+        if findings := _public_findings(project, f"{title}\n{text_value or ''}"):
+            raise ValueError("public content refused: " + "; ".join(findings))
     phases = phase_check(f"{title}\n{text_value}", scratch_roots([wt] if wt else []), event_list)  # ticket 201: a PR that says "phase N" carries all of it
     if refusal := phase_refusal(phases):
         raise ValueError(f"{refusal}. Nothing was pushed: finish them, or name the tickets the PR carries without calling it the phase")
@@ -4709,7 +4774,7 @@ def pr_open(target, title, body_text=None, environments=None, cwd=None, no_proof
         subprocess.run([GIT, "-C", repo, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
     reasons = branch_guard(repo, ref, prod, previous)
     try:
-        reasons += audit_publication([f"origin/{envs[0]}..{ref}"], repo, checks=("author", "trailer"))
+        reasons += audit_publication([f"origin/{envs[0]}..{ref}"], repo, checks=("author", "trailer", "public"))
     except subprocess.CalledProcessError as e:
         raise ValueError(f"did not audit the commits of {branch}: {(e.stderr or '').strip()[-200:]}")
     if reasons:
@@ -6979,6 +7044,8 @@ def _external_denied(ev, cur):
     cmd = ev.get("tool_input", {}).get("command") if ev.get("tool_name") == "Bash" and isinstance(ev.get("tool_input"), dict) else None
     if not isinstance(cmd, str):
         return None
+    if public := _public_external_denial(ev, cmd):
+        return "public", public
     away, night = bool(_dict(_dict(cur).get("ausente"))), night_active(cur)
     if not (away or night):
         return None
@@ -7055,6 +7122,8 @@ def hook_external(ev, run):
     if policy == "night":
         reason = (f"{MARK} night mode: `{item_name}` is an external action or bypasses a hook, and nobody is watching. Park the decision with `orq pend add` and carry on with what "
                   "is independent. If the user is back and authorized it, `orq night off` lifts it. A commit that fails pre-commit is not bypassed: fix what the hook pointed at.")
+    elif policy == "public":
+        reason = f"{MARK} public content refused: {item_name}; referencie a issue/PR do GitHub. Nothing was published."
     else:
         pend_id = _park_denied(ev["tool_input"]["command"], item_name)
         reason = (f"{MARK} away mode: line `{item_name}` of the away policy (AWAY_EXTERNAL) denies it: {AWAY_EXTERNAL[item_name][1]}. It is already in the user's pending items "
@@ -7442,6 +7511,50 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
     if mate_to_open:
         return f"open the mate of group {mate_to_open[0]} ({len(mate_to_open[1])} ready tickets: {', '.join(mate_to_open[1])}): `orq mate open {mate_to_open[0]}`"
     return None
+
+
+def _public_external_denial(ev, cmd):
+    """Always-on project publication guard, independent of away/night policy."""
+    segs = cmdnorm.segments(cmd)
+    actions = []
+    for segment in segs:
+        if re.search(r"^gh(?:\s+.*)?\s+(?:pr\s+(?:create|edit)|issue\s+(?:create|comment))\b|^(?:orq|orq\.py)(?:\s+.*)?\s+pr\s+open\b", segment):
+            actions.append((segment, ev.get("cwd") or os.getcwd(), _public_project(ev.get("cwd") or os.getcwd())))
+        elif match := re.match(_EXT_GIT + r"(commit|push)\b", segment):
+            folder = _git_place(ev, match.group(1))
+            actions.append((segment, folder, _public_project(folder)))
+    if not actions:
+        return None
+    if not any(project for _, _, project in actions):
+        return None
+    text = cmd
+    try:
+        args = shlex.split(cmd)
+    except ValueError:
+        args = []
+    for i, arg in enumerate(args):
+        if arg in ("-F", "--body-file") and i + 1 < len(args):
+            with contextlib.suppress(OSError):
+                text += "\n" + open(os.path.expanduser(args[i + 1])).read()
+    findings = []
+    for segment, folder, project in actions:
+        if not project:
+            continue
+        git_match = re.match(_EXT_GIT + r"(commit|push)\b", segment)
+        if git_match and git_match.group(2) == "push":
+            head = (_git(folder, "branch", "--show-current") or "").strip()
+            base = (_git(folder, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}") or "").strip()
+            if not base:
+                default = default_branch(folder)
+                base = f"origin/{default}" if default != BRANCH_NO_REMOTE else ""
+            if base and head:
+                try:
+                    findings.extend(audit_publication([f"{base}..{head}"], folder, checks=("public",)))
+                except Exception as exc:  # fail closed when the publication range cannot be inspected
+                    findings.append(f"could not inspect public commits: {exc}")
+            continue
+        findings.extend(_public_findings(project, text))
+    return "; ".join(findings) if findings else None
 
 
 def _work_without_user(events, now_at):
@@ -10191,10 +10304,13 @@ def check_delivery_report(dispatch=None, report_path=None, cwd=None):
         raise ValueError("which dispatch? pass --dispatch <id> (the one in your preamble)")
     origin = _origin_of(events)
     disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == origin(d)), None)
-    if not disp or not disp.get("conformidade"):
-        return {"dispatch": d, "ok": True, "faltando": []}
     text_value = _report_text(cwd, report_path)
-    missing = conformance_missing(disp["conformidade"], disp.get("entrada_real"), text_value)
+    missing = conformance_missing(disp["conformidade"], disp.get("entrada_real"), text_value) if disp and disp.get("conformidade") else []
+    project = _public_project(cwd)
+    if project:
+        missing.extend(f"public content: {finding}" for finding in _public_findings(project, text_value))
+    if not missing and (not disp or not disp.get("conformidade")):
+        return {"dispatch": d, "ok": True, "faltando": []}
     append_event({"tipo": "entrega_conferida", "dispatch": d, "hash": _report_hash(text_value), "ok": not missing, "faltando": missing})
     return {"dispatch": d, "ok": not missing, "faltando": missing}
 
@@ -12882,6 +12998,7 @@ def projects():
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
                          "tests": _file_tests(d.get("tests")),
+                         "publico_proibido": d.get("publico_proibido") if isinstance(d.get("publico_proibido"), dict) else None,
                          "sem_ci": d.get("sem_ci") is True, "integrator": "manual" if d.get("integrator") == "manual" else None,
                          "priority_base": _int_in(d.get("priority_base"), 1, 3), "reserve_slots": _int_in(d.get("reserve_slots"), 0), "max_slots": _int_in(d.get("max_slots"), 0)}
     return findings
@@ -14002,6 +14119,11 @@ def manager_turn_off(run=None, take_over=False):
 # ---------- machine budget and dispatch queue (ticket 79) ----------
 
 MACHINE_FILE = "machine.json"  # on top of MACHINE_DEFAULTS; `orq machine set <key> <value>` records it
+PUBLICO_PROIBIDO_DEFAULT = {
+    "patterns": [r"re:\bdbq\b", r"re:\borq\b", r"re:\bOrca\b", r"re:\bticket \d{2,4}\b", r"re:\bt\d{3}\b",
+                 r"re:\b(?:task|ctx|run)_\w+", "plan/", ".scratch/"],
+    "allow_by_project": {"orq": ["orq", "Orca", r"re:\bticket \d{2,4}\b", r"re:\bt\d{3}\b"], "dbq": ["dbq"]},
+}
 MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB of RAM, 12 CPUs: each one may bring up an E2E stack)
                   "max_e2e": 1,  # informational only: the global E2E queue (scripts/e2e-lock.sh) already serializes the stacks
                   "max_caros": 2, "modelos_caros": ["claude-opus-*", "gpt-6-astra*", "gpt-6-sol*"],  # glob patterns; the expensive model counts toward max_workers too
@@ -14014,7 +14136,8 @@ MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB o
                   "age_colors": [[5, "warn"], [15, "hot"], [30, "crit"]],  # minutes of waiting where a queue item turns yellow, orange and red (ticket 345); AGE_FACTOR stretches them per kind, P1 halves them
                   "reserve_idle_min": 5,  # minutes a queue item waits before it may take a slot another project reserves (`reserve_slots`) and is not using (ticket 344)
                   "release_batch_max": 5,  # a close that releases more dependents than this queues only this many; the rest enter as the queue drops (ticket 344)
-                  "stop_bloqueia": False}  # True: the coordinator's Stop blocks the end of the turn with any entry that has no effect (GATE_BLOCKERS times per set); turning it on is the user's decision (ticket 27). An entry with no intake in the turn always blocks (ticket 150)
+                  "stop_bloqueia": False,
+                  "publico_proibido": PUBLICO_PROIBIDO_DEFAULT}  # global publication guard, extended with per-project rules
 DISPATCH_QUEUE = "dispatch-queue.json"  # {itens: [...]}: what `orq dispatch_worker` and `orq resume` could not bring up; the manager brings it up by priority
 DISPATCH_QUEUE_SPECS = "fila-despacho"  # ORQ_HOME/fila-despacho/<id>.md: copy of the spec of a queued dispatch (the coordinator's file may vanish)
 MACHINE_ALIVE = ("rodando", "travado", "nao_comecou", "parado", "perguntando")
@@ -14162,6 +14285,9 @@ class NoSlot(Exception):
 
 
 def _machine_kind_ok(default, v):
+    if isinstance(default, dict):
+        allow = v.get("allow_by_project", {}) if isinstance(v, dict) else None
+        return isinstance(v, dict) and isinstance(v.get("patterns"), list) and all(isinstance(x, str) for x in v["patterns"]) and isinstance(allow, dict) and all(isinstance(k, str) and isinstance(items, list) and all(isinstance(x, str) for x in items) for k, items in allow.items())
     if isinstance(default, bool):
         return isinstance(v, bool)
     if isinstance(default, (int, float)):
@@ -14174,7 +14300,12 @@ def _machine_kind_ok(default, v):
 def machine_cfg():
     """MACHINE_DEFAULTS on top of maquina.json; a key of the wrong type or an unknown one counts as absent."""
     read_text = _dict(_read_json(_path(MACHINE_FILE)))
-    return {k: read_text[k] if k in read_text and _machine_kind_ok(p, read_text[k]) else p for k, p in MACHINE_DEFAULTS.items()}
+    out = {k: read_text[k] if k in read_text and _machine_kind_ok(p, read_text[k]) else p for k, p in MACHINE_DEFAULTS.items()}
+    if "publico_proibido" in read_text and _machine_kind_ok(PUBLICO_PROIBIDO_DEFAULT, read_text["publico_proibido"]):
+        configured = read_text["publico_proibido"]
+        out["publico_proibido"] = {"patterns": list(dict.fromkeys([*PUBLICO_PROIBIDO_DEFAULT["patterns"], *configured["patterns"]])),
+                                    "allow_by_project": {**PUBLICO_PROIBIDO_DEFAULT["allow_by_project"], **configured.get("allow_by_project", {})}}
+    return out
 
 
 def machine_set(key_name, value):
