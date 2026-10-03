@@ -15,7 +15,7 @@ VERSION = "0.2.6"
 TOML = '[markdown]\ndone_keep = 100000\n'  # the `.tasks.toml` of a backlog folder: archiving would take out of the file a ticket that orq still consults (numbering, Blocked by)
 CLI_TIMEOUT_S = 20
 HOLD_KINDS = ("captain", "external", "load", "parked", "future")
-META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task")  # `key_name: value` lines at the top of the pending item's body
+META_PENDING = ("frente", "link", "comando", "espera", "gate", "gate_run", "task", "ticket")  # `key_name: value` lines at the top of the pending item's body
 META_TICKET = ("spec", "orca", "modelo", "effort", "issue", "despacho", "espera", "scratch", "projeto", "wave", "role")  # same for the ticket (`wave: N` and `role: milestone|join` mark the tickets of a wave, ticket 342); `orca: task_x run_y` is the bridge to Orca
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -191,7 +191,7 @@ def pending_from_item(i):
     """The pending item (pendencias.json format) from a `pending` item of the backlog; keys in the order in which `pending add` writes them."""
     meta, detail = body_meta(i["corpo"], META_PENDING)
     fields = (("detalhe", detail), ("frente", meta.get("frente")), ("desde", i["since"]), ("link", meta.get("link")), ("comando", meta.get("comando")),
-              ("espera", meta.get("espera")), ("ate", (i["hold"] or {}).get("until")), ("gate", meta.get("gate")), ("gate_run", meta.get("gate_run")), ("task", meta.get("task")))
+              ("espera", meta.get("espera")), ("ate", (i["hold"] or {}).get("until")), ("gate", meta.get("gate")), ("gate_run", meta.get("gate_run")), ("task", meta.get("task")), ("ticket", meta.get("ticket")))
     return {"id": i["id"], "tipo": i["kind"], "titulo": i["titulo"], **{k: v for k, v in fields if v}}
 
 
@@ -213,7 +213,7 @@ def ticket_of_item(i, by_id, root):
             "despacho": meta.get("despacho"), "espera": meta.get("espera"), "projeto": meta.get("projeto"),  # the `Despacho:` and `Espera:` headers (ticket 142)
             "scratch": meta.get("scratch"),  # the `.scratch/<feature>/issues/NN-*.md` the ticket was born from (ticket 201)
             "wave": int(meta["wave"]) if meta.get("wave", "").isdigit() else None, "role": meta.get("role"),  # ticket 342: the wave the ticket belongs to; `role` is milestone or join for the wave's own tickets
-            "fechado_em": i["closed"]}
+            "fechado_em": i["closed"], "hold": i["hold"] if active_hold(i) else None}  # ticket 397: only a hold that still applies; `dispatch_wait` skips the ticket and the list shows it
 
 
 def repo_from_title(title):
