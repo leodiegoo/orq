@@ -5257,8 +5257,8 @@ def destructive_command(line_list):
     """The destructive command (DESTRUCTIVE) the permission prompt at the end of the screen asks about, or None. Reads from the last `Bash(` or `Bash command` line on:
     a command that already ran, up in the history, never counts."""
     screen = [re.sub(r"[│╭╮╰╯─]", " ", str(l)).strip() for l in line_list or []]
-    start = next((i for i in range(len(screen) - 1, -1, -1) if re.match(r"^\W*(?:Bash\(|Bash command\b)", screen[i])), None)
-    for line in screen[start:] if start is not None else []:
+    first = next((i for i in range(len(screen) - 1, -1, -1) if re.match(r"^\W*(?:Bash\(|Bash command\b)", screen[i])), None)
+    for line in screen[first:] if first is not None else []:
         if any(r.search(line) for r in DESTRUCTIVE):
             return re.sub(r"^\W*Bash\(", "", line).removesuffix(")")
     return None
@@ -5374,7 +5374,7 @@ def notify_screens():
         d, p = w["dispatchId"], (screens_read.get(w["dispatchId"]) or {}).get("pergunta")
         if not p and d in open_entries:
             append_event({"tipo": "pergunta_tela_fim", "dispatch": d})
-        if p and (command := screens_read[d].get("destrutivo")) and _deny_destructive(w, command, g["coordenador"]):
+        if p and p["tipo"] == "permissao" and (command := screens_read[d].get("destrutivo")) and _deny_destructive(w, command, g["coordenador"]):
             line_list.append(f"{w.get('taskId')}: destructive prompt answered no ({_quote(command, 60)})")
             continue
         if not p or (d in open_entries and open_entries[d].get("texto") == p["texto"] and open_entries[d].get("opcoes") == p["opcoes"]):
@@ -10574,7 +10574,7 @@ def _read_screens(ws, details):
         m = waiting and waiting.search("\n".join(map(str, tail[-15:])))
         found_item = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": screen_question(tail, agent), "limite": screen_limit(tail, agent),
                       "espera_cmd": stuck_wait_command(tail) if agent == "claude" else None}
-        found_item["destrutivo"] = found_item["pergunta"] and found_item["pergunta"]["tipo"] == "permissao" and destructive_command(tail) or None
+        found_item["destrutivo"] = found_item["pergunta"] and destructive_command(tail) or None  # notify_screens only acts on it for a permission prompt
         return w["dispatchId"], found_item if m or found_item["pergunta"] or found_item["limite"] or found_item["espera_cmd"] else None
     target = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (details.get(w.get("dispatchId")) or {}).get("agente") in HARNESS]
     with ThreadPoolExecutor(8) as ex:
