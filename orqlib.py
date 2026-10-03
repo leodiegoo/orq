@@ -7155,6 +7155,8 @@ ONLY_ORQ_COMMAND = re.compile(r"\s*/away(\s+\w+)?\s*$")
 
 
 def hook_prompt(ev, run):
+    if not os.environ.get("ORQ_MATE"):
+        wake_release()  # a new turn: the Stop's `hook acordar` leaves, and whatever waits in the queue goes out in this prompt's context
     org = origin_name(ev.get("prompt"))
     text_value, with_notice = split_notice(ev.get("prompt")) if org == "usuario" else (ev.get("prompt") or "", False)
     if with_notice and not text_value.strip():
@@ -7453,6 +7455,75 @@ def give_run_back_to_manager():
     if own in g["runs"]:
         manager_bind(g["gerente"], [own])
         append_event({"tipo": "gerente", "op": "devolver", "terminal": g["gerente"], "run": own})
+
+
+WAKE_LOCK = "acordar.json"  # {pid, sessao, ts}: the `hook acordar` process that waits for the notice queue (ticket 394)
+WAKE_POLL_S = float(os.environ.get("ORQ_ACORDAR_POLL_S") or 5)
+WAKE_FRESH_S = 30  # a lock whose beat is older than this is dead, whatever its pid says (the harness kills the hook at its timeout without a goodbye)
+
+
+def _wake_lock_read():
+    return _dict(_read_json(_path(WAKE_LOCK)))
+
+
+def wake_lock_alive():
+    """True while a `hook acordar` process owns the lock (live pid, fresh beat): it delivers the queued notices through the harness's rewake, so the manager does not type them."""
+    lock = _wake_lock_read()
+    try:
+        os.kill(lock["pid"], 0)
+        return (now_dt() - _dt(lock["ts"])).total_seconds() < WAKE_FRESH_S
+    except PermissionError:
+        return True
+    except (KeyError, TypeError, ValueError, OSError, AttributeError):
+        return False
+
+
+def _wake_lock_mut(fn):
+    with _lock("wake.lock"):
+        if (out := fn(_wake_lock_read())) is not None:
+            _write_json(_path(WAKE_LOCK), out)
+
+
+def wake_release():
+    """A new turn starts (prompt): whichever `hook acordar` waits no longer owns anything and leaves with 0 at its next beat."""
+    if os.path.exists(_path(WAKE_LOCK)):
+        with _lock("wake.lock"), contextlib.suppress(OSError):
+            os.remove(_path(WAKE_LOCK))
+
+
+def take_wake_notices():
+    """Removes from the `notices` queue and returns the texts due now: with away on, the ones whose coordinator has been idle long enough (the rule of `deliver_notices`);
+    with away off, all (a rewake does not touch the draft in the box, so the draft guard has nothing to do)."""
+    cur = _cursor_ro()
+    away = bool(_dict(cur.get("ausente")))
+    due = [a for a in cur.get("avisos") or [] if isinstance(a, dict) and a.get("texto") and not (away and active_coordinator(minutes_elapsed=a.get("minutos")))]
+    got = []
+
+    def pega(c):
+        got.extend(a for a in c.get("avisos") or [] if a in due)  # another reader (the user's prompt) may have emptied it meanwhile
+        c["avisos"] = [a for a in c.get("avisos") or [] if a not in got]
+    if due:
+        _cursor_mut(pega)
+    return [a["texto"] for a in got]
+
+
+def hook_wake(ev):
+    """Stop of the Claude coordinator, async rewake (ticket 394): takes the lock, waits for a due notice in the queue and wakes the stopped session with it
+    (stderr + exit 2, the harness delivers it as a turn). Leaves with 0 when another Stop took the lock or a prompt released it (the notice goes out in that prompt's context)."""
+    me, session = os.getpid(), (ev.get("session_id") or "")[:8]
+    _wake_lock_mut(lambda lock: {"pid": me, "sessao": session, "ts": now()})
+
+    def beat(lock):
+        return {**lock, "ts": now()} if lock.get("pid") == me else None
+    while True:
+        if _wake_lock_read().get("pid") != me:
+            return 0
+        if texts := take_wake_notices():
+            append_event({"tipo": "aviso_entregue", "via": "rewake", "n": len(texts), "texto": _quote(" | ".join(texts), 300), "sessao": session})
+            print("\n".join(texts), file=sys.stderr)
+            return 2
+        _wake_lock_mut(beat)
+        time.sleep(WAKE_POLL_S)
 
 
 def _hook_stop(ev, run):
@@ -7844,7 +7915,7 @@ def guard_worker():
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
 
 
-HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_place, "externas": hook_external, "prligar": hook_pr_link}
+HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "acordar": hook_wake, "ask": hook_ask, "guard": hook_guard, "session": hook_session, "lugar": hook_place, "externas": hook_external, "prligar": hook_pr_link}
 HOOK_STATE = {}  # the hook running in this process: kind, failed (it raised or lost Orca), notice (the systemMessage to print), printed
 
 
@@ -7883,6 +7954,8 @@ def run_hook(kind, harness="claude"):
             return 0  # outside Orca there is no Run or terminal: it neither calls Orca nor fills the log
         ev = json.load(sys.stdin)
         ev["_harness_orq"] = harness  # which agent the hook came from: the coordinator keeps its own
+        if kind == "acordar" and (os.environ.get("ORQ_MATE") or harness != "claude"):
+            return 0  # only the Claude coordinator has an async rewake; the mate and Codex get their notices typed
         if os.environ.get("ORQ_MATE"):
             if kind in ("prompt", "stop"):
                 mate_turn(kind, ev)  # without Orca: the deadline for requests to the mate counts from the end of its turn
@@ -7929,6 +8002,9 @@ def run_hook(kind, harness="claude"):
                 if last_item and kind == "prompt" and origin_name(ev.get("prompt")) == "usuario":
                     print(json.dumps(lost_binding(ev, last_item), ensure_ascii=False))
                 return 0
+        if kind == "acordar":
+            signal.alarm(0)  # it waits for hours: the harness's own timeout (28800 s) is the ceiling
+            return hook_wake(ev)
         emit_hook(HOOKS[kind](ev, run))
     except Exception as e:
         signal.alarm(0)  # the warning (macOS notification) may take a second: the alarm has already done its job
@@ -9012,7 +9088,7 @@ def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None, v
     (coordinator with someone at it, or held with away off: the notice waits in the cursor's `notices` queue, goes out in the next prompt's context, `context` False for what the summary already
     shows, and `deliver_notices` types it if the coordinator goes idle) or, with away on, the `type_text` reason (nothing went out: retry later). `adiado` already counts as delivered."""
     away = bool(_dict(_cursor_ro().get("ausente")))
-    if not away or not active_coordinator(minutes_elapsed=minutes_elapsed):
+    if not wake_lock_alive() and (not away or not active_coordinator(minutes_elapsed=minutes_elapsed)):  # with the `hook acordar` waiting, the queue is the channel (ticket 394)
         result = type_text(handle, text_value, *([valid_while] if valid_while else []))  # the condition only travels when there is one: callers and tests patch type_text with two arguments
         if away or result == "enviado":
             return result
@@ -9026,7 +9102,7 @@ def deliver_notices():
     """One panel tick: types the oldest notice in the queue (one per tick; the next one finds the coordinator busy). With away on, only with the coordinator idle for more than
     COORDINATOR_IDLE_MIN (WAKE_IDLE_MIN for the wake-up notice); with away off (ticket 182), whenever it is stopped with an empty prompt box (`type_text` checks that). Returns the panel lines."""
     g, queue = _manager_cfg(), _cursor_ro().get("avisos")
-    if not g.get("coordenador") or not isinstance(queue, list) or not queue:
+    if not g.get("coordenador") or not isinstance(queue, list) or not queue or wake_lock_alive():  # the `hook acordar` waiting takes the queue (ticket 394)
         return []
     away = bool(_dict(_cursor_ro().get("ausente")))
     a = next((x for x in queue if not (away and active_coordinator(minutes_elapsed=x.get("minutos")))), None)  # the wake-up notice (2 min) does not wait behind a 10 one
@@ -16639,7 +16715,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
 # the `choices` values (pt -> en): the CLI accepts both and delivers the pt one, which is what the code records today
 STOP_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
 EFFECT_EN = {"tarefa": "task", "decisao": "decision", "conversa": "conversation", "descartado": "discarded", "lembrete": "reminder"}
-HOOK_EN = {"lugar": "place", "externas": "external", "prligar": "prlink"}  # the installed hooks call the pt name and it holds forever: no log
+HOOK_EN = {"acordar": "wake", "lugar": "place", "externas": "external", "prligar": "prlink"}  # the installed hooks call the pt name and it holds forever: no log
 
 
 def _arg(p, pt, **kw):

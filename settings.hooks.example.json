@@ -93,6 +93,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /path/to/orq/orq.py hook acordar",
+            "timeout": 28800,
+            "asyncRewake": true
+          }
+        ]
       }
     ],
     "PostToolUse": [

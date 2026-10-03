@@ -19571,6 +19571,7 @@ def test_ticket124_install_repoints_hooks_in_place_appends_the_missing_ones_and_
     assert s["statusLine"]["command"] == f'D=$HOME/.claude; W={clone}/statusline.sh; sh "$W"', s["statusLine"]
     commands = [h["command"] for groups in s["hooks"].values() for g in groups for h in g["hooks"]]
     assert sum("hook stop" in c for c in commands) == 1, "the repointed Stop is not appended again"
+    assert sum("hook acordar" in c for c in commands) == 1, "the rewake hook of the example is appended (ticket 394)"
     assert any(c == f"{sys.executable} {clone}/orq.py hook prompt" for c in commands), commands
     c = json.load(open(hooks))["hooks"]
     assert [g["hooks"][0]["command"] for g in c["Stop"]] == ["mine", f"/usr/bin/python3 {clone}/orq.py hook stop codex"], "Codex keeps each group in its position"
@@ -23634,6 +23635,161 @@ def test_ticket389_heartbeat_absorption_event_says_who_absorbed():
     c.inbox(_hb("lendo"))
     _waiter(c)
     assert [[e["by"] for e in x.events() if e["tipo"] == "heartbeat_absorvido"] for x in (a, b, c)] == [["manager"], ["prompt-hook"], ["waiter"]]
+
+
+# ---------- ticket 394: `hook acordar` wakes the stopped Claude coordinator through the Stop's async rewake ----------
+
+WAKE_ENV = {"ORQ_ACORDAR_POLL_S": "0.1"}
+LONG_NOTICE = "orq: PR 12 merged " + "x" * 200
+
+
+def _wake_start(a, session="abcdef123456", **env):
+    return subprocess.Popen([sys.executable, ORQ, "hook", "acordar"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env={**a.env, **WAKE_ENV, **env}), json.dumps({"session_id": session})
+
+
+def _wake_wait(p, ev, seconds=5):
+    try:
+        out, err = p.communicate(ev, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        raise
+    return p.returncode, out, err
+
+
+def _wake_queue(a, *texts, **extra):
+    cursor_file = os.path.join(a.home, "cursor.json")
+    cur = _read_state(cursor_file) if os.path.exists(cursor_file) else {}
+    cur.setdefault("avisos", []).extend({"texto": t, "ts": "2026-10-03T07:00:00Z", "contexto": True, **extra} for t in texts)
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(cursor_file, cur)
+
+
+def _wake_lock_pid(a):
+    f = os.path.join(a.home, "acordar.json")
+    return json.load(open(f)).get("pid") if os.path.exists(f) else None
+
+
+def _wait_until(cond, seconds=5):
+    end = time.time() + seconds
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_ticket394_wake_prints_the_queued_notice_and_exits_2_recording_the_rewake():
+    a = Env()
+    _wake_queue(a, LONG_NOTICE)
+    p, ev = _wake_start(a)
+    code, _, err = _wake_wait(p, ev)
+    assert code == 2 and err.strip() == LONG_NOTICE, (code, err)  # whole: the 150-character cap belongs to `terminal send`, not to the rewake
+    assert not _read_state(os.path.join(a.home, "cursor.json")).get("avisos"), "delivered: out of the queue"
+    delivered = [e for e in a.events() if e["tipo"] == "aviso_entregue"]
+    assert len(delivered) == 1 and delivered[0]["via"] == "rewake" and delivered[0]["n"] == 1, delivered
+
+
+def test_ticket394_wake_waits_without_a_notice_and_wakes_when_one_arrives():
+    a = Env()
+    p, ev = _wake_start(a)
+    p.stdin.write(ev)
+    p.stdin.close()
+    assert _wait_until(lambda: _wake_lock_pid(a) == p.pid), "took the lock"
+    time.sleep(0.5)
+    assert p.poll() is None, "no notice: it keeps waiting"
+    _wake_queue(a, "orq: wake de teste")
+    assert p.wait(5) == 2 and p.stderr.read().strip() == "orq: wake de teste"
+
+
+def test_ticket394_wake_leaves_with_0_when_the_user_prompts_and_the_prompt_carries_the_notice():
+    a = Env()
+    p, ev = _wake_start(a)
+    p.stdin.write(ev)
+    p.stdin.close()
+    assert _wait_until(lambda: _wake_lock_pid(a) == p.pid)
+    cursor_file = os.path.join(a.home, "cursor.json")
+    cur = _read_state(cursor_file)
+    cur["ausente"] = {"ligada_em": "2026-10-03T00:00:00Z"}  # away on and the user just spoke: the notice is not due for the rewake
+    _write_state(cursor_file, cur)
+    _user_spoke(a.home, 1)
+    _wake_queue(a, "orq: fica para o prompt")
+    time.sleep(0.4)
+    assert p.poll() is None, "away on with a recent user prompt: not due"
+    ctx = json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "fica para o prompt" in ctx
+    assert p.wait(5) == 0 and p.stderr.read() == "" and p.stdout.read() == ""
+
+
+def test_ticket394_two_stops_of_the_same_session_leave_one_waiting_and_the_old_leaves_0():
+    a = Env()
+    first, ev = _wake_start(a)
+    first.stdin.write(ev)
+    first.stdin.close()
+    assert _wait_until(lambda: _wake_lock_pid(a) == first.pid)
+    second, ev2 = _wake_start(a)
+    second.stdin.write(ev2)
+    second.stdin.close()
+    assert first.wait(5) == 0 and first.stderr.read() == "", "the old one gave way"
+    assert _wake_lock_pid(a) == second.pid and second.poll() is None
+    _wake_queue(a, "orq: so um")
+    assert second.wait(5) == 2
+
+
+def test_ticket394_wake_does_nothing_for_workers_mates_and_codex():
+    a = Env()
+    _wake_queue(a, "orq: nao sai")
+    for env, args, label in (({"ORQ_MATE": "grupo"}, (), "mate"), ({}, ("codex",), "codex")):
+        r = a.orq("hook", "acordar", *args, stdin=json.dumps({"session_id": "abcdef123456"}), **env)
+        assert r.returncode == 0 and r.stderr == "", (label, r)
+    w = Env(run=None)
+    os.makedirs(w.home, exist_ok=True)
+    _write_state(os.path.join(w.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    _wake_queue(w, "orq: nao sai")
+    r = w.orq("hook", "acordar", stdin=json.dumps({"session_id": "abcdef123456"}), **WAKE_ENV)
+    assert r.returncode == 0 and r.stderr == "", r
+    assert not os.path.exists(os.path.join(a.home, "acordar.json")) and not os.path.exists(os.path.join(w.home, "acordar.json"))
+    assert "acordar" not in open(os.path.join(HERE, "codex.hooks.example.json")).read()
+
+
+def test_ticket394_the_manager_does_not_type_a_notice_the_waiting_hook_delivers():
+    with tempfile.TemporaryDirectory() as home:
+        before, dig = orq_mod.HOME, orq_mod.type_text
+        sent = []
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t, *_: sent.append(t) or "enviado"
+        _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
+        try:
+            orq_mod._write_json(os.path.join(home, orq_mod.WAKE_LOCK), {"pid": os.getpid(), "sessao": "abcdef12", "ts": orq_mod.now()})
+            assert orq_mod.wake_lock_alive()
+            assert orq_mod.notify_coordinator("term_c", "orq: a") == "adiado" and sent == [], "queued, not typed"
+            assert orq_mod.deliver_notices() == [] and sent == [], "nor on the manager's lap"
+            assert [x["texto"] for x in orq_mod._cursor_ro()["avisos"]] == ["orq: a"]
+            os.remove(os.path.join(home, orq_mod.WAKE_LOCK))  # hook gone (no entry in the settings, or its timeout passed): typing as before
+            assert orq_mod.deliver_notices() and sent == ["orq: a"]
+            assert orq_mod.notify_coordinator("term_c", "orq: b") == "enviado" and sent == ["orq: a", "orq: b"]
+            orq_mod._write_json(os.path.join(home, orq_mod.WAKE_LOCK), {"pid": os.getpid(), "sessao": "abcdef12", "ts": "2000-01-01T00:00:00Z"})
+            assert not orq_mod.wake_lock_alive(), "a beat that stopped is a dead hook"
+            orq_mod._write_json(os.path.join(home, orq_mod.WAKE_LOCK), {"pid": 2 ** 22 + 7, "sessao": "abcdef12", "ts": orq_mod.now()})
+            assert not orq_mod.wake_lock_alive(), "a pid that is gone too"
+        finally:
+            orq_mod.HOME, orq_mod.type_text = before, dig
+
+
+def test_ticket394_the_example_registers_the_rewake_and_start_checks_for_it():
+    example = json.load(open(os.path.join(HERE, "settings.hooks.example.json")))
+    wake = [h for g in example["hooks"]["Stop"] for h in g["hooks"] if "hook acordar" in h["command"]]
+    assert len(wake) == 1 and wake[0]["asyncRewake"] is True and wake[0]["timeout"] == 28800, wake
+    with tempfile.TemporaryDirectory() as t:
+        settings = os.path.join(t, "settings.json")
+        without = json.loads(json.dumps(example))
+        without["hooks"]["Stop"] = [g for g in without["hooks"]["Stop"] if "hook acordar" not in json.dumps(g)]
+        json.dump(without, open(settings, "w"))
+        before = orq_mod.HOOKS_FILES["claude"]
+        orq_mod.HOOKS_FILES["claude"] = settings
+        try:
+            assert orq_mod.missing_hooks("claude") == ["Stop: orq.py hook acordar"]
+        finally:
+            orq_mod.HOOKS_FILES["claude"] = before
 
 
 if __name__ == "__main__":
