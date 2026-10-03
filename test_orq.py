@@ -4038,6 +4038,10 @@ def _spec_tk(a, body_text="Faça X.", item_name="spec.md", acceptance=ACCEPTANCE
 
 
 def _new(a, title="Ticket de teste", *extra, spec=None, **env):
+    if "--modelo" not in extra:  # `ticket new` refuses a ticket without model and effort (ticket 354)
+        extra = ("--modelo", "claude-sonnet-5-5", *extra)
+    if "--effort" not in extra:
+        extra = ("--effort", "medium", *extra)
     return a.orq("ticket", "novo", "--titulo", title, "--spec-arquivo", spec or _spec_tk(a), *extra, **env)
 
 
@@ -4745,7 +4749,7 @@ def test_review5_b25_new_ticket_takes_the_number_lock():
     spec = _spec_tk(a)
     with open(os.path.join(a.home, "ticket.lock"), "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)  # another `ticket new` is choosing the number
-        p = subprocess.Popen([sys.executable, ORQ, "ticket", "novo", "--titulo", "Espera", "--spec-arquivo", spec], env=a.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = subprocess.Popen([sys.executable, ORQ, "ticket", "novo", "--titulo", "Espera", "--spec-arquivo", spec, "--modelo", "m", "--effort", "low"], env=a.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(1.5)
         created_items = [n for n in (os.listdir(a.env["ORQ_ISSUES"]) if os.path.isdir(a.env["ORQ_ISSUES"]) else []) if n.endswith(".md")]
         assert p.poll() is None and not created_items, "preso na trava, sem arquivo"
@@ -13193,6 +13197,40 @@ def test_ticket105_released_p1_or_p2_with_model_enters_the_dispatch_queue_and_p3
     assert not _log(a, "started.log"), "o ticket só entra na fila: quem sobe é o gerente"
 
 
+def test_ticket354_ticket_new_refuses_without_model_and_effort_and_creates_with_both():
+    a = Env(run="run_a")
+    spec = _spec_tk(a)
+    for extra in ((), ("--modelo", "claude-sonnet-5-5"), ("--effort", "medium")):
+        r = a.orq("ticket", "novo", "--titulo", "Sem modelo", "--spec-arquivo", spec, *extra)
+        assert r.returncode == 1 and "--model and --effort" in r.stderr, (extra, r.stderr)
+    assert not os.path.exists(a.env["ORQ_ISSUES"]) or os.listdir(a.env["ORQ_ISSUES"]) == [], "nothing was created"
+    r = a.orq("ticket", "novo", "--titulo", "Com modelo", "--spec-arquivo", spec, "--modelo", "claude-sonnet-5-5", "--effort", "medium")
+    assert r.returncode == 0, r.stderr
+
+
+def test_ticket354_released_without_model_becomes_an_entry_for_the_coordinator():
+    a = Env(run="run_a")
+    _case_87(a)
+    a.orq("ticket", "fechar", "87", "--answer", "feito")
+    (e,) = [x for x in a.events() if x["tipo"] == "entrada" and x.get("origem") == "ticket"]
+    assert e["fonte"] == "ticket 91" and "orq ticket edit 91 --model <model> --effort <effort>" in e["texto"], e
+    assert not e.get("grupo") and not [x for x in a.events() if x["tipo"] == "mate_pedido"]
+
+
+def test_ticket354_released_without_model_of_a_group_ticket_goes_to_its_mate():
+    a = _panel79()
+    _group(a)
+    _manager(a)
+    _mate_alive(a)
+    _tk105(a, "87", "orq: Primeiro", "claimed", task="task_87")
+    _tk105(a, "91", "orq: Sem modelo", is_blocked="87", task="task_91")
+    _tasks105(a, ("task_87", "dispatched"), ("task_91", "blocked"))
+    a.orq("ticket", "fechar", "87", "--answer", "feito")
+    (p,) = [x for x in a.events() if x["tipo"] == "mate_pedido"]
+    assert p["grupo"] == "orq" and "orq ticket edit 91 --model <model> --effort <effort>" in p["texto"], p
+    assert not [x for x in a.events() if x["tipo"] == "entrada" and x.get("origem") == "ticket"], "the mate has it: the coordinator gets no entry"
+
+
 def test_ticket105_task_blocked_of_the_released_becomes_ready_and_the_pending_stays():
     a = Env(run="run_a")
     _case_87(a)
@@ -17174,7 +17212,7 @@ def test_ticket102_m5_new_cycle_dispatch_close_leaves_backlog_and_task_coherent(
     assert json.loads(r.stdout)["ticket"] == "01"
     it = _bl_items(a)["t01"]
     assert (it["kind"], it["estado"], it["repo"], it["titulo"]) == ("ticket", "queued", "orq", "orq: Base")
-    assert _meta_tk(it) == {"spec": "issues/01-orq-base.md", "orca": "task_tk1 run_a"}, it["corpo"]
+    assert _meta_tk(it) == {"spec": "issues/01-orq-base.md", "orca": "task_tk1 run_a", "modelo": "claude-sonnet-5-5", "effort": "medium"}, it["corpo"]
     txt = _read_text(a, "01")
     assert txt.startswith("# 01: orq: Base\n") and not re.search(r"^(Status|Blocked by|Run|Task):", txt, re.M), "o arquivo guarda só o texto"
     assert "\n## What to build\n" in txt and "\n## Acceptance criteria\n" in txt
