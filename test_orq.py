@@ -8275,6 +8275,21 @@ def test_digest_lists_the_open_tickets_by_status_with_blocker_and_the_last_5_res
     assert re.fullmatch(r"\d{4}-\d\d-\d\d", t["resolvidos"][0]["em"])
 
 
+def test_digest_ticket_brings_since_for_ready_blocked_and_in_progress_with_the_heartbeat():
+    a = Env(run="run_a")
+    _tk_status(a, "01", "Pronto", "ready-for-agent", days=2)
+    _tk_status(a, "02", "Espera o 01", "ready-for-agent", is_blocked="01", days=1)
+    _tk_status(a, "03", "Em curso", "claimed", task="task_aaaaaaaaaa", days=9)
+    os.makedirs(os.path.join(a.home, "..", "orq"), exist_ok=True)
+    started, beat = now_iso(-3600), now_iso(-600)
+    a.set("../orq/aberto.json", _open_agent("rodando", desde=started, ultimo_heartbeat=beat))
+    ab = {x["num"]: x for x in _json_digest(a)["tickets_orq"]["abertos"]}
+    assert ab["03"]["desde"] == started and ab["03"]["heartbeat"] == beat, "in progress counts from the dispatch, not from the file"
+    for n, days in (("01", 2), ("02", 1)):
+        assert abs(datetime.fromisoformat(ab[n]["desde"].replace("Z", "+00:00")).timestamp() - (time.time() - days * 86400)) < 120, ab[n]
+        assert "heartbeat" not in ab[n]
+
+
 def test_digest_ticket_brings_the_project_by_title_prefix_and_null_without_group():
     a = Env(run="run_a")
     os.makedirs(os.path.join(a.home, "groups"))

@@ -5381,10 +5381,20 @@ def _log_line(e, title):
     return None
 
 
-def panel_tickets(ts, open_state):
+def _ticket_since(t):
+    """When the ticket entered its current state: the file's mtime (in file mode the header changes with the state; with tickets in the backlog it is the creation or the last text edit).
+    ponytail: a backlog ticket blocked or released later keeps the file's date; add a state timestamp to the backlog item if that matters."""
+    with contextlib.suppress(OSError, TypeError):
+        return datetime.fromtimestamp(os.path.getmtime(t["arquivo"]), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
+def panel_tickets(ts, agents):
     """The digest's `tickets_orq`: the open tickets (not resolved or wontfix) with group (ready, blocked, in progress), the blockers still
-    open, the task and the state of its live worker; plus the 5 most recent resolved ones, with the closing date (the backlog's, or the file's)."""
-    live = {a.get("task"): _agent_state(a) for a in _dict(open_state).get("agentes") or [] if a.get("estado") in ANDA}
+    open, the task and the state of its live worker, `desde` (in progress: the dispatch; ready or blocked: the ticket's creation or last edit) and, in progress,
+    `heartbeat` (the worker's last sign of life); plus the 5 most recent resolved ones, with the closing date (the backlog's, or the file's).
+    `agents` is the reassessed list of workers."""
+    live = {a.get("task"): a for a in agents or [] if a.get("estado") in ANDA}
     closed = ("resolved", "wontfix")
     open_items = {t["num"] for t in ts if t["status"] not in closed}
     output, projects = [], groups()
@@ -5394,7 +5404,8 @@ def panel_tickets(ts, open_state):
         blockers = [n for n in t["blocked_by"] if n in open_items]
         group_name = "bloqueado" if blockers else "andamento" if t["status"] == "claimed" else "pronto"
         output.append({"num": t["num"], "titulo": t["titulo"], "status": t["status"], "grupo": group_name, "bloqueios": blockers,
-                      "task": t["task"], "worker": live.get(t["task"]), "arquivo": t["arquivo"],
+                      "task": t["task"], "worker": _agent_state(w) if (w := live.get(t["task"])) else None, "arquivo": t["arquivo"],
+                      "desde": (w and w.get("desde")) or _ticket_since(t), **({"heartbeat": w.get("ultimo_heartbeat")} if w and group_name == "andamento" else {}),
                       "projeto": group_of(projects, title=t["titulo"])[0]})
     done_items = []
     for t in ts:
@@ -5434,10 +5445,11 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
                          "nota": next((i["nota"] for i in tagged_items if i.get("nota")), ""), "prs": [_pr_contract(i) for i in g["itens"]]})
     today = now_at.astimezone().date()
     pending = [{**i, "depois": bool(pending_after(i, today))} for i in _dict(pending_items).get("itens", []) if isinstance(i, dict)]
+    agents = reassess(_dict(open_state).get("agentes") or [], events, now_at, turns)
     running = sorted(({"titulo": a.get("titulo") or "untitled worker", "estado": _agent_state(a), "tipo": "entrega" if a.get("estado") == "aguardando_integracao" else "worker",
                        "desde": (_dict(a.get("integracao")).get("ts") if a.get("estado") == "aguardando_integracao" else None) or a.get("desde"),  # a delivery's age counts from the integrator queue, not from the worker's start
                        **({"prioridade": a["prioridade"]} if a.get("prioridade") else {})}
-                      for a in reassess(_dict(open_state).get("agentes") or [], events, now_at, turns) if a.get("estado") in (*ANDA, "hibernado")), key=lambda r: r.get("prioridade") or 2)  # highest first
+                      for a in agents if a.get("estado") in (*ANDA, "hibernado")), key=lambda r: r.get("prioridade") or 2)  # highest first
     if machine:  # the slots and the dispatch queue (ticket 79): one extra key, `running` still holds only workers and the E2E queue
         machine = {**machine, "ocupadas": sum(not r["estado"].startswith("hibernated") for r in running), "livres": max(machine["max_workers"] - sum(not r["estado"].startswith("hibernated") for r in running), 0)}
     if e2e:  # the E2E queue is one extra line in `running`: `stuck_lock` when it does not move
@@ -5447,7 +5459,7 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
         line = sorted([*line, cleaned], key=lambda x: x["ts"])
     return {"versao": 1, "geradoEm": now_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(away_alias), "desde": _dict(away_alias).get("ligada_em")},
             "fila": declared or derived, "proximoPasso": next_step, "features": features, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
-            "tickets_orq": panel_tickets(ts, open_state),
+            "tickets_orq": panel_tickets(ts, agents),
             "pagina": {"data": now_at.astimezone().strftime("%Y-%m-%d"), "gerado": now_at.astimezone().strftime("%H:%M"), "desde": since, "poll": prs.get("ultimo_poll"),
                        "linha_antes": max(0, len(line) - DIGEST_LINES), "declarada": bool(declared),
                        "pontos": _points(list(flow_info.values()) or [task_flow(None, events)])}}

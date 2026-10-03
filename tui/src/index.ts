@@ -1,6 +1,6 @@
 // orq gerente tui: só leitura. Relê os arquivos do ORQ_HOME a cada ORQ_TUI_S segundos (3 por padrão); q ou Ctrl+C sai.
 // Tema: --theme light|dark|auto ou ORQ_TUI_THEME; auto pergunta ao terminal (OSC 11), depois COLORFGBG e o tema do macOS.
-// Backlog: j/k ou setas rolam, PgUp/PgDn rolam uma página, e troca o filtro de estado, g o de grupo, 0 limpa os dois.
+// Backlog: j/k ou setas rolam, PgUp/PgDn rolam uma página, e troca o filtro de estado, g o de grupo, o põe os mais antigos primeiro, 0 limpa os dois.
 import { createCliRenderer } from "@opentui/core"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -13,7 +13,7 @@ const intervalo = Number(process.env.ORQ_TUI_S || 3) * 1000
 
 const renderer = await createCliRenderer({ exitOnCtrlC: true })
 const tema = await detectarTema({ argv: process.argv, env: process.env, osc: () => renderer.waitForThemeMode(500) })
-const atualizar = criarTela(renderer, `orq gerente tui — ${home} — q sai · j/k rola · e estado · g grupo · 0 limpa`, tema)
+const atualizar = criarTela(renderer, `orq gerente tui — ${home} — q sai · j/k rola · e estado · g grupo · o antigos · 0 limpa`, tema)
 
 let vista: Vista = VISTA0
 let estado: Estado | null = null
@@ -51,6 +51,7 @@ renderer.keyInput.on("keypress", (k: { name?: string }) => {
   else if (k.name === "pageup") rola(-pagina)
   else if (k.name === "e") vista = { ...vista, estado: proximoFiltro(FILTROS_ESTADO, vista.estado), offset: 0 }
   else if (k.name === "g") vista = { ...vista, grupo: proximoFiltro(filtrosGrupo(estado), vista.grupo), offset: 0 }
+  else if (k.name === "o") vista = { ...vista, antigos: !vista.antigos, offset: 0 }
   else if (k.name === "0") vista = VISTA0
   else return
   desenha()
