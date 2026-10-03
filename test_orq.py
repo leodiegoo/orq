@@ -25588,6 +25588,69 @@ def test_ticket435_alarm_off_does_not_call_channels_and_records_disabled():
         assert orqlib._alarm_channels("sumiu:term_x", "sumiu", 900) == [{"canal": "all", "resultado": "disabled"}]
 
 
+def test_ticket482_escalate_uses_dispatch_context_after_a_mistyped_handle_silently_drops_send():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_service")
+    a.set("run.json", {"id": "run_a", "handle": "term_service"})
+    a.set("dispatch.json", {"taskId": "task_integrator", "dispatchId": "ctx_integrator"})
+    a.set("caps.json", {"ctx_integrator": "revoked"})
+    a.set("terminals.json", ["term_service", "term_coordinator"])
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "manager.json"), "w") as f:
+        json.dump({"coordenador": "term_coordinator", "gerente": "term_manager", "runs": ["run_a"]}, f)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_integrator", "dispatch": "ctx_integrator", "terminal": "term_service", "servico": True}) + "\n")
+    question = "The merge has a behavior conflict; which side should win?"
+
+    old = subprocess.run([a.bin, "orchestration", "send", "--from", "term_service", "--to", "term_coordinatr", "--type", "escalation",
+                          "--subject", "Need a decision", "--body", question, "--task-id", "task_integrator", "--dispatch-id", "ctx_integrator", "--json"],
+                         capture_output=True, text=True, env=a.env, timeout=10)
+    assert json.loads(old.stdout)["ok"] is True and not any(e.get("tipo") == "entrada" for e in a.events()), \
+        "a mistyped address is accepted but never creates a coordinator entry"
+
+    result = a.orq("escalate", question)
+    assert result.returncode == 0 and "e1" in result.stdout, result.stderr or result.stdout
+    (entry,) = [e for e in a.events() if e.get("tipo") == "entrada"]
+    assert (entry["id"], entry["origem"], entry["run"], entry["task"], entry["dispatch"], entry["texto"]) == \
+        ("e1", "servico", "run_a", "task_integrator", "ctx_integrator", question), entry
+    (sent_old,) = [json.loads(line) for line in open(os.path.join(a.fake, "sent.log"))]
+    assert "--to" in sent_old and sent_old[sent_old.index("--to") + 1] == "term_coordinatr"
+    (notice,) = [json.loads(line) for line in open(os.path.join(a.fake, "send.log"))]
+    assert notice[notice.index("--terminal") + 1] == "term_coordinator"
+    text = notice[notice.index("--text") + 1]
+    assert "e1" in text and question in text, text
+
+
+def test_ticket482_escalate_reports_when_coordinator_notice_fails_after_recording_entry():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_service")
+    a.set("run.json", {"id": "run_a", "handle": "term_service"})
+    a.set("dispatch.json", {"taskId": "task_integrator", "dispatchId": "ctx_integrator"})
+    a.set("caps.json", {"ctx_integrator": "revoked"})
+    a.set("terminals.json", ["term_service", "term_coordinator"])
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "manager.json"), "w") as f:
+        json.dump({"coordenador": "term_coordinator", "gerente": "term_manager", "runs": ["run_a"]}, f)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "despacho", "run": "run_a", "task": "task_integrator", "dispatch": "ctx_integrator", "terminal": "term_service", "servico": True}) + "\n")
+    with mock.patch.object(orqlib, "HOME", a.home), mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_service"}), \
+         mock.patch.object(orqlib, "notify_coordinator", return_value="falhou"):
+        try:
+            orqlib.escalate("The run is blocked.")
+        except RuntimeError as error:
+            assert "e1" in str(error) and "notification failed" in str(error), str(error)
+        else:
+            assert False, "failed coordinator notification must not claim delivery"
+    (entry,) = [e for e in a.events() if e.get("tipo") == "entrada"]
+    assert entry["texto"] == "The run is blocked."
+
+
+def test_ticket482_escalate_refuses_non_service_context_without_claiming_delivery():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_service")
+    a.set("run.json", {"id": "run_a", "handle": "term_service"})
+    result = a.orq("escalate", "The run is blocked.")
+    assert result.returncode != 0 and "service Dispatch" in result.stderr, result.stdout + result.stderr
+    assert "recorded" not in result.stdout.lower() and not a.events(), result.stdout
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
