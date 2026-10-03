@@ -11609,7 +11609,7 @@ def _dispatch_end(dispatch, w):
     return {"motivo": end_reason(dispatch, read_events(), msgs), **wt}
 
 
-def release(dispatch, run=None, all_cwd=False):
+def release(dispatch, run=None, all_cwd=False, owned=None):
     """pending ack of the dispatch, worker-release and, if the state comes back `retained`, `orca terminal close` of the worker's terminal. Records an event.
 
     Only acts on a dispatch that appears in the worker-list (of all Runs, or of `run`); refuses one that is still running.
@@ -11620,7 +11620,7 @@ def release(dispatch, run=None, all_cwd=False):
     if w.get("dispatchStatus") == "dispatched":
         raise ValueError(f"dispatch {dispatch} is still running: wait for worker_done or use worker-stop")
     with _no_run(w.get("runId")):
-        return _release(dispatch, w, all_cwd)
+        return _release(dispatch, w, all_cwd, owned)
 
 
 def _close_setup(dispatch, w, run_id, handle):
@@ -11650,7 +11650,7 @@ def _close_setup(dispatch, w, run_id, handle):
     return closed_items, notices
 
 
-def _release(dispatch, w, all_cwd=False):
+def _release(dispatch, w, all_cwd=False, owned=None):
     """The release body, with the dispatch's Run already commanded by the coordinator (or with the refusal that explains what is missing)."""
     run_id, handle, notices = w.get("runId"), w.get("agentTerminalHandle"), []
     if dispatch in _released(read_events()):
@@ -11661,7 +11661,8 @@ def _release(dispatch, w, all_cwd=False):
     if notice:
         notices.append(notice)
     end = _dispatch_end(dispatch, w)
-    owned = worktree_owned_pids(end.get("caminho"))  # before the terminal closes: afterwards the agent is gone and what it left is below no harness
+    if owned is None:  # before the terminal closes: afterwards the agent is gone and what it left is below no harness
+        owned = worktree_owned_pids(end.get("caminho"))
     try:
         state = orca("worker-release", "--dispatch", dispatch, timeout=30, run=run_id).get("state")
     except RuntimeError as e:
@@ -11857,6 +11858,7 @@ def relaunch(dispatch, note, model=None, effort=None, run=None):
         raise ValueError(f"task {task} does not exist in Run {run_id}")
     base = {"nota": note, "terminal": w.get("agentTerminalHandle"), "worktree": cp["caminho"], "head": cp["head"], "sujo": cp["sujo"]}
     _control("relancar", w, "iniciado", modelo=request[0], effort=request[1], **base)
+    old_processes = worktree_owned_pids(cp["caminho"])
     _stop_worker("relancar", w, {**base, "modelo": request[0], "effort": request[1]})
     selector = f"id:{cp['worktree_id']}" if cp["worktree_id"] else f"path:{cp['caminho']}"
     res, error, launched = None, None, None
@@ -11879,7 +11881,7 @@ def relaunch(dispatch, note, model=None, effort=None, run=None):
     if launched != request:
         notices.append(f"the requested profile ({request[0]}/{request[1]}) did not start ({error}); the new worker uses the previous one ({launched[0]}/{launched[1]})")
     for step, fn, lap in (("note not delivered", lambda: steer(task, f"Relaunched after {dispatch}. What changed: {note}", run_id), f"orq steer {task} <note>"),
-                             ("terminal of the old worker not released", lambda: release(dispatch, run_id), f"orq release {dispatch}")):
+                             ("terminal of the old worker not released", lambda: release(dispatch, run_id, owned=old_processes), f"orq release {dispatch}")):
         try:
             fn()
         except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:

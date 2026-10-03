@@ -413,6 +413,8 @@ elif cmd == "worker-start":
     json.dump(ts, open(os.path.join(d, "tasks_%s.json" % (run or bound)), "w"))
     if os.environ.get("FAKE_INICIO") not in ("nunca", "depois_do_enter"):
         turno_comeca("ctx_term_novo%d" % n)
+    if os.environ.get("FAKE_PROCESS_AFTER_START") and os.environ.get("ORQ_PROCESSOS"):
+        json.dump(json.load(open(os.environ["FAKE_PROCESS_AFTER_START"])), open(os.environ["ORQ_PROCESSOS"], "w"))
     res = {"runId": run or bound, "taskId": tid, "dispatchId": "ctx_term_novo%d" % n, "state": "ready", "stage": "input_accepted",
            "effects": [{"kind": "worktree", "action": "reused", "id": "wt"}, {"kind": "terminal", "role": "agent", "action": "created", "id": "term_novo%d" % n},
                        {"kind": "dispatch_input", "role": "agent", "id": "term_novo%d" % n, "state": "accepted"}]}
@@ -6692,6 +6694,29 @@ def test_it_should_relaunch_in_the_same_worktree_and_task_with_retry_of_and_the_
         assert (ev["dispatch"], ev["novo_dispatch"], ev["task"], ev["nota"]) == ("ctx_w1", "ctx_term_novo2", "task_w1", "o índice novo já existe: pule a migração"), ev
         assert ev["worktree_intacta"] is True and _head(repo) == before and os.path.exists(os.path.join(repo, "novo"))
         assert _log(a, "released.log"), "o terminal do worker antigo é liberado depois que o novo sobe"
+
+
+def test_relaunch_release_ends_old_processes_and_spares_new_worker_in_same_worktree():
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        wt = os.path.join(t, "worker")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "--detach", wt, "HEAD"], check=True)
+        a = Env(run="run_a")
+        _ctl_env(a, wt)
+        ps_path = _procs147(a, wt)
+        after_start = os.path.join(a.tmp.name, "new-worker-processes.json")
+        old = [{"pid": 501, "ppid": 1, "rss": 10, "args": "claude old worker", "cwd": wt},
+               {"pid": 502, "ppid": 501, "rss": 10, "args": "node old child", "cwd": wt}]
+        new = [{"pid": 601, "ppid": 1, "rss": 10, "args": "codex new worker", "cwd": wt},
+               {"pid": 602, "ppid": 601, "rss": 10, "args": "node new child", "cwd": wt}]
+        json.dump(old, open(ps_path, "w"))
+        json.dump(old + new, open(after_start, "w"))
+        r = a.orq("relancar", "ctx_w1", "--nota", "continue", FAKE_PROCESS_AFTER_START=after_start)
+        assert r.returncode == 0, r.stderr
+        remaining = {p["pid"] for p in json.load(open(ps_path))}
+        assert remaining == {601, 602}, f"old worker ended and new worker survived: {remaining}"
+        (event,) = [e for e in a.events() if e["tipo"] == "processos"]
+        assert {p["pid"] for p in event["lista"]} == {501, 502}, event
 
 
 def test_it_should_refuse_a_relaunch_without_a_note():
@@ -23824,4 +23849,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
