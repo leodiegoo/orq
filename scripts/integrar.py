@@ -8,7 +8,7 @@
 
 Before the tests it runs the night replay (test_noite_replay.py, ticket 216) and prints its time; a red replay leaves main where it was and writes a
 `[PENDENTE` line to ciclos.log, which the manager turns into a notice to the coordinator (ticket 137).
-After the fast-forward it appends `FF main <from>..<to>` to ciclos.log (the completed-cycle line that closes an earlier `[PENDENTE`, ticket 370) and calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
+After the fast-forward it appends `FF main <from>..<to>` to ciclos.log (the completed-cycle line that closes an earlier `[PENDENTE`, ticket 370) and calls `orq integrate conclude`: it records the cycle, audits and pushes main (ticket 185) and, only after the push, closes what the cycle integrated (queue, ticket, worker).
 
 The live clone is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
 markers in orqlib.py and takes everything down. Here the conflict only exists in the worktree.
