@@ -23379,6 +23379,17 @@ def test_ticket341_touches_line_declares_the_area_and_unblock_frees_the_ticket()
     assert _bl_items(a)["t02"]["bloqueios"] == []
 
 
+def test_ticket391_cited_ticket_numbers_and_files_do_not_block_but_blocked_by_and_shared_function_still_do():
+    a = _env_tk()
+    _new(a, "First", spec=_area_spec(a, "a.md", "Change `_external_denied`; see `plan/issues/318-x.md`."))
+    _new(a, "Copy", spec=_area_spec(a, "b.md", "Copy of ticket 318, see `plan/issues/318-x.md`; also tickets 12, 13 and `07-y.md`."))
+    assert _bl_items(a)["t02"]["bloqueios"] == [], "a cited ticket number or file is not an area"
+    _new(a, "Third", spec=_area_spec(a, "c.md", "Fix `_external_denied()`."))
+    assert _bl_items(a)["t03"]["bloqueios"] == ["t01"], "a shared function still blocks"
+    _new(a, "Fourth", "--blocked-by", "02", spec=_area_spec(a, "d.md", "Nothing shared."))
+    assert _bl_items(a)["t04"]["bloqueios"] == ["t02"], "explicit Blocked by still blocks"
+
+
 def test_ticket388_send_back_refuses_the_dispatch_a_later_one_replaced_on_the_same_worktree():
     a = Env()
     a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"},

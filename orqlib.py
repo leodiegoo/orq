@@ -10202,19 +10202,20 @@ def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None, proj
 
 _TOUCHES = re.compile(r"^Touches:[ \t]*(.+)$", re.M | re.I)
 _AREA_TOKEN = re.compile(r"`([^`\s<>]{3,})`")
+_AREA_TICKET_FILE = re.compile(r"(?:^|/)\d+-[^/]*\.md$")  # a cited ticket file (`plan/issues/318-x.md`) is a reference, not an area (ticket 391)
 _AREA_COMMON = {"readme.md", "docs/design.md", "test_orq.py", "orqlib.py", "orq.py", "final-report.md", "test_noite_replay.py"}  # every ticket touches these: they never make two tickets collide
 
 
 def ticket_area(text):
     """The area a ticket will touch (ticket 341): the `Touches:` line (comma-separated files, functions or folders) when the spec declares it; otherwise the names the text cites in
-    backticks that look like a function (`_external_denied`, `pr_open()`) or a path (`.github/workflows/`, `hooks/x.py`), minus the files every ticket touches and the orq worktree boilerplate."""
+    backticks that look like a function (`_external_denied`, `pr_open()`) or a path (`.github/workflows/`, `hooks/x.py`), minus the files every ticket touches, the ticket files it cites (ticket 391) and the orq worktree boilerplate."""
     text = re.split(r"^## (?:orq worktree|Delivery conformance)\b", text or "", flags=re.M)[0]
     if m := _TOUCHES.search(text):
         return {x.strip().strip("`").rstrip("()").lower() for x in m.group(1).split(",") if x.strip()}
     found = set()
     for tok in _AREA_TOKEN.findall(text):
         tok = tok.rstrip("()").rstrip(".,;:")
-        if tok.isupper() or tok.lower() in _AREA_COMMON or tok.startswith("--") or not re.search(r"[_/]|\.\w{1,4}$", tok):
+        if tok.isupper() or tok.lower() in _AREA_COMMON or tok.startswith("--") or _AREA_TICKET_FILE.search(tok) or not re.search(r"[_/]|\.\w{1,4}$", tok):
             continue
         found.add(tok.lower())
     return found
