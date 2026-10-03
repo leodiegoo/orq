@@ -20982,11 +20982,13 @@ def _run_tests(tests, jobs, cover=False, echo=print):
 
 
 @contextlib.contextmanager
-def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
-    """One full suite at a time on the machine (ticket 328), like the E2E queue: a `<time_ns>-<pid>` ticket in `queue` with the worktree, in order of arrival.
-    Waits while an older ticket has a live pid, echoing who is ahead whenever that changes; a dead owner's ticket is removed. The ticket goes away at the end."""
+def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print, integrator=False):
+    """One full suite of workers at a time on the machine (tickets 328 and 366), like the E2E queue: a `<a|b><time_ns>-<pid>` ticket in `queue` with the worktree.
+    A worker's ticket (`b`) waits while an older worker's or any integrator's (`a`) pid is alive; the integrator's waits only for older integrators, so it goes ahead of the
+    waiting workers and never behind a running one. Echoes who is ahead (`esperando vaga de suite`, which the panel reads off the screen) whenever that changes;
+    a dead owner's ticket is removed. The ticket goes away at the end. Tickets of the first format (no letter) sort before both and are waited for."""
     os.makedirs(queue, exist_ok=True)
-    mine = f"{time.time_ns():020d}-{os.getpid()}"
+    mine = f"{'a' if integrator else 'b'}{time.time_ns():020d}-{os.getpid()}"
     with open(os.path.join(queue, mine), "w") as f:
         f.write(HERE)
     try:
@@ -21004,8 +21006,10 @@ def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
                 break
             if ahead[0][0] != shown:
                 shown, (n, wt) = ahead[0][0], ahead[0]
-                echo(f"suite queue: {len(ahead)} ahead; running: {wt} (pid {n.rsplit('-', 1)[-1]}, {int((time.time_ns() - int(n.split('-')[0])) / 6e10)} min)")
+                echo(f"{orq_mod.SUITE_WAIT}: {len(ahead)} ahead; running: {wt} (pid {n.rsplit('-', 1)[-1]}, {int((time.time_ns() - int(n.split('-')[0].lstrip('ab'))) / 6e10)} min)")
             time.sleep(poll_s)
+        if shown:
+            echo("vaga de suite obtida")
         yield
     finally:
         with contextlib.suppress(OSError):
@@ -21053,12 +21057,15 @@ def _dict_file(path):
 
 
 def _suite_args(argv):
-    """`test_orq.py [-j N] [--map PATH] [name...]`: a name equal to a test picks exactly it, any other is a substring. -j defaults to min(4, CPUs/2)."""
+    """`test_orq.py [-j N] [--map PATH] [name...]`: a name equal to a test picks exactly it, any other is a substring. -j defaults to min(4, CPUs/2), and to SUITE_JOBS
+    for a worker's full suite (no names, no --map: the integrator's run is the one that writes the map)."""
     ap = argparse.ArgumentParser(prog="test_orq.py")
-    ap.add_argument("-j", "--jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("-j", "--jobs", type=int)
     ap.add_argument("--map", help="writes the test map (the functions each test ran) to PATH")
     ap.add_argument("names", nargs="*")
-    return ap.parse_args(argv)
+    opts = ap.parse_args(argv)
+    opts.jobs = opts.jobs or max(1, min(4 if opts.names or opts.map else orq_mod.SUITE_JOBS, (os.cpu_count() or 2) // 2))
+    return opts
 
 
 def _pick(all_tests, names):
@@ -21127,7 +21134,7 @@ def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead
         threading.Timer(0.3, lambda: (holder.kill(), holder.wait())).start()  # reaped: a zombie still answers kill(pid, 0)
         with _suite_turn(q, poll_s=0.05, echo=seen.append):
             pass
-        assert time.time() - t0 >= 0.3 and seen and seen[0].startswith("suite queue: 1 ahead; running: /wt/vivo (pid "), seen
+        assert time.time() - t0 >= 0.3 and seen and seen[0].startswith("esperando vaga de suite: 1 ahead; running: /wt/vivo (pid "), seen
     finally:
         holder.kill()
         holder.wait()
@@ -21186,9 +21193,9 @@ def test_ticket328_affected_runs_changed_tests_and_the_ones_behind_a_changed_hel
 def test_ticket328_affected_falls_back_to_the_full_suite_when_it_cannot_tell():
     root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "tool.py": "def f():\n    pass\n"})
     assert orq_mod.affected_tests(root, "main", {})["tests"] is None, "no map"
-    _edit328(root, "orqlib.py", "import os", "import os\nimport re")
+    _edit328(root, "orqlib.py", "LIMIT = 3", "LIMIT = 3\nif LIMIT:\n    pass")
     r = orq_mod.affected_tests(root, "main", MAP328)
-    assert r["tests"] is None and "module-level line" in r["reasons"][-1], r
+    assert r["tests"] is None and "module-level line" in r["reasons"][-1], "a module-level `if` is read by nobody and by everybody: full suite"
     subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
     _edit328(root, "tool.py", "pass", "return 1")
     r = orq_mod.affected_tests(root, "main", MAP328)
@@ -21222,6 +21229,91 @@ def test_ticket328_orq_test_affected_runs_only_the_affected_tests():
     assert (r.returncode, r.stdout) == (0, "orq test: the diff against main touches no test\n"), r
     r = Env().orq("test", cwd=tempfile.mkdtemp())
     assert r.returncode != 0 and "no test_orq.py" in r.stderr, r
+
+
+def test_ticket366_suite_queue_second_worker_waits_and_the_integrator_goes_ahead():
+    q = tempfile.mkdtemp()
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    order, seen = [], []
+    try:
+        with open(os.path.join(q, f"b{1:020d}-{holder.pid}"), "w") as f:
+            f.write("/wt/w1")  # worker 1 holds the machine
+
+        def worker2():
+            with _suite_turn(q, poll_s=0.05, echo=seen.append):
+                order.append("w2")
+
+        t = threading.Thread(target=worker2)
+        t.start()
+        time.sleep(0.4)
+        assert order == [] and seen and seen[0].startswith("esperando vaga de suite: 1 ahead; running: /wt/w1 (pid "), (order, seen)
+        assert orq_mod.SCREEN_WAIT.search(seen[0]) and orq_mod.HARNESS["codex"]["tela"]["espera"].search(seen[0]), "the panel reads the wait off the worker's screen"
+        mine = []
+        with _suite_turn(q, poll_s=0.05, echo=mine.append, integrator=True):
+            order.append("integrator")
+        assert order == ["integrator"] and mine == [], "the integrator went ahead of the waiting worker without waiting for the running one"
+        holder.kill()
+        holder.wait()
+        t.join(10)
+        assert order == ["integrator", "w2"], order
+        assert seen[-1] == "vaga de suite obtida" and os.listdir(q) == [], (seen, os.listdir(q))
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_ticket366_worker_waits_for_the_integrator_ticket_too():
+    q = tempfile.mkdtemp()
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with open(os.path.join(q, f"a{1:020d}-{holder.pid}"), "w") as f:
+            f.write("/live/integrator")
+        seen = []
+        t0 = time.time()
+        threading.Timer(0.3, lambda: (holder.kill(), holder.wait())).start()
+        with _suite_turn(q, poll_s=0.05, echo=seen.append):
+            pass
+        assert time.time() - t0 >= 0.3 and seen[0].startswith("esperando vaga de suite: 1 ahead; running: /live/integrator"), seen
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_ticket366_full_suite_of_a_worker_runs_with_j_2_and_the_integrator_keeps_its_own():
+    cpus = os.cpu_count() or 2
+    assert _suite_args([]).jobs == max(1, min(2, cpus // 2)) and _suite_args(["-j", "3"]).jobs == 3
+    assert _suite_args(["--map", "m.json"]).jobs == max(1, min(4, cpus // 2)), "the integrator's full run"
+    assert _suite_args(["test_x"]).jobs == max(1, min(4, cpus // 2)), "a filtered run keeps its width"
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328})
+    m = os.path.join(root, "..", os.path.basename(root) + "-map.json")
+    with open(m, "w") as f:
+        json.dump(MAP328, f)
+    dry = lambda *args: Env().orq("test", *args, "--dry-run", cwd=root).stdout  # noqa: E731
+    assert dry() == "test_orq.py -j 2\n" and dry("-j", "3") == "test_orq.py -j 3\n" and dry("test_a") == "test_orq.py test_a\n"
+    assert dry("--affected", "--base", "main", "--map", os.path.join(root, "sem-mapa.json")) == "test_orq.py -j 2\n", "--affected that falls back to the full suite"
+    _edit328(root, "orqlib.py", "return 2", "return 3")
+    assert dry("--affected", "--base", "main", "--map", m) == "test_orq.py test_c\n", "the affected tests keep the width of any filtered run"
+
+
+def test_ticket366_affected_ignores_a_new_import_constant_or_def_but_not_a_read_import_that_goes_away():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328})
+    _edit328(root, "orqlib.py", "import os", "import os\nimport re")
+    _edit328(root, "orqlib.py", "LIMIT = 3", "LIMIT = 3\nNEW = 1")
+    _edit328(root, "orqlib.py", "\n\ndef c():", "\n\ndef novo():\n    return 9\n\n\ndef c():")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == set(), r
+    _edit328(root, "orqlib.py", "return 1", "return 11")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_a"}, "and the def that changed still picks its tests"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "orqlib.py", "import os\n", "")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == set(), "an import nobody reads"
+    root = _repo328({"orqlib.py": LIB328.replace("return 2", "return os.sep"), "test_orq.py": TESTS328})
+    _edit328(root, "orqlib.py", "import os\n", "")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "the import of os is read" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "orqlib.py", "import os", "import sys as os")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] is None, "an import that changes what the name is: the def that reads it may break"
 
 
 def test_ticket328_the_caller_environment_does_not_reach_the_tests():
@@ -22437,7 +22529,7 @@ if __name__ == "__main__":
         print(f"ignored from the environment: {', '.join(CALLER_ENV)}")
     live = _live_events()
     real_logs = log_snapshot(_real_logs())  # ticket 216: the legacy log too
-    with _suite_turn() if not opts.names else contextlib.nullcontext():
+    with _suite_turn(integrator=bool(opts.map)) if not opts.names else contextlib.nullcontext():
         w0, c0 = time.time(), _cpu()
         results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
         wall, cpu = time.time() - w0, _cpu() - c0
