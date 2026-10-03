@@ -129,7 +129,7 @@ if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
     open(os.path.join(d, cmd + ".log"), "a").write(json.dumps(a) + "\\n")
     if os.environ.get("FAKE_FAIL_TERMINAL") == cmd:
         failure("falhou terminal " + cmd)
-    if cmd == "send" and os.environ.get("FAKE_PROMPT_BLOCKED") and "--text" in a:
+    if cmd == "send" and os.environ.get("FAKE_PROMPT_BLOCKED") and "--text" in a and "--enter" in a:
         failure("agent_prompt_blocked Terminal prompt request ID: x")  # o Orca sabe que o agente está no meio do turno, mesmo com o tui-idle satisfeito
     if cmd == "send" and os.environ.get("FAKE_FAIL_SEND_DEPOIS") and len(ler_linhas("send.log")) > int(os.environ["FAKE_FAIL_SEND_DEPOIS"]):
         failure("falhou terminal send")  # o enésimo send em diante falha (o texto do anterior já foi digitado)
@@ -9881,7 +9881,7 @@ def _screen52(item_name):
 
 def test_ticket52_screen_question_recognizes_askuserquestion_permission_and_trust():
     p = orq_mod.screen_question(_screen52("tela-permissao.txt"))
-    assert p["tipo"] == "permissao" and "Do you want to proceed?" in p["texto"] and "Dangerous rm" in p["texto"], p
+    assert p["tipo"] == "permissao" and "Do you want to proceed?" in p["texto"] and "npm run build" in p["texto"], p
     assert [o[0] for o in p["opcoes"]] == [1, 2, 3] and p["opcoes"][0][1] == "Yes", p
     q = orq_mod.screen_question(_screen52("tela-askuserquestion.txt"))
     assert q["tipo"] == "pergunta" and "Qual escopo" in q["texto"], q
@@ -9945,12 +9945,13 @@ def test_ticket52_reply_screen_types_the_option_with_enter_and_records_who_repli
     _screen_in_manager52(a)
     r = a.orq("responder-tela", "task_term_w1", "2", ORCA_TERMINAL_HANDLE="term_coord")
     assert r.returncode == 0, r.stderr
-    (env,) = [e for e in _log(a, "send.log") if e[e.index("--terminal") + 1] == "term_w1"]
-    assert env[env.index("--text") + 1] == "2" and "--enter" in env, env
+    number, enter = [e for e in _log(a, "send.log") if e[e.index("--terminal") + 1] == "term_w1"]  # ticket 371: number and Enter in two sends
+    assert number[number.index("--text") + 1] == "2" and "--enter" not in number and "--text" not in enter and "--enter" in enter, (number, enter)
     (c,) = [e for e in a.events() if e["tipo"] == "controle" and e["acao"] == "responder-tela"]
     assert c["por"] == "term_coord" and c["opcao"].startswith("2) Yes, and") and c["resultado"] == "ok" and "Do you want to proceed?" in c["pergunta"], c
     r = a.orq("responder-tela", "task_term_w1", "no, and", ORCA_TERMINAL_HANDLE="term_coord")
-    assert r.returncode == 0 and _log(a, "send.log")[-1][_log(a, "send.log")[-1].index("--text") + 1] == "3", "o começo do rótulo também vale"
+    typed = [e for e in _log(a, "send.log") if "--text" in e]
+    assert r.returncode == 0 and typed[-1][typed[-1].index("--text") + 1] == "3", "o começo do rótulo também vale"
 
 
 def test_ticket52_reply_screen_refuses_without_open_menu_or_with_option_that_does_not_exist():
@@ -22959,6 +22960,139 @@ def test_ticket344_machine_and_status_show_the_slots_per_project_and_warn_after_
     assert (js["product-app"]["vivos"], js["product-app"]["posicao"], js["product-app"]["espera_min"]) == (0, 1, 14) and js["orq"]["aviso"] is None
     _queue_items344(a, ("product-app", "cache do E2E", 3, 4))
     assert "WARNING" not in a.orq("machine").stdout, "4 minutes is not starving yet"
+
+
+# ---------- ticket 371: the manager unblocks a stuck wait, refuses a destructive prompt and reconciles the backlog ----------
+
+def _wait_screen371(path):
+    return [f"● Bash(until grep -q passed {path}; do sleep 5; done)", "  ⎿  Running… (ctrl+b to run in background)", "✻ Working… (12m · esc to interrupt)"]
+
+
+def _interrupts371(a, handle="term_w1"):
+    return [e for e in _log(a, "send.log") if "--interrupt" in e and e[e.index("--terminal") + 1] == handle]
+
+
+def _age_wait371(a, minutes):
+    p = os.path.join(a.home, "stuck-wait.json")
+    st = json.load(open(p))
+    for w in st["waits"].values():
+        w["first_seen"] -= minutes * 60
+    json.dump(st, open(p, "w"))
+
+
+def test_ticket371_stuck_wait_is_interrupted_once_with_the_standard_steer():
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
+    _screen_in_manager52(a)
+    log_file = os.path.join(a.tmp.name, "build.log")
+    open(log_file, "w").close()  # the log the worker waits on never fills
+    a.set("screens.json", {"term_w1": _wait_screen371(log_file)})
+    a.orq("gerente", "absorver")
+    assert not _interrupts371(a), "the first sight only starts the clock"
+    _age_wait371(a, 5)
+    a.orq("gerente", "absorver")
+    assert not _interrupts371(a), "under 10 minutes"
+    _age_wait371(a, 6)
+    r = a.orq("gerente", "absorver")
+    assert "stuck wait interrupted" in r.stdout, r.stdout
+    assert len(_interrupts371(a)) == 1
+    assert [e[e.index("--text") + 1] for e in _sent_notices(a, "term_w1")] == [orq_mod.STUCK_WAIT_STEER], "the standard steer, typed once the worker is at the prompt"
+    (ev,) = [e for e in a.events() if e["tipo"] == "wait_interrupted"]
+    assert ev["task"] == "task_term_w1" and ev["arquivo"] == log_file and "until grep" in ev["comando"], ev
+    a.orq("gerente", "absorver")
+    a.orq("gerente", "absorver")
+    assert len(_interrupts371(a)) == 1 and len(_sent_notices(a, "term_w1")) == 1, "once per worker per hour"
+
+
+def test_ticket371_wait_on_a_file_that_is_filling_is_left_alone():
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
+    _screen_in_manager52(a)
+    log_file = os.path.join(a.tmp.name, "build.log")
+    open(log_file, "w").close()
+    a.set("screens.json", {"term_w1": _wait_screen371(log_file)})
+    a.orq("gerente", "absorver")
+    _age_wait371(a, 11)
+    open(log_file, "w").write("running 3 of 40\n")  # the log has content that was not there before
+    a.orq("gerente", "absorver")
+    assert not _interrupts371(a), "progress restarts the clock"
+    assert orq_mod.stuck_wait_command(["● Bash(until grep -q x /tmp/l; do sleep 5; done)", "  ⎿  Running in the background"]) is None
+    assert orq_mod.stuck_wait_command(["● Bash(npm test)", "  ⎿  Running…"]) is None
+
+
+def test_ticket371_destructive_prompt_gets_no_and_the_coordinator_hears_the_command():
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
+    _screen_in_manager52(a, "tela-permissao-rm.txt")
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0 and "destructive prompt answered no" in r.stdout, r
+    number, enter = [e for e in _log(a, "send.log") if e[e.index("--terminal") + 1] == "term_w1"]
+    assert number[number.index("--text") + 1] == "3" and "--enter" in enter, "the 'No' option of the menu"
+    (ev,) = [e for e in a.events() if e["tipo"] == "screen_denied"]
+    assert ev["task"] == "task_term_w1" and ev["comando"] == "rm -rf $S/*.exit", ev
+    (env,) = _sent_notices(a)
+    text_value = _whole_notice(env[env.index("--text") + 1])
+    assert "rm -rf $S/*.exit" in text_value and "answered no" in text_value, text_value
+    assert not [e for e in a.events() if e["tipo"] == "pergunta_tela"], "it is not asked of the coordinator"
+
+
+def test_ticket371_destructive_command_reads_only_the_prompt_at_the_end_of_the_screen():
+    for c in ("rm -rf $S/*.exit", "rm -fr x", "rm -r -f x", "git reset --hard HEAD~1", "git push --force origin x", "git push origin x -f"):
+        assert orq_mod.destructive_command([f"● Bash({c})", "Do you want to proceed?"]) == c, c
+    for c in ("rm -r build", "rm x", "git push origin x", "git reset --soft HEAD~1"):
+        assert orq_mod.destructive_command([f"● Bash({c})", "Do you want to proceed?"]) is None, c
+    assert orq_mod.destructive_command(["● Bash(rm -rf x)", "done", "● Bash(npm test)", "Do you want to proceed?"]) is None, "a command in the history does not count"
+
+
+def test_ticket371_answer_screen_works_when_orca_refuses_a_text_plus_enter_send():
+    a = Env(run="run_a")
+    _screen_in_manager52(a)
+    r = a.orq("responder-tela", "task_term_w1", "2", ORCA_TERMINAL_HANDLE="term_coord", FAKE_PROMPT_BLOCKED="1")
+    assert r.returncode == 0, r.stderr
+    assert [e[e.index("--text") + 1] for e in _log(a, "send.log") if "--text" in e] == ["2"]
+
+
+def _doctor_env371(tmp):
+    repo = _repo_with_branch(tmp, "feat/orq-x", "feat/orq-y")  # both are at main's commit: in main by ancestry
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger", ORQ_REPOS=repo)
+    a.env["ORQ_BACKLOG"] = os.path.join(a.tmp.name, "data", "backlog.md")
+    a.env["ORQ_BACKLOG_TICKETS"] = "1"
+    a.set("../pendencias.json", {"itens": []})
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    return a
+
+
+def test_ticket371_backlog_doctor_closes_the_integrated_orq_ticket_and_only_warns_about_the_project_one():
+    a = _doctor_env371(tempfile.mkdtemp())
+    _project(a, "outro", {"repo": f"path:{a.tmp.name}"})
+    r1, r2 = _new(a, "orq: integrado"), _new(a, "outro: de projeto", "--projeto", "outro")
+    assert r1.returncode == 0 and r2.returncode == 0, (r1.stderr, r2.stderr)
+    a.orq("integrate", "queue", "add", "feat/orq-x", "01")
+    a.orq("integrate", "queue", "rm", "01")
+    _evs(a, {"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/orq-x"], "tickets": [], "ts": "2999-01-01T00:00:00Z"})  # the integrator's record: only 01's branch went through a cycle
+    assert _new(a, "orq: so ancestral").returncode == 0
+    a.orq("integrate", "queue", "add", "feat/orq-y", "03")  # in main by ancestry, no cycle recorded it: ticket 356 refuses to close it
+    a.orq("integrate", "queue", "rm", "03")
+    for n in ("t01", "t02", "t03"):
+        backlog_mod.cli(a.env["ORQ_BACKLOG"], "start", n)  # In flight
+    ts = _tasks_fake(a)
+    for t in ts:
+        t["status"] = "completed"  # the workers finished
+    a.set("tasks_run_a.json", ts)
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0 and "01: backlog fixed" in r.stdout, r
+    items = _bl_items(a)
+    assert items["t01"]["estado"] == "done" and items["t02"]["estado"] == "in_flight" and items["t03"]["estado"] == "in_flight", "only the ticket the cycle recorded closes"
+    (env,) = _sent_notices(a)
+    text_value = _whole_notice(env[env.index("--text") + 1])
+    assert "02:" in text_value and "03:" in text_value and "orq ticket close 02" in text_value and "01:" not in text_value, text_value
+    assert not [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "reabrir"], "nothing for the sweep to reopen"
+    a.orq("gerente", "absorver")
+    assert len(_sent_notices(a)) == 1, "the hour has not passed: no new round"
+    p = os.path.join(a.home, "backlog-doctor.json")
+    st = json.load(open(p))
+    st["ts"] -= 3601
+    json.dump(st, open(p, "w"))
+    a.orq("gerente", "absorver")
+    assert len(_sent_notices(a)) == 1, "the same list is not warned again"
+
 
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
