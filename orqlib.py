@@ -203,6 +203,7 @@ PR_VISIBLE_D = 7  # a feature with all PRs resolved for longer than this leaves 
 FLOWS = ("promocao", "direto")  # promocao (promotion): the same feature branch opens one PR per environment, in order; direto (direct): a single PR, to the production branch
 BRANCH_NO_REMOTE = "main"  # the default branch when the remote does not say which one it is (no origin/HEAD) and the project declares no environments
 ACTION_TITLES = re.compile(r"^#{1,6}\s*(?:\d+\.\s*)?(?:Itens de ação|O que fazer hoje|O que precisa de ação)\s*$", re.I)
+NO_ACTION_ITEMS = re.compile(r"^\W*(?:Itens de ação|O que fazer hoje|O que precisa de ação)\W*:\W*nenhum[ao]?\W*$", re.I)
 # the plan limit notice on a line at the end of the screen. Claude Code 2.1: `You've hit your session limit · resets 6:50pm (…)` and `Usage limit reached · continuing automatically at …`
 # (the phrases it writes to the transcript); `Weekly limit reached ∙ resets Oct 5, 9am` is the weekly one. Codex 0.159 (binary strings): `You've hit your usage limit. …` and `You're out of credits`.
 # Only valid at the start of the line (except the `⎿`/`●`/`■` decoration): the phrase quoted in the middle of a worker's text does not count.
@@ -1941,7 +1942,8 @@ def _extra(events, all_listing, now_at, pending_items=None, cursor=None, open_st
             parts.append(f"Alert: steer not read in {a.get('task')} after {STEER_ATTEMPTS} notices to the stopped terminal: check the worker (orq agents).")
             continue
         title = re.sub(r"^\s*\[scout\]\s*", "", a.get("titulo") or "", flags=re.I)
-        parts.append(f"Alert: scout {_quote(title)!r} finished without reportPath ({(a.get('task') or '')[:14]}).")
+        what = "reported without the `## Itens de ação` section" if a.get("alerta") == "scout_sem_itens" else "finished without reportPath"
+        parts.append(f"Alert: scout {_quote(title)!r} {what} ({(a.get('task') or '')[:14]}).")
     if len(alerts) > 2:
         parts.append(f"+{len(alerts) - 2} alerts.")
     prs = [e for e in all_listing if e.get("origem") == "pr"]
@@ -2068,9 +2070,10 @@ def summary_four(events, open_state, pending_items, ts, since=None, now_at=None,
 def action_items(md):
     """Numbered items (list or table) from the report's action section; None if there is no section or it has no items.
 
+    `[]` is the explicit "none": an `Itens de ação: nenhum` line, or a line that only says "nenhum" inside the section.
     Accepts "Itens de ação" and the old titles "O que fazer hoje" and "O que precisa de ação".
     """
-    item_list, inside, in_fence = [], False, False
+    item_list, inside, in_fence, none = [], False, False, False
     for line in md.splitlines():
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
@@ -2082,10 +2085,11 @@ def action_items(md):
                 break
             inside = bool(ACTION_TITLES.match(line.strip()))
             continue
+        none = none or bool(NO_ACTION_ITEMS.match(line) or (inside and re.match(r"\s*(?:[-*]\s*)?\W*nenhum[ao]?\W*$", line, re.I)))
         m = inside and (re.match(r"\s*\d+[.)]\s+(.+)", line) or re.match(r"\s*\|\s*\d+\s*\|\s*([^|]+?)\s*\|", line))
         if m:
             item_list.append(" ".join(re.sub(r"[*`]", "", m.group(1)).split())[:300])
-    return item_list or None
+    return item_list or ([] if none else None)
 
 
 def report_path(content, base, when_ms=None):
@@ -3599,22 +3603,56 @@ def _ingest_msg(m, since, already, titles, send=True):
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
     _release_delivered(m, p, queued)
     if p.get("reportPath"):
-        append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": m.get("subject") or "", "fonte": f"worker {m.get('subject') or ''}",
-                      "caminho": p["reportPath"], "ref": m["id"], "run": m["run_id"], "task": p.get("taskId"), **_run_group(m["run_id"])}, new_id=True)
+        items = _report_items(p["reportPath"])
+        alert = None
+        if items is None and _readable(p["reportPath"]) and "[scout]" in _task_title(m, p, titles).lower():  # a scout owes the section (or "nenhum")
+            alert = {"tipo": "alerta", "alerta": "scout_sem_itens", "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "titulo": _task_title(m, p, titles)}
+        for e in worker_report_entries(m["id"], m.get("subject") or "", p["reportPath"], m["run_id"], p.get("taskId"), items):
+            append_event(e, new_id=True)
+        if alert:
+            append_event(alert)
         return 1
     log(f"ingest: worker_done {m['id']} without reportPath (task {p.get('taskId')}, {m.get('subject')})")
     if p.get("outcome") != "succeeded":  # a scout that failed has no report and is not an alert
         return 0
+    if "[scout]" in _task_title(m, p, titles).lower():
+        append_event({"tipo": "alerta", "alerta": "scout_sem_relatorio", "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "titulo": _task_title(m, p, titles)})
+    return 0
+
+
+def _task_title(m, p, titles):
     if m["run_id"] not in titles:
         try:
             tasks = orca("task-list", "--run", m["run_id"], timeout=20)["tasks"]
         except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
             raise _Transient(f"{type(e).__name__}: {e}")
         titles[m["run_id"]] = {t["id"]: t.get("task_title") or "" for t in tasks}
-    title = titles[m["run_id"]].get(p.get("taskId"), "")
-    if "[scout]" in title.lower():
-        append_event({"tipo": "alerta", "alerta": "scout_sem_relatorio", "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "titulo": title})
-    return 0
+    return titles[m["run_id"]].get(p.get("taskId"), "")
+
+
+def _readable(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace"):
+            return True
+    except OSError:
+        return False
+
+
+def _report_items(path):
+    """The action items of a worker report: the list, `[]` for an explicit "nenhum", None with no section (or no file)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return action_items(f.read())
+    except OSError:
+        return None
+
+
+def worker_report_entries(msg, subject, path, run, task, items):
+    """The `relatorio_worker` entries of one report: one per action item (ref `<msg>:<i>`), or a single one with the subject when there are none."""
+    base = {"tipo": "entrada", "origem": "relatorio_worker", "fonte": f"worker {subject}", "caminho": path, "run": run, "task": task, **_run_group(run)}
+    if not items:
+        return [{**base, "texto": subject, "ref": msg}]
+    return [{**base, "texto": t, "ref": f"{msg}:{i}", "msg": msg, "item": i} for i, t in enumerate(items, 1)]
 
 
 def _record_worker_done(m):
@@ -3634,7 +3672,7 @@ def ingest_mailbox(msgs):
         fcntl.flock(lock, fcntl.LOCK_EX)
         since = _dt(_dict(_read_cursor().get("ingest")).get("desde") or START)
         event_list = read_events()
-        already = {e.get("ref") for e in event_list if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in event_list if e.get("tipo") == "alerta"}
+        already = {e.get("msg") or e.get("ref") for e in event_list if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in event_list if e.get("tipo") == "alerta"}
         done_items = {e.get("msg") for e in event_list if e.get("tipo") == "worker_done"}
         for m in msgs:
             if m.get("type") != "worker_done" or not m.get("id") or not m.get("created_at"):
@@ -3657,7 +3695,7 @@ def ingest_inbox():
     since, last_item, fresh, titles = _dt(ing["desde"]), ing["inbox_seq"], 0, {}
     advanced, tent = last_item, dict(ing.get("tentativas") or {})
     event_list = read_events()
-    already = {e.get("ref") for e in event_list if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in event_list if e.get("tipo") == "alerta"}
+    already = {e.get("msg") or e.get("ref") for e in event_list if e.get("origem") == "relatorio_worker"} | {e.get("msg") for e in event_list if e.get("tipo") == "alerta"}
     done_items = {e.get("msg") for e in event_list if e.get("tipo") == "worker_done"}  # the digest reads from here what each worker delivered
     reserves = {e.get("dispatch") for e in event_list if e.get("origem") == "relatorio-final"} - set(_sent_back(event_list))  # relatorio-final.md already delivered: the late worker_done does not repeat
     msgs = sorted((m for m in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(m.get("sequence"), int)),
@@ -3724,8 +3762,8 @@ def ingest_final_reports():
         run, msg = runs.get(dispatch), f"relatorio-final:{dispatch}" + (f":{int(mtime.timestamp())}" if dispatch in sent_back_list else "")
         subject = title or f"final report of worker {dispatch}"
         append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
-        append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": file_path, "ref": msg, "run": run,
-                      "task": t.get("task"), **_run_group(run)}, new_id=True)
+        for e in worker_report_entries(msg, subject, file_path, run, t.get("task"), _report_items(file_path)):
+            append_event(e, new_id=True)
         # Orca refused the worker's own worker_done (revoked capability, e.g. after a send_back or a resume): it stays `dispatched` with an idle terminal
         append_event({"tipo": "alerta", "alerta": "entrega_recusada", "task": t.get("task"), "run": run, "dispatch": dispatch, "msg": msg,
                       "titulo": f"{subject}: worker_done refused, delivery recorded from {FINAL_REPORT}; stop the idle terminal"})
@@ -9819,6 +9857,9 @@ def orphan_sweep(now_at=None, dry_run=False):
 # ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
 # The 02/10 incident (#2039): a "phase 1 integrated" went out without four tickets of the plan, and nothing proved item by item what each ticket asked for.
 
+SCOUT_ITEMS_TITLE = "## Report action items"
+SCOUT_ITEMS_BLOCK = (f"{SCOUT_ITEMS_TITLE}\n\nEnd the report with a `## Itens de ação` section: a numbered list, one decision or follow-up per item, each self-contained. "
+                     "With nothing to decide, write the line `Itens de ação: nenhum`. orq turns each item into an entry the coordinator must close; a report with neither raises an alert.\n")
 CONFORMANCE_TITLE = "## Delivery conformance"
 REAL_ENTRY = "[real entry]"
 _CHECKBOX = re.compile(r"^[ \t]*- \[[ xX]\][ \t]+(.+?)[ \t]*$", re.M)
@@ -13260,6 +13301,11 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
                 spec = f"{spec.rstrip()}\n\n{other_repos_block(pairs)}"
             else:
                 _write(tk["arquivo"], f"{text.rstrip()}\n\n{other_repos_block(pairs)}")
+        if title.lower().startswith("[scout]") and SCOUT_ITEMS_TITLE not in text:  # the report's decisions become one entry each (ingest)
+            if spec is not None:
+                spec = f"{spec.rstrip()}\n\n{SCOUT_ITEMS_BLOCK}"
+            elif tk and tk["arquivo"]:
+                _write(tk["arquivo"], f"{text.rstrip()}\n\n{SCOUT_ITEMS_BLOCK}")
         if orq_ticket(title, project):
             if spec is not None:
                 spec = _with_orq_block(spec)

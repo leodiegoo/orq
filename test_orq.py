@@ -23792,6 +23792,84 @@ def test_ticket394_the_example_registers_the_rewake_and_start_checks_for_it():
             orq_mod.HOOKS_FILES["claude"] = before
 
 
+# ticket 399: a worker report becomes one entry per action item; a scout with no section is an alert
+
+def _report399(a, text, name="r399.md"):
+    path = os.path.join(a.tmp.name, name)
+    open(path, "w").write(text)
+    return path
+
+
+THREE_ITEMS = "# Achados\n\n## Itens de ação\n\n1. Decidir A\n2. Decidir B\n3. Decidir C\n"
+
+
+def _done399(path, task="task_x"):
+    return {**_msg(-5, seq=970), "id": "msg_1", "type": "worker_done", "created_at": "2026-09-29T17:31:00Z", "subject": "achados",
+            "payload": json.dumps({"taskId": task, "outcome": "succeeded", "reportPath": path})}
+
+
+def test_action_items_tells_none_from_no_section():
+    f = orq_mod.action_items
+    assert f("# R\n\nItens de ação: nenhum\n") == [] and f("## Itens de ação\n\nNenhum.\n") == []
+    assert f("# R\n\ntexto\n") is None and f("## Itens de ação\n\nnada a fazer\n") is None
+
+
+def test_ticket_399_worker_report_items_become_one_entry_each_and_do_not_duplicate():
+    a = Env()
+    path = _report399(a, THREE_ITEMS)
+    _ingest_env(a, inbox={"ok": True, "result": {"messages": [_done399(path)], "count": 1}})
+    a.inbox(("worker_done", {"taskId": "task_x", "outcome": "succeeded", "reportPath": path}))  # the same message, on the `orq caixa` side
+    a.orq("ingest")
+    rw = _entries(a, "relatorio_worker")
+    assert [(e["item"], e["texto"], e["ref"]) for e in rw] == [(1, "Decidir A", "msg_1:1"), (2, "Decidir B", "msg_1:2"), (3, "Decidir C", "msg_1:3")], rw
+    a.orq("ingest")
+    a.prompt(NOTICE_A)  # ingest_mailbox
+    assert len(_entries(a, "relatorio_worker")) == 3, "ingerir de novo não duplica"
+
+
+def test_ticket_399_mailbox_first_then_manager_does_not_duplicate():
+    a = Env()
+    path = _report399(a, THREE_ITEMS)
+    _ingest_env(a, inbox={"ok": True, "result": {"messages": [_done399(path)], "count": 1}})
+    a.inbox(("worker_done", {"taskId": "task_x", "outcome": "succeeded", "reportPath": path}))
+    a.prompt(NOTICE_A)
+    assert len(_entries(a, "relatorio_worker")) == 3
+    a.orq("ingest")
+    assert len(_entries(a, "relatorio_worker")) == 3
+
+
+def test_ticket_399_final_report_items_become_one_entry_each():
+    a = Env()
+    file_path = _reserve92(a, report=THREE_ITEMS)
+    a.orq("ingest")
+    a.orq("ingest")
+    rw = [e for e in _entries(a, "relatorio_worker") if e.get("task") == "task_92"]
+    assert [(e["item"], e["caminho"]) for e in rw] == [(1, file_path), (2, file_path), (3, file_path)], rw
+
+
+def test_ticket_399_scout_report_without_section_alerts_and_code_ticket_does_not():
+    for title, text, alerts in (("[scout] varre", "# Achados\n\nsó prosa\n", ["scout_sem_itens"]), ("[scout] varre", "# A\n\nItens de ação: nenhum\n", []),
+                                ("Implementar x", "# A\n\nsó prosa\n", [])):
+        a = Env()
+        path = _report399(a, text)
+        _ingest_env(a, inbox={"ok": True, "result": {"messages": [_done399(path, "task_s")], "count": 1}})
+        a.set("tasks_run_a.json", [{"id": "task_s", "task_title": title, "status": "completed"}])
+        a.orq("ingest")
+        assert [e["alerta"] for e in a.events() if e["tipo"] == "alerta"] == alerts, (title, text)
+        assert len(_entries(a, "relatorio_worker")) == 1
+
+
+def test_ticket_399_scout_spec_asks_for_the_action_items_section():
+    a = Env(run="run_a")
+    r = a.orq("despachar", "--run", "run_a", "--titulo", "[scout] varre o cache", "--spec-arquivo", _spec(a, "# s\n\nVarra.\n"), "--modelo", "claude-haiku-4-5-20251001", "--effort", "low")
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    sent = arg[arg.index("--spec") + 1]
+    assert "## Itens de ação" in sent and "Itens de ação: nenhum" in sent, sent
+    b = Env(run="run_a")
+    assert _dispatch(b, spec=_spec(b, "# s\n\nFaça.\n")).returncode == 0
+    assert "Itens de ação" not in _log(b, "started.log")[0][_log(b, "started.log")[0].index("--spec") + 1], "ticket de código não leva o bloco"
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
@@ -23824,4 +23902,5 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
+
 
