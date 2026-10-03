@@ -37,8 +37,41 @@ def git(cwd, *args):
     return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
 
 
+CYCLE = {}  # the running cycle: id, start, branches and the seconds of each stage (ticket 355); die() closes it as returned
+
+
+def record(*args):
+    """Tells orq about a stage of the cycle (`orq integrate cycle`); the panel reads it. A failure only warns: the integration does not depend on it."""
+    r = subprocess.run([sys.executable, os.path.join(alive(), "orq.py"), "integrate", "cycle", "--id", CYCLE["id"], *args], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    if r.returncode:
+        print(f"integrar: could not record the cycle ({r.stderr.strip()})", file=sys.stderr)
+
+
+def start_cycle(branches):
+    CYCLE.clear()
+    CYCLE.update(id=f"{int(time.time())}-{os.getpid()}", t0=time.time(), stage_at=time.time(), branches=branches, secs={})
+    record("--stage", "merge", "--branches", *branches)
+
+
+def stage(name):
+    """Enters stage `name`, closing the previous one's seconds."""
+    if CYCLE:
+        CYCLE["secs"][CYCLE.get("stage", "merge")] = time.time() - CYCLE["stage_at"]
+        CYCLE.update(stage=name, stage_at=time.time())
+        record("--stage", name)
+
+
+def end_cycle(outcome, why=None):
+    if CYCLE:
+        secs = {**CYCLE["secs"], CYCLE.get("stage", "merge"): time.time() - CYCLE["stage_at"]}
+        record("--stage", "end", "--outcome", outcome, *(["--why", why[:200]] if why else []), *(f"--{k}-s={secs[k]:.1f}" for k in ("merge", "replay", "tests") if k in secs))
+        CYCLE.clear()
+
+
 def die(msg):
     print(f"integrar: {msg}", file=sys.stderr)
+    end_cycle("returned", msg.splitlines()[0])
     sys.exit(1)
 
 
@@ -101,12 +134,15 @@ def advance(wt):
     branch = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
     if not branch.startswith("integra/"):
         die(f"{wt} is not an integration worktree (branch {branch or 'detached'})")
+    if not CYCLE:  # `--avancar`: the conflict's cycle ended as returned; this is a new one
+        start_cycle(open(branches_file(wt)).read().split() if os.path.exists(branches_file(wt)) else [])
     if git(wt, "status", "--porcelain").stdout.strip():
         die(f"{wt} has a conflict or uncommitted changes: resolve, commit and run `integrar.py --avancar {wt}`")
     markers = git(wt, "grep", "-nE", "^(<<<<<<<|>>>>>>>) ", "--", ".").stdout.strip()
     if markers:
         die(f"leftover conflict marker:\n{markers}")
     replay = os.environ.get("ORQ_REPLAY", "" if os.environ.get("ORQ_TESTES") else REPLAY)
+    stage("replay")
     if replay:
         started = time.time()
         if subprocess.run(replay, shell=True, cwd=wt).returncode:
@@ -116,6 +152,7 @@ def advance(wt):
                 f.write(f"[PENDENTE: main did not advance, night replay failed] {time.strftime('%Y-%m-%d %H:%M')} {branch} in {wt}\n")
             die(f"night replay failing in {wt} ({time.time() - started:.1f} s); main did not advance")
         print(f"integrar: night replay ok in {time.time() - started:.1f} s")
+    stage("tests")
     if subprocess.run(tests_for(viva, wt), shell=True, cwd=wt).returncode:
         die(f"tests failing in {wt}; main did not advance")
     old = git(viva, "rev-parse", "--short", "HEAD").stdout.strip()
@@ -128,6 +165,7 @@ def advance(wt):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M')} FF main {old}..{git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}\n")
     conclude(viva, wt)  # before removing the worktree: the branches file lives in its gitdir
+    end_cycle("merged")
     git(viva, "worktree", "remove", "--force", wt)
     git(viva, "branch", "-d", branch)
     print(f"integrar: main at {git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}, worktree removed")
@@ -166,6 +204,7 @@ def integrate(branches, no_proof=None):
         die(r.stderr.strip())
     with open(branches_file(wt), "w") as f:
         f.write("\n".join(branches))
+    start_cycle(branches)
     for b in branches:
         r = git(wt, "merge", "--no-edit", b)
         if r.returncode:

@@ -176,6 +176,8 @@ orq machine set age_colors '[[10,"warn"],[30,"hot"],[60,"crit"]]'
 
 An item that crosses the critical limit records one `queue_item_aged` event (once per item, from the manager's lap or the digest, whichever runs first). It shows up in the digest's `linha` as a `sec` entry.
 
+**The integrator's queue and cycle (ticket 355).** `scripts/integrar.py` records `integrate_cycle` events (through `orq integrate cycle`): `merge` when the cycle starts, then `replay` and `tests` as it enters each step, and `end` with the `outcome` (`merged`, or `returned` with `returned_for`, the reason) and the seconds of the merge, replay and tests. A conflict, a red replay or red tests end the cycle as returned; `--avancar` after a conflict starts a new one. The digest's `integrator` field (also in `orq integrate queue list`, as lines on top) carries the running cycle (branches, how long, step), the queue in order with each wait, and the forecast: what is left of the running cycle plus the cycles still to start, (branches waiting / average branches per cycle) plus the return rate of the last 5 cycles as a fraction of one more, each cycle costing the median of those 5. With no history a cycle counts 6 min and the forecast says "estimated without history". With items in the queue and no cycle started for more than 10 min (counted from the later of the last cycle event and the oldest item), the digest's `integrator.stalled` carries the time it stopped, the dashboard and the TUI draw the block in red with "integrador parado desde HH:MM", and the coordinator gets one `integrador_parado` alert per stall (it goes away when a cycle starts).
+
 ### 2. `projects/<name>.json`: one file per project
 
 The easy way is `orq project add <path|url>`, which writes it. By hand:
