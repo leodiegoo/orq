@@ -416,6 +416,31 @@ elif cmd == "worker-start":
     res = {"runId": run or bound, "taskId": tid, "dispatchId": "ctx_term_novo%d" % n, "state": "ready", "stage": "input_accepted",
            "effects": [{"kind": "worktree", "action": "reused", "id": "wt"}, {"kind": "terminal", "role": "agent", "action": "created", "id": "term_novo%d" % n},
                        {"kind": "dispatch_input", "role": "agent", "id": "term_novo%d" % n, "state": "accepted"}]}
+elif cmd == "dispatch":
+    # como o Orca real (guia orchestration, 02/10): --inject numa task `ready` abre um dispatch NOVO, com capacidade nova, no terminal dado; fora de `ready` é task_not_startable
+    if bound is None or (run and run != bound):
+        print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "consumer_fenced"}})); sys.exit(0)
+    open(os.path.join(d, "dispatched.log"), "a").write(json.dumps(a) + "\\n")
+    ts = read_value("tasks_%s.json" % (run or bound), [])
+    t = next((t for t in ts if t["id"] == opt("--task")), None)
+    if t is None or t.get("status") != "ready":
+        failure("task_not_startable: " + str(opt("--task")) + " is " + str(t and t.get("status")))
+    new = "ctx_novo_disp%d" % len(ler_linhas("dispatched.log"))
+    t["status"], t["dispatch_id"] = "dispatched", new
+    json.dump(ts, open(os.path.join(d, "tasks_%s.json" % (run or bound)), "w"))
+    caps = read_value("caps.json", {})
+    caps[new] = "valid"
+    json.dump(caps, open(os.path.join(d, "caps.json"), "w"))
+    res = {"dispatch": {"id": new, "task_id": t["id"], "status": "dispatched"}, "injected": True}
+elif cmd == "send" and opt("--type") == "worker_done":
+    # como o Orca real (02/10, ticket 322): o primeiro worker_done aceito revoga a capacidade do dispatch; o seguinte volta "capability is revoked"
+    caps = read_value("caps.json", {})
+    if caps.get(opt("--dispatch-id")) == "revoked":
+        failure("Dispatch " + str(opt("--dispatch-id")) + " capability is revoked")
+    caps[opt("--dispatch-id")] = "revoked"
+    json.dump(caps, open(os.path.join(d, "caps.json"), "w"))
+    open(os.path.join(d, "done.log"), "a").write(json.dumps(a) + "\\n")
+    res = {"message": {"id": "msg_done"}}
 elif cmd in ("task-create", "task-update"):
     # como o Orca real (conferido num Run de teste em 29/09): só o Run ligado escreve (consumer_fenced); task-create devolve {task} com status
     # pending se há deps e ready se não; task-update muda o status e devolve {task}; id desconhecido é erro
@@ -16616,9 +16641,9 @@ def test_ticket165_give_back_sends_fix_writes_event_and_returns_task_to_dispatch
     r = a.orq("devolver", "task_feita", "o padrão era decisão do usuário")
     assert r.returncode == 0, r.stderr
     (env,) = _sent(a)
-    assert env[:5] == ["send", "--run", "run_a", "--to", "dispatch:ctx_0"] and "o padrão era decisão do usuário" in env[env.index("--body") + 1], env
+    assert env[:5] == ["send", "--run", "run_a", "--to", "dispatch:ctx_novo_disp1"] and "o padrão era decisão do usuário" in env[env.index("--body") + 1], env  # ticket 329: the new dispatch, not the one with the capability revoked
     (ev,) = [e for e in a.events() if e["tipo"] == "devolver"]
-    assert (ev["task"], ev["dispatch"], ev["run"]) == ("task_feita", "ctx_0", "run_a"), ev
+    assert (ev["task"], ev["dispatch"], ev["run"], ev["novo_dispatch"]) == ("task_feita", "ctx_0", "run_a", "ctx_novo_disp1"), ev
     assert a.orq("devolver", "task_fantasma", "x").returncode == 1
 
 
@@ -16630,6 +16655,7 @@ def test_ticket177_give_back_accepts_delivered_dispatch_that_task_list_does_not_
     _steer_env(a)
     a.set("tasks_run_a.json", [{"id": "task_feita", "status": "completed", "dispatch_id": None}])
     for target in ("ctx_0", "task_feita"):
+        a.set("tasks_run_a.json", [{"id": "task_feita", "status": "completed", "dispatch_id": None}])  # the new dispatch delivered again: completed, zeroed
         r = a.orq("devolver", target, "refaça")
         assert r.returncode == 0, (target, r.stderr)
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_0", "ctx_0"]
@@ -21589,6 +21615,183 @@ def test_ticket345_status_line_paints_the_oldest_age_with_ansi_only_on_request(m
         assert orq_mod.queue_age_line() == "Queues: 1 item, the oldest waiting 20 min"
     finally:
         orq_mod.queue_ages = real
+
+
+# ---- ticket 329: conformance checked before the worker_done; a send-back after it opens a new dispatch ----
+
+def _worker_done_cmd329(dispatch, report=None):
+    flag = f" --report-path {report}" if report else ""
+    return (f"orca orchestration send --from term_w1 --dispatch-capability dcap_x --type worker_done --subject \"done\" --body \"b\" --task-id task_t141 "
+            f"--dispatch-id {dispatch} --outcome succeeded{flag}")
+
+
+def _hook329(a, command, cwd):
+    r = a.orq("hook", "external", stdin=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd, "session_id": "s329"}))
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_ticket329_check_delivery_refuses_a_report_with_an_item_without_proof_before_the_worker_done():
+    a = Env(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt")
+    os.makedirs(wt)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "titulo": "orq: teste", "conformidade": ["volta ao worker", "entra na fila"]})
+    report = os.path.join(wt, "final-report.md")
+    open(report, "w").write("feito\n\n## Conformance\n\n1. volta `test_volta` (test_orq.py:10)\n2. entra na fila, sem prova\n")
+    cmd = _worker_done_cmd329("ctx_term_w1")
+    assert "orq check-delivery" in _hook329(a, cmd, wt), "worker_done without the check: the hook warns"
+    r = a.orq("check-delivery", "--dispatch", "ctx_term_w1", cwd=wt)
+    assert r.returncode == 1 and "2. entra na fila" in r.stdout and "1. volta" not in r.stdout, (r.stdout, r.stderr)
+    (ev,) = [e for e in a.events() if e["tipo"] == "entrega_conferida"]
+    assert (ev["ok"], ev["faltando"]) == (False, ["2. entra na fila"]), ev
+    assert "orq check-delivery" in _hook329(a, cmd, wt), "a failed check does not silence the hook"
+    open(report, "w").write("feito\n\n## Conformance\n\n1. volta `test_volta`\n2. fila `test_fila` (test_orq.py:20)\n")
+    r = a.orq("check-delivery", "--dispatch", "ctx_term_w1", cwd=wt)
+    assert r.returncode == 0 and "complete" in r.stdout, (r.stdout, r.stderr)
+    assert _hook329(a, cmd, wt) == "", "checked on the current report: silent"
+    open(report, "a").write("\nmais uma linha\n")
+    assert "orq check-delivery" in _hook329(a, cmd, wt), "the report changed after the check: the hook warns again"
+    assert _hook329(a, "ls", wt) == "" and _hook329(a, _worker_done_cmd329("ctx_sem_itens"), wt) == "", "other commands and dispatches with no items are left alone"
+
+
+def test_ticket329_check_delivery_finds_the_dispatch_of_its_own_terminal():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_w1")
+    wt = os.path.join(a.tmp.name, "wt")
+    os.makedirs(wt)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "titulo": "t", "terminal": "term_w1", "conformidade": ["x"]})
+    r = a.orq("check-delivery", cwd=wt)
+    assert r.returncode == 1 and "1. x" in r.stdout, (r.stdout, r.stderr)
+    assert [e["dispatch"] for e in a.events() if e["tipo"] == "entrega_conferida"] == ["ctx_term_w1"]
+
+
+def _send_back329():
+    """An incomplete delivery of ticket 141 whose old dispatch already has its capability revoked by the first worker_done."""
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery201(a, "feito\n\n## Conformance\n\n1. volta `test_volta`\n2. fila, sem prova\n")
+    a.set("caps.json", {"ctx_term_w1": "revoked"})
+    return a
+
+
+def _worker_done329(a, dispatch):
+    r = subprocess.run([a.bin, "orchestration", "send", "--from", "term_w1", "--type", "worker_done", "--dispatch-id", dispatch, "--task-id", "task_t141"],
+                       capture_output=True, text=True, env=a.env, timeout=30)
+    return json.loads(r.stdout)
+
+
+def test_ticket329_send_back_after_worker_done_opens_a_new_dispatch_with_a_new_capability():
+    a = _send_back329()
+    assert "capability is revoked" in _worker_done329(a, "ctx_term_w1")["error"]["message"], "the old dispatch cannot deliver again"
+    assert a.orq("ingest").returncode == 0
+    (dv,) = [e for e in a.events() if e["tipo"] == "devolver"]
+    assert (dv["dispatch"], dv["novo_dispatch"], dv["via"]) == ("ctx_term_w1", "ctx_novo_disp1", "terminal"), dv
+    (call,) = [json.loads(x) for x in open(os.path.join(a.fake, "dispatched.log"))]
+    assert call[:5] == ["dispatch", "--task", "task_t141", "--to", "term_w1"] and "--inject" in call, call
+    to_old = [c for c in _sent(a) if c[c.index("--to") + 1] == "dispatch:ctx_term_w1"]
+    (reason,) = [c for c in _sent(a) if c[c.index("--to") + 1] == "dispatch:ctx_novo_disp1"]
+    assert not to_old and "2. entra na fila" in reason[reason.index("--body") + 1], _sent(a)
+    task = next(t for t in json.load(open(os.path.join(a.fake, "tasks_run_a.json"))) if t["id"] == "task_t141")
+    assert (task["status"], task["dispatch_id"]) == ("dispatched", "ctx_novo_disp1"), task
+    assert not os.path.exists(os.path.join(a.home, "integrar-fila.json")) or not _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"], "nothing in the queue before the new worker_done"
+    assert "error" not in _worker_done329(a, "ctx_novo_disp1"), "the new dispatch's worker_done is accepted"
+    assert "capability is revoked" in _worker_done329(a, "ctx_novo_disp1")["error"]["message"], "and spends it, as the real one does"
+    assert "ctx_term_w1" in orqlib._sent_back(a.events()), "the return is open until the new worker_done is ingested"
+    complete = {"id": "msg_142", "run_id": "run_a", "type": "worker_done", "subject": "entregue", "body": "feito\n\n## Conformance\n\n1. volta `test_volta`\n2. fila `test_fila`\n",
+                "sequence": 6, "read": 0, "created_at": "2099-01-01T00:00:01Z",
+                "payload": json.dumps({"taskId": "task_t141", "dispatchId": "ctx_novo_disp1", "outcome": "succeeded", "branch": "feat/orq-x"})}
+    old = json.load(open(os.path.join(a.fake, "inbox.json")))
+    old["result"]["messages"].append(complete)
+    a.set("inbox.json", old)
+    assert a.orq("ingest").returncode == 0
+    verdicts = [e for e in a.events() if e["tipo"] == "conformidade"]
+    assert [(e["dispatch"], e["ok"]) for e in verdicts] == [("ctx_term_w1", False), ("ctx_novo_disp1", True)], verdicts
+    assert [(i["ticket"], i["branch"]) for i in _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]] == [("141", "feat/orq-x")], "the delivery enters the queue after the new worker_done"
+    assert orqlib._sent_back(a.events()) == {}, "the new dispatch's worker_done answers the return"
+
+
+def test_ticket329_send_back_counts_across_the_dispatches_it_opened():
+    a = _send_back329()
+    _evs(a, {"tipo": "conformidade", "msg": "msg_old1", "dispatch": "ctx_term_w1", "ok": False, "faltando": ["1. x"], "enviado": True},
+         {"tipo": "devolver", "dispatch": "ctx_term_w1", "novo_dispatch": "ctx_novo_a", "task": "task_t141", "run": "run_a"},
+         {"tipo": "conformidade", "msg": "msg_old2", "dispatch": "ctx_novo_a", "ok": False, "faltando": ["1. x"], "enviado": True},
+         {"tipo": "devolver", "dispatch": "ctx_novo_a", "novo_dispatch": "ctx_novo_b", "task": "task_t141", "run": "run_a"})
+    inbox = json.load(open(os.path.join(a.fake, "inbox.json")))
+    inbox["result"]["messages"][0]["payload"] = json.dumps({"taskId": "task_t141", "dispatchId": "ctx_novo_b", "outcome": "succeeded", "branch": "feat/orq-x"})
+    a.set("inbox.json", inbox)
+    assert a.orq("ingest").returncode == 0
+    assert [e["novo_dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_novo_a", "ctx_novo_b"], "a third send-back would loop: the alert takes over"
+    (al,) = [e for e in a.events() if e["tipo"] == "alerta" and e.get("alerta") == "conformidade_repetida"]
+    assert al["dispatch"] == "ctx_novo_b", al
+
+
+def test_ticket329_a_second_send_back_finds_the_dispatch_the_first_one_opened():
+    a = _send_back329()
+    assert a.orq("devolver", "task_t141", "primeira").returncode == 0
+    a.set("tasks_run_a.json", [{"id": "task_t141", "status": "completed", "dispatch_id": None}])  # the new dispatch delivered: completed, zeroed; worker-list does not list it
+    assert a.orq("devolver", "ctx_novo_disp1", "segunda").returncode == 0
+    assert [(e["dispatch"], e["novo_dispatch"], e["terminal"]) for e in a.events() if e["tipo"] == "devolver"] == [("ctx_term_w1", "ctx_novo_disp1", "term_w1"), ("ctx_novo_disp1", "ctx_novo_disp2", "term_w1")]
+
+
+def test_ticket329_the_new_dispatch_is_recorded_even_when_the_reason_does_not_reach_it():
+    a = _send_back329()
+    r = a.orq("devolver", "task_t141", "x", FAKE_FAIL="send")
+    assert r.returncode == 0 and "reason not delivered" in json.loads(r.stdout)["aviso_terminal"], (r.stdout, r.stderr)
+    assert [e["novo_dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_novo_disp1"], "the link the checks follow is already there"
+
+
+def test_ticket329_scratch_ticket_of_a_delivery_that_passed_on_the_new_dispatch_counts_as_done():
+    a = Env(run="run_a")
+    plan = _plan201(a.tmp.name, {"04": (1, "ready-for-agent")})
+    scratch = os.path.realpath(os.path.join(plan, "issues", "04-t.md"))
+    events = [{"tipo": "despacho", "dispatch": "ctx_1", "task": "t", "titulo": "#2039 fase 1, ticket 04: x", "scratch": [scratch]},
+              {"tipo": "worker_done", "dispatch": "ctx_1", "outcome": "succeeded", "msg": "m1"}, {"tipo": "conformidade", "dispatch": "ctx_1", "ok": False, "msg": "m1"},
+              {"tipo": "devolver", "dispatch": "ctx_1", "novo_dispatch": "ctx_2", "task": "t"}]
+    assert scratch not in orq_mod.scratch_done(plan, events), "sent back: not delivered yet"
+    events += [{"tipo": "worker_done", "dispatch": "ctx_2", "outcome": "succeeded", "msg": "m2"}, {"tipo": "conformidade", "dispatch": "ctx_2", "ok": True, "msg": "m2"}]
+    assert scratch in orq_mod.scratch_done(plan, events), "the new dispatch delivered it, and only the first one has a despacho event"
+
+
+def test_ticket329_final_report_edited_after_a_send_back_is_not_a_delivery_of_the_old_dispatch():
+    a = Env(run="run_a")
+    wt = os.path.join(a.tmp.name, "wt")
+    os.makedirs(wt)
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ingest": {"desde": "2000-01-01T00:00:00Z", "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
+    _write_state(os.path.join(a.home, "turnos.json"), {"ctx_1": {"task": "t", "sessao": "s", "cwd": wt, "inicio": "2026-10-02T10:00:00Z", "fim": "2026-10-02T10:10:00Z"}})
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "t", "dispatch": "ctx_1", "titulo": "x"}, {"tipo": "worker_done", "dispatch": "ctx_1", "outcome": "succeeded", "msg": "m1"},
+         {"tipo": "devolver", "dispatch": "ctx_1", "novo_dispatch": "ctx_2", "task": "t", "run": "run_a", "ts": "2026-10-02T10:20:00Z"})
+    open(os.path.join(wt, "final-report.md"), "w").write("# meio editado\n")
+    assert a.orq("ingest").returncode == 0
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["m1"], "the worker answers on ctx_2: no fallback worker_done for ctx_1"
+
+
+def test_ticket329_send_back_resumes_the_session_when_the_terminal_is_gone():
+    a = _send_back329()
+    a.set("terminals.json", ["term_int"])
+    _write_state(os.path.join(a.home, "turnos.json"), {"ctx_term_w1": {"task": "task_t141", "sessao": "sess-1", "cwd": a.tmp.name, "inicio": "2026-10-02T10:00:00Z", "fim": "2026-10-02T10:10:00Z", "modelo": "claude-sonnet-5-5"}})
+    assert a.orq("devolver", "task_t141", "refaça o item 2").returncode == 0
+    (create,) = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
+    assert "--resume" in create[create.index("--command") + 1] and "sess-1" in create[create.index("--command") + 1], create
+    (call,) = [json.loads(x) for x in open(os.path.join(a.fake, "dispatched.log"))]
+    assert call[call.index("--to") + 1] == "term_ret1", call
+    (dv,) = [e for e in a.events() if e["tipo"] == "devolver"]
+    assert (dv["via"], dv["terminal"]) == ("retomado", "term_ret1"), dv
+
+
+def test_ticket329_accept_delivery_lets_a_mate_checked_delivery_through_and_records_who():
+    a = _send_back329()
+    _evs(a, *({"tipo": "conformidade", "msg": f"msg_old{n}", "dispatch": "ctx_term_w1", "ok": False, "faltando": ["2. fila"], "enviado": True} for n in (1, 2)))
+    assert a.orq("ingest").returncode == 0
+    assert [e["tipo"] for e in a.events() if e["tipo"] == "alerta"] == ["alerta"] and not [e for e in a.events() if e["tipo"] == "entrega_orq"]
+    r = a.orq("accept-delivery", "ctx_term_w1", "--by", "mate-orq", "--summary", "read the diff: both items are covered by test_volta and test_fila")
+    assert r.returncode == 0, r.stderr
+    (acc,) = [e for e in a.events() if e["tipo"] == "conformidade_aceita"]
+    assert (acc["dispatch"], acc["por"]) == ("ctx_term_w1", "mate-orq") and "both items" in acc["resumo"], acc
+    assert [e for e in a.events() if e["tipo"] == "conformidade"][-1]["conferido_por"] == "mate-orq"
+    assert [i["ticket"] for i in _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]] == ["141"], "the accepted delivery enters the queue"
+    r = a.orq("accept-delivery", "ctx_term_w1", "--by", "mate-orq", "--summary", "again")
+    assert r.returncode == 1 and "nothing to accept" in r.stderr, r.stderr
+    assert a.orq("accept-delivery", "ctx_term_w1", "--by", " ", "--summary", "x").returncode == 1
 
 
 if __name__ == "__main__":
