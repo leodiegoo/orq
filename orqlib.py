@@ -7149,6 +7149,35 @@ def confirm_batches(run_id, res, by):
     return ev, res
 
 
+HOOK_TIMINGS_FILE = "hook-timings.json"
+HOOK_CLOCK = time.perf_counter
+
+
+def timed_hook_stage(stages, name, fn, clock=None):
+    """Runs one hook stage and records its elapsed milliseconds; `clock` keeps measurements deterministic in tests."""
+    clock = clock or HOOK_CLOCK
+    started = clock()
+    try:
+        return fn()
+    finally:
+        stages[f"{name}_ms"] = round((clock() - started) * 1000, 3)
+
+
+def save_hook_timings(kind, stages):
+    """Persist the latest measured stages per hook kind for `orq doctor hooks`."""
+    path = _path(HOOK_TIMINGS_FILE)
+    current = _dict(_read_json(path))
+    current[kind] = stages
+    _write_json(path, current)
+
+
+def hook_timings_text():
+    """Human-readable latest stage timings, empty before a hook has run."""
+    timings = _dict(_read_json(_path(HOOK_TIMINGS_FILE)))
+    return [f"hook timing: {kind}: " + ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items())
+            for kind, stages in sorted(timings.items()) if isinstance(stages, dict)]
+
+
 def absorb_heartbeats(run_id, pending_messages=None):
     """If ALL the Run's unacknowledged messages are heartbeat, consumes, acknowledges and returns the recorded event; otherwise None.
 
@@ -8023,6 +8052,7 @@ def run_hook(kind, harness="claude"):
     """Coordinator only (Run linked and terminal that is not a worker's). Fail-open: any exception becomes exit 0, a line in the log and, in session, prompt and stop, a warning to the user."""
     HOOK_STATE.clear()
     HOOK_STATE["kind"] = kind
+    stages, started, persist_timings = {}, HOOK_CLOCK(), False
 
     def overflow(*_):
         raise TimeoutError(f"hook {kind} passou de {HOOK_TIMEOUT}s")
@@ -8031,7 +8061,7 @@ def run_hook(kind, harness="claude"):
         signal.alarm(HOOK_TIMEOUT)
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             return 0  # outside Orca there is no Run or terminal: it neither calls Orca nor fills the log
-        ev = json.load(sys.stdin)
+        ev = timed_hook_stage(stages, "parse", lambda: json.load(sys.stdin))
         ev["_harness_orq"] = harness  # which agent the hook came from: the coordinator keeps its own
         if kind == "acordar" and (os.environ.get("ORQ_MATE") or harness != "claude"):
             return 0  # only the Claude coordinator has an async rewake; the mate and Codex get their notices typed
@@ -8060,7 +8090,22 @@ def run_hook(kind, harness="claude"):
                 if out:
                     print(json.dumps(out, ensure_ascii=False))
             return 0
-        run = coordinator(ev)
+        sid = ev.get("session_id") or ""
+        role = timed_hook_stage(stages, "role_lookup", lambda: _roles().get(sid))
+        if kind in ("prompt", "stop") and role == "worker":
+            persist_timings = True
+            def worker_fast_path():
+                timed_hook_stage(stages, "record_turn", lambda: record_turn(kind, ev, harness))
+                if kind == "prompt" and (origin_name(ev.get("prompt")) == "orca" or (ev.get("prompt") or "").startswith(STEER_LINE)):
+                    try:
+                        if out := timed_hook_stage(stages, "worker_ack", lambda: worker_ack(ev)):
+                            print(json.dumps(out, ensure_ascii=False))
+                    except Exception as e:  # noqa: BLE001 - fail-open: without the ack the worker reads as before
+                        log(f"worker ack: {type(e).__name__}: {e}")
+            timed_hook_stage(stages, "worker_fast_path", worker_fast_path)
+            return 0
+        run = timed_hook_stage(stages, "coordinator_lookup", lambda: coordinator(ev))
+        persist_timings = run is not None or role == "worker"
         if run is None:
             sid = ev.get("session_id") or ""
             if kind in ("prompt", "stop") and _roles().get(sid) == "worker":
@@ -8084,13 +8129,17 @@ def run_hook(kind, harness="claude"):
         if kind == "acordar":
             signal.alarm(0)  # it waits for hours: the harness's own timeout (28800 s) is the ceiling
             return hook_wake(ev)
-        emit_hook(HOOKS[kind](ev, run))
+        emit_hook(timed_hook_stage(stages, "hook_body", lambda: HOOKS[kind](ev, run)))
     except Exception as e:
         signal.alarm(0)  # the warning (macOS notification) may take a second: the alarm has already done its job
         log(f"hook {kind}: {type(e).__name__}: {e}")
         hook_failed(e)
     finally:
         signal.alarm(0)
+        if stages and persist_timings:
+            stages["total_ms"] = round((HOOK_CLOCK() - started) * 1000, 3)
+            with contextlib.suppress(Exception):
+                save_hook_timings(kind, stages)
         if HOOK_STATE.get("failed") and not HOOK_STATE.get("printed"):
             emit_hook()  # the hook died or lost Orca before answering: the warning still reaches the user
         elif kind in WARN_KINDS and not HOOK_STATE.get("failed"):
@@ -11153,6 +11202,8 @@ def doctor_hooks(pin=False):
     broken += len(mate_problems)
     if mate_problems:
         print("\n".join(mate_problems))
+    if timing_lines := hook_timings_text():
+        print("\n".join(timing_lines))
     if pin:
         print("orq link: " + ("wrapper written" if pin_orq_link() else "unchanged"))
     return 1 if broken else 0
@@ -12540,6 +12591,33 @@ def install_codex_hooks(example):
     return install_hooks(example, CODEX_HOOKS)
 
 
+def set_codex_hook_timeout(file_name, timeout=15):
+    """Put an explicit hook ceiling on each orq Codex command; changing command text requires renewed trust in `/hooks`."""
+    try:
+        text = open(file_name, encoding="utf-8").read()
+    except FileNotFoundError:
+        return 0
+    changed = 0
+
+    def update(match):
+        nonlocal changed
+        command = json.loads('"' + match.group(1) + '"')
+        if not HOOK_ORQ.search(command):
+            return match.group(0)
+        updated = re.sub(r"^ORQ_HOOK_TIMEOUT=\d+\s+", "", command)
+        updated = f"ORQ_HOOK_TIMEOUT={timeout} {updated}"
+        if updated == command:
+            return match.group(0)
+        changed += 1
+        return '"command": ' + json.dumps(updated, ensure_ascii=False)
+
+    updated_text = re.sub(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', update, text)
+    if changed:
+        json.loads(updated_text)
+        _replace_config(file_name, updated_text)
+    return changed
+
+
 ORQ_FILE_PATH = re.compile(r"[^\s\"';=]*/(orq\.py(?= hook )|precompact\.py(?= retomar\b|\s*$))")  # the script of an orq hook, not a log path that ends in .py
 STATUSLINE_PATH = re.compile(r"[^\s\"';=]*/orq/statusline\.sh\b")
 
@@ -12611,8 +12689,11 @@ def install():
     for agent, target in HOOKS_FILES.items():
         moved = repoint_hooks(target)
         add = install_hooks(os.path.join(orqpaths.HERE, HOOKS_EXAMPLE[agent]), target)
+        timeout_changes = set_codex_hook_timeout(target) if agent == "codex" else 0
         out += [f"{agent}: {moved} command(s) repointed to {orqpaths.CODE}" + (": Codex trusts a hook by its text, review them in /hooks" if agent == "codex" else "")] if moved else []
         out += [f"{agent}: added {ev} group {g}" for ev, g in add]
+        if timeout_changes:
+            out.append(f"codex: {timeout_changes} hook command(s) set ORQ_HOOK_TIMEOUT=15; hook hash changes, review again in /hooks")
     out += install_links()
     if pin_orq_link(python):
         out.append(f"wrote: {ORQ_LINK} -> {os.path.join(orqpaths.CODE, 'orq.py')}")
