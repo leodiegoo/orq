@@ -3639,6 +3639,18 @@ def test_release_does_ack_then_release_and_writes_the_event():
     assert (ev["dispatch"], ev["task"], ev["run"], ev["estado"], ev["fechado"], ev["terminal"]) == ("ctx_term_w1", "task_w1", "run_a", "released", False, "term_w1"), ev
 
 
+def test_release_in_another_run_returns_its_binding_to_the_mate():
+    a = Env(run="run_a")
+    _multi(a, {"run_a": "term_coord", "run_b": "term_mate"})
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_b", "task": "task_w1", "status": "completed", "terminal": "active"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    r = a.orq("liberar", "ctx_term_w1")
+    assert r.returncode == 0, r.stderr
+    assert _binds(a) == {"run_a": "term_coord", "run_b": "term_mate"}
+    (ev,) = [e for e in a.events() if e["tipo"] == "liberar"]
+    assert ev["run"] == "run_b"
+
+
 def test_release_retained_closes_the_worker_terminal_after_the_release():
     a = Env(run="run_a")
     _release_env(a, release="retained")
@@ -4163,6 +4175,18 @@ def test_ticket_close_writes_answer_resolved_and_closes_the_task():
     assert json.load(open(os.path.join(a.fake, "tasks_run_a.json")))[0]["status"] == "completed"
     (ev,) = [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "fechar"]
     assert (ev["ticket"], ev["task"], ev["task_fechada"]) == ("01", "task_tk1", True)
+
+
+def test_ticket_close_in_another_run_returns_its_binding_to_the_mate():
+    a = Env(run="run_a")
+    _multi(a, {"run_a": "term_coord", "run_b": "term_mate"})
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "01-mate.md"), "w") as f:
+        f.write("# 01: Mate\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_b\nTask: task_mate\n\n## What to build\n\nX\n")
+    a.set("tasks_run_b.json", [{"id": "task_mate", "status": "dispatched", "deps": "[]"}])
+    r = a.orq("ticket", "fechar", "01", "--answer", "done")
+    assert r.returncode == 0, r.stderr
+    assert _binds(a) == {"run_a": "term_coord", "run_b": "term_mate"}
 
 
 def test_ticket_close_unblocks_the_ticket_that_depended_on_it():
