@@ -7158,6 +7158,8 @@ def hook_prompt(ev, run):
         if org == "aviso_orq" and text_value.lstrip().startswith("orq: PR ") and (obligation_part := obligations_line(read_events())):
             ln = [*ln, obligation_part]  # the merge notice arrives already carrying what it asks for
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
+    with contextlib.suppress(Exception):
+        _gate_resets_total((ev.get("session_id") or "")[:8])
     entry = append_event({"tipo": "entrada", "origem": "usuario", "texto": text_value[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             "terminal": os.environ["ORCA_TERMINAL_HANDLE"],
                             **({"com_aviso": True} if with_notice else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, new_id=True)
@@ -7316,26 +7318,44 @@ def away_blocker(events, now_at):
 
 
 INTAKE_OLD_MIN = 30  # an entry from another session with no intake for longer than this also blocks the Stop
+STOP_TETO_SESSAO = 4  # blocks in a row of the session, of any origin, below the 8 in a row of Claude Code; the next Stop goes through with `gate_falhou` (`teto_da_sessao`)
 GATE_BLOCKERS = 2  # the Stop blocks the same set of open entries, in one session, up to 2 times in a row; then releases with a systemMessage and `gate_falhou`
 
 
 def _gate_blocks(session, ids):
-    """Should the Stop block now? Counts in cursor.json per session and per set of open entries: a new set restarts the counter, and the
-    GATE_BLOCKERS+1-th Stop of the same set goes through. The payload's `stop_hook_active` is not used: another hook (OMC, engram) turns it on without it being our block."""
+    """Should the Stop block now? Counts in cursor.json per session: `n` per set of open entries (a new set restarts it, and the GATE_BLOCKERS+1-th Stop of
+    the same set goes through) and `total` for every block of the session, whatever its origin (entry, obligation, away; ids=[] for away alone): the
+    STOP_TETO_SESSAO+1-th goes through, because a set that changes each time would restart `n` forever. Returns "block", "conjunto" or "teto". The payload's
+    `stop_hook_active` is not used: another hook (OMC, engram) turns it on without it being our block."""
     r = []
 
     def count_from(c):
         s = _sub(_sub(c, "stop_gate"), session)
         key_name = ",".join(sorted(ids))
-        if s.get("conjunto") != key_name:
-            s.clear()
-            s.update(conjunto=key_name, n=0)
-        if s["n"] < GATE_BLOCKERS:
-            s["n"] += 1
-            r.append(True)
+        if ids and s.get("conjunto") != key_name:
+            s["conjunto"], s["n"] = key_name, 0
+        if s.get("total", 0) >= STOP_TETO_SESSAO:
+            r.append("teto")
+        elif ids and s["n"] >= GATE_BLOCKERS:
+            r.append("conjunto")
+        else:
+            s["total"] = s.get("total", 0) + 1
+            if ids:
+                s["n"] += 1
+            r.append("block")
 
     _cursor_mut(count_from)
-    return bool(r)
+    return r[0]
+
+
+def _gate_resets_total(session):
+    """A Stop with nothing to block, or a prompt from the user, ends the run of blocks of the session."""
+    def reset(c):
+        s = _sub(_sub(c, "stop_gate"), session)
+        if s.get("total"):
+            s["total"] = 0
+
+    _cursor_mut(reset)
 
 
 def _stop_motive(events, now_at):
@@ -7418,9 +7438,12 @@ def _hook_stop(ev, run):
     old_entries = obligations_to_chase(events, now_at)
     asked = [p for p in mate_pending(events, _mates(), now_at) if p["grupo"] == mate and p["estado"] != "escalado"] if mate else []  # the mate answers before it stops (ticket 323)
     blocker = None if mate else away_blocker(events, now_at)
+    session = (ev.get("session_id") or "")[:8]
     if not without and not old_entries and not asked and not blocker:
+        with contextlib.suppress(Exception):
+            _gate_resets_total(session)
         return None
-    msg, session, gate_ids = MARK, (ev.get("session_id") or "")[:8], []
+    msg, gate_ids = MARK, []
     if without:
         ids = [e["id"] for e in without]
         append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": session})
@@ -7440,10 +7463,20 @@ def _hook_stop(ev, run):
                 + f". Answer each with `orq mate raise --corr {asked[0]['corr']} --type answer --text \"…\"` before you stop.")
         gate_ids += [p["corr"] for p in asked]
     if gate_ids:
-        if _gate_blocks(session, gate_ids):
+        verdict = _gate_blocks(session, gate_ids)
+        if verdict == "block":
             return {"decision": "block", "reason": msg}
-        append_event({"tipo": "gate_falhou", "abertas": gate_ids, "sessao": session})
-    return {**({"systemMessage": msg} if without or old_entries or asked else {}), **({"decision": "block", "reason": blocker} if blocker else {})}
+        append_event({"tipo": "gate_falhou", "abertas": gate_ids, "sessao": session, **({"motivo": "teto_da_sessao"} if verdict == "teto" else {})})
+    if blocker:
+        verdict = _gate_blocks(session, [])
+        if verdict == "block":
+            return {"decision": "block", "reason": blocker}
+        append_event({"tipo": "gate_falhou", "abertas": [], "sessao": session, "motivo": "teto_da_sessao"})
+        return {"systemMessage": f"{MARK} {STOP_TETO_SESSAO} blocks in a row in this session: letting the turn end. {blocker}"}
+    elif not gate_ids:
+        with contextlib.suppress(Exception):
+            _gate_resets_total(session)
+    return {"systemMessage": msg} if without or old_entries or asked else {}
 
 
 def _ask_data(ev):

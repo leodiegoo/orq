@@ -14062,6 +14062,50 @@ def test_ticket156_third_stop_of_same_collection_passes_with_gate_failed():
     assert [x for x in a.events() if x["tipo"] == "gate_falhou"], "o orçamento estourado deixa o evento"
 
 
+def test_ticket392_session_ceiling_stops_the_chain_of_blocks_across_changing_sets():
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0")
+    a.prompt("um")
+    e = _merge_main(a)
+    verdicts = []
+    for key in ("deploy", "limpeza", None):
+        verdicts += [json.loads(_stop(a).stdout or "{}") for _ in range(3)]
+        if key:
+            assert a.orq("feito", e, key, "--prova", "ok").returncode == 0
+    blocks = [bool(v.get("decision")) for v in verdicts]
+    assert sum(blocks) == orq_mod.STOP_TETO_SESSAO and not any(blocks[-3:]), blocks  # 2 per set, 2 sets; the third set's Stops go through
+    assert verdicts[-1]["systemMessage"]
+    failed = [x for x in a.events() if x["tipo"] == "gate_falhou" and x.get("motivo") == "teto_da_sessao"]
+    assert failed and failed[0]["sessao"] == "abcdef12"
+
+
+def test_ticket392_away_block_counts_in_the_same_session_total():
+    a = Env(run="run_a")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODEL105)
+    a.orq("away", "on")
+    path = os.path.join(a.home, "cursor.json")
+    cursor = json.load(open(path))
+    cursor["stop_gate"] = {"abcdef12": {"conjunto": "e1,e2", "n": 2, "total": orq_mod.STOP_TETO_SESSAO - 1}}  # 3 blocks already, from entries and obligations
+    json.dump(cursor, open(path, "w"))
+    blocks = [bool(_stop126(a).get("decision")) for _ in range(3)]
+    assert blocks == [True, False, False], blocks  # the away budget alone (AWAY_BLOCKERS) would block 3 times
+    assert any(x["tipo"] == "gate_falhou" and x.get("motivo") == "teto_da_sessao" for x in a.events())
+
+
+def test_ticket392_user_prompt_and_empty_stop_zero_the_total():
+    a = Env(run="run_a")
+    _tk105(a, "88", "Passagem escrita", task="task_88", extra=MODEL105)
+    a.orq("away", "on")
+    _stop126(a)
+    total = lambda: json.load(open(os.path.join(a.home, "cursor.json")))["stop_gate"]["abcdef12"]["total"]  # noqa: E731
+    assert total() == 1
+    a.prompt("/away")  # an orq command closes by itself, so it leaves no open entry behind
+    assert total() == 0
+    _stop126(a)
+    assert total() == 1
+    a.orq("away", "off")
+    assert _stop126(a) == {} and total() == 0
+
+
 def test_ticket156_obligation_done_or_deferred_allows_stopping():
     a = _prs_env(ORQ_OBRIGACAO_MIN="0")
     e = _merge_main(a)
