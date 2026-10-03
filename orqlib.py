@@ -1694,8 +1694,8 @@ def open_steers(events, now_at):
     """
     out = {}
     for e in events:
-        m = e.get("msg_id")
-        if e.get("tipo") == "steer" and m and _ts(e.get("ts")):
+        m = e.get("resposta_id") if e.get("tipo") == "resposta_worker" and e.get("aviso_terminal") else e.get("msg_id")
+        if m and e.get("tipo") in ("steer", "resposta_worker") and _ts(e.get("ts")):
             out[m] = {"steer": e, "tentativas": 0, "ultima": _ts(e["ts"])}
         elif e.get("tipo") == "steer_reentrega" and m in out and _ts(e.get("ts")):
             out[m]["tentativas"] += 1
@@ -9463,7 +9463,7 @@ def redeliver_steers(now_at=None):
 
 
 def _steer_receipt(target, text_value):
-    """`orq reply <task|msg_id> "<text>"` run by the worker: the receipt of its open steer (`steer_fim` read, source reply), or None if the target is no open steer."""
+    """`orq reply <task|msg_id> "<text>"` run by the worker: the receipt of its open steer or coordinator answer (`steer_fim` read, source reply), or None if the target has no open delivery."""
     m, s = next(((m, s) for m, s in open_steers(read_events(), datetime.now(timezone.utc)).items() if target in (m, s["steer"].get("task"))), (None, None))
     if not s:
         return None
@@ -9492,8 +9492,14 @@ def reply_to(msg_id, text_value):
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
     dispatch = _msg_dispatch(line)
     woken = wake(dispatch, f"coordinator's answer to your message {msg_id}: {text_value}") if dispatch in _hibernated() else None  # the hibernated worker would not read the reply in the inbox
-    return append_event({"tipo": "resposta_worker", "msg_id": msg_id, "run": target, "dispatch": dispatch, "texto": text_value,
-                         "resposta_id": (res.get("message") or res).get("id"), **({"acordado": woken["estado"]} if woken else {})})
+    terminal_delivery = None
+    if dispatch and not woken:
+        handle = _dispatch_terminal(target, dispatch)
+        terminal_delivery = type_text(handle, text_value) if handle else "sem_terminal"
+    response_id = (res.get("message") or res).get("id")
+    return append_event({"tipo": "resposta_worker", "msg_id": msg_id, "run": target, "dispatch": dispatch, "task": _payload(line).get("taskId"), "texto": text_value,
+                         "resposta_id": response_id, **({"linha": text_value} if response_id else {}),
+                         **({"acordado": woken["estado"]} if woken else {}), **({"aviso_terminal": terminal_delivery} if terminal_delivery is not None else {})})
 
 
 REQUEST_TITLE = "## User request"

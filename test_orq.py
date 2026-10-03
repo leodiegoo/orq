@@ -6298,6 +6298,34 @@ def test_ticket26_reply_links_question_run_and_replies_through_manager():
     assert (ev["msg_id"], ev["run"], ev["dispatch"]) == ("msg_q50", "run_b", "ctx_q"), ev
 
 
+def test_ticket415_reply_types_answer_into_stopped_codex_worker_prompt():
+    a = Env(run="run_a")
+    _multi(a, {"run_a": "term_coord"}, ["run_a"])
+    a.set("workers.json", [{"handle": "term_q", "run": "run_a", "task": "task_q", "dispatch": "ctx_q", "status": "dispatched", "agent": "codex"}])
+    _inbox(a, _ask_question(50, "ctx_q"))
+    _write_state(os.path.join(a.home, "turnos.json"), {"ctx_q": {"inicio": _iso(-600), "fim": _iso(-60), "harness": "codex"}})
+    r = a.orq("reply", "msg_q50", "use o índice")
+    assert r.returncode == 0, r.stderr
+    typed = _sent_notices(a, "term_q")
+    assert len(typed) == 1 and typed[0][typed[0].index("--text") + 1] == "use o índice", typed
+    (ev,) = [e for e in a.events() if e["tipo"] == "resposta_worker"]
+    assert ev["aviso_terminal"] == "enviado" and ev["resposta_id"] == "msg_r1", ev
+    assert "steer without receipt" in a.orq("agents").stdout
+
+
+def test_ticket415_reply_does_not_type_answer_into_busy_worker():
+    a = Env(run="run_a")
+    _multi(a, {"run_a": "term_coord"}, ["run_a"])
+    a.set("workers.json", [{"handle": "term_q", "run": "run_a", "task": "task_q", "dispatch": "ctx_q", "status": "dispatched", "agent": "codex"}])
+    _inbox(a, _ask_question(50, "ctx_q"))
+    a.set("busy.json", ["term_q"])
+    r = a.orq("reply", "msg_q50", "use o índice")
+    assert r.returncode == 0, r.stderr
+    assert _sent_notices(a, "term_q") == [] and len(_log(a, "replied.log")) == 1
+    (ev,) = [e for e in a.events() if e["tipo"] == "resposta_worker"]
+    assert ev["aviso_terminal"] == "ocupado", ev
+
+
 def test_ticket26_reply_in_coordinator_linked_run_without_manager():
     a = Env(run="run_a")
     _inbox(a, _ask_question(50, "ctx_q", run="run_a"))
@@ -24004,5 +24032,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
-
