@@ -3199,7 +3199,7 @@ def _ingest_msg(m, since, already, titles, send=True):
     p = _payload(m)
     _delivery_proof(m, p)
     try:
-        if _delivery_conformance(m, p, send):  # an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
+        if _delivery_worktrees(m, p, send) and _delivery_conformance(m, p, send):  # a commit outside the dispatch worktrees (ticket 352); an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
             queued = _orq_delivery(m, p)
             _delivery_head_of_worktree(m, p)
             if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
@@ -8577,6 +8577,67 @@ def _delivery_conformance(m, p, send=True):
     return not missing
 
 
+def _is_ancestor(path, sha):
+    try:
+        return subprocess.run(["git", "-C", path, "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True, timeout=10).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _common_dir(path):
+    return os.path.realpath((_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir") or path).strip())
+
+
+def check_worktrees(shas, allowed, repos):
+    """Cited commits that live in a worktree the dispatch did not list: [(sha, where, expected)] (ticket 352). `allowed` are the worktrees of the dispatch (Orca's and the
+    ones `orq dispatch` made for the ticket's other repos); `repos` add the live clones to look in. A commit that an allowed worktree holds is fine; one that exists in no
+    worktree proves nothing here (`check_delivery` warns). `expected` is the allowed worktree of the same repository, else the first one."""
+    allowed = [os.path.realpath(a) for a in allowed if a]
+    found = list(dict.fromkeys(os.path.realpath(w) for r in [*allowed, *repos] if r for w in (l[9:] for l in (_git(r, "worktree", "list", "--porcelain") or "").splitlines() if l.startswith("worktree "))))
+    out = []
+    for sha in shas:
+        holders = [w for w in found if _is_ancestor(w, sha)]
+        if holders and not any(h in allowed for h in holders):
+            expected = next((a for a in allowed if _common_dir(a) == _common_dir(holders[0])), allowed[0] if allowed else None)
+            out.append((sha, holders[0], expected))
+    return out
+
+
+def _delivery_worktrees(m, p, send=True):
+    """worker_done `succeeded` that cites a commit made outside the dispatch's worktrees (a live clone, a worktree of its own) -> `worktree_fora` event and `send_back` with the
+    path expected (ticket 352). True when the delivery may go on. Up to CONFORMANCE_SEND_BACKS times per dispatch, then an alert and the coordinator decides."""
+    d = p.get("dispatchId")
+    if p.get("outcome") != "succeeded" or not d:
+        return True
+    events = read_events()
+    verdicts = [e for e in events if e.get("tipo") == "worktree_fora" and e.get("dispatch") == d]
+    prev = next((e for e in reversed(verdicts) if e.get("msg") == m["id"]), None)
+    if prev and (prev.get("ok", True) or prev.get("enviado") or not send):
+        return prev.get("ok", True)
+    wt = _dispatch_worktree(m.get("run_id"), d)
+    text_value = f"{m.get('subject') or ''}\n{m.get('body') or ''}\n{_text_of(os.path.expanduser(p.get('reportPath') or ''))}"
+    shas = list(dict.fromkeys(SHA_RE.findall(text_value)))
+    if not wt or not shas:
+        return True
+    disp = next((e for e in reversed(events) if e.get("tipo") == "despacho" and e.get("dispatch") == d), None) or {}
+    repos = [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r] + [repo_folder(x["repo"]) for x in projects().values()]
+    bad = prev["fora"] if prev else [f"{sha[:8]} is in {where}; expected {expected}" for sha, where, expected in check_worktrees(shas, [wt, *disp.get("worktrees", [])], repos)]
+    ev = {"tipo": "worktree_fora", "msg": m["id"], "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "ok": not bad, "fora": bad}
+    sent = len({e.get("msg") for e in verdicts if e.get("enviado")})
+    if bad and send and sent >= CONFORMANCE_SEND_BACKS:
+        ev["aviso"] = f"sent back {sent} times already: it stays out of the queue for the coordinator (orq send-back {d}, or orq integrate queue add)"
+        append_event({"tipo": "alerta", "alerta": "worktree_fora_repetida", "dispatch": d, "task": p.get("taskId"), "run": m.get("run_id"), "msg": m["id"], "fora": bad})
+    elif bad and send:
+        try:
+            send_back(d, "commit outside the dispatch worktrees: " + "; ".join(bad) + ". Redo the work in the expected worktree and deliver again; never commit in a live clone.", m.get("run_id"))
+            ev["enviado"] = True
+        except Exception as e:  # noqa: BLE001 - the delivery stays out of the queue anyway; the coordinator sends it back by hand
+            ev["aviso"] = f"send-back failed ({type(e).__name__}: {e}): orq send-back {d} \"<the list>\""
+            log(f"worktrees: {d}: {ev['aviso']}")
+    append_event(ev)
+    return not bad
+
+
 def _md_field(txt, item_name):
     """`Nome: value` or `**Nome:** value` of a ticket's text, or None."""
     m = re.search(rf"^\**{re.escape(item_name)}(?::\**|\**:)[ \t]*(.*?)[ \t]*$", txt, re.M | re.I)
@@ -11350,18 +11411,40 @@ def orq_ticket(title, project=None):
 
 
 def orq_worktree_block(number=None):
-    """The block that tells the worker of an orq ticket to work in its own worktree: the live checkout (ORQ_INSTALL) receives only the integrator."""
-    n = number or "<ticket>"
-    live, wt = ORQ_INSTALL, os.path.join(WT_ROOT, n)
-    return (f"{ORQ_WT_TITLE}\n\nNever commit on `main` of the live checkout `{live}`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
-            f"Create the worktree `{wt}` from `origin/main` on a branch of its own (`git -C {live} worktree add -b <type>/<description> {wt} origin/main`) "
-            "and work and commit only in it.\n"
-            "Run `orq test --affected` (the tests your diff touches), not the whole `python3 test_orq.py`: the integrator runs the full suite.\n")
+    """The block that tells the worker of an orq ticket where to work: Orca's worktree of the dispatch (its starting folder), never the live checkout (ORQ_INSTALL)."""
+    live = ORQ_INSTALL
+    return (f"{ORQ_WT_TITLE}\n\nWork and commit only in the worktree Orca created for this dispatch: the folder you start in. Do not create another one and do not check out a branch in a live clone.\n"
+            f"Never commit on `main` of the live checkout `{live}`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
+            "Run `orq test --affected` (the tests your diff touches), not the whole `python3 test_orq.py`: the integrator runs the full suite.\n"
+            "The delivery is refused if a commit you cite lives outside the worktrees of the dispatch.\n")
 
 
 def _with_orq_block(txt, number=None):
     """`txt` with the worktree block at the end; if the block is already there, returns `txt` as it came."""
     return txt if ORQ_WT_TITLE in txt else txt.rstrip("\n") + "\n\n" + orq_worktree_block(number)
+
+
+OTHER_REPOS_TITLE = "## Other repos' worktrees"
+
+
+def other_repos_worktrees(txt, number):
+    """The `Other repos: <path>, <path>` line of the ticket or spec -> a worktree of each repo, made now by `orq dispatch` (ticket 352), as [(repo, worktree)]. The worker commits
+    in these and in Orca's, nowhere else: a live clone of another repo never gets a checkout or a commit of a worker."""
+    out = []
+    for repo in filter(None, (x.strip() for x in (_md_field(txt or "", "Other repos") or "").split(","))):
+        repo = os.path.realpath(os.path.expanduser(repo))
+        wt = os.path.join(WT_ROOT, f"{number}-{os.path.basename(repo)}")
+        if not os.path.isdir(wt):
+            base = "origin/HEAD" if _git(repo, "rev-parse", "--verify", "--quiet", "origin/HEAD") else "HEAD"
+            r = subprocess.run(["git", "-C", repo, "worktree", "add", "-b", f"chore/{number}-{os.path.basename(wt)}", wt, base], capture_output=True, text=True, timeout=60)
+            if r.returncode:
+                raise ValueError(f"could not make the worktree of {repo}: {r.stderr.strip()}")
+        out.append((repo, wt))
+    return out
+
+
+def other_repos_block(pairs):
+    return f"{OTHER_REPOS_TITLE}\n\nCommit in these worktrees for each repo; never in the repo's own clone:\n" + "".join(f"- {repo}: `{wt}`\n" for repo, wt in pairs)
 
 
 def _gate_backlog(tk):
@@ -11463,6 +11546,13 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             raise NoSlot(reason)
         if reason:
             return _enqueue_dispatch(reason, run, title, spec, model, effort, worktree, name, base_branch, entry, tk, priority, agent, project, service)
+        text = spec if spec is not None else _text_of((tk or {}).get("arquivo") or "")
+        pairs = other_repos_worktrees(text, (tk or {}).get("num") or "x")  # ticket 352: one worktree per other repo the ticket touches
+        if pairs and OTHER_REPOS_TITLE not in text:
+            if spec is not None:
+                spec = f"{spec.rstrip()}\n\n{other_repos_block(pairs)}"
+            else:
+                _write(tk["arquivo"], f"{text.rstrip()}\n\n{other_repos_block(pairs)}")
         if orq_ticket(title, project):
             if spec is not None:
                 spec = _with_orq_block(spec)
@@ -11513,7 +11603,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
               **({"projeto": project} if project else {}),
               **({"servico": True} if service else {}), **({"direct": direct} if direct else {}),
-              **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
+              **({"worktrees": [w for _, w in pairs]} if pairs else {}), **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError, OSError):
