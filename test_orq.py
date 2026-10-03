@@ -16413,6 +16413,28 @@ def test_ticket177_give_back_accepts_delivered_dispatch_that_task_list_does_not_
         r = a.orq("devolver", target, "refaça")
         assert r.returncode == 0, (target, r.stderr)
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_0", "ctx_0"]
+def test_ticket335_send_back_resumed_terminal_carries_ticket_title():
+    a = Env(run="run_a")
+    _outage48(a)
+    a.set("workers.json", [_w48("term_w1", status="completed")])
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    r = a.orq("devolver", "ctx_term_w1", "refaça")
+    assert r.returncode == 0, r.stderr
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--title") + 1] == "Ticket 99 (resumed)", c
+
+
+def test_ticket335_refused_worker_done_after_resume_alerts_coordinator():
+    a = Env()
+    _reserve92(a)
+    assert a.orq("ingest").returncode == 0
+    (al,) = [e for e in a.events() if e["tipo"] == "alerta" and e["alerta"] == "entrega_recusada"]
+    assert (al["dispatch"], al["task"]) == ("ctx_92", "task_92") and "worker_done refused" in al["titulo"], al
+    a.orq("ingest")
+    assert len([e for e in a.events() if e.get("alerta") == "entrega_recusada"]) == 1, "o segundo ingest não repete"
+
+
 # ---------- ticket 155: an obligation orq can prove closes on its own ----------
 
 def _py155(a, code):

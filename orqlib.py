@@ -3333,6 +3333,9 @@ def ingest_final_reports():
         append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": file_path, "ref": msg, "run": run,
                       "task": t.get("task"), **_run_group(run)}, new_id=True)
+        # Orca refused the worker's own worker_done (revoked capability, e.g. after a send_back or a resume): it stays `dispatched` with an idle terminal
+        append_event({"tipo": "alerta", "alerta": "entrega_recusada", "task": t.get("task"), "run": run, "dispatch": dispatch, "msg": msg,
+                      "titulo": f"{subject}: worker_done refused, delivery recorded from {FINAL_REPORT}; stop the idle terminal"})
         with contextlib.suppress(Exception):  # the same check as a real worker_done (ticket 201); a failure only skips it
             _delivery_conformance({"id": msg, "subject": subject, "body": "", "run_id": run}, {"dispatchId": dispatch, "taskId": t.get("task"), "outcome": "succeeded", "reportPath": file_path})
         fresh += 1
@@ -8417,7 +8420,7 @@ def send_back(target, reason, run=None, achado=False):
                     cp = _checkpoint(d)
                 except (RuntimeError, subprocess.TimeoutExpired):
                     cp = {"head": None, "sujo": None}
-                line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": d, "cwd": cwd, "terminal": handle}
+                line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": _dispatch_title(run_, t["id"], d), "cwd": cwd, "terminal": handle}
                 r = _start_session(line, tn["sessao"], tn.get("modelo"), cp, f"start another worker with: orq relaunch {d} --note 'the session could not be resumed'", body_text,
                                   tn.get("harness") or "claude", None)
                 if r["estado"] == "falhou":
@@ -12562,6 +12565,17 @@ def dispatch_session(dispatch, agent, timeout=15):
     return {"sessao": h["sessionId"], "cwd": h.get("cwd"), "transcrito": _dict(h.get("source")).get("filePath")} if h else {}
 
 
+def _dispatch_title(run, task, dispatch):
+    """The terminal title of a dispatch that comes back: the title of its `despacho` event, else the Orca task's, else the dispatch id."""
+    ev = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == dispatch and e.get("titulo")), {})
+    if ev.get("titulo"):
+        return ev["titulo"]
+    try:
+        return next((t.get("task_title") for t in orca("task-list", "--run", run, timeout=20)["tasks"] if t["id"] == task and t.get("task_title")), dispatch)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError, KeyError):
+        return dispatch
+
+
 def _start_session(line, session, model, cp, tip, msg=MSG_CONTINUE, agent="claude", effort=None):
     """The agent resume (HARNESS) of `session` in a new terminal in worktree `line["cwd"]`, `retomada` event and screen check. Returns `line` with the
     state (retomado, sem_atividade or falhou)."""
@@ -13413,7 +13427,7 @@ def wake(target, text_value=None):
     d, p = next(((d, p) for d, p in _hibernated().items() if target in (d, p.get("task"))), (None, None))
     if not d:
         raise ValueError(f"{target} is not hibernated")
-    line = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p.get("titulo") or d, "cwd": p["cwd"], "terminal": p["terminal"]}
+    line = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p.get("titulo") or _dispatch_title(p["run"], p["task"], d), "cwd": p["cwd"], "terminal": p["terminal"]}
     if not os.path.isdir(p["cwd"]):
         return {**line, "estado": "sem_worktree", "aviso": f"the folder {p['cwd']} does not exist: nothing was started"}
     try:
