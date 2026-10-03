@@ -3785,6 +3785,20 @@ def test_dispatch_runs_worker_start_with_model_and_effort_and_returns_the_ids():
         ("run_a", "task_novo1", "ctx_term_novo1", "Ticket 05", "claude-sonnet-5-5", "medium", "term_novo1"), ev
 
 
+def test_dispatch_brief_authorizes_commit_only_when_project_enables_it():
+    a = Env(run="run_a")
+    _project(a, "autorizado", {"repo": "path:/r/autorizado", "commit_autorizado": True})
+    _project(a, "padrao", {"repo": "path:/r/padrao"})
+
+    assert _dispatch(a, "--projeto", "autorizado").returncode == 0
+    assert _dispatch(a, "--projeto", "padrao").returncode == 0
+
+    specs = [arg[arg.index("--spec") + 1] for arg in _log(a, "started.log")]
+    assert "coordinator authorizes you to commit" in specs[0]
+    assert "push" in specs[0] and "unless this spec explicitly authorizes it" in specs[0]
+    assert "coordinator authorizes you to commit" not in specs[1]
+
+
 def test_dispatch_prints_the_ready_waiter_command_and_does_not_create_another():
     a = Env(run="run_a")
     out = json.loads(_dispatch(a).stdout)

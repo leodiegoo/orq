@@ -13169,7 +13169,7 @@ def _file_tests(v):
 
 
 def projects():
-    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "merge_allowed", "erro"}}.
+    """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "merge_allowed", "commit_autorizado", "erro"}}.
 
     Fairness between projects in the dispatch queue (ticket 344): `priority_base` (1 to 3: the queue item inherits `min(its priority, priority_base)`), `reserve_slots` (machine slots only
     this project uses while it has work) and `max_slots` (live workers of the project at the same time); each one comes as None when absent or of the wrong type.
@@ -13199,6 +13199,7 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
+                         "commit_autorizado": d.get("commit_autorizado") is True,
                          "merge_allowed": {b: v for b, v in d["merge_allowed"].items() if v is True} if isinstance(d.get("merge_allowed"), dict) else {},
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
@@ -13836,6 +13837,9 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             spec = (f"{head}\n\n{REQUEST_TITLE}\n{request}\n\nWhat the coordinator wrote below does not replace it: done is checked against this request.\n\n"
                     f"{rest.lstrip(chr(10))}")
         if spec is not None:
+            commit_permission = "\n\nThe coordinator authorizes you to commit changes on this worker branch. Do not push; pushing is prohibited unless this spec explicitly authorizes it."
+            if project and projects().get(project, {}).get("commit_autorizado") is True:
+                spec = f"{spec.rstrip()}{commit_permission}"
             spec = f"{spec.rstrip()}\n\n{SPEC_BLOCKS}\n"
         environment = night_environment() if night_active(_cursor_ro()) else None  # at night the worker comes up with no git prompt (credential, pinentry)
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before

@@ -12,6 +12,8 @@ The coordinator is the Claude Code or Codex session the user talks to. It create
 
 Workers are Claude Code or Codex sessions Orca starts for a task (`orq dispatch --agent claude|codex`). Their first prompt is always Orca's dispatch preamble.
 
+The selected project's `commit_autorizado` flag can add commit permission to a worker's spec: the coordinator authorizes commits on that worker branch. The same line keeps pushing prohibited unless the spec explicitly allows it. Missing or false leaves the spec unchanged.
+
 A secondmate (`mate`, ticket 80) is a coordinator for one group of projects: a Claude Code or Codex session opened by `orq mate open` with `ORQ_MATE=<group>` in its environment, bound to its own Run. It talks to the coordinator only through `events.jsonl` (see "Secondmates by group").
 
 The agent manager (`manager`) is a plain shell running `painel-agent-manager.sh`. It has no model and costs no tokens.
