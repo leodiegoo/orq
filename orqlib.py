@@ -2329,7 +2329,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
     "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
     "segurar": "hold", "segurar_solta": "hold_release",
-    "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue",
+    "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue", "integrador_steer": "integrator_steer",
     "despacho": "dispatch", "despacho_fila": "dispatch_queued", "alerta": "alert", "alerta_visto": "alert_seen", "uso_aviso": "usage_notice",
     "uso_parou": "usage_stopped", "run_projeto": "run_project", "resposta": "answer", "resposta_worker": "worker_answer",
     "resposta_suspeita": "suspect_answer", "resposta_lavish": "lavish_answer", "resposta_coordenador": "coordinator_answer", "prioridade": "priority",
@@ -8517,6 +8517,38 @@ def wake_stopped(now_at=None):
     return [f"coordinator stopped with work that does not need the user: notice typed ({_quote(reason, 80)})"]
 
 
+INTEGRATOR_IDLE_MIN = float(os.environ.get("ORQ_INTEGRADOR_OCIOSO_MIN") or 2)  # the integrator ended its turn this long ago with the queue not empty: the manager steers it
+INTEGRATOR_REPEAT_MIN = float(os.environ.get("ORQ_INTEGRADOR_REPETE_MIN") or 10)  # the same steer is not typed again before this, if it does not start a turn
+
+
+def integrator_steer(now_at=None):
+    """One manager tick (ticket 363): the integrator service ended its turn at least INTEGRATOR_IDLE_MIN ago and the integrator queue still has branches → types "run the next
+    cycle" into it (a hibernated one is woken with it), once per idle period and at most every INTEGRATOR_REPEAT_MIN. Empty queue, running turn or no integrator: nothing.
+    Returns the panel lines."""
+    now_at, events = now_at or now_dt(), read_events()
+    d, queue = _integrator_dispatch(events), integration_queue()
+    if not d or not queue:
+        return []
+    turn = _dict(_turns_ro().get(d["dispatch"]))
+    ended, started = _ts(turn.get("fim")), _ts(turn.get("inicio"))
+    hibernated = d["dispatch"] in _hibernated()
+    if not hibernated and (not ended or (started and started > ended) or (now_at - ended).total_seconds() < INTEGRATOR_IDLE_MIN * 60):
+        return []
+    last = max((t for e in events if e.get("tipo") == "integrador_steer" and (t := _ts(e.get("ts")))), default=None)
+    if last and (now_at - last).total_seconds() < INTEGRATOR_REPEAT_MIN * 60:
+        return []
+    text_value = f"orq: the integrator queue has {len(queue)} branch(es) waiting and your turn ended: run the next cycle."
+    if hibernated:
+        result = wake(d["dispatch"], text_value)["estado"]
+    elif not (h := _integrator_terminal(events)):
+        return []
+    else:
+        result = type_text(h, text_value)
+        result = type_text_busy(h, text_value) if result == "ocupado" else result
+    append_event({"tipo": "integrador_steer", "dispatch": d["dispatch"], "fila": len(queue), "resultado": result})
+    return [f"integrator idle with {len(queue)} in the queue: steer ({result})"]
+
+
 def context_notices():
     """Empties the `notices` queue and returns the user-prompt context line with the notices that were not typed (empty if there are none)."""
     taken = []
@@ -8760,6 +8792,26 @@ MSG_REDISPATCH = ("The coordinator sent your delivery back. Orca revoked the cap
                   "capability) arrives in this terminal in a moment, followed by the reason. Do nothing until it arrives; send the new worker_done with the new preamble's command.")
 
 
+def _inject_dispatch(run_, task, handle, restore, repeat):
+    """Opens a NEW dispatch of `task` in terminal `handle` (Orca revokes a dispatch's capability at its first worker_done, so a worker that goes on needs a new one): waits for
+    the terminal to be idle, puts the task back to `ready`, `dispatch --inject`. Returns the new dispatch id. On a refusal the task goes back to `restore`; ValueError says what
+    to repeat (`repeat`). Runs inside `_no_run(run_)`."""
+    try:
+        orca("wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "60000", area="terminal", timeout=70)  # ponytail: tui-idle is satisfied early in a turn; the agent queues what is typed
+        orca("task-update", "--id", task, "--status", "ready", "--run", run_, timeout=20)
+        res = orca("dispatch", "--task", task, "--to", handle, "--run", run_, "--inject", timeout=60)
+    except subprocess.TimeoutExpired as e:  # the dispatch may have opened: reverting the task or repeating would stack a second one
+        raise ValueError(f"orca dispatch of {task} in {handle} gave no answer ({e}): check `orq agents` before repeating `{repeat}`")
+    except RuntimeError as e:
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+            orca("task-update", "--id", task, "--status", restore, "--run", run_, timeout=20)
+        raise ValueError(f"the new dispatch of {task} did not open in {handle} ({e}): the task is back to {restore}; repeat `{repeat}`")
+    new = _dict(res.get("dispatch")).get("id") or res.get("dispatchId")
+    if not new:
+        raise ValueError(f"orca dispatch answered with no dispatch id: {json.dumps(res)[:300]}")
+    return new
+
+
 def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
     worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
@@ -8803,19 +8855,7 @@ def send_back(target, reason, run=None, achado=False):
             if r["estado"] == "falhou":
                 raise ValueError(r["aviso"])
             handle, via = r["novo"], "retomado"
-        try:
-            orca("wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "60000", area="terminal", timeout=70)  # ponytail: tui-idle is satisfied early in a turn; the agent queues what is typed
-            orca("task-update", "--id", t["id"], "--status", "ready", "--run", run_, timeout=20)
-            res = orca("dispatch", "--task", t["id"], "--to", handle, "--run", run_, "--inject", timeout=60)
-        except subprocess.TimeoutExpired as e:  # the dispatch may have opened: reverting the task or repeating would stack a second one
-            raise ValueError(f"orca dispatch of {t['id']} in {handle} gave no answer ({e}): check `orq agents` before repeating `orq send-back {t['id']} \"<reason>\"`")
-        except RuntimeError as e:
-            with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
-                orca("task-update", "--id", t["id"], "--status", "completed", "--run", run_, timeout=20)
-            raise ValueError(f"the new dispatch of {t['id']} did not open in {handle} ({e}): the task is back to completed; repeat `orq send-back {t['id']} \"<reason>\"`")
-        new = _dict(res.get("dispatch")).get("id") or res.get("dispatchId")
-        if not new:
-            raise ValueError(f"orca dispatch answered with no dispatch id: {json.dumps(res)[:300]}")
+        new = _inject_dispatch(run_, t["id"], handle, "completed", f"orq send-back {t['id']} \"<reason>\"")
         ev = append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "novo_dispatch": new, "terminal": handle, "run": run_, "texto": reason, "via": via})  # before the best-effort part: the link is what the checks follow
         try:
             orca("send", "--run", run_, "--to", f"dispatch:{new}", "--subject", "Delivery sent back", "--body", body_text, "--priority", "high", timeout=10)
@@ -13639,6 +13679,21 @@ MSG_WAKE = ("You were hibernated: the coordinator closed the terminal for being 
               "or the task already delivered, write the final report in a final-report.md file at the root of your worktree and show the path in the terminal.")
 
 
+MSG_WAKE_REVOKED = ("You were hibernated: the coordinator closed the terminal for being idle to free memory and has now woken you, in the same session. Orca had already revoked the "
+                    "capability of the dispatch you were on, so a NEW dispatch (fresh preamble with its own capability and handle) arrives in this terminal in a moment. Do nothing until it "
+                    "arrives; use the commands of the new preamble from then on. What arrived: {texto}")
+
+
+def _revoked_dispatch(d, run):
+    """Did Orca already settle dispatch `d` (worker-list `dispatchStatus` other than `dispatched`)? Then its capability is spent: send and escalation come back "capability is revoked".
+    Orca unreadable, or no such worker: False (the plain resume goes ahead)."""
+    try:
+        w = next((w for w in _all_workers(run) if w.get("dispatchId") == d), None)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return False
+    return bool(w) and w.get("dispatchStatus") != "dispatched"
+
+
 def _hibernated():
     """cursor.json `hibernados`: {dispatch: {task, run, titulo, agente, modelo, effort, sessao, cwd, terminal, entregue, desde, motivo, rss_liberado_mb}}."""
     return {d: p for d, p in _dict(_cursor_ro().get("hibernados")).items() if isinstance(p, dict)}
@@ -13926,12 +13981,15 @@ def _external_wait(a, pending, prs, tks):
     return None
 
 
-def hibernate_reason(a, now_at, cfg, pending=(), prs=(), tks=(), woken_at=None):
+def hibernate_reason(a, now_at, cfg, pending=(), prs=(), tks=(), woken_at=None, services=()):
     """Pure: why worker `a` (a row from agentes()) should hibernate, or None. Only looks at orq state; the screen and the processes are checked afterwards.
 
     Only the ended turn counts (end of turn in the worker hooks, no heartbeat or prompt after): `stopped`, what waits on purpose (`running` with
     a declared wait) and `delivered` without release. A stuck question, locked and the screen with a background shell stay out (those keep escalating).
-    Three reasons: waiting on something external that orq knows about (already past cfg.externa_min), delivered and not released, or stopped (both past cfg.min)."""
+    Three reasons: waiting on something external that orq knows about (already past cfg.externa_min), delivered and not released, or stopped (both past cfg.min).
+    A service dispatch (`services`: integrator, secondmate) never hibernates: its capability is spent after the first worker_done, and idle is how it waits for the next cycle (ticket 363)."""
+    if a.get("dispatch") in services:
+        return None
     end, start_at = _ts(a.get("turno_fim")), _ts(a.get("turno_inicio"))
     if a["estado"] not in ("parado", "rodando", "entregue", "aguardando_integracao") or a.get("retido") or a.get("tela") or not end or (start_at and start_at > end):
         return None
@@ -13967,6 +14025,8 @@ def _hibernate_agent(a, reason, procs, force=False):
         return refuse(f"worker {a['estado']}: no terminal to close")
     if a["terminal"] in _protected(a["run"]):
         return refuse("it is the coordinator or the manager: they never hibernate")
+    if a["dispatch"] in _services(read_events()):
+        return refuse("it is a service worker (integrator, secondmate): it never hibernates")
     if not (line["sessao"] and cwd and os.path.isdir(cwd)) or agent not in HARNESS:
         return refuse("no session_id and worktree recorded by the worker hooks (not an orq worker, or no way back)")
     if a["estado"] == "perguntando":
@@ -14018,8 +14078,9 @@ def hibernate_idle(now_at=None):
         return []
     _cursor_mut(lambda c: c.__setitem__("hibernar_volta", time.time()))
     now_at, cfg = now_at or datetime.now(timezone.utc), _hibernate_cfg()
-    woken_at, pending, prs, tks = _woken_at(read_events()), _load_pending()["itens"], _prs_ro()["itens"], tickets()
-    cand = [(a, m) for a in agents() if (m := hibernate_reason(a, now_at, cfg, pending, prs, tks, woken_at.get(a["dispatch"])))]
+    events = read_events()
+    woken_at, services, pending, prs, tks = _woken_at(events), _services(events), _load_pending()["itens"], _prs_ro()["itens"], tickets()
+    cand = [(a, m) for a in agents() if (m := hibernate_reason(a, now_at, cfg, pending, prs, tks, woken_at.get(a["dispatch"]), services))]
     if not cand:
         return []
     procs, line_list = _processes(), []
@@ -14049,13 +14110,30 @@ def wake(target, text_value=None):
     except (RuntimeError, subprocess.TimeoutExpired):
         cp = {"head": None, "sujo": None}
     coord_handle = (_manager_cfg() or {}).get("coordenador") or os.environ.get("ORCA_TERMINAL_HANDLE")
-    msg = f"{MSG_WAKE.format(texto=text_value or 'woken by hand (orq wake).')} " + MSG_ESCALATE.format(coord=coord_handle or "<coordinator>", run=p["run"], task=p["task"], dispatch=d)
+    revoked = not p.get("entregue") and _revoked_dispatch(d, p["run"])  # a delivered worker keeps the old flow: the steer or the reply carry what it needs
+    said = text_value or "woken by hand (orq wake)."
+    msg = (MSG_WAKE_REVOKED.format(texto=said) if revoked else f"{MSG_WAKE.format(texto=said)} " + MSG_ESCALATE.format(coord=coord_handle or "<coordinator>", run=p["run"], task=p["task"], dispatch=d))
     r = _start_session(line, p["sessao"], p.get("modelo"), cp, f"start another worker with: orq relaunch {d} --note 'the hibernated session could not be resumed'", msg,
                       p.get("agente") or "claude", p.get("effort"))
-    if r["estado"] != "falhou":
-        _forget_hibernated(d)
-        append_event({"tipo": "acordar", "dispatch": d, "task": p["task"], "run": p["run"], "terminal": r.get("novo"), "motivo": _quote(text_value or "manual", 200)})
-    return r
+    if r["estado"] == "falhou":
+        return r
+    new = None
+    if revoked and r.get("novo"):  # ticket 363: a new dispatch of the same task, so the worker has a capability again; its preamble is the handle the worker uses
+        try:
+            with _no_run(p["run"]):
+                task = next((t for t in orca("task-list", "--run", p["run"], timeout=20)["tasks"] if t["id"] == p["task"]), {})
+                new = _inject_dispatch(p["run"], p["task"], r["novo"], task.get("status") or "completed", f"orq wake {p['task']}")
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+            r = {**r, "aviso": f"the session resumed in {r['novo']} but the new dispatch did not open ({e}): the terminal is up without a capability; `orq send-back {p['task']}` opens one"}  # not `falhou`: a retry would start a second terminal
+        if new and d in _services(read_events()):
+            append_event({"tipo": "servico_marcado", "dispatch": new})  # the new dispatch is the same service
+    _forget_hibernated(d)
+    append_event({"tipo": "acordar", "dispatch": d, "task": p["task"], "run": p["run"], "terminal": r.get("novo"), "motivo": _quote(text_value or "manual", 200),
+                  **({"novo_dispatch": new} if new else {})})
+    if new:
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+            orca("send", "--run", p["run"], "--to", f"dispatch:{new}", "--subject", "Woken", "--body", said, "--priority", "high", timeout=10)
+    return {**r, **({"novo_dispatch": new} if new else {})}
 
 
 def wake_triggers():
@@ -14288,6 +14366,10 @@ def manager_absorb():
         line_list += wake_stopped()
     except Exception as e:  # noqa: BLE001 - the notice to the idle coordinator doesn't take down the panel; the next loop tries
         log(f"acorda parado: {type(e).__name__}: {e}")
+    try:
+        line_list += integrator_steer()
+    except Exception as e:  # noqa: BLE001 - the steer to the idle integrator doesn't take down the panel; the next loop tries
+        log(f"integrador ocioso: {type(e).__name__}: {e}")
     try:
         line_list += [*wake_triggers(), *hibernate_idle()]
     except Exception as e:  # noqa: BLE001 - hibernating is a saving, it can't take down the panel; the next loop tries
