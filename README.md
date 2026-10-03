@@ -168,6 +168,8 @@ The scale is `age_colors` in `machine.json`, minutes at which an item turns yell
 orq machine set age_colors '[[10,"warn"],[30,"hot"],[60,"crit"]]'
 ```
 
+**How long each ticket has been in its state (ticket 365).** `tickets_orq.abertos` of the digest carries `desde` per ticket (in progress: the worker's dispatch; ready or blocked: the ticket file's last change, which is the creation until someone edits the header) and, in progress, `heartbeat` (the worker's last sign of life). The dashboard's "Tickets do orq" section and the backlog block of `orq manager tui` print "há N min" on each ticket in the same scale, colors and ▲ as the queues (a ticket in progress counts as `worker`, any other as `fila`); the TUI's `o` key and the panel's "mais antigos primeiro" button put the longest-waiting first, and in progress the panel adds "sem heartbeat há N min".
+
 An item that crosses the critical limit records one `queue_item_aged` event (once per item, from the manager's lap or the digest, whichever runs first). It shows up in the digest's `linha` as a `sec` entry.
 
 What the queue does: the manager starts one queued item per lap, P1 before P2, oldest first; a cheap model still starts while there is a general slot; a request never silently drops to a cheaper model. Pressure is split by owner: when most of the load comes from outside orq (a browser, a VM, indexing), the notice names the biggest outside processes and the manager holds new dispatches without suggesting a pause, because pausing a worker would not help. `orq status`, the digest and the dashboard show slots taken, slots free and the queue; `orq dispatch-queue list|rm <id>|discard <id> --reason "..."` manages it.

@@ -287,8 +287,8 @@ const SEM_SINAL_VERMELHO_S = 1800
 export const situacao = (i: Item): Situacao => (i.estado === "done" ? "feito" : i.bloqueado ? "bloqueado" : i.estado === "in_flight" ? "andamento" : i.retido ? "retido" : "pronto")
 
 /** Estado do backlog na vista: `estado` e `grupo` filtram (null = todos); `offset` é a primeira task da janela. */
-export type Vista = { estado: Situacao | null; grupo: string | null; offset: number }
-export const VISTA0: Vista = { estado: null, grupo: null, offset: 0 }
+export type Vista = { estado: Situacao | null; grupo: string | null; offset: number; antigos?: boolean }
+export const VISTA0: Vista = { estado: null, grupo: null, offset: 0, antigos: false }
 export type Tamanho = { largura: number; altura: number }
 
 /** O próximo valor da lista circular de filtros (null = todos). */
@@ -296,12 +296,18 @@ export const proximoFiltro = <T>(lista: (T | null)[], atual: T | null): T | null
 export const FILTROS_ESTADO: (Situacao | null)[] = [null, ...SITUACOES]
 export const filtrosGrupo = (e: Estado): (string | null)[] => [null, ...new Set((e.backlog ?? []).map((i) => i.grupo))]
 
-/** As tasks da vista: prioridade primeiro (sem prioridade por último), depois estado; as feitas só com o filtro `feito`. */
+// a idade do ticket (ticket 365): o `desde` que o digest manda em tickets_orq.abertos, casado pelo número (t5 = "05"); andamento conta do despacho
+const idadeDoTicket = (e: Estado, i: Item): Idade | undefined => {
+  const t = (e.digest?.tickets_orq?.abertos ?? []).find((x: Json) => `t${Number(x.num)}` === i.id)
+  return t && idadeDe(e, t.desde, t.grupo === "andamento" ? "worker" : "fila", i.prioridade ?? undefined)
+}
+
+/** As tasks da vista: prioridade primeiro (sem prioridade por último), depois estado; as feitas só com o filtro `feito`. Com `antigos`, o que espera há mais tempo vem primeiro. */
 export function filtradas(e: Estado, v: Vista): Item[] {
   const ordem: Situacao[] = ["andamento", "pronto", "bloqueado", "retido", "feito"]
   return (e.backlog ?? [])
     .filter((i) => (v.estado ? situacao(i) === v.estado : i.estado !== "done") && (!v.grupo || i.grupo === v.grupo))
-    .sort((a, b) => (a.prioridade ?? 9) - (b.prioridade ?? 9) || ordem.indexOf(situacao(a)) - ordem.indexOf(situacao(b)) || a.id.localeCompare(b.id, "en", { numeric: true }))
+    .sort(v.antigos ? (a, b) => (idadeDoTicket(e, b)?.min ?? -1) - (idadeDoTicket(e, a)?.min ?? -1) || a.id.localeCompare(b.id, "en", { numeric: true }) : (a, b) => (a.prioridade ?? 9) - (b.prioridade ?? 9) || ordem.indexOf(situacao(a)) - ordem.indexOf(situacao(b)) || a.id.localeCompare(b.id, "en", { numeric: true }))
 }
 
 function segundos(s: number): string {
@@ -374,14 +380,16 @@ function blocoBacklog(e: Estado, v: Vista, util: number, janela: number): Bloco 
       seg((i.prioridade === null ? "--" : `P${i.prioridade}`) + " ", i.prioridade === null ? "secundario" : COR_PRIORIDADE[i.prioridade], true),
       seg(i.id.padEnd(5)),
     ]
-    const fixo = prefixo.reduce((n, x) => n + x.t.length, 0) + sufixo.length
+    const idade = idadeDoTicket(e, i)
+    const idadeSeg = idade ? [seg(" "), idadeTrecho(idade)] : []
+    const fixo = prefixo.reduce((n, x) => n + x.t.length, 0) + sufixo.length + idadeSeg.reduce((n, x) => n + x.t.length, 0)
     const det = detalhe(e, i, por_id)
     if (linhas.length + (det.length ? 2 : 1) > janela && mostradas) break
-    linhas.push(aperta([...prefixo, seg(corta(i.titulo, Math.max(12, util - fixo))), seg(sufixo, "secundario")], util))
+    linhas.push(aperta([...prefixo, seg(corta(i.titulo, Math.max(12, util - fixo))), ...idadeSeg, seg(sufixo, "secundario")], util))
     if (det.length) linhas.push(aperta([seg("      ↳ ", "secundario"), ...det], util))
     mostradas++
   }
-  const filtro = `estado: ${v.estado ?? "todos"} · grupo: ${v.grupo ?? "todos"} · ${lista.length ? `${offset + 1}-${offset + mostradas}` : "0"} de ${lista.length}   j/k rola · e estado · g grupo · 0 limpa`
+  const filtro = `estado: ${v.estado ?? "todos"} · grupo: ${v.grupo ?? "todos"} · ${v.antigos ? "mais antigos primeiro · " : ""}${lista.length ? `${offset + 1}-${offset + mostradas}` : "0"} de ${lista.length}   j/k rola · e estado · g grupo · o antigos · 0 limpa`
   return { id: "backlog", titulo, linhas: [...contagens, aperta([seg(filtro, "secundario")], util), ...(linhas.length ? linhas : [[seg("nenhuma task neste filtro", "secundario")]])] }
 }
 
