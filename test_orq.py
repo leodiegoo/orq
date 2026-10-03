@@ -10462,6 +10462,19 @@ def test_ticket73_screens_reads_the_running_codex_worker_with_its_defaults():
         orq_mod.orca = orig
 
 
+def test_ticket416_codex_working_screen_keeps_stale_worker_alive_but_empty_prompt_does_not():
+    for screen, expected in (("tela-codex-ocupado.txt", "rodando"), ("tela-codex-ocioso.txt", "travado")):
+        a = Env(run="run_a")
+        _limit90(a, screen, "codex")
+        a.set("terminals.json", ["term_coord", "term_w1"])
+        workers = json.load(open(os.path.join(a.fake, "workers.json")))
+        workers[0]["desde"] = _iso(-3600)
+        a.set("workers.json", workers)
+        a.set("tasks_run_a.json", [{"id": "task_term_w1", "task_title": "Ticket 416", "status": "dispatched", "created_at": _iso(-3600), "dispatch_id": "ctx_term_w1"}])
+        worker = _agents(a, "--run", "run_a", ORCA_TERMINAL_HANDLE="term_coord")["ctx_term_w1"]
+        assert worker["estado"] == expected, worker
+
+
 
 def test_ticket73_dispatch_codex_trusts_repo_root_in_codex_config_without_breaking_what_exists():
     a = Env(run="run_a")
@@ -24088,5 +24101,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
-
