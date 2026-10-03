@@ -1535,6 +1535,8 @@ def recent_alerts(events, now_at, agents_=None):
             resolve(e.get("task"))
         elif e.get("tipo") == "intake":
             resolve(e.get("ref"))
+        elif e.get("tipo") == "integrate_cycle" and e.get("stage") == "merge":
+            resolve(None, "integrador_parado")
     for a in agents_ or []:
         if a.get("estado") == "liberado":
             resolve(a.get("task"))
@@ -1791,6 +1793,9 @@ def _extra(events, all_listing, now_at, pending_items=None, cursor=None, open_st
         parts.append(f"Plan limit: {a.get('task')} ({a.get('limite')}): no turn until the plan renews, a steer does not arrive.")
     alerts = recent_alerts(events, now_at, agent_rows)
     for a in alerts[:2]:
+        if a.get("alerta") == "integrador_parado":
+            parts.append(f"Alert: integrator stopped since {_hora_local(a.get('desde'))} with the queue waiting: wake it (orq integrate queue list).")
+            continue
         if a.get("alerta") == "steer_nao_lido":
             parts.append(f"Alert: steer not read in {a.get('task')} after {STEER_ATTEMPTS} notices to the stopped terminal: check the worker (orq agents).")
             continue
@@ -5789,7 +5794,7 @@ def digest_json(d):
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
             "fila": [{k: p[k] for k in ("passo", "nome", "por", "prs", "feito", "pronto", "avisos")} for p in d["fila"]], "proximoPasso": d["proximoPasso"],
             "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
-            "tickets_orq": d["tickets_orq"], "idade": d["idade"],
+            "tickets_orq": d["tickets_orq"], "idade": d["idade"], "integrator": d["integrator"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
             **({"retro": d["retro"]} if d.get("retro") else {})}  # additive: with no recorded round the v1 contract stays as it was
 
@@ -5845,6 +5850,7 @@ def digest_generate(now_at=None, since=None, with_html=False):
     PRs' state is whatever the poll (`orq pr poll`, the manager panel) left in prs.json."""
     now_at = now_at or datetime.now(timezone.utc)
     age_alerts()  # on the orq clock (ORQ_AGORA in tests), not on the digest's
+    integrator_alert()
     events, away_alias = read_events(), _dict(_cursor_ro().get("ausente")) or None
     window = since if since is not None else (away_alias or {}).get("ligada_em") or last_from_user(events, now_at)
     d = build_digest(events, _prs_ro(), _pending_ro(), _read_json(_path("open.json")), tickets(), _queue_ro(), window, now_at, _turns_ro(), away_alias, e2e_queue(),
@@ -5853,6 +5859,7 @@ def digest_generate(now_at=None, since=None, with_html=False):
     d["idade"] = {"escala": cfg["age_colors"], "fatores": AGE_FACTOR,  # the panel and the TUI draw the same scale from these
                   "filas": [{k: i[k] for k in ("kind", "id", "titulo", "prioridade", "desde")} for i in queue_ages(now_at, cfg)],
                   "obrigacoes": [{"entrada": o["entrada"], "chave": o["chave"], "texto": o.get("texto"), "desde": o.get("ts")} for o in open_obligations(events)]}
+    d["integrator"] = integrator_now()  # on the orq clock, like the age alerts above
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rounds()[-4:]]  # the latest rounds of `orq retro --write_out`
     with contextlib.suppress(OSError), open(_path(os.path.join(DIGEST, "ausencia.md")), encoding="utf-8") as f:  # the last `orq away off`
         d["ausencia"] = f.read().rstrip().splitlines()
@@ -13420,6 +13427,84 @@ def age_alerts(now_at=None, cfg=None):
     return lines
 
 
+CYCLE_DEFAULT_S = 360  # with no finished cycle in the log, a cycle is taken to last 6 min (ticket 355)
+CYCLE_STALL_S = 600  # a queue with items and no cycle started for 10 min is a stopped integrator
+CYCLE_HISTORY = 5  # the median and the return rate read this many finished cycles
+
+
+def integrate_cycle_record(cycle_id, stage, branches=None, **extra):
+    """One `integrate_cycle` event, written by integrar.py: `stage` is merge (the start), replay, tests or end; `end` carries `outcome` (merged or returned), `returned_for` and the seconds of each stage."""
+    return append_event({"tipo": "integrate_cycle", "cycle_id": cycle_id, "stage": stage, **({"branches": list(branches)} if branches else {}),
+                         **{k: v for k, v in extra.items() if v is not None}})
+
+
+def integrator_state(events, queue_items, now_at):
+    """Pure: the integrator's queue and cycle for the digest, the panel and `orq integrate queue list` (ticket 355).
+
+    {cycle: None | {branches, desde, stage, running_s}, queue: [{ticket, branch, desde, in_cycle}], estimate: {seconds, eta, cycles_left, return_rate, no_history}, stalled: None | {desde}}.
+    The time to empty the queue is what is left of the running cycle plus the cycles still to start, (waiting branches / average cycle size) rounded up, plus the return rate as one extra
+    cycle's fraction, each costing the median of the last CYCLE_HISTORY finished cycles. ponytail: the estimate ignores that a cycle's cost grows with its size; refine if it misleads."""
+    cycles = {}
+    for e in events:
+        if e.get("tipo") == "integrate_cycle" and e.get("cycle_id") and _ts(e.get("ts")):
+            c = cycles.setdefault(e["cycle_id"], {"branches": [], "desde": e["ts"], "stage": "merge", "ended": None, "last": e["ts"]})
+            c["branches"] = e.get("branches") or c["branches"]
+            c["last"] = e["ts"]
+            if e.get("stage") == "end":
+                c["ended"] = e
+            else:
+                c["stage"] = e.get("stage") or c["stage"]
+    done = [c for c in cycles.values() if c["ended"]][-CYCLE_HISTORY:]
+    open_c = next((c for c in reversed(list(cycles.values())) if not c["ended"]), None)
+    durations = sorted((_dt(c["ended"]["ts"]) - _dt(c["desde"])).total_seconds() for c in done)
+    median = (durations[len(durations) // 2] + durations[(len(durations) - 1) // 2]) / 2 if durations else CYCLE_DEFAULT_S
+    size = sum(len(c["branches"]) for c in done) / len(done) if done and any(c["branches"] for c in done) else 1
+    rate = sum(c["ended"].get("outcome") == "returned" for c in done) / len(done) if done else 0
+    in_cycle = set(open_c["branches"]) if open_c else set()
+    items = [{"ticket": i["ticket"], "branch": i["branch"], "desde": i.get("ts"), "in_cycle": i["branch"] in in_cycle} for i in queue_items]
+    waiting = sum(not i["in_cycle"] for i in items)
+    running = (now_at - _dt(open_c["desde"])).total_seconds() if open_c else 0
+    to_start = -(-waiting // size) + rate
+    left = (max(median - running, 0) if open_c else 0) + to_start * median
+    iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    estimate = {"seconds": int(left), "eta": iso(now_at + timedelta(seconds=left)), "cycles_left": round(to_start, 2), "return_rate": round(rate, 2), "no_history": not done}
+    stalled = None
+    if items and not open_c:  # quiet since the last cycle event or since the oldest item arrived, whichever is later
+        marks = [_dt(c["last"]) for c in cycles.values()] + [_dt(i["desde"]) for i in items[:1] if i["desde"]]
+        if marks and (now_at - max(marks)).total_seconds() > CYCLE_STALL_S:
+            stalled = {"desde": iso(max(marks))}
+    return {"cycle": {"branches": open_c["branches"], "desde": open_c["desde"], "stage": open_c["stage"], "running_s": int(running)} if open_c else None,
+            "queue": items, "estimate": estimate, "stalled": stalled}
+
+
+def integrator_now(now_at=None):
+    return integrator_state(read_events(), list(integration_queue().values()), now_at or now_dt())
+
+
+def integrator_lines(state):
+    """The lines `orq integrate queue list` puts on top: the stalled integrator, the running cycle and the estimate."""
+    c, est, items = state["cycle"], state["estimate"], state["queue"]
+    out = []
+    if state["stalled"]:
+        out.append(f"INTEGRATOR STOPPED since {_hora_local(state['stalled']['desde'])}: {len(items)} in the queue and no cycle started")
+    if c:
+        out.append(f"Cycle running: {len(c['branches'])} branch{'es' if len(c['branches']) != 1 else ''}, {int(c['running_s'] // 60)} min, step {c['stage']}")
+    if items:
+        out.append(f"Ends around {_hora_local(est['eta'])} (~{max(round(est['seconds'] / 60), 1)} min)" + (", estimated without history" if est["no_history"] else ""))
+    return out
+
+
+def integrator_alert(now_at=None):
+    """Once per stall, an `integrador_parado` alert for the coordinator; a cycle that starts afterwards puts it away (recent_alerts). Returns the text it recorded, or none."""
+    now_at = now_at or now_dt()
+    events = read_events()
+    stalled = integrator_state(events, list(integration_queue().values()), now_at)["stalled"]
+    if not stalled or any(e.get("tipo") == "alerta" and e.get("alerta") == "integrador_parado" and e.get("desde") == stalled["desde"] for e in events):
+        return []
+    append_event({"tipo": "alerta", "alerta": "integrador_parado", "desde": stalled["desde"]})
+    return [f"integrator stopped since {_hora_local(stalled['desde'])} with the queue waiting"]
+
+
 class NoSlot(Exception):
     """The manager tried to start a queue item and the machine has no slot left (another dispatch took the slot)."""
 
@@ -13978,7 +14063,7 @@ def _machine_notify(reason, in_queue, cfg, cause=(None, None)):
 def machine_round():
     """The dispatch queue work in one round of the agent manager panel: high pressure notifies the coordinator and only the exempt Run starts; otherwise it starts one item that fits."""
     cfg = machine_cfg()
-    aged = age_alerts(cfg=cfg)
+    aged = age_alerts(cfg=cfg) + integrator_alert()
     reading = machine_read()
     level, reason = machine_level(reading, cfg)
     refilled = release_refill(cfg)
@@ -16507,6 +16592,14 @@ def parser():
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
+    igy = ig.add_parser("cycle", help="orq integrate cycle --id <cycle> --stage merge|replay|tests|end [--branches b...] [--outcome merged|returned --why text --merge-s N --replay-s N --tests-s N]: what integrar.py records for the panel")
+    igy.add_argument("--id", required=True)
+    igy.add_argument("--stage", required=True, choices=("merge", "replay", "tests", "end"))
+    igy.add_argument("--branches", nargs="*")
+    igy.add_argument("--outcome", choices=("merged", "returned"))
+    igy.add_argument("--why")
+    for k in ("merge-s", "replay-s", "tests-s"):
+        igy.add_argument(f"--{k}", type=float)
     igk = ig.add_parser("check", help="orq integrate check <branch>... [--no-proof REASON]: what integrar.py runs before merging; refuses a queued branch whose tip is not the commit its delivery proved")
     igk.add_argument("branches", nargs="+")
     _arg(igk, "sem-prova", metavar="REASON", help="goes ahead without the proof; the reason goes to the `prova` event")
@@ -16956,6 +17049,8 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"warning: {x}", file=sys.stderr)
+        elif a.cmd == "integrate" and a.op == "cycle":
+            integrate_cycle_record(a.id, a.stage, a.branches, outcome=a.outcome, returned_for=a.why, merge_s=a.merge_s, replay_s=a.replay_s, tests_s=a.tests_s)
         elif a.cmd == "integrate" and a.op == "check":
             for x in integrate_proof(a.branches, a.no_proof):
                 print(f"warning: {x}", file=sys.stderr)
@@ -16965,7 +17060,7 @@ def main(argv=None):
             print(json.dumps(integrate_queue_rm(a.ticket), ensure_ascii=False))
         elif a.cmd == "integrate":
             item_list = list(integration_queue().values())
-            print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (since {_hora_local(i['ts'])})" for i in item_list) or "integrator queue empty")
+            print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(integrator_lines(integrator_now()) + [f"{i['ticket']} {i['branch']} (since {_hora_local(i['ts'])})" for i in item_list]) or "integrator queue empty")
         elif a.cmd == "test":
             return run_tests(a.affected, a.base, a.jobs, a.names, a.map, a.dry_run)
         elif a.cmd == "worktrees":

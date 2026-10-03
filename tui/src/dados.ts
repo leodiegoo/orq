@@ -478,10 +478,35 @@ function blocoOndas(e: Estado): Bloco {
   return { id: "ondas", titulo: `Ondas (${linhas.length})`, linhas }
 }
 
+// o integrador (ticket 355): o ciclo em andamento, a fila em ordem com a espera de cada item e a previsão; fila parada pinta o bloco de vermelho
+const ETAPA: Record<string, string> = { merge: "merge", replay: "replay", tests: "suíte" }
+
+function blocoIntegrador(e: Estado): Bloco | null {
+  const g = e.digest?.integrator
+  if (!g || (!g.cycle && !(g.queue ?? []).length)) return null
+  const linhas: Linha[] = []
+  if (g.stalled) linhas.push([seg(`integrador parado desde ${hora(g.stalled.desde)}`, "vermelho", true), seg(` (${(g.queue ?? []).length} na fila, nenhum ciclo começou)`, "vermelho")])
+  if (g.cycle) {
+    const min = minutosDesde(g.cycle.desde, e.agora) ?? 0
+    linhas.push([seg(`ciclo: ${g.cycle.branches.length} branch${g.cycle.branches.length === 1 ? "" : "es"}, roda há ${Math.floor(min)} min, etapa ${ETAPA[g.cycle.stage] ?? g.cycle.stage}`, "azul")])
+  } else if (!g.stalled) linhas.push([seg("nenhum ciclo rodando", "secundario")])
+  for (const [n, i] of (g.queue ?? []).slice(0, 8).entries()) {
+    const id = idadeDe(e, i.desde, "integracao")
+    linhas.push([seg(`  ${n + 1}. ${i.ticket} ${i.branch}`, i.in_cycle ? "azul" : undefined), ...(id ? [seg(" "), idadeTrecho(id)] : [])])
+  }
+  if ((g.queue ?? []).length > 8) linhas.push([seg(`  … +${g.queue.length - 8}`, "secundario")])
+  if ((g.queue ?? []).length) {
+    const min = Math.max(1, Math.round(g.estimate.seconds / 60))
+    linhas.push([seg(`termina por volta de ${hora(g.estimate.eta)} (~${min} min)${g.estimate.no_history ? " estimado sem histórico" : ""}`)])
+  }
+  return { id: "integrador", titulo: g.stalled ? "Integrador PARADO" : "Integrador", linhas }
+}
+
 /** Os sete blocos (e o das ondas, quando o serve manda alguma). O backlog vem logo depois do gerente e ocupa o que sobra da altura (a janela rola com `vista.offset`); cada linha dele é cortada na largura. */
 export function montarBlocos(e: Estado, vista: Vista = VISTA0, tela: Tamanho = { largura: 100, altura: 60 }): Bloco[] {
   const ondas = blocoOndas(e)
-  const outros = [blocoGerente(e), blocoWorkers(e), ...(ondas.linhas.length ? [ondas] : []), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
+  const integrador = blocoIntegrador(e)
+  const outros = [blocoGerente(e), blocoWorkers(e), ...(ondas.linhas.length ? [ondas] : []), ...(integrador ? [integrador] : []), blocoFilas(e), blocoPendencias(e), blocoMaquina(e), blocoEventos(e)]
   const util = tela.largura - 4 // borda e margem da caixa
   const gasto = outros.reduce((n, b) => n + b.linhas.reduce((m, l) => m + Math.max(1, Math.ceil(texto(l).length / util)), 2), 0) // linha comprida quebra
   const janela = Math.max(JANELA_MIN, tela.altura - gasto - 2 - 1 - 1) // borda do backlog, linha de filtro, rodapé

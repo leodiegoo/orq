@@ -8420,7 +8420,7 @@ def test_digest_writes_the_v1_contract_at_the_fixed_path():
     assert r.returncode == 0 and r.stdout.splitlines()[0] == os.path.join(a.home, "digest", "atual.json"), r
     d = json.load(open(r.stdout.splitlines()[0]))
     assert d["versao"] == 1 and d["geradoEm"].endswith("Z") and d["ausente"] == {"ligado": False, "desde": None}, d
-    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "pendencias", "linha", "rodando", "tickets_orq", "idade"}, set(d)
+    assert set(d) == {"versao", "geradoEm", "ausente", "fila", "proximoPasso", "pendencias", "linha", "rodando", "tickets_orq", "idade", "integrator"}, set(d)
     assert [p["nome"] for p in d["fila"]] == ["Base de auth", "Tela nova"] and [p["passo"] for p in d["fila"]] == [1, 2], d["fila"]
     assert set(d["fila"][0]) == {"passo", "nome", "por", "prs", "feito", "pronto", "avisos"} and d["fila"][0]["feito"] is False
     assert [(x["numero"], x["base"], x["estado"], x["titulo"]) for x in d["fila"][0]["prs"]] == [
@@ -18639,7 +18639,7 @@ def _outputs(a):
     """The output of the main commands and the saved digest, to compare before and after the migration. Only what depends on the clock comes out
     (the fake Orca gives the dispatch `since` from the call time): ages, hours and the geradoEm."""
     def without_clock(txt):
-        return re.sub(r"\b\d+(?:[.,]\d+)? ?(?:s|min|h|d)\b|\b\d{2}:\d{2}(?::\d{2})?\b", "<t>", txt)
+        return re.sub(r"\b\d+(?:[.,]\d+)? ?(?:s|min|h|d)\b|\b\d{2}:\d{2}(?::\d{2})?\b|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", "<t>", txt)
     out = {c: without_clock(a.orq(*c.split()).stdout) for c in ("status", "summary", "agents --all", "digest")}
     out["agents --json"] = [{k: v for k, v in x.items() if k not in ("desde", "idade_s")} for x in json.loads(a.orq("agents", "--all", "--json").stdout)]
     d = json.load(open(os.path.join(a.home, "digest", "atual.json")))
@@ -20547,7 +20547,7 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
-    "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped",
+    "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "integrate_cycle": "hook_stop wake_stopped",
     "clean_run": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped", "coordenador_parou": "hook_stop wake_stopped",
     "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
     "entrada": "hook_stop wake_stopped", "entrega": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "hook_stop wake_stopped",
@@ -22147,6 +22147,83 @@ def test_ticket345_item_that_crosses_the_critical_limit_raises_queue_item_aged_o
     assert len(aged) == 2, "once per item, however many digests run"
     line = _json_digest(a, "--since", "2026-10-02T00:00:00Z")["linha"]
     assert not line, "the digest's line stays empty with away mode off, as the contract says"
+
+
+def _cycle355(a, id_, start, secs, branches, outcome="merged"):
+    """The `integrate_cycle` events of a finished cycle: start at `start` (HH:MM on 2026-10-02), `secs` later its end."""
+    t0 = datetime.fromisoformat(f"2026-10-02T{start}:00+00:00")
+    f = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    _evs(a, {"tipo": "integrate_cycle", "cycle_id": id_, "stage": "merge", "branches": branches, "ts": f(t0)},
+         {"tipo": "integrate_cycle", "cycle_id": id_, "stage": "end", "outcome": outcome, "ts": f(t0 + timedelta(seconds=secs))})
+
+
+def _queue355(a, minutes_ago, n=6, now="2026-10-02T10:00:00Z"):
+    os.makedirs(a.home, exist_ok=True)
+    t = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    items = [{"branch": f"feat/b{i}", "ticket": f"{i:02d}", "ts": (t - timedelta(minutes=minutes_ago - i)).strftime("%Y-%m-%dT%H:%M:%SZ")} for i in range(n)]
+    json.dump({"itens": items}, open(os.path.join(a.home, "integrate-queue.json"), "w"))
+
+
+def test_ticket355_digest_integrator_has_queue_running_cycle_and_estimate_between_hand_bounds():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _cycle355(a, "c1", "08:00", 600, ["x1", "x2"])
+    _cycle355(a, "c2", "08:20", 300, ["x3", "x4"])
+    _cycle355(a, "c3", "08:40", 420, ["x5", "x6"], outcome="returned")  # median 420 s, 2 branches a cycle, 1 of 3 returned
+    _evs(a, {"tipo": "integrate_cycle", "cycle_id": "c4", "stage": "merge", "branches": ["feat/b0", "feat/b1"], "ts": "2026-10-02T09:55:00Z"},
+         {"tipo": "integrate_cycle", "cycle_id": "c4", "stage": "replay", "ts": "2026-10-02T09:57:00Z"})
+    _queue355(a, 20)
+    d = _json_digest(a)["integrator"]
+    assert [i["ticket"] for i in d["queue"]] == ["00", "01", "02", "03", "04", "05"] and [i["in_cycle"] for i in d["queue"]] == [True, True] + [False] * 4, d["queue"]
+    assert d["cycle"]["branches"] == ["feat/b0", "feat/b1"] and d["cycle"]["stage"] == "replay" and d["cycle"]["running_s"] == 300, d["cycle"]
+    # by hand: 120 s left of the running cycle + (4 waiting / 2 a cycle + 1/3 returned) x 420 s = 120 + 980 = 1100 s; between 120 + 2x420 and 120 + 3x420
+    assert 960 <= d["estimate"]["seconds"] <= 1380 and not d["estimate"]["no_history"], d["estimate"]
+    assert d["estimate"]["eta"] == (datetime(2026, 10, 2, 10, 0) + timedelta(seconds=d["estimate"]["seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert d["stalled"] is None
+
+
+def test_ticket355_without_history_the_estimate_is_six_minutes_a_cycle_and_says_so():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _queue355(a, 3, n=2)
+    d = _json_digest(a)["integrator"]
+    assert d["estimate"]["no_history"] and d["estimate"]["seconds"] == 2 * 360 and d["cycle"] is None, d
+    assert "estimated without history" in a.orq("integrar", "fila", "lista").stdout
+
+
+def test_ticket355_queue_with_no_cycle_for_11_min_is_a_stopped_integrator_and_alerts_once():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _cycle355(a, "c1", "07:00", 300, ["x1"])
+    _queue355(a, 11, n=1)
+    d = _json_digest(a)["integrator"]
+    assert d["stalled"] == {"desde": "2026-10-01T23:49:00Z".replace("2026-10-01T23:49", "2026-10-02T09:49")}, d["stalled"]
+    _json_digest(a)
+    assert len([e for e in a.events() if e.get("tipo") == "alerta" and e.get("alerta") == "integrador_parado"]) == 1, "once per stall"
+    assert "INTEGRATOR STOPPED since" in a.orq("integrar", "fila", "lista").stdout
+    _evs(a, {"tipo": "integrate_cycle", "cycle_id": "c2", "stage": "merge", "branches": ["feat/b0"], "ts": "2026-10-02T10:00:00Z"})
+    assert "integrator stopped" not in a.orq("status").stdout, "a cycle that starts puts the alert away"
+
+
+def test_ticket355_queue_waiting_less_than_10_min_is_not_stopped():
+    a = Env(ORQ_AGORA="2026-10-02T10:00:00Z")
+    _cycle355(a, "c1", "07:00", 300, ["x1"])
+    _queue355(a, 9, n=1)
+    assert _json_digest(a)["integrator"]["stalled"] is None
+
+
+def test_ticket355_integrar_py_records_the_cycle_start_and_end_with_stage_times():
+    a = Env(run="run_a")
+    r, g = _integrate154(a, "true")
+    assert r.returncode == 0, r.stdout + r.stderr
+    ev = [e for e in a.events() if e.get("tipo") == "integrate_cycle"]
+    assert [e["stage"] for e in ev] == ["merge", "replay", "tests", "end"] and ev[0]["branches"] == ["feat/b1"], ev
+    assert ev[-1]["outcome"] == "merged" and {"merge_s", "replay_s", "tests_s"} <= set(ev[-1]), ev[-1]
+
+
+def test_ticket355_integrar_py_with_red_tests_records_the_cycle_as_returned_with_the_reason():
+    a = Env(run="run_a")
+    r, g = _integrate154(a, "false")
+    assert r.returncode != 0
+    end = [e for e in a.events() if e.get("tipo") == "integrate_cycle"][-1]
+    assert end["stage"] == "end" and end["outcome"] == "returned" and "tests failing" in end["returned_for"], end
 
 
 def test_ticket345_status_line_has_the_oldest_age_in_the_scale_color():
