@@ -122,7 +122,9 @@ NO_BINDING = "term_00000000-0000-0000-0000-000000000000"  # handle Orca does not
 STUCK_S = 15 * 60  # a running dispatch with no heartbeat for longer than this is stuck: it shows up in the summary and the panel with the suggested orq steer
 WAIT_CAP_S = 60 * 60  # heartbeat `esperando: <reason>` without `até HH:MM` is valid for this long; after that the dispatch is stuck due to "espera vencida" (expired wait)
 SCREEN_CAP_S = 45 * 60  # shell/monitor running on screen with no heartbeat for this long: stops being a wait and becomes stuck ("shell sem heartbeat", shell without heartbeat)
-SCREEN_WAIT = re.compile(r"(?:\d+\s+)?(?:shell|monitor)s?\s+still\s+running", re.I)  # the Claude Code footer with the turn ended, waiting on a background process
+SUITE_WAIT = "esperando vaga de suite"  # what the test runner prints in the suite queue (ticket 366): the panel reads it off the worker's screen as a wait, not as a hang
+SUITE_JOBS = 2  # `-j` of a worker's full suite (ticket 366): the integrator's run keeps min(4, CPUs/2)
+SCREEN_WAIT = re.compile(rf"(?:\d+\s+)?(?:shell|monitor)s?\s+still\s+running|{SUITE_WAIT}", re.I)  # the Claude Code footer with the turn ended, waiting on a background process; or the suite queue
 SCREEN_LINES = 30  # lines from the end of the screen read per terminal (the footer is in the last ones; the permission prompt with the command and the notice goes past 15)
 SCREEN_OPTION = re.compile(r"^\s*([❯>])?\s*(\d{1,2})\.\s+(\S.*?)\s*$")  # `❯ 1. Yes`: an option of a Claude Code menu, with the cursor on the chosen one
 SCREEN_QUESTIONS = (("trust", re.compile(r"trust (?:this|the files in this) folder|Is this a project you (?:created|trust)", re.I)),
@@ -237,7 +239,7 @@ HARNESS["codex"] = {
              "perguntas": (("trust", re.compile(r"Trust this folder\?|Do you trust the contents of this directory", re.I)),
                            ("hooks", re.compile(r"Hooks? need review|hooks? (?:are|is) new or changed", re.I))),
              "limite": SCREEN_LIMIT_CODEX,
-             "espera": re.compile(r"\d+\s+background terminals?\s+running", re.I),  # `• Working (9s • esc to interrupt) · 1 background terminal running`
+             "espera": re.compile(rf"\d+\s+background terminals?\s+running|{SUITE_WAIT}", re.I),  # `• Working (9s • esc to interrupt) · 1 background terminal running`
              "falha": ("No saved session found", "command not found")},
     "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: ultra only on the models that have it (Orca refuses it on Luna)
 }
@@ -11592,10 +11594,11 @@ def _top(src):
 
 
 def _touched(src, ranges):
-    """What the line ranges touch at the top of a module: (defs and classes, module names assigned, loose). Loose is a module-level statement that is
-    neither, like an import or an `if`: then no map says which tests it reaches. The module docstring counts as nothing."""
+    """What the line ranges touch at the top of a module: (defs and classes, module names assigned, loose, imports as (name bound, module, name)). Loose is a module-level statement that is
+    none of those, like an `if`: then no map says which tests it reaches. An import is not loose (ticket 366): what matters is which names it binds, because only
+    a name that goes away can break the code that reads it. The module docstring counts as nothing."""
     import ast
-    defs, names, loose = set(), set(), False
+    defs, names, loose, imported = set(), set(), False, set()
     for i, (first, st) in enumerate(_top(src)):
         if not any(a <= st.end_lineno and b >= first for a, b in ranges):
             continue
@@ -11603,9 +11606,11 @@ def _touched(src, ranges):
             defs.add(st.name)
         elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             names |= {n.id for t in getattr(st, "targets", [getattr(st, "target", None)]) for n in ast.walk(t) if isinstance(n, ast.Name)}
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            imported |= {((a.asname or a.name).split(".")[0], getattr(st, "module", None), a.name) for a in st.names}  # (name bound, where from, what): `import sys as os` is not `import os`
         elif not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
             loose = True
-    return defs, names, loose
+    return defs, names, loose, imported
 
 
 def _using(top, names):
@@ -11620,9 +11625,11 @@ def affected_tests(root, base, test_map):
 
     A changed def or class of a .py reaches the tests that ran it (the map: {tests: {test: ["file:function"]}}); a module-level name reaches it through the
     defs that use it; a test changed or new in test_orq.py always runs. A file the map does not know (a script run without coverage, a non-.py) reaches the
-    tests whose source mentions its name; an untracked file counts as new. Full suite: no map, a failed diff, a loose module-level line (import, `if`),
+    tests whose source mentions its name; an untracked file counts as new. Full suite: no map, a failed diff, a loose module-level line (`if`, a call),
+    an import that dropped a name some def or test reads (a new import, like a new constant or def, reaches nothing that already existed: ticket 366),
     a .py the map does not know that no test mentions, or a changed def that already existed and that no test in the map ran (untested, run only at
-    import like orqpaths, or newer than the map). Limit: a module-level name used only through another module name (A = B + 1) is followed one level."""
+    import like orqpaths, or newer than the map). Limit: a module-level name used only through another module name (A = B + 1) is followed one level;
+    a new import that rebinds a name the old code took from elsewhere (a builtin) is not seen."""
     diff = _git(root, "diff", "-U0", "--no-color", "--no-renames", base, "--")
     untracked = (_git(root, "ls-files", "--others", "--exclude-standard") or "").split("\n")
     by_fn = {}
@@ -11660,9 +11667,12 @@ def affected_tests(root, base, test_map):
         except OSError:
             cur = ""
         prev = _git(root, "show", f"{base}:{path}") or ""
-        (d1, n1, l1), (d2, n2, l2) = _touched(cur, new), _touched(prev, old)
+        (d1, n1, l1, i1), (d2, n2, l2, i2) = _touched(cur, new), _touched(prev, old)
         if l1 or l2:
-            return {"tests": None, "reasons": reasons + [f"{path}: a module-level line outside any def (import, if...): full suite"], "precompact": precompact}
+            return {"tests": None, "reasons": reasons + [f"{path}: a module-level line outside any def (if, a call...): full suite"], "precompact": precompact}
+        gone = {n for n, *_ in i2 - i1}
+        if gone and (_using(_top(prev), gone) or via_tests_file(set(), gone)):
+            return {"tests": None, "reasons": reasons + [f"{path}: the import of {', '.join(sorted(gone))} is read by a def or a test: full suite"], "precompact": precompact}
         names = n1 | n2
         defs = d1 | d2 | _using(_top(cur), names) | _using(_top(prev), names)
         hits = {t for d in defs for t in by_fn.get(f"{path}:{d}", ())} | via_tests_file(defs if path == "test_orq.py" else set(), names)
@@ -11685,7 +11695,7 @@ def run_tests(affected=False, base=None, jobs=None, names=(), test_map=None, dry
     root = (_git(cwd or os.getcwd(), "rev-parse", "--show-toplevel") or "").strip()
     if not root or not os.path.exists(os.path.join(root, "test_orq.py")):
         raise ValueError("orq test runs inside a clone or worktree of orq (there is no test_orq.py here)")
-    cmd, precompact = [sys.executable, "test_orq.py", *(["-j", str(jobs)] if jobs else []), *names], False
+    names, precompact = list(names), False
     if affected:
         base = base or (_git(root, "merge-base", "HEAD", "origin/main") or "").strip() or BRANCH_NO_REMOTE
         r = affected_tests(root, base, _read_json(test_map or TEST_MAP))
@@ -11698,7 +11708,9 @@ def run_tests(affected=False, base=None, jobs=None, names=(), test_map=None, dry
             return 0
         else:
             print(f"orq test: {len(r['tests'])} affected tests (diff against {base})", file=sys.stderr)
-            cmd += sorted(r["tests"])
+            names += sorted(r["tests"])
+    jobs = jobs or (None if names else SUITE_JOBS)  # no names: a worker's full suite (ticket 366)
+    cmd = [sys.executable, "test_orq.py", *(["-j", str(jobs)] if jobs else []), *names]
     runs = ([cmd] if not affected or r["tests"] is None or r["tests"] else []) + ([[sys.executable, "test_precompact.py"]] if precompact else [])
     if dry_run:
         print("\n".join(shlex.join(c[1:]) for c in runs))
