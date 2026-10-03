@@ -22567,6 +22567,157 @@ def test_ticket369_stalled_worker_of_a_mate_run_becomes_a_mate_request_and_leave
         orq_mod._mates, orq_mod.mate_request, orq_mod.append_event = saved
 
 
+# ---------- ticket 344: fair dispatch queue between projects ----------
+
+def _fair344(a, max_workers=7, **limits):
+    """Two projects, orq (the tool) and product-app (the product), a machine with `max_workers` slots; `limits` is {project: extra keys of its file}."""
+    a.orq("machine", "set", "max_workers", str(max_workers))
+    for name, base in (("orq", 3), ("product-app", 1)):
+        _project(a, name, {"repo": f"path:/r/{name}", "priority_base": base, **limits.get(name, {})})
+
+
+def _live344(a, *projects):
+    """One live worker per project name in `projects` (term_v0…, the first of the fleet), with the project in its dispatch event."""
+    _fleet79(a, live=[(f"Vivo {n}", SONNET) for n in range(len(projects))])
+    _evs(a, *({"tipo": "despacho", "run": "run_a", "dispatch": f"ctx_term_v{n}", "task": f"task_term_v{n}", "titulo": f"Vivo {n}", "modelo": SONNET, "projeto": p} for n, p in enumerate(projects)))
+
+
+def _queue_items344(a, *items):
+    """The queue as `(project, title, priority, minutes waiting)` tuples: oldest first as given."""
+    _write_state(os.path.join(a.home, "fila-despacho.json"), {"itens": [
+        {"id": f"fd{n:04d}", "tipo": "despacho", "run": "run_a", "titulo": t, "modelo": SONNET, "effort": "medium", "agente": "claude", "prioridade": p, "projeto": proj,
+         "ts": _iso(-60 * m), "motivo": "test", "falhas": 0, "spec_arquivo": _spec(a), "worktree": "new-top-level"} for n, (proj, t, p, m) in enumerate(items)]})
+
+
+def _order344(a):
+    return [i["titulo"] for i in json.loads(a.orq("machine", "--json").stdout)["fila"]]
+
+
+def test_ticket344_one_free_slot_goes_to_the_other_project_even_behind_twelve_orq_items():
+    a = _panel79()
+    _manager(a)
+    _fair344(a)
+    _live344(a, *["orq"] * 6)
+    _queue_items344(a, *[("orq", f"orq {n}", 2, 40 - n) for n in range(12)], ("product-app", "cache do E2E", 2, 5))
+    assert _order344(a)[0] == "cache do E2E", "the product's item is the first of the queue"
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert _started_titles79(a) == ["cache do E2E"], "one free slot: it goes to product-app, not to the oldest orq item"
+
+
+def test_ticket344_projects_without_priority_base_take_turns_by_fewest_live_workers():
+    a = _panel79()
+    _manager(a)
+    _fair344(a, orq={"priority_base": None}, **{"product-app": {"priority_base": None}})
+    _live344(a, "orq", "orq", "product-app")
+    _queue_items344(a, ("orq", "orq 1", 2, 30), ("orq", "orq 2", 2, 29), ("product-app", "neo 1", 2, 5), ("product-app", "neo 2", 2, 4))
+    assert _order344(a) == ["neo 1", "orq 1", "neo 2", "orq 2"], "product-app has the fewest live workers: it goes first and the two alternate"
+
+
+def test_ticket344_priority_base_puts_the_product_ahead_and_an_explicit_p1_still_cuts_the_line():
+    a = _panel79()
+    _manager(a)
+    _fair344(a)
+    _live344(a)
+    _queue_items344(a, ("orq", "orq P2", 2, 30), ("orq", "orq P1", 1, 20), ("product-app", "neo P3", 3, 10), ("product-app", "neo P2", 2, 9))
+    assert _order344(a) == ["orq P1", "neo P3", "neo P2", "orq P2"], "P1 and the product's items (base 1) tie, orq's P2 comes after both"
+
+
+def test_ticket344_orq_never_goes_past_its_ceiling_while_product_web_waits():
+    a = _panel79()
+    _manager(a)
+    _fair344(a, orq={"max_slots": 4})
+    _live344(a, *["orq"] * 4)
+    _queue_items344(a, *[("orq", f"orq {n}", 2, 40 - n) for n in range(3)], ("product-app", "cache do E2E", 3, 5))
+    for _ in range(3):
+        assert a.orq("gerente", "absorver").returncode == 0
+    assert _started_titles79(a) == ["cache do E2E"], "3 slots are free but orq is at 4/4: only product-app starts"
+    assert [i["titulo"] for i in _queue79(a)] == ["orq 0", "orq 1", "orq 2"]
+    r = a.orq("despachar", "--run", "run_a", "--titulo", "orq direto", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium", "--projeto", "orq")
+    assert json.loads(r.stdout)["estado"] == "enfileirado" and "orq: 4/4 project slots" in json.loads(r.stdout)["motivo"], r.stdout
+
+
+def test_ticket344_drain_hands_a_mate_run_item_to_the_mate_before_the_project_slot_rule_holds_the_rest():
+    a = _panel79()
+    _mate_queue351(a, "run_mate")
+    _fair344(a, orq={"max_slots": 1})
+    _live344(a, "orq")
+    _mate_alive(a)  # _live344 rebuilt the fleet: the mate's terminal must be alive again (it rewrites terminals and cursor, so the live worker and the mate's Run are set again)
+    a.set("terminals.json", ["term_mate", "term_coord", "term_v0"])
+    c = _read_state(os.path.join(a.home, "cursor.json"))
+    c["mates"]["orq"]["runs"] = ["run_mate"]
+    _write_state(os.path.join(a.home, "cursor.json"), c)
+    _queue_items344(a, ("orq", "orq mate item", 2, 30), ("orq", "orq held", 2, 20))
+    q = _read_state(os.path.join(a.home, "fila-despacho.json"))
+    q["itens"][0].update(run="run_mate", ticket="88")
+    _write_state(os.path.join(a.home, "fila-despacho.json"), q)
+    assert a.orq("gerente", "absorver").returncode == 0
+    ev = a.events()
+    assert [e["op"] for e in ev if e["tipo"] == "despacho_fila"] == ["mate"], "the mate's item goes to the mate although orq is at its ceiling (1/1)"
+    assert len([e for e in ev if e["tipo"] == "mate_pedido"]) == 1 and not _started_titles79(a)
+    assert [i["titulo"] for i in _queue79(a)] == ["orq held"], "the project slot rule holds the other orq item"
+    _queue_items344(a, ("orq", "orq held", 2, 20), ("product-app", "cache do E2E", 2, 5))
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert _started_titles79(a) == ["cache do E2E"] and [i["titulo"] for i in _queue79(a)] == ["orq held"], "then the free slot goes to the other project"
+
+
+def test_ticket344_a_reserved_slot_is_held_for_its_project_until_the_item_has_waited_and_the_project_has_no_work():
+    a = _panel79()
+    _manager(a)
+    _fair344(a, 3, **{"product-app": {"reserve_slots": 2}})
+    _live344(a, "orq")
+    _queue_items344(a, ("orq", "orq novo", 2, 1))
+    a.orq("gerente", "absorver")
+    assert not _started_titles79(a), "2 free slots, both reserved for product-app: a 1-minute-old orq item waits"
+    _queue_items344(a, ("orq", "orq novo", 2, 10))
+    a.orq("gerente", "absorver")
+    assert _started_titles79(a) == ["orq novo"], "product-app has no work: after reserve_idle_min the slot is orq's"
+    b = _panel79()
+    _manager(b)
+    _fair344(b, 3, **{"product-app": {"reserve_slots": 2}})
+    _live344(b, "orq")
+    _queue_items344(b, ("orq", "orq velho", 2, 30), ("product-app", "neo", 2, 0))
+    b.orq("gerente", "absorver")
+    assert _started_titles79(b) == ["neo"], "with work in the queue the reserve is not lent, however old the orq item is"
+
+
+def test_ticket344_close_that_releases_many_queues_the_first_and_the_rest_enter_as_the_queue_drops():
+    a = _panel79()
+    _manager(a)
+    _fleet79(a, live=[(f"Vivo {n}", SONNET) for n in range(4)])
+    _tk105(a, "70", "Raiz", "claimed", task="task_70")
+    for n in range(71, 79):
+        _tk105(a, str(n), f"Filho {n}", is_blocked="70", task=f"task_{n}", extra=MODEL105)
+    _tasks105(a, ("task_70", "dispatched"), *((f"task_{n}", "blocked") for n in range(71, 79)))
+    r = a.orq("ticket", "fechar", "70", "--answer", "feito")
+    assert r.returncode == 0, r.stderr
+    assert sorted(i["ticket"] for i in _queue79(a)) == ["71", "72", "73", "74", "75"], "the default batch is 5: the first five by priority and number"
+    assert "released 8, queued 5" in r.stderr and "3 wait outside the dispatch queue" in r.stderr, r.stderr
+    assert _read_state(os.path.join(a.home, "cursor.json"))["held_releases"] == ["76", "77", "78"]
+    a.orq("gerente", "absorver")
+    assert len(_queue79(a)) == 5, "the queue is full: nothing enters"
+    for i in _queue79(a)[:3]:
+        a.orq("fila-despacho", "rm", i["id"])
+    r = a.orq("gerente", "absorver")
+    assert "queue: ticket 76 entered" in r.stdout, r.stdout
+    assert sorted(i["ticket"] for i in _queue79(a)) == ["74", "75", "76", "77", "78"], "the three held tickets entered as three places opened"
+    assert "held_releases" not in _read_state(os.path.join(a.home, "cursor.json"))
+
+
+def test_ticket344_machine_and_status_show_the_slots_per_project_and_warn_after_ten_minutes_without_a_slot():
+    a = _panel79()
+    _manager(a)
+    _fair344(a)
+    _live344(a, *["orq"] * 6)
+    _queue_items344(a, ("orq", "orq 1", 2, 30), ("product-app", "cache do E2E", 3, 14))
+    text_value = a.orq("machine").stdout
+    assert "project orq: 6 live, 1 in the queue" in text_value and "project product-app: 0 live, 1 in the queue (first at position 1)" in text_value, text_value
+    assert "WARNING: product-app: 1 item waiting for 14 min, 0 of 7 slots" in text_value, text_value
+    js = {r["projeto"]: r for r in json.loads(a.orq("machine", "--json").stdout)["projetos"]}
+    assert (js["product-app"]["vivos"], js["product-app"]["posicao"], js["product-app"]["espera_min"]) == (0, 1, 14) and js["orq"]["aviso"] is None
+    _queue_items344(a, ("product-app", "cache do E2E", 3, 4))
+    assert "WARNING" not in a.orq("machine").stdout, "4 minutes is not starving yet"
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)

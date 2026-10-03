@@ -454,6 +454,13 @@ function blocoMaquina(e: Estado): Bloco {
       (vagas?.max_caros !== undefined ? `   caros ${vagas.caros ?? 0} / ${vagas.max_caros}` : ""),
   ]
   if (alta) linhas.push([seg("PRESSÃO ALTA: o gerente segura despachos novos", "vermelho", true)])
+  const projetos: Json[] = vagas?.projetos ?? []
+  if (projetos.length > 1 || projetos.some((p) => p.aviso)) {
+    for (const p of projetos) {
+      linhas.push(`projeto ${p.projeto ?? "(sem projeto)"}: ${p.vivos} vivos, ${p.fila} na fila${p.posicao ? ` (1º na posição ${p.posicao})` : ""}`)
+      if (p.aviso) linhas.push(`  AVISO: ${p.aviso}`)
+    }
+  }
   return { id: "maquina", titulo: "Máquina contra o orçamento", linhas }
 }
 

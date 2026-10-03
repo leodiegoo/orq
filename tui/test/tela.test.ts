@@ -99,4 +99,18 @@ test("it should leave the badge in the theme text when the project has no valid 
   const sem = { ...e, digest: { ...e.digest, projetos: [{ nome: "orq", cor: "azul" }], grupos: [] } }
   const workers = montarBlocos(sem).find((b) => b.id === "workers")!
   expect((workers.linhas[0] as Trecho[])[0]).toEqual({ t: "orq", c: undefined, b: undefined })
+
+test("it should list the slots per project and the starvation warning in the machine block", () => {
+  const e = { ...lerEstado(fixtures, agora), vivoMs: agora - 5000 }
+  const maquina = {
+    ...e.aberto?.maquina,
+    projetos: [
+      { projeto: "product-app", vivos: 0, fila: 1, posicao: 1, aviso: "product-app: 1 item waiting for 14 min, 0 of 6 slots" },
+      { projeto: "orq", vivos: 6, fila: 3, posicao: 2, aviso: null },
+    ],
+  }
+  const linhas = montarBlocos({ ...e, aberto: { ...e.aberto, maquina } }).find((b) => b.id === "maquina")!.linhas
+  expect(linhas).toContain("projeto product-app: 0 vivos, 1 na fila (1º na posição 1)")
+  expect(linhas).toContain("  AVISO: product-app: 1 item waiting for 14 min, 0 of 6 slots")
+  expect(linhas).toContain("projeto orq: 6 vivos, 3 na fila (1º na posição 2)")
 })
