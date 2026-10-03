@@ -19742,6 +19742,7 @@ EVENTOS_LIDOS = {
     "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta": "wake_stopped",
     "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
     "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
+    "clean_run": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
 }
 NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
 
