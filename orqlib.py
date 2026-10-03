@@ -360,7 +360,7 @@ def declared_wait(phase, ts):
     return reason, (deadline if deadline >= local else deadline + timedelta(days=1)).astimezone(timezone.utc)
 
 
-def _alive_or_stuck(phase, ts, age, now_at, screen=None, interrupted=False):
+def _alive_or_stuck(phase, ts, age, now_at, screen=None, interrupted=False, working=False):
     """(state, wait, reason) of a dispatch open by the last heartbeat: a declared wait within the deadline is not stuck; expired, it is "espera vencida".
 
     Without a declared wait: `interrupted` (the coordinator paused the worker) and `screen` (shell/monitor running in the footer) are also waits, this one only up to
@@ -373,6 +373,8 @@ def _alive_or_stuck(phase, ts, age, now_at, screen=None, interrupted=False):
         return "travado", None, "wait expired"
     if interrupted:
         return "rodando", "interrupted by the coordinator", None
+    if working:
+        return "rodando", "Codex is working", None
     if screen:
         return ("travado", None, "shell without heartbeat") if age is not None and age > SCREEN_CAP_S else ("rodando", screen, None)
     return ("travado" if age is not None and age > STUCK_S else "rodando"), None, None
@@ -1432,7 +1434,7 @@ def integrate_conclude(hash_, branches, dispatch=None):
     return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": pub["avisos"], "publicacao": pub["estado"]}
 
 
-def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=None, screens=None, screen_questions=None, hibernated=None, integration=None, limits=None, paused=None):
+def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=None, screens=None, screen_questions=None, hibernated=None, integration=None, limits=None, paused=None, working=None):
     """Pure: one line per worker-list dispatch, with the state (rodando, travado, nao_comecou, parado, perguntando, entregue or liberado).
 
     Dispatched without an open question is `nao_comecou` or `stopped` when the turns from the worker hooks say so (dispatch_turn); otherwise `travado` when the
@@ -1470,7 +1472,7 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
                 if when:
                     age = int((now_at - when).total_seconds())
             pause = _paused(pauses.get(d), signal_name.get("ts"), t)
-            state, waiting, reason = _alive_or_stuck(signal_name.get("fase"), signal_name.get("ts"), heartbeat_age, now_at, screens.get(d), pause)
+            state, waiting, reason = _alive_or_stuck(signal_name.get("fase"), signal_name.get("ts"), heartbeat_age, now_at, screens.get(d), pause, (working or {}).get(d, False))
             state = "perguntando" if d in questions or (screen_questions or {}).get(d) else turn if turn in ("nao_comecou", "parado") and not (waiting or reason) else state  # a declared wait (within the deadline or expired) outweighs the ended turn (M16)
             if d in not_started and not (t.get("inicio") or signal_name):  # despachar saw the prompt fail to enter: it does not wait NOT_STARTED_S
                 state = "nao_comecou"
@@ -11539,10 +11541,11 @@ def _read_screens(ws, details):
         agent = details[w["dispatchId"]]["agente"]
         waiting = HARNESS[agent]["tela"]["espera"]
         m = waiting and waiting.search("\n".join(map(str, tail[-15:])))
-        found_item = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": screen_question(tail, agent), "limite": screen_limit(tail, agent),
+        working = agent == "codex" and bool(re.search(r"(?:^|\s)Working\s*(?:\(|…|\.\.\.)[^\n]*esc to interrupt", "\n".join(map(str, tail[-15:])), re.I))
+        found_item = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "working": working, "pergunta": screen_question(tail, agent), "limite": screen_limit(tail, agent),
                       "espera_cmd": stuck_wait_command(tail) if agent == "claude" else None}
         found_item["destrutivo"] = found_item["pergunta"] and destructive_command(tail) or None  # notify_screens only acts on it for a permission prompt
-        return w["dispatchId"], found_item if m or found_item["pergunta"] or found_item["limite"] or found_item["espera_cmd"] else None
+        return w["dispatchId"], found_item if m or working or found_item["pergunta"] or found_item["limite"] or found_item["espera_cmd"] else None
     target = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (details.get(w.get("dispatchId")) or {}).get("agente") in HARNESS]
     with ThreadPoolExecutor(8) as ex:
         return {d: a for d, a in ex.map(read_screen, target) if a}
@@ -11567,6 +11570,7 @@ def agents(run=None, include_all=False, now_at=None):
     screens_read = _read_screens([w for w in ws if w.get("dispatchId") not in hib], detail_entry)  # the hibernated one's terminal does not exist: nothing to read
     agent_rows = build_agents(ws, msgs, events, now_at, detail_entry, live, _turns_ro(), {d: a["espera"] for d, a in screens_read.items() if a["espera"]},
                         {d: a["pergunta"] for d, a in screens_read.items() if a["pergunta"]}, hib, limits={d: a["limite"] for d, a in screens_read.items() if a["limite"]},
+                        working={d: a["working"] for d, a in screens_read.items() if a["working"]},
                         paused=_dict(_cursor_ro().get("pausados")))
     unread_ids = {e.get("dispatch") for e in recent_alerts(events, now_at, agent_rows) if e.get("alerta") == "steer_nao_lido"}
     project_of = {e["dispatch"]: e["projeto"] for e in events if e.get("tipo") == "despacho" and e.get("dispatch") and e.get("projeto")}

@@ -350,7 +350,7 @@ Late notices. A busy coordinator receives queued notices one after another. The 
 
 Notice for another Run. `check` on a Run the terminal is not bound to fails, so orq reads the global inbox instead. If every unread message addressed to that Run is a heartbeat, the prompt is blocked and `heartbeat_seen` is recorded, but nothing is consumed; the messages come out in a batch when the coordinator binds that Run.
 
-The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same function. Acknowledging the same delivery twice is harmless in Orca, so the hook, the waiter and the manager loop can race without losing messages. The recorded heartbeats feed `orq agents`: a running dispatch whose last heartbeat is older than 15 minutes is shown as stuck, with the `orq steer` command to send.
+The waiter script (`orca-wait-runs.py`) acknowledges heartbeats with the same function. Acknowledging the same delivery twice is harmless in Orca, so the hook, the waiter and the manager loop can race without losing messages. The recorded heartbeats feed `orq agents`: a running dispatch whose last heartbeat is older than 15 minutes is shown as stuck, with the `orq steer` command to send. Codex has an additional screen signal: a current `Working … (esc to interrupt)` footer counts as activity regardless of heartbeat age, including while a background terminal runs; the prompt-ready screen does not.
 
 ## Reading the mailbox (ticket 140)
 
