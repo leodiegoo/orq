@@ -5784,6 +5784,16 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
                        "pontos": _points(list(flow_info.values()) or [task_flow(None, events)])}}
 
 
+def badge_colors(folder):
+    """[{nome, cor}] from ORQ_HOME/<folder>/*.json that carry a `color`; one without it (or not a string) is left out, there is nothing to paint (ticket 387)."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(_path(folder), "*.json"))):
+        cfg = _read_json(f)
+        if isinstance(cfg, dict) and isinstance(cfg.get("color"), str) and cfg["color"]:
+            out.append({"nome": os.path.basename(f)[:-5], "cor": cfg["color"]})
+    return out
+
+
 def digest_json(d):
     """What goes into atual.json: the contract's keys, each step only with its own, and an empty `line` with away mode off."""
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
@@ -5791,7 +5801,8 @@ def digest_json(d):
             "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"], "idade": d["idade"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
-            **({"retro": d["retro"]} if d.get("retro") else {})}  # additive: with no recorded round the v1 contract stays as it was
+            **({"retro": d["retro"]} if d.get("retro") else {}),
+            **{k: v for k, v in (("projetos", badge_colors("projects")), ("grupos", badge_colors(GROUPS_DIR))) if v}}  # additive: with no recorded round the v1 contract stays as it was
 
 
 def html_digest(d):

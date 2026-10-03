@@ -8490,6 +8490,17 @@ def test_digest_ticket_brings_the_project_by_title_prefix_and_null_without_group
     assert (ab["01"]["projeto"], ab["02"]["projeto"]) == ("orq", None), ab
 
 
+def test_digest_brings_projects_and_groups_as_name_and_color_and_skips_the_ones_without():
+    a = Env(run="run_a")
+    for kind, name, cfg in (("projects", "web", {"repo": "path:/x", "color": "#58a6ff"}), ("projects", "plain", {"repo": "path:/y"}),
+                            ("groups", "orq", {"projetos": [], "prefixos": [], "color": "#a371f7"})):
+        os.makedirs(os.path.join(a.home, kind), exist_ok=True)
+        with open(os.path.join(a.home, kind, name + ".json"), "w") as f:
+            json.dump(cfg, f)
+    d = _json_digest(a)
+    assert (d["projetos"], d["grupos"]) == ([{"nome": "web", "cor": "#58a6ff"}], [{"nome": "orq", "cor": "#a371f7"}]), d
+
+
 def test_digest_without_tickets_sends_empty_tickets_orq():
     assert _json_digest(Env(run="run_a"))["tickets_orq"] == {"abertos": [], "resolvidos": []}
 
