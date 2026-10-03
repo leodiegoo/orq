@@ -322,7 +322,7 @@ orq does its work in hooks, so the hooks are the one thing you must register. Bo
 | `SessionStart` | `orq hook session` | injects status and open tickets; shows a handoff from the other harness |
 | `PreToolUse` (`AskUserQuestion`) | `orq hook guard` | refuses the question widget while a worker runs, or in away mode |
 | `PreToolUse` (`Bash`) | `orq hook external` | denies push, merge, deploy and other external actions in night mode; warns (never blocks) when a `worker_done` goes out with no passing `orq check-delivery` on the current report |
-| `PreToolUse` (`Bash\|Edit\|Write…`) | `orq hook place` | warns (never blocks) about a write in the wrong place: the main checkout off its default branch, or a worktree that is not the coordinator's |
+| `PreToolUse` (`Bash\|Edit\|Write…`) | `orq hook place` | warns (never blocks) about a write in the wrong place: the main checkout off its default branch, or a worktree that is not the coordinator's; follows a `cd <dir>` before `git commit\|push` and warns on a lone `cd` into such a place (ticket 393) |
 | `PreToolUse` (`Bash\|Agent`) | `worker-routing-guard.py` | refuses a dispatch with no explicit model and effort |
 | `PostToolUse` (`Bash`) | `orq hook prlink` | links a PR to its task when the coordinator runs `gh pr create` (also as `rtk proxy gh pr create`, in a loop); says "linked" only when it did, otherwise that the PR has no task and the `orq pr link` to run |
 | `PostToolUse` (`AskUserQuestion`) | `orq hook ask` | records the answer |

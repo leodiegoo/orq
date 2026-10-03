@@ -7608,6 +7608,7 @@ def hook_guard(ev, run):
 
 WRITE_PLACE = re.compile(r"^git((?:\s+-\S+(?:\s+\S+)?)*)\s+(commit|push)\b")  # on a cmdnorm segment
 GIT_C_PLACE = re.compile(r"\s-C\s+(\S+)")
+CD_PLACE = re.compile(r"^cd\s+(\S+)")
 
 
 def hook_place(ev, run):
@@ -7615,14 +7616,19 @@ def hook_place(ev, run):
     default branch or with the cwd in a worktree that is not the coordinator's (CLAUDE_PROJECT_DIR). Only looks at write commands: git commit/push and file edits."""
     tool_name, ti = ev.get("tool_name"), ev.get("tool_input") or {}
     if tool_name == "Bash":
-        m = next(filter(None, map(WRITE_PLACE.search, cmdnorm.segments(ti.get("command") or ""))), None)
-        if not m:
-            return None
-        d = ev.get("cwd") or os.getcwd()
-        c = GIT_C_PLACE.search(m.group(1) or "")  # `git -C <dir> commit` writes to <dir>, not to the cwd
-        if c:
-            d = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
-            d = d if os.path.isdir(d) else ev.get("cwd") or os.getcwd()
+        cwd = ev.get("cwd") or os.getcwd()
+        d, m = cwd, None
+        for seg in cmdnorm.segments(ti.get("command") or ""):  # `cd <dir>` in command position moves where the next git writes (subshell included: it writes there)
+            if cd := CD_PLACE.match(seg):
+                nd = os.path.join(d, os.path.expanduser(cd.group(1).strip("'\"")))
+                d = nd if os.path.isdir(nd) else d
+            elif m := WRITE_PLACE.search(seg):
+                break
+        if not m and d == cwd:
+            return None  # no write and no cd that landed anywhere: nothing to look at (a lone `cd` into a bad place still warns below)
+        if m and (c := GIT_C_PLACE.search(m.group(1) or "")):  # `git -C <dir> commit` writes to <dir>, whatever the cd said
+            nd = os.path.join(d, os.path.expanduser(c.group(1).strip("'\"")))
+            d = nd if os.path.isdir(nd) else d
     elif tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"):
         file_path = ti.get("file_path") or ti.get("notebook_path") or next(iter(PATCH_FILE.findall(ti.get("command") or "")), "")
         d = os.path.dirname(os.path.join(ev.get("cwd") or os.getcwd(), file_path)) if file_path else ""

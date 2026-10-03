@@ -4396,6 +4396,31 @@ def test_place_only_in_coordinator_and_under_100_ms():
     assert time.perf_counter() - t < 0.1, "o hook em si (git incluído) passa de 100 ms"
 
 
+def test_place_follows_the_cd_before_a_git_write():
+    a = Env(run="run_a")
+    a.prompt("oi")
+    p, w = _repo(a.tmp.name)  # the cwd is the main checkout on main; the worker worktree is elsewhere
+    neutral = a.tmp.name
+    q, _ = _repo(os.path.join(a.tmp.name, "other"), branch="feat/outra")
+    for cmd in (f"cd {q} && git commit -m x", f"cd {w}; git push", f"(cd {q} && git commit -m x)", f"cd {q} && rtk git push"):
+        assert "wrong place" in _notice(_place(a, neutral, cmd=cmd, CLAUDE_PROJECT_DIR=p)), cmd
+    assert _notice(_place(a, neutral, cmd=f"cd {p} && git commit -m x", CLAUDE_PROJECT_DIR=p)) == "", "cd to the main on the default branch is fine"
+    assert _notice(_place(a, neutral, cmd=f'echo "cd {q} && git commit"', CLAUDE_PROJECT_DIR=p)) == ""
+    assert "wrong place" in _notice(_place(a, neutral, cmd=f"cd {p} && git -C {w} commit", CLAUDE_PROJECT_DIR=p)), "-C wins over the cd"
+
+
+def test_place_lone_cd_warns_in_a_worker_worktree_or_off_the_default_branch():
+    a = Env(run="run_a")
+    a.prompt("oi")
+    p, w = _repo(a.tmp.name)
+    q, _ = _repo(os.path.join(a.tmp.name, "other"), branch="feat/outra")
+    msg = _notice(_place(a, p, cmd=f"cd {w}", CLAUDE_PROJECT_DIR=p))
+    assert "wrong place" in msg and os.path.realpath(w) in msg, msg
+    assert "wrong place" in _notice(_place(a, p, cmd=f"cd {q} && ls", CLAUDE_PROJECT_DIR=p))
+    assert _notice(_place(a, a.tmp.name, cmd=f"cd {p}", CLAUDE_PROJECT_DIR=p)) == "", "checkout on the default branch"
+    assert _notice(_place(a, p, cmd=f"cd {w}", CLAUDE_PROJECT_DIR=w)) == "", "the coordinator's own home"
+
+
 def test_place_is_in_the_example_settings():
     cfg = json.load(open(os.path.join(HERE, "settings.hooks.example.json")))
     g = [x for x in cfg["hooks"]["PreToolUse"] if "orq.py hook place" in json.dumps(x)]
