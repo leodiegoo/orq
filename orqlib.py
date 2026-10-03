@@ -15054,6 +15054,7 @@ MACHINE_DEFAULTS = {"max_workers": 4,  # workers alive at the same time (24 GB o
                   "age_colors": [[5, "warn"], [15, "hot"], [30, "crit"]],  # minutes of waiting where a queue item turns yellow, orange and red (ticket 345); AGE_FACTOR stretches them per kind, P1 halves them
                   "reserve_idle_min": 5,  # minutes a queue item waits before it may take a slot another project reserves (`reserve_slots`) and is not using (ticket 344)
                   "release_batch_max": 5,  # a close that releases more dependents than this queues only this many; the rest enter as the queue drops (ticket 344)
+                  "integration_batch_max": 5,  # queued branches selected per integrator cycle (ticket 458)
                   "stop_bloqueia": False,
                   "publico_proibido": PUBLICO_PROIBIDO_DEFAULT}  # global publication guard, extended with per-project rules
 DISPATCH_QUEUE = "dispatch-queue.json"  # {itens: [...]}: what `orq dispatch_worker` and `orq resume` could not bring up; the manager brings it up by priority
@@ -15219,6 +15220,11 @@ def machine_cfg():
     """MACHINE_DEFAULTS on top of maquina.json; a key of the wrong type or an unknown one counts as absent."""
     read_text = _dict(_read_json(_path(MACHINE_FILE)))
     out = {k: read_text[k] if k in read_text and _machine_kind_ok(p, read_text[k]) else p for k, p in MACHINE_DEFAULTS.items()}
+    batch_max = read_text.get("integration_batch_max")
+    if type(batch_max) is int and batch_max > 0:
+        out["integration_batch_max"] = batch_max
+    else:
+        out["integration_batch_max"] = MACHINE_DEFAULTS["integration_batch_max"]
     if "publico_proibido" in read_text and _machine_kind_ok(PUBLICO_PROIBIDO_DEFAULT, read_text["publico_proibido"]):
         configured = read_text["publico_proibido"]
         out["publico_proibido"] = {"patterns": list(dict.fromkeys([*PUBLICO_PROIBIDO_DEFAULT["patterns"], *configured["patterns"]])),
@@ -15237,6 +15243,8 @@ def machine_set(key_name, value):
         raise ValueError(f"value {value!r} is not JSON (use 4, true or [\"claude-opus-*\"])")
     if not _machine_kind_ok(MACHINE_DEFAULTS[key_name], v):
         raise ValueError(f"value {value} does not fit {key_name} (expects {type(MACHINE_DEFAULTS[key_name]).__name__})")
+    if key_name == "integration_batch_max" and (type(v) is not int or v < 1):
+        raise ValueError("integration_batch_max must be a positive integer")
     _write_json(_path(MACHINE_FILE), {**_dict(_read_json(_path(MACHINE_FILE))), key_name: v}, indent=2)
     return machine_cfg()
 
