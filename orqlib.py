@@ -8,6 +8,7 @@ import collections
 import contextlib
 import difflib
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -21,6 +22,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -35,6 +37,31 @@ def ThreadPoolExecutor(n):  # late import: concurrent.futures costs ~11 ms and o
     from concurrent.futures import ThreadPoolExecutor as _T
     return _T(n)
 
+COVER_HITS = set()  # the `file:function` of the clone this process ran, after cover_start (ticket 328)
+
+
+def cover_start():
+    """Records the top-level functions of the clone's .py files this process runs, as `file:function` in COVER_HITS: the test map of `orq test --affected` (ticket 328).
+    sys.monitoring turns each function off after its first call, so the cost is one callback per function. With ORQ_COVER, appends them to that file at exit."""
+    mon, root = sys.monitoring, orqpaths.HERE + os.sep
+
+    def hit(code, _offset):
+        f = os.path.realpath(code.co_filename)
+        if f.startswith(root) and not code.co_qualname.startswith("<"):
+            COVER_HITS.add(f"{f[len(root):]}:{code.co_qualname.split('.')[0]}")
+        return mon.DISABLE
+    if mon.get_tool(mon.COVERAGE_ID) is None:
+        mon.use_tool_id(mon.COVERAGE_ID, "orq")
+    mon.register_callback(mon.COVERAGE_ID, mon.events.PY_START, hit)
+    mon.set_events(mon.COVERAGE_ID, mon.events.PY_START)
+    if os.environ.get("ORQ_COVER"):
+        import atexit
+        atexit.register(lambda: open(os.environ["ORQ_COVER"], "a").write("".join(f"{h}\n" for h in COVER_HITS)))
+
+
+if os.environ.get("ORQ_COVER"):
+    cover_start()
+
 HOME = orqpaths.HOME  # the clone (ORQ_HOME overrides); the plan and the integration worktrees live in it too (ticket 124)
 PLAN = orqpaths.PLAN  # tickets, specs, reports and the design map (ORQ_PLAN)
 WT_ROOT = orqpaths.WT  # the orq ticket worktrees and the integrator's (ORQ_WT)
@@ -45,6 +72,7 @@ CLEAN_SCRIPT = os.environ.get("ORQ_LIMPAR") or os.path.join(orqpaths.HERE, "scri
 CLEAN_DELAY_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # the same delay as the "merged" hook
 CLOSED_DAYS = float(os.environ.get("ORQ_FECHADO_DIAS") or 1)  # days between the task's last PR closed without merge and the automatic branch cleanup
 REPORTS = os.environ.get("ORQ_RELATORIOS") or os.path.join(PLAN, "relatorios")
+STEERS = os.environ.get("ORQ_STEERS") or os.path.join(PLAN, "steers")  # the long adjustments, one file each: <task>-<n>.md
 FINAL_BASE = os.environ.get("ORQ_FINAL_BASE")  # forces the base that closes out the branch; without it, the project's production applies (same as limpar-mergeados.py)
 LAVISH = os.environ.get("ORQ_LAVISH") or "lavish-axi"
 ASK_MIN = float(os.environ.get("ORQ_PERGUNTAR_MIN") or 30)  # how long `orq ask` waits for the answer before leaving the pending item open
@@ -102,8 +130,10 @@ SCREEN_QUESTIONS = (("trust", re.compile(r"trust (?:this|the files in this) fold
                   ("pergunta", re.compile(r"Enter to select|Type something|Chat about this", re.I)))  # o AskUserQuestion aberto
 SCREEN_FOOTER_MAX = 4  # non-empty lines after the options (menu footer) for the menu to still count as open
 WAIT_PHASE = re.compile(r"^\s*(?:esperando:|waiting\b[:\s.…-]*)\s*(.*?)(?:\s+até\s+(\d{1,2}):(\d{2}))?\s*$", re.I)
-STEER_READ_S = 90  # adjustment the dispatch has not read (`read` in the Orca inbox or the id in the worker's transcript) this long after sending, or after the last retype, is redelivered
-STEER_ATTEMPTS = 3  # retypes of the notice to the idle worker; without a read STEER_READ_S after the third, it becomes the "steer não lido" (unread steer) alert
+STEER_READ_S = 300  # adjustment with no receipt (read in the Orca inbox, the id in the worker's transcript, or `orq reply`) this long after sending, or after the retype, is typed again (ticket 350)
+STEER_ATTEMPTS = 1  # retypes of the line to the idle worker; without a receipt STEER_READ_S after it, it becomes the "steer not read" alert, the user's entry
+STEER_LINE = "orq: adjustment in "  # how the line of a long adjustment starts: the worker's prompt hook acks the inbox on it too
+STEER_FILE_MIN = 250  # an adjustment longer than this goes whole to STEERS/<task>-<n>.md and the message carries only a line with the path (Orca's notice cuts at 300)
 STEER_TRANSCRIPT_BYTES = 4_000_000  # the end of the worker's transcript where the steer message id is looked up
 STEER_WINDOW_S = 30 * 60  # a steer older than this leaves the tracking: the 200-message inbox no longer reaches it
 NOT_STARTED_S = 120  # a dispatch open with no turn recorded this long after the dispatch did not start (the worker-start that was left without Enter)
@@ -121,6 +151,8 @@ NOTICE_RUN = re.compile(r"orchestration check --run (run_\w+)")
 SUMMARY_REQUEST_S = 60  # a user entry newer than this is the request of `orq summary` itself
 ANDA = ("rodando", "perguntando", "travado", "limite", "parado", "nao_comecou", "aguardando_integracao", "devolvida")  # states that appear in "Anda" (Moving) of `orq summary`
 PANEL_ALIVE = "manager-alive"  # the agent manager panel touches this file on every round (painel-agent-manager.sh), outside orq
+PANEL_OK = "manager-ok"  # touched only at the end of a round whose absorb phase finished without error (ticket 229): progress, not just life
+FAILING_ROUNDS = 3  # consecutive failed rounds that open a `gerente_falha` episode
 PANEL_STOPPED_S = 60  # a stamp older than this already warrants a "painel lento" (slow panel) notice; stopped is the limit of panel_limit_s
 PANEL_LIMIT_MIN_S = 90  # the stamp only counts as a stopped panel after this long (or PANEL_ROUNDS_X average rounds, whichever is greater)
 PANEL_ROUNDS_X = 3
@@ -129,6 +161,9 @@ PANEL_INTERVAL_MAX_S = 30  # ceiling of the `sleep` when the round exceeds PANEL
 REMEMBERED_ROUNDS = 10  # round durations kept in gerente.json `voltas_s`
 INTEGRATE_QUEUE_FILE = "integrate-queue.json"  # {itens: [{branch, ticket, ts}]}: the branches waiting for the integrator; the ticket's worker stays "aguardando integração" (awaiting integration)
 PANEL_CHECK = "manager-check.json"  # {ts, terminal, morto}: what the last `orq manager checar` (outside the hook) saw in Orca; the hook only reads it
+PANEL_RESPAWN = "manager-respawn.json"  # {terminal, tentativas, ts}: the on-its-own respawns (ticket 230) of the dead manager terminal `terminal`
+RESPAWN_MAX = 3  # attempts per dead terminal; after that only the manual notice (`orq manager spawn`) is left
+RESPAWN_WAIT_S = 300  # a new attempt on the same dead terminal waits this long
 MANAGER = "manager.json"  # {coordenador, gerente, runs}: the coordinator talks to Orca through the agent manager terminal
 RUN_STOPPED_MIN = float(os.environ.get("ORQ_RUN_PARADO_MIN") or 30)  # a Run with no open task or message for this long leaves the manager
 RECENT_RUN_H = 24  # a Run with no open work only shows up in the summary until 24 h after the last activity; after that it goes to the archive (`orq runs --include_all`)
@@ -160,6 +195,7 @@ PR_POLL_S = float(os.environ.get("ORQ_PR_POLL_S") or 120)  # minimum interval be
 PR_GH_S = 15  # time limit for each `gh pr view`
 OLD_READ_MIN = float(os.environ.get("ORQ_LEITURA_VELHA_MIN") or 10)  # minutes: CI and conflict read longer ago than this show up as a stale reading
 CHECK_FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+BASE_RED = CHECK_FAILED - {"CANCELLED"}  # a cancelled run on the base tip says nothing about the base being red
 STOPPED_WT_D = 3  # a worktree with no worker and no activity for longer than this enters the `orq status` line
 PR_VISIBLE_D = 7  # a feature with all PRs resolved for longer than this leaves `orq status`
 FLOWS = ("promocao", "direto")  # promocao (promotion): the same feature branch opens one PR per environment, in order; direto (direct): a single PR, to the production branch
@@ -451,29 +487,88 @@ def integration_queue():
     return {i["ticket"]: i for i in _dict(_read_json(_path(INTEGRATE_QUEUE_FILE))).get("itens") or [] if isinstance(i, dict) and i.get("ticket")}
 
 
-def integrate_queue_add(branch, ticket):
-    """Puts the ticket's branch on the integrator queue (repeating swaps the branch, doesn't duplicate). While it is there, the ticket's worker stays `aguardando integração`."""
+def integrate_queue_add(branch, ticket, head=None):
+    """Puts the ticket's branch on the integrator queue (repeating swaps the branch, doesn't duplicate). While it is there, the ticket's worker stays `aguardando integração`.
+    `head` is the commit the delivery proved (ticket 222): `integrate_proof` refuses the cycle when the branch tip is not that commit. Without it (manual add, old item) it only warns."""
     n = str(ticket).strip().zfill(2)
     if not branch or not branch.strip():
         raise ValueError("empty branch")
-    new = {"branch": branch.strip(), "ticket": n, "ts": now()}
+    new = {"branch": branch.strip(), "ticket": n, "ts": now(), **({"head": head} if head else {})}
     with _lock("integrate-queue.lock"):
         item_list = [i for i in _dict(_read_json(_path(INTEGRATE_QUEUE_FILE))).get("itens") or [] if isinstance(i, dict)]
         pos = next((k for k, i in enumerate(item_list) if i.get("ticket") == n), len(item_list))
         item_list[pos:pos + 1] = [new]
         _write_json(_path(INTEGRATE_QUEUE_FILE), {"itens": item_list}, indent=2)
-    return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": new["branch"]})
+    return append_event({"tipo": "integrar_fila", "op": "add", "ticket": n, "branch": new["branch"], **({"head": head} if head else {})})
 
 
-def audit_publication(revs, repo=None):
+def prove(task, step, head, result, **extra):
+    """Records that `step` proved something about `task` at commit `head` (`prova` event, ticket 222): what `pr open` and the integrator compare the branch tip against."""
+    return append_event({"tipo": "prova", "task": task, "passo": step, "head": head, "resultado": result, **extra})
+
+
+def proof_head(task, events=None):
+    """The commit of the task's last proof (`prova` event), or None."""
+    return next((e["head"] for e in reversed(events or read_events()) if e.get("tipo") == "prova" and e.get("task") == task and e.get("head")), None)
+
+
+def _branch_repo(branch):
+    """The first ORQ_REPOS repository that has `branch`, or None."""
+    return next((r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r and _git(r, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") is not None), None)
+
+
+def _proof_gap(repo, branch, head):
+    """Why the tip of `branch` is not the proven `head` (commits after the proof, or not a descendant of it), or None when it is."""
+    tip = (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip()
+    if tip == head:
+        return None
+    if subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", head, tip], capture_output=True).returncode == 0:
+        after = (_git(repo, "log", "--reverse", "--format=%h %s (%an)", f"{head}..{tip}") or "").strip().replace("\n", "\n    ")
+        return f"{branch} has commits after the proof ({head[:7]}), run `orq review` again:\n    {after}"
+    return f"{branch} ({tip[:7]}) is not a descendant of the proven commit {head[:7]} (amend, rebase or reset)"
+
+
+def proof_guard(checks, no_proof=None):
+    """`checks` is [(repo, branch, head, who)], `who` the event keys (task or ticket). A branch whose tip is the proven head passes; no head recorded passes with a notice;
+    commits after the proof or a non-descendant tip are refused (ValueError listing all of them), unless `no_proof` gives the reason, which goes to the `prova` event. Returns the notices."""
+    notices, refused = [], []
+    for repo, branch, head, who in checks:
+        if not head:
+            notices.append(f"{branch}: no proven commit recorded, nothing to compare")
+        elif gap := _proof_gap(repo, branch, head):
+            if not no_proof:
+                refused.append(gap)
+                continue
+            notices.append(f"{gap} (--no-proof: {no_proof})")
+            prove(who.get("task"), "no_proof", (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip(), "waived", motivo=no_proof, branch=branch, anterior=head, **{k: v for k, v in who.items() if k != "task"})
+    if refused:
+        raise ValueError("\n".join(refused) + "\nor `--no-proof \"<reason>\"` to go ahead without the proof")
+    return notices
+
+
+def integrate_proof(branches, no_proof=None):
+    """The integrator cycle's check (`integrar.py` calls it before merging): each queued branch against the commit its delivery recorded. A branch not in the queue or not found passes."""
+    queue = integration_queue()
+    checks = []
+    for b in branches:
+        item = next((i for i in queue.values() if i["branch"] == b), None)
+        if item and (repo := _branch_repo(b)):
+            checks.append((repo, b, item.get("head"), {"ticket": item["ticket"]}))
+    return proof_guard(checks, no_proof)
+
+
+def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "readme")):
     """Reasons why `revs` (args of `git rev-list`, e.g. `base..head`) cannot go to the public main: author or committer outside the configured noreply
     (`ORQ_AUTOR` or `git config user.email`), Co-Authored-By trailer or generator footer, forbidden term in the diff or message, `orqlib.py`/`orq.py` without `README.md` in the range.
-    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check."""
-    git = lambda *x: subprocess.run(["git", *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
+    Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check. `checks` narrows it: `orq pr open` on a product repo
+    passes ("author", "trailer"), since the forbidden terms list holds the product's own name and the README rule is orq's (ticket 227)."""
+    git = lambda *x: subprocess.run([GIT, *(["-C", repo] if repo else []), *x], capture_output=True, text=True, check=True).stdout  # noqa: E731
     expected = os.environ.get("ORQ_AUTOR") or git("config", "user.email").strip()
     terms = []
     listing = os.environ.get("ORQ_TERMOS") or os.path.join(PLAN, "termos-proibidos.txt")
-    if os.path.exists(listing):
+    if "terms" not in checks:
+        pass
+    elif os.path.exists(listing):
         spec = importlib.util.spec_from_file_location("audiencia_check", os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "audiencia-check.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -484,17 +579,17 @@ def audit_publication(revs, repo=None):
     for sha in git("rev-list", "--reverse", *revs).split():
         an, ae, cn, ce, msg = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha).split("\0", 4)
         findings = [f"author {an} <{ae}> and committer {cn} <{ce}> must be <{expected}> (git commit --amend --reset-author, or git rebase --exec 'git commit --amend --no-edit --reset-author')"
-                   for _ in [0] if {ae, ce} != {expected}]
-        if re.search(r"^co-authored-by:|generated with|🤖", msg, re.I | re.M):
+                   for _ in [0] if "author" in checks and {ae, ce} != {expected}]
+        if "trailer" in checks and re.search(r"^co-authored-by:|generated with|🤖", msg, re.I | re.M):
             findings.append("Co-Authored-By trailer or generator footer in the message (git commit --amend to remove the line)")
         added_text = "\n".join(l[1:] for l in git("show", "--format=", "--unified=0", sha).splitlines() if l.startswith("+") and not l.startswith("+++"))
         findings += [f"forbidden term /{t.pattern}/ in the diff or the message" for t in terms if t.search(msg) or t.search(added_text)]
         changed_files = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).split())
-        if first_code is None and changed_files & {"orqlib.py", "orq.py"}:
+        if "readme" in checks and first_code is None and changed_files & {"orqlib.py", "orq.py"}:
             first_code = sha
         files_set |= changed_files
         reasons += [f"{sha[:7]} {msg.splitlines()[0] if msg.strip() else ''}: {m}" for m in findings]
-    if first_code and "README.md" not in files_set:
+    if "readme" in checks and first_code and "README.md" not in files_set:
         reasons.append(f"{first_code[:7]}: changes orqlib.py/orq.py and no commit in the range touches README.md (document the change)")
     return reasons
 
@@ -585,6 +680,7 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         ev = read_events()
         lib = _released(ev) | {e.get("dispatch") for e in ev if e.get("tipo") == "liberar" and e.get("estado") in ("released", "already_released")}
         live = {str(e["ticket"]).zfill(2) for e in ev if e.get("tipo") == "despacho" and e.get("ticket") and e.get("dispatch") not in lib}  # `retained` and `release_unknown` count as alive
+        live |= {str(i["ticket"]).zfill(2) for i in integration_queue().values()}  # a delivery still on the integrator queue is not residue (ticket 326)
     subjects = set((_git(repo, "log", "--format=%s", ref) or "").splitlines())
     out, cwds, rewrites = {"removidas": [], "ficaram": [], "bundle": None}, None, []
     for item_name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
@@ -636,6 +732,382 @@ def clean_orq_worktrees(repo=None, root=None, ref="origin/main", dry_run=False, 
         out["removidas"].remove(x)
         out["ficaram"].append({"pasta": x["pasta"], "motivo": reason})
     return out
+
+
+# ---------- orq clean: residue with no owner (ticket 326) ----------
+
+CLEAN_DEFAULTS = {"notice_hours": 24,  # a notice in avisos/ older than this goes, whatever its condition
+                  "backups_keep": 3, "backups_days": 7,  # backup-pt-* and plan/backups/*.bundle: the 3 newest and the ones under 7 days stay
+                  "settings_keep": 3,  # ~/.claude/settings.json.bak-* and ~/.claude/backups/*: the 3 newest stay
+                  "integra_hours": 1,  # an integra-* worktree with no process and no commit for this long is an orphan
+                  "state_hours": 24}  # *.antes-* and dead-owner lock files older than this go
+CLEAN_FILE = "clean.json"  # same keys as CLEAN_DEFAULTS; machine.json takes the same keys, clean.json wins
+CLEAN_SAFE = ("notices", "state")  # the manager applies these every hour; CLEAN_SIZE once a day, outside away mode and without machine pressure
+CLEAN_SIZE = ("worktrees", "branches", "integra", "backups", "claude")
+CLEAN_CATEGORIES = (*CLEAN_SAFE, *CLEAN_SIZE, "test-lines")  # test-lines is only listed: `orq clean --test-lines --apply` is the user's approval
+CLEAN_STAMPS = "clean-run.json"  # {safe, size}: when the manager last ran each tier
+CLEAN_TEST_IDS = {"task": {"x"}, "run": {"x", "run_a"}, "terminal": {"term_x"}}  # what the suites that leaked into the real events.jsonl wrote (ticket 326, 02/10)
+NOTICE_CONDITIONS = {  # `valid_while` of a notice in avisos/: the notice is valid while the function answers True; unknown names count as valid (the age still expires it)
+    "e2e_stuck": lambda: bool((e2e_queue() or {}).get("presa")),
+    "manager_down": lambda: bool(panel_notice()),
+    "machine_pressure": lambda: machine_level()[0] == "alta"}
+STATE_NOTICES = {"e2e-notice.json": "e2e_stuck", fail_safe.MARKER: "hooks_broken"}  # state files that only mean something while their condition holds
+STATE_NOTICES_VALID = {"hooks_broken": lambda: bool(fail_safe.broken_line())}
+
+
+def clean_cfg():
+    """CLEAN_DEFAULTS on top of machine.json and clean.json; a key of the wrong type or an unknown one counts as absent."""
+    cfg = dict(CLEAN_DEFAULTS)
+    for name in (MACHINE_FILE, CLEAN_FILE):
+        stored = _dict(_read_json(_path(name)))
+        cfg.update({k: stored[k] for k in CLEAN_DEFAULTS if isinstance(stored.get(k), (int, float)) and not isinstance(stored[k], bool)})
+    return cfg
+
+
+def _claude_dir():
+    """The folder with settings.json.bak-* and backups/. Under the test suite (ORQ_TESTING) a missing ORQ_CLAUDE_DIR means no folder: a test must not list or remove the real ~/.claude."""
+    return os.environ.get("ORQ_CLAUDE_DIR") or (None if os.environ.get("ORQ_TESTING") else os.path.expanduser("~/.claude"))
+
+
+def _size_of(path):
+    """Bytes of a file, or of a folder through `du` (a worktree has thousands of files; du is the fast way)."""
+    try:
+        if not os.path.isdir(path) or os.path.islink(path):
+            return os.lstat(path).st_size
+        r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=30)
+        return int(r.stdout.split()[0]) * 1024 if r.returncode == 0 and r.stdout.split() else 0
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0
+
+
+def _clean_protected(path):
+    """Why orq clean never touches `path`, or None: plan/ (tickets, specs, reports), the live state (events, cursor, backlog.*, projects/, groups/) and any file git tracks."""
+    real = os.path.realpath(path)
+    plan, home = os.path.realpath(PLAN), os.path.realpath(HOME)
+    if real == plan or (real.startswith(plan + os.sep) and os.path.dirname(real) != os.path.join(plan, "backups")):
+        return "plan/ is never touched"
+    rel = os.path.relpath(real, home)
+    if not rel.startswith("..") and (rel in ("events.jsonl", "cursor.json") or rel.startswith(("backlog.", "projects" + os.sep, "groups" + os.sep)) or rel in ("projects", "groups")):
+        return "live state is never touched"
+    try:
+        tracked = subprocess.run(["git", "-C", os.path.dirname(real), "ls-files", "--error-unmatch", "--", os.path.basename(real)], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        tracked = True  # git did not answer: the safe reading is "versioned"
+    return "versioned file" if tracked else None
+
+
+def _newest_kept(entries, keep, days, now_at):
+    """`entries` = [(path, mtime)]: the ones to remove, i.e. outside the `keep` newest and older than `days` days."""
+    ordered = sorted(entries, key=lambda e: e[1], reverse=True)
+    return [(p, m) for p, m in ordered[keep:] if now_at - m >= days * 86400]
+
+
+def _clean_item(category, target, reason, now_at, age_at=None, size=None, **extra):
+    return {"categoria": category, "alvo": target, "bytes": _size_of(target) if size is None else size, "idade_s": int(now_at - age_at) if age_at is not None else None, "motivo": reason, **extra}
+
+
+def _clean_notices(now_at, cfg):
+    """avisos/: the long notices `_short` stores (`<hash>.txt` + `<hash>.json` with `valid_while`). A notice goes when its condition stopped holding, or after notice_hours."""
+    folder, out = os.path.join(HOME, "avisos"), []
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        path = os.path.join(folder, name)
+        if name.endswith(".json") and os.path.exists(path[:-5] + ".txt"):
+            continue  # the sidecar goes with its notice
+        mtime = os.path.getmtime(path)
+        side = _dict(_read_json(path[:-4] + ".json")) if name.endswith(".txt") else {}
+        cond = side.get("valid_while")
+        if cond in NOTICE_CONDITIONS and not NOTICE_CONDITIONS[cond]():
+            reason = f"the condition `{cond}` no longer holds"
+        elif now_at - mtime >= cfg["notice_hours"] * 3600:
+            reason = f"older than {cfg['notice_hours']:g} h"
+        else:
+            continue
+        if not _clean_protected(path):
+            out.append(_clean_item("notices", path, reason, now_at, mtime))
+    return out
+
+
+def _lock_free(path):
+    try:
+        with open(path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_dead(path):
+    try:
+        pid = int(open(path).read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _clean_state(now_at, cfg):
+    """Runtime files that became leftovers: `*.antes-*` (a state file kept before a change), a lock/pid file whose owner died and whose flock is free, and the
+    `*-notice.json` of a state that already resolved (e2e-notice.json with the E2E queue free, hook-failed.json with the hooks working)."""
+    out = []
+    for name in sorted(os.listdir(HOME)) if os.path.isdir(HOME) else []:
+        path = os.path.join(HOME, name)
+        if not os.path.isfile(path):
+            continue
+        mtime, old = os.path.getmtime(path), now_at - os.path.getmtime(path) >= cfg["state_hours"] * 3600
+        cond = STATE_NOTICES.get(name)
+        if ".antes-" in name and old:
+            reason = "state file kept before a change, older than %g h" % cfg["state_hours"]
+        elif name.endswith((".lock", ".pid")) and old and _pid_dead(path) and _lock_free(path):
+            reason = "lock whose owner process is gone"
+        elif cond and not (NOTICE_CONDITIONS.get(cond) or STATE_NOTICES_VALID[cond])():
+            reason = f"notice of a state that already resolved (`{cond}` no longer holds)"
+        else:
+            continue
+        if not _clean_protected(path):
+            out.append(_clean_item("state", path, reason, now_at, mtime))
+    return out
+
+
+def _clean_worktrees(now_at, repo, root, backups):
+    r = clean_orq_worktrees(repo, root, dry_run=True, now_at=now_at, backups=backups)
+    return [_clean_item("worktrees", x["pasta"], f"branch {x['branch']} already in origin/main ({x['via']})", now_at, _birth(x["pasta"]), branch=x["branch"], via=x["via"]) for x in r["removidas"]]
+
+
+def _clean_integra(now_at, cfg, repo, root):
+    """`<root>/integra-*` worktrees (the integrator's own): no process inside, clean, and the last commit older than integra_hours. Never one whose ticket is still in the integrator queue."""
+    queued = {i["branch"] for i in integration_queue().values()}
+    out, cwds = [], None
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        d = os.path.join(root, name)
+        if not name.startswith("integra-") or not os.path.exists(os.path.join(d, ".git")):
+            continue
+        branch = (_git(d, "branch", "--show-current") or "").strip()
+        last, status = (_git(d, "log", "-1", "--format=%ct") or "").strip(), _git(d, "status", "--porcelain")
+        cwds = _open_cwds() if cwds is None else cwds
+        real = os.path.realpath(d)
+        reason = ("detached HEAD" if not branch else "branch is on the integrator queue" if branch in queued else "uncommitted changes" if status is None or status.strip()
+                  else "a process is inside" if any(c == real or c.startswith(real + os.sep) for c in cwds) else "no commit time" if not last.isdigit()
+                  else "a commit is newer than the limit" if now_at - int(last) < cfg["integra_hours"] * 3600 else None)
+        if not reason:
+            out.append(_clean_item("integra", d, f"integration folder with no process and no new commit for over {cfg['integra_hours']:g} h", now_at, int(last), branch=branch))
+    return out
+
+
+def _local_branches(repo):
+    """[(branch, tip sha, checked-out path or '')] of the local branches."""
+    out = _git(repo, "for-each-ref", "--format=%(refname:short) %(objectname) %(worktreepath)", "refs/heads") or ""
+    return [(p[0], p[1], p[2] if len(p) > 2 else "") for p in (l.split(" ", 2) for l in out.splitlines() if l.strip())]
+
+
+def _clean_branches(now_at, repo, ref=None):
+    """Local branches whose tip is already in `ref`. Not: main/environment branches, one checked out in a worktree, one at the very tip of `ref` (a branch a worker just
+    created), one on the integrator queue."""
+    ref = ref or BRANCH_NO_REMOTE
+    if _git(repo, "rev-parse", "--verify", "-q", ref) is None:
+        return []
+    tip = (_git(repo, "rev-parse", ref) or "").strip()
+    queued = {i["branch"] for i in integration_queue().values()}
+    out = []
+    for b, sha, worktree in _local_branches(repo):
+        if b == ref or _environment_branch(b) or worktree or sha == tip or b in queued or _git(repo, "merge-base", "--is-ancestor", b, ref) is None:
+            continue
+        stamp = (_git(repo, "log", "-1", "--format=%ct", b) or "0").strip()
+        out.append(_clean_item("branches", b, f"already integrated into {ref}", now_at, int(stamp) if stamp.isdigit() else None, size=0, sha=sha))
+    return out
+
+
+def _clean_backups(now_at, cfg, backups):
+    """`backup-pt-*` folders in ORQ_HOME (the migration to English) and plan/backups/*.bundle: the newest `backups_keep` and the ones under `backups_days` days stay."""
+    entries = [(os.path.join(HOME, n), os.path.getmtime(os.path.join(HOME, n))) for n in os.listdir(HOME) if n.startswith("backup-pt-")] if os.path.isdir(HOME) else []
+    bundles = [(os.path.join(backups, n), os.path.getmtime(os.path.join(backups, n))) for n in os.listdir(backups) if n.endswith(".bundle")] if os.path.isdir(backups) else []
+    return [_clean_item("backups", p, f"not among the {cfg['backups_keep']:g} newest and older than {cfg['backups_days']:g} days", now_at, m)
+            for group in (entries, bundles) for p, m in _newest_kept(group, cfg["backups_keep"], cfg["backups_days"], now_at) if not _clean_protected(p)]
+
+
+def _clean_claude(now_at, cfg):
+    """~/.claude/settings.json.bak-* and ~/.claude/backups/*: the newest `settings_keep` of each stay."""
+    base = _claude_dir()
+    if not base:
+        return []
+    baks = [(os.path.join(base, n), os.path.getmtime(os.path.join(base, n))) for n in os.listdir(base) if n.startswith("settings.json.bak-")] if os.path.isdir(base) else []
+    folder = os.path.join(base, "backups")
+    saved = [(os.path.join(folder, n), os.path.getmtime(os.path.join(folder, n))) for n in os.listdir(folder)] if os.path.isdir(folder) else []
+    return [_clean_item("claude", p, f"not among the {cfg['settings_keep']:g} newest", now_at, m)
+            for group in (baks, saved) for p, m in _newest_kept(group, cfg["settings_keep"], 0, now_at)]
+
+
+def _is_test_event(line):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(e, dict) and any(e.get(k) in ids for k, ids in CLEAN_TEST_IDS.items())
+
+
+def clean_test_lines():
+    """The lines of events.jsonl that a test suite wrote into the real log (tasks and runs `x`, `run_a`, `term_x`): (line number, text). Lists only."""
+    try:
+        with open(_path("events.jsonl"), encoding="utf-8") as f:
+            return [(n, l.rstrip("\n")) for n, l in enumerate(f, 1) if _is_test_event(l)]
+    except OSError:
+        return []
+
+
+def _clean_test_lines(now_at):
+    lines = clean_test_lines()
+    return [_clean_item("test-lines", _path("events.jsonl"), f"{len(lines)} event line(s) from a test suite (task/run `x`, `run_a`, `term_x`); `orq clean --test-lines --apply` removes them after a backup", now_at,
+                        size=sum(len(l) + 1 for _, l in lines))] if lines else []
+
+
+def _clean_bundle(repo, branches, backups, now_at, ref):
+    """Bundle of the commits of `branches` that `ref` does not have (verified). Nothing to bundle when all of them are in `ref`: returns (None, True). (path, ok)."""
+    branches = [b for b in branches if (_git(repo, "log", "--format=%H", "-1", f"{ref}..{b}") or "").strip()]
+    if not branches:
+        return None, True
+    os.makedirs(backups, exist_ok=True)
+    bundle = os.path.join(backups, f"orq-clean-{time.strftime('%Y-%m-%d-%H%M%S', time.localtime(now_at))}.bundle")
+    ok = subprocess.run(["git", "-C", repo, "bundle", "create", bundle, *branches, f"^{ref}"], capture_output=True).returncode == 0 \
+        and subprocess.run(["git", "-C", repo, "bundle", "verify", bundle], capture_output=True).returncode == 0
+    return (bundle if ok else None), ok
+
+
+def clean_plan(now_at=None, only=None, repo=None, root=None, backups=None):
+    """What `orq clean` would remove, by category: {category: [item]}. Pure read: writes nothing, records nothing. `only`: the categories to look at (default all)."""
+    now_at = time.time() if now_at is None else now_at
+    repo, root, backups, cfg = repo or HOME, root or WT_ROOT, backups or os.path.join(PLAN, "backups"), clean_cfg()
+    looks = {"notices": lambda: _clean_notices(now_at, cfg), "state": lambda: _clean_state(now_at, cfg), "worktrees": lambda: _clean_worktrees(now_at, repo, root, backups),
+             "branches": lambda: _clean_branches(now_at, repo), "integra": lambda: _clean_integra(now_at, cfg, repo, root), "backups": lambda: _clean_backups(now_at, cfg, backups),
+             "claude": lambda: _clean_claude(now_at, cfg), "test-lines": lambda: _clean_test_lines(now_at)}
+    return {c: looks[c]() for c in CLEAN_CATEGORIES if only is None or c in only}
+
+
+def _remove_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def clean_apply(plan, now_at=None, repo=None, root=None, backups=None, approve_test_lines=False):
+    """Removes what `plan` lists, each category with its own rule, and records one `clean` event per item (`categoria`, `alvo`, `bytes`, `motivo`) and one `clean_run` with the totals.
+    A worktree or branch goes after a verified bundle of the commits `main` does not have (a branch already in main has nothing to bundle: the event keeps its tip sha).
+    Never a path `_clean_protected` refuses. The test lines of events.jsonl only with `approve_test_lines`, after a copy of the log in plan/backups. Returns {removed: [item], kept: [(item, why)]}."""
+    now_at = time.time() if now_at is None else now_at
+    repo, root, backups = repo or HOME, root or WT_ROOT, backups or os.path.join(PLAN, "backups")
+    removed, kept = [], []
+
+    def done(item):
+        removed.append(item)
+        append_event({"tipo": "clean", **item})
+
+    for item in plan.get("notices", []) + plan.get("state", []) + plan.get("backups", []) + plan.get("claude", []):
+        if why := _clean_protected(item["alvo"]):
+            kept.append((item, why))
+            continue
+        sidecar = item["alvo"][:-4] + ".json" if item["categoria"] == "notices" and item["alvo"].endswith(".txt") else None
+        for p in (item["alvo"], sidecar):
+            if p and os.path.lexists(p):
+                _remove_path(p)
+        done(item)
+    for item in plan.get("integra", []):
+        bundle, ok = _clean_bundle(repo, [item["branch"]], backups, now_at, BRANCH_NO_REMOTE)
+        if not ok or _git(repo, "worktree", "remove", item["alvo"]) is None:
+            kept.append((item, "backup bundle failed" if not ok else "git worktree remove refused"))
+        elif _git(repo, "branch", "-D", item["branch"]) is None:
+            kept.append((item, "folder removed, git branch refused"))
+        else:
+            done({**item, **({"bundle": bundle} if bundle else {})})
+    if plan.get("worktrees"):
+        r = clean_orq_worktrees(repo, root, now_at=now_at, backups=backups)
+        gone = {x["pasta"] for x in r["removidas"]}
+        for item in plan["worktrees"]:
+            (done({**item, **({"bundle": r["bundle"]} if r["bundle"] else {})}) if item["alvo"] in gone else kept.append((item, "no longer eligible")))
+    for item in plan.get("branches", []):
+        b = item["alvo"]
+        if (_git(repo, "rev-parse", b) or "").strip() != item["sha"] or _git(repo, "merge-base", "--is-ancestor", b, BRANCH_NO_REMOTE) is None:
+            kept.append((item, "branch moved since the listing"))
+        elif _git(repo, "branch", "-D", b) is None:  # -D: `-d` judges against HEAD; the ancestry in main was just checked
+            kept.append((item, "git branch refused"))
+        else:
+            done(item)
+    for item in plan.get("test-lines", []) if approve_test_lines else []:
+        with _lock("cursor.lock"):
+            os.makedirs(backups, exist_ok=True)
+            copy = os.path.join(backups, f"events-{time.strftime('%Y-%m-%d-%H%M%S', time.localtime(now_at))}.jsonl.bak")
+            shutil.copy2(item["alvo"], copy)
+            with open(item["alvo"], encoding="utf-8") as f:
+                rows = f.readlines()
+            drop = [i for i, l in enumerate(rows) if _is_test_event(l)]
+            with open(item["alvo"] + ".tmp", "w", encoding="utf-8") as f:
+                f.writelines(l for i, l in enumerate(rows) if i not in set(drop))
+            os.replace(item["alvo"] + ".tmp", item["alvo"])
+        done({**item, "motivo": f"{len(drop)} test line(s) removed; log backup at {copy}"})
+    totals = {}
+    for it in removed:
+        totals[it["categoria"]] = totals.get(it["categoria"], 0) + 1
+    if removed:
+        append_event({"tipo": "clean_run", "quantos": [[c, n] for c, n in totals.items()], "bytes": sum(it["bytes"] for it in removed)})
+    return {"removed": removed, "kept": kept}
+
+
+def clean_human(n):
+    return f"{n / 1048576:.0f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB" if n >= 1024 else f"{n} B"
+
+
+def _clean_block(plan, categories):
+    lines = []
+    for category in categories:
+        items = plan.get(category) or []
+        if items:
+            lines.append(f"{category} ({len(items)}, {clean_human(sum(i['bytes'] for i in items))}):")
+            lines += [f"  {i['alvo']}  {clean_human(i['bytes'])}" + (f", {i['idade_s'] // 3600} h old" if i["idade_s"] is not None else "") + f": {i['motivo']}" for i in items]
+    return lines
+
+
+def clean_text(plan, result=None):
+    """The report of `orq clean`: one block per category with size, age and reason, and the test lines apart (they need the user's approval). With nothing removable it says
+    `nothing to clean` (the second pass of `--apply`); `result` is what clean_apply did."""
+    removable = _clean_block(plan, [c for c in CLEAN_CATEGORIES if c != "test-lines"])
+    approval = _clean_block(plan, ["test-lines"])
+    head = ("dry run: nothing was removed (orq clean --apply removes it)" if result is None else f"removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}") if removable else "nothing to clean"
+    return "\n".join([head, *removable, *(f"kept {i['alvo']}: {why}" for i, why in (result or {}).get("kept", [])), *(["needs your approval:", *approval] if approval else [])])
+
+
+def clean_summary_line(events, since):
+    """One digest line for the cleaning since `since` ("cleaned 41 notices, 12 worktrees, 380 MB"), or None."""
+    runs = [e for e in events if e.get("tipo") == "clean_run" and (e.get("ts") or "") >= since]
+    if not runs:
+        return None
+    totals, size = {}, 0
+    for e in runs:
+        size += e.get("bytes") or 0
+        for c, n in e.get("quantos") or []:
+            totals[c] = totals.get(c, 0) + n
+    return {"ts": runs[-1]["ts"], "tipo": "info", "titulo": "Cleaned " + ", ".join(f"{n} {c}" for c, n in totals.items()) + f", {clean_human(size)}", "detalhe": "orq clean, by the manager"}
+
+
+def clean_round(now_at=None):
+    """Manager round: the safe categories (notices, state) every hour; the size ones (worktrees, branches, integra, backups, claude) once a day, only outside away mode and
+    with the machine under no pressure. The stamps in clean-run.json keep it from running every loop. Returns the panel lines."""
+    now_at = time.time() if now_at is None else now_at
+    stamps = _dict(_read_json(_path(CLEAN_STAMPS)))
+    lines = []
+    for tier, cats, every in (("safe", CLEAN_SAFE, 3600), ("size", CLEAN_SIZE, 86400)):
+        if now_at - (stamps.get(tier) or 0) < every:
+            continue
+        if tier == "size" and (_dict(_cursor_ro().get("ausente")) or machine_level()[0] == "alta"):
+            continue
+        stamps[tier] = now_at
+        _write_json(_path(CLEAN_STAMPS), stamps)
+        result = clean_apply(clean_plan(now_at, only=cats), now_at)
+        if result["removed"]:
+            lines.append(f"clean ({tier}): removed {len(result['removed'])} item(s), {clean_human(sum(i['bytes'] for i in result['removed']))}")
+    return lines
 
 
 def integrate_conclude(hash_, branches, dispatch=None):
@@ -694,6 +1166,7 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
     released, pauses, screens, not_started = _released(events), interrupted_dispatches(events), screens or {}, _not_started(events)
     delivery_notices = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
     integration, dispatch_tickets, services = integration_queue() if integration is None else integration, _dispatch_ticket(events), _services(events)
+    held = _held(events)
     controls = {}
     for e in events:
         if e.get("tipo") == "controle" and e.get("resultado") != "iniciado":
@@ -735,6 +1208,7 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
         if waiting:
             agent_row["espera"] = waiting
         _mark_integration_and_service(agent_row, integration, dispatch_tickets, services)
+        _mark_held(agent_row, held, dispatch_tickets)
         if (screen_questions or {}).get(d) and w.get("dispatchStatus") == "dispatched" and state != "sem_terminal":
             agent_row["pergunta"] = screen_questions[d]
         if screens.get(d) and state != "sem_terminal":
@@ -774,6 +1248,30 @@ def _sent_back(events):
     return out
 
 
+def _held(events):
+    """{ticket or dispatch: {motivo, ts}} of the deliveries the coordinator holds on purpose (`orq hold`): they leave the away Stop and the "Delivered, not released" notice.
+    Keyed by ticket when there is one, so the follow-up dispatch of a held ticket inherits the reason; `hold --release` and `send-back` (the worker redoes it) drop it."""
+    tickets_of, out = _dispatch_ticket(events), {}
+    for e in events:
+        if e.get("tipo") not in ("segurar", "segurar_solta", "devolver"):
+            continue
+        key = e.get("ticket") or tickets_of.get(e.get("dispatch")) or tickets_of.get(e.get("task")) or e.get("dispatch") or e.get("task")
+        if e["tipo"] == "segurar":
+            out[str(key)] = {"motivo": e.get("motivo"), "ts": e.get("ts")}
+        else:
+            out.pop(str(key), None)
+    return out
+
+
+def _mark_held(agent_row, held, dispatch_tickets):
+    """`segurada` ({motivo, ts}) in the line of a delivered worker whose ticket or dispatch is held; gone when it is not (the cache line may carry an old one)."""
+    agent_row.pop("segurada", None)
+    if agent_row.get("estado") == "entregue":
+        tk = dispatch_tickets.get(agent_row.get("dispatch")) or dispatch_tickets.get(agent_row.get("task"))
+        if entry := held.get(str(tk)) or held.get(str(agent_row.get("dispatch"))) or held.get(str(agent_row.get("task"))):
+            agent_row["segurada"] = entry
+
+
 def _mark_integration_and_service(agent_row, integration, dispatch_tickets, services):
     """Puts into `agent_row` (an agent's line) what the integrator queue and the service dispatches say about it: the state `aguardando_integracao` in place of
     travado/nao_comecou/parado, and the service's `cycle`. The reason for travado goes away: the worker isn't stuck, it's waiting for main."""
@@ -797,7 +1295,7 @@ def reassess(agents_, events, now_at, turns=None, integration=None):
     integration, dispatch_tickets, services = integration_queue() if integration is None else integration, _dispatch_ticket(events), _services(events)
     signals = liveness_signals(events)
     released = _released(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}
-    pauses, out, sent_back_list = interrupted_dispatches(events), [], _sent_back(events)
+    pauses, out, sent_back_list, held = interrupted_dispatches(events), [], _sent_back(events), _held(events)
     for agent_row in agents_:
         agent_row = dict(agent_row)
         if agent_row.get("estado") in ("entregue", "devolvida", "servico", "rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao") and agent_row.get("dispatch") in released:
@@ -833,6 +1331,7 @@ def reassess(agents_, events, now_at, turns=None, integration=None):
             else:
                 agent_row.pop("limite", None), agent_row.pop("limite_ts", None)
         _mark_integration_and_service(agent_row, integration, dispatch_tickets, services)
+        _mark_held(agent_row, held, dispatch_tickets)
         out.append(agent_row)
     return out
 
@@ -846,7 +1345,7 @@ def alive_line(events, open_state, now_at=None, turns=None):
     if isinstance((open_state or {}).get("agentes"), list):
         agent_rows = reassess(open_state["agentes"], events, now_at, turns)
         live = sorted((a for a in agent_rows if a["estado"] in ("travado", "limite", "nao_comecou", "parado", "perguntando", "rodando", "aguardando_integracao")), key=lambda a: a.get("prioridade") or 2)
-        without_release = sum(a["estado"] == "entregue" and not a.get("retido") for a in agent_rows)
+        without_release = sum(a["estado"] == "entregue" and not a.get("retido") and not a.get("segurada") for a in agent_rows)
         item_list = []
         for a in live[:3]:
             item_name = f"{'P' + str(a['prioridade']) + ' ' if a.get('prioridade') else ''}{(a.get('task') or '?')[:9]}… "
@@ -1001,6 +1500,21 @@ def panel_limit_s(g):
     return max(PANEL_LIMIT_MIN_S, PANEL_ROUNDS_X * _avg_rounds(g))
 
 
+def _failing_rounds_notice(g, now_at=None):
+    """Panel alive but no round finished well for longer than panel_limit_s (ticket 229): the stamp only proves life, `manager-ok` proves progress. Without the
+    ok stamp it warns only after a recorded failure (a fresh install has none yet). A slow round without error stays "slow panel"."""
+    try:
+        ok_age = (now_at or time.time()) - os.path.getmtime(_path(PANEL_OK))
+    except OSError:
+        ok_age = None
+    fails = g.get("falhas_seguidas") or 0
+    if ok_age is None and not fails or ok_age is not None and ok_age <= panel_limit_s(g):
+        return None
+    detail = f" ({g['ultimo_erro']})" if g.get("ultimo_erro") else ""
+    since = f"{int(ok_age // 60)} min" if ok_age is not None else "the start"
+    return f"agent manager alive, but no round finished well for {since}{detail}: no worker notice arrives"
+
+
 def panel_notice(now_at=None):
     """Notice that the agent manager panel has stopped, or None: with the manager attached to this coordinator, Orca's notices go to the manager's
     terminal and only the panel relays them; the `manager-alive` stamp belongs to the panel's shell, so it holds even with orq.py broken (M19)."""
@@ -1012,11 +1526,15 @@ def panel_notice(now_at=None):
     except OSError:
         age = None
     if age is not None and age <= PANEL_STOPPED_S:
-        return None
+        return _failing_rounds_notice(g, now_at)
     ck = _dict(_read_json(_path(PANEL_CHECK)))
     if ck.get("morto") and ck.get("terminal") == g.get("gerente"):
+        tried = _respawn_state(g["gerente"])["tentativas"]
+        if tried < RESPAWN_MAX:
+            return (f"the agent manager terminal ({g['gerente']}) vanished from Orca: orq is bringing it back up on its own (attempt {max(tried, 1)} of {RESPAWN_MAX}, "
+                    f"one every {RESPAWN_WAIT_S // 60} min); worker_done messages wait in the inbox meanwhile.")
         return (f"the agent manager terminal ({g['gerente']}) vanished from Orca: no worker notice arrives and the worker_done messages stay in the inbox. "
-                "Bring it back up with: orq manager spawn")
+                f"Spawning it on its own failed {tried} times. Bring it back up with: orq manager spawn")
     if age is not None and age <= panel_limit_s(g):  # the process is alive, the round is just slow (high load)
         media = _avg_rounds(g)
         return (f"slow panel ({media:.0f} s per loop)" if media else f"slow panel ({int(age)} s without a stamp)") + ": the process is alive, worker notices are delayed"
@@ -1025,9 +1543,66 @@ def panel_notice(now_at=None):
     return f"agent manager panel stopped for {int(age // 60)} min: no worker notice arrives; restart painel-agent-manager.sh in its terminal"
 
 
+def _respawn_state(terminal):
+    """{terminal, tentativas, ts} of the on-its-own respawns of `terminal`; zeroed when the file is about another terminal (a new manager starts over)."""
+    st = _dict(_read_json(_path(PANEL_RESPAWN)))
+    if st.get("terminal") == terminal and isinstance(st.get("tentativas"), int) and isinstance(st.get("ts"), (int, float)):
+        return st
+    return {"terminal": terminal, "tentativas": 0, "ts": 0}
+
+
+def _respawn_due(st, now_at):
+    return st["tentativas"] < RESPAWN_MAX and (not st["tentativas"] or now_at - st["ts"] >= RESPAWN_WAIT_S)
+
+
+@contextlib.contextmanager
+def _lock_try(item_name):
+    """Non-blocking flock on HOME/<nome>: yields False when someone else holds it."""
+    os.makedirs(HOME, exist_ok=True)
+    with open(_path(item_name), "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+
+
+def manager_respawn_alone(dead, now_at=None):
+    """Outside the hook, after `manager_check` found `dead` (the gerente.json terminal) vanished from Orca: this coordinator brings the manager back up
+    itself (`manager_start`, which still demands Orca's proof). Single flight: a non-blocking flock on manager.lock (whoever loses does nothing), one
+    attempt per RESPAWN_WAIT_S and RESPAWN_MAX per dead terminal; then only the manual notice is left. Returns the `subiu_sozinho` event or None."""
+    now_at = now_at or time.time()
+    if not _respawn_due(_respawn_state(dead), now_at):
+        return None
+    with _lock_try("manager.lock") as got:
+        if not got:
+            return None
+        _MANAGER_LOCK[0] = 1  # manager_bind below takes the same lock: the flock is not reentrant across file descriptors
+        try:
+            g = _manager_cfg()
+            st = _respawn_state(dead)
+            if g.get("gerente") != dead or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE") or not _respawn_due(st, now_at):
+                return None  # another process already brought it back, or it is not this coordinator's manager (never take the manager of another)
+            _write_json(_path(PANEL_RESPAWN), {"terminal": dead, "tentativas": st["tentativas"] + 1, "ts": now_at})
+            try:
+                res = manager_start()
+            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                log(f"gerente subir sozinho {dead}: {type(e).__name__}: {e}")
+                return None
+        finally:
+            _MANAGER_LOCK[0] = 0
+    ev = append_event({"tipo": "gerente", "op": "subiu_sozinho", "terminal": res["terminal"], "anterior": dead})
+    text = f"orq: agent manager came back up on its own (terminal {res['terminal']})"
+    with contextlib.suppress(Exception):  # the line goes out with the next prompt's context (context_notices); nothing is typed over the coordinator
+        _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text, "ts": now(), "contexto": True}))
+    return ev
+
+
 def check_manager_bg(now_at=None):
-    """In the coordinator prompt: `manager-alive` stamp old (or missing) and the last check more than PANEL_STOPPED_S ago, asks Orca in the background
-    whether the manager's terminal still exists (`orq manager checar`). The hook does not wait for Orca: the notice comes out on the next prompt, via panel_notice."""
+    """In the coordinator's prompt, Stop and SessionStart hooks: `manager-alive` stamp old (or missing) and the last check more than PANEL_STOPPED_S ago, asks Orca in the background
+    whether the manager's terminal still exists (`orq manager checar`), which brings a dead one back up on its own. The hook does not wait for Orca: the notice comes
+    out on the next prompt, via panel_notice."""
     g = _manager_cfg()
     if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return
@@ -1277,6 +1852,11 @@ def now():
     return os.environ.get("ORQ_AGORA") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # ORQ_AGORA: the tests' simulated clock
 
 
+def now_dt():
+    """`now()` as a datetime: the clock the Stop and the manager's wake-up read, so the night replay (ticket 216) drives them with ORQ_AGORA."""
+    return _dt(now())
+
+
 TIMEOUT_ORCA = float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)  # the tests start one Python process per call and use more (B31)
 
 
@@ -1421,30 +2001,45 @@ def _box_block(m, events):
     return ln
 
 
-def _run_box(run, coord_handle, ack, detail=False):
-    """Reads (and with `ack` confirms) a Run's inbox in the same generation: binds the coordinator (its `--from`) to the Run, then check and ack.
+def _box_lines(msgs, detail):
+    """(heartbeats, lines) of a batch: heartbeats are only counted; `detail` (the prompt hook, ticket 182) brings each other message whole (`_box_block`)."""
+    hb = sum(1 for m in msgs if m.get("type") == "heartbeat")
+    events = read_events() if detail else []
+    return hb, [l for m in msgs if m.get("type") != "heartbeat" for l in (_box_block(m, events) if detail else [_box_line(m)])]
 
-    `detail` (the prompt hook, ticket 182): each message that is not a heartbeat comes whole (`_box_block`), after the ingest."""
+
+def _global_box(run, ack):
+    """Reads the Run's unread messages from Orca's global inbox (`inbox --full`), without `run-use` (ticket 336): Orca binds one Run per terminal and a
+    coordinator `run-use` on a Run it does not command takes it off whoever holds it, the agent manager included. Nothing is consumed or acknowledged
+    (the delivery would be consumer_fenced anyway); with `ack` each `worker_done` still goes through the ingest, so the report entry and the integrator queue
+    do not wait for the coordinator to bind the Run."""
+    msgs = sorted((m for m in orca("inbox", "--limit", "200", "--full", timeout=20)["messages"]
+                   if isinstance(m, dict) and m.get("to_handle") == f"run:{run}" and not m.get("read")), key=lambda m: m.get("sequence") or 0)
+    if ack:
+        ingest_mailbox(msgs)
+    return msgs
+
+
+def _run_box(run, coord_handle, ack, detail=False, own=None):
+    """Reads (and with `ack` confirms) a Run's inbox in the same generation: check and ack by the handle that commands the Run.
+
+    A Run that neither the agent manager nor the coordinator (`own`, the Run bound to its terminal) commands is read from the global inbox, with no binding
+    and no ack (`_global_box`). `detail` (the prompt hook, ticket 182): each message that is not a heartbeat comes whole (`_box_block`), after the ingest."""
+    if not _is_manager_run(run) and run != own:
+        msgs = _global_box(run, ack)
+        hb, line_list = _box_lines(msgs, detail)
+        return [f"{run}: {len(msgs)} mensagem(ns)" + (f", {hb} heartbeat(s)" if hb else "") + (", lidas sem ligar o Run" if msgs else ""), *("  " + l for l in line_list)]
     line_list, hb, n = [], 0, 0
-    if _is_manager_run(run):  # o gerente segura o Run: o orca() o liga sob a trava
-        acting_as = None
-    else:
-        acting_as = coord_handle
-        orca("run-use", "--id", run, acting_as=acting_as)
+    acting_as = None if _is_manager_run(run) else coord_handle  # o gerente segura o Run: o orca() o liga sob a trava
     res = orca("check", "--run", run, acting_as=acting_as)
     for _ in range(INBOX_BATCHES):
         msgs = res.get("messages") or []
         if not res.get("deliveryId") or not msgs:
             break
-        hb += sum(1 for m in msgs if m.get("type") == "heartbeat")
         if ack:
             ingest_mailbox(msgs)
-        if detail:
-            events = read_events()
-            line_list += [l for m in msgs if m.get("type") != "heartbeat" for l in _box_block(m, events)]
-        else:
-            line_list += [_box_line(m) for m in msgs if m.get("type") != "heartbeat"]
-        n += len(msgs)
+        batch_hb, batch_lines = _box_lines(msgs, detail)
+        hb, line_list, n = hb + batch_hb, line_list + batch_lines, n + len(msgs)
         if not ack:
             break
         res = orca("check", "--run", run, "--ack", res["deliveryId"], acting_as=acting_as)
@@ -1456,7 +2051,7 @@ def inbox(run=None, ack=False, all_listing=False, detail=False):
     """`orq inbox [<run>] [--ack] [--all_listing]`: reads Orca's inbox, and with `ack` confirms it, in the consumer's same generation.
 
     The coordinator's terminal comes from orq's state (gerente.json) and only then from the env. `--all_listing` walks the Runs with unread messages (the inbox
-    covers all). At the end the binding goes back to the Run the coordinator was on."""
+    covers all). A Run the coordinator does not command is read without binding it (ticket 336): the binding stays where it was."""
     coord_handle = (_manager_cfg() or {}).get("coordenador") or os.environ.get("ORCA_TERMINAL_HANDLE")
     before = _current_run_id(acting_as=coord_handle)
     if all_listing:
@@ -1467,15 +2062,8 @@ def inbox(run=None, ack=False, all_listing=False, detail=False):
     if not all(targets):
         raise ValueError("no Run bound: pass the Run (`orq inbox <run>`)")
     output = []
-    try:
-        for r in targets:
-            output += _run_box(r, coord_handle, ack, detail)
-    finally:
-        if before and any(r != before and not _is_manager_run(r) for r in targets):
-            try:
-                orca("run-use", "--id", before, acting_as=coord_handle)
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
-                log(f"inbox: run-use back to Run {before}: {type(e).__name__}: {e}")
+    for r in targets:
+        output += _run_box(r, coord_handle, ack, detail, own=before)
     return output or ["inbox empty"]
 
 
@@ -1552,7 +2140,7 @@ KEYS_EN = {
     "entrada": "entry", "entrada_sem_tratamento": "untreated_entry", "entrega": "delivery", "entrega_com_aviso": "delivery_with_notice",
     "entregas": "deliveries", "entregue": "delivered", "enviado": "sent", "erro": "error", "escrito_por": "written_by", "espera": "wait",
     "espera_motivo": "wait_reason", "esperam": "waiting", "estado": "state", "eventos": "events", "externa_min": "external_min", "falha": "failure",
-    "falhas": "failures", "falhos": "failed_list", "falhou": "failed", "fase": "phase", "fechado": "closed", "fechado_em": "closed_at",
+    "falhas": "failures", "falhas_na_base": "failures_on_base", "base_avisada": "base_notified", "base_vermelha_desde": "base_red_since", "falhos": "failed_list", "falhou": "failed", "fase": "phase", "fechado": "closed", "fechado_em": "closed_at",
     "fechou": "closed_it", "feito": "done", "ficam": "stay", "ficaram": "stayed", "fila": "queue", "fila_e2e": "e2e_queue", "fila_tipo": "queue_type",
     "filho": "child", "filhos": "children", "fim": "end", "fim_dispatch": "dispatch_end", "fluxo": "flow", "fonte": "source", "fora": "outside",
     "fora_cpu": "out_cpu", "fora_por_cpu": "out_by_cpu", "fora_por_mem": "out_by_mem", "fora_rss_mb": "out_rss_mb", "frente": "stream",
@@ -1603,6 +2191,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "entrada": "entry", "obrigacao": "obligation", "steer_fim": "steer_end", "steer_reentrega": "steer_redelivered",
     "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
     "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
+    "segurar": "hold", "segurar_solta": "hold_release",
     "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue",
     "despacho": "dispatch", "despacho_fila": "dispatch_queued", "alerta": "alert", "alerta_visto": "alert_seen", "uso_aviso": "usage_notice",
     "uso_parou": "usage_stopped", "run_projeto": "run_project", "resposta": "answer", "resposta_worker": "worker_answer",
@@ -1614,7 +2203,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "entrega_orq": "orq_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
     "ausente_desligar": "away_off", "coordenador_parou": "coordinator_stopped", "coordenador_retomou": "coordinator_resumed", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
     "processos": "processes", "resumo_add": "summary_add", "devolver": "send_back", "limite_tela": "screen_limit",
-    "pendente_avisado": "pending_notified", "revisao_nm": "nm_review",
+    "pendente_avisado": "pending_notified", "revisao_nm": "nm_review", "prova": "proof",
 }
 PENDING_EN = {"acao": "action", "decisao": "decision", "avisar": "notify"}
 ESCALATION_EN = {"resposta": "answer", "decisao": "decision", "pr": "pr", "bloqueio": "blocker", "resumo": "summary"}
@@ -2003,6 +2592,38 @@ def record_turn(kind, ev, harness="claude"):
     _turns_mut(write)
 
 
+def worker_ack(ev):
+    """Prompt hook of a worker (and of the integrator, a service worker), ticket 350: confirms (`check --ack`) every batch of the terminal's inbox older than the newest message.
+
+    A worker that reads with `check` and never acks gets the oldest batch again at each reread (FIFO), so the newest message, a steer, never shows. The newest batch
+    stays open for the worker's own `check`. An older message the transcript does not cite (the worker never saw it) comes back in the context before it is confirmed.
+    Fail-open: the hook's output is the context text, or None."""
+    handle = os.environ["ORCA_TERMINAL_HANDLE"]
+    box = orca("check", "--terminal", handle, "--peek")["messages"]
+    if not box:
+        return None
+    newest, acked, res = box[-1].get("id"), [], orca("check", "--terminal", handle)
+    for _ in range(INBOX_BATCHES):
+        if not res.get("deliveryId") or any(m.get("id") == newest for m in res.get("messages") or []):
+            break
+        acked += res.get("messages") or []
+        res = orca("check", "--terminal", handle, "--ack", res["deliveryId"])
+    unseen = [m for m in acked if m.get("type") != "heartbeat"]
+    if unseen:
+        try:
+            with open(ev["transcript_path"], "rb") as f:
+                f.seek(max(0, f.seek(0, 2) - STEER_TRANSCRIPT_BYTES))
+                tail = f.read()
+        except (KeyError, OSError):
+            tail = b""
+        unseen = [m for m in unseen if str(m.get("id")).encode() not in tail]
+    if not acked:
+        return None
+    ln = [f"orq: the hook confirmed {len(acked)} older message(s) in your inbox, so your next `orca orchestration check` brings the newest."]
+    ln += [f"  not seen yet, {m.get('id')} {m.get('subject') or ''}: {str(m.get('body') or '')[:INBOX_BODY_HOOK]}" for m in unseen]
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}}
+
+
 def daily_report(base, created_ms):
     """The only .scratch/*/*.md with the run's date in its name and written between the run start and WAIT_REPORT_S after; None with zero or several.
 
@@ -2084,6 +2705,7 @@ def complete_reports(runs, event_list):
                 continue
             for e in fresh_entries:
                 append_event(e, new_id=True)
+            flag_citations(r, path)
             for id_ in without[r["id"]]:
                 if id_ not in closed_ids:
                     append_event({"tipo": "intake", "entrada": id_, "efeito": "descartado", "nota": f"replaced by the items of {os.path.basename(path)}"})
@@ -2091,6 +2713,92 @@ def complete_reports(runs, event_list):
         except Exception as e:  # noqa: BLE001 - a poisonous run does not lock the others
             log(f"ingest automations: completing {r.get('id') if isinstance(r, dict) else r}: {type(e).__name__}: {e}")
     return n
+
+
+CITE_MIN = 8  # characters of a quote (spaces collapsed) below which it is not checked: "ok" would match any line
+_CITE_PTR = re.compile(r"(?:transcript:)?((?:~|\.{0,2}/)?[\w@%+.\-]+(?:/[\w@%+.\-]+)*\.[A-Za-z0-9]+):(\d+)")
+_CITE_QUOTE = re.compile(r'"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d|`([^`\n]+)`')
+
+
+def _squash(text_value):
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def citation_pairs(report):
+    """[(file, line, quote)] from a report: a `transcript:<file>:<line>` or `<file>:<line>` pointer plus the quote on the same line ("..", `..`),
+    or else the `>` block or the code fence right under it. The pointer itself is cut out first, so a pointer in backticks is not read as a quote.
+    ponytail: a quote shorter than CITE_MIN is skipped, not flagged."""
+    lines, out = report.splitlines(), []
+    for i, ln in enumerate(lines):
+        for m in _CITE_PTR.finditer(ln):
+            lo, hi = m.start(), m.end()
+            if ln[:lo].endswith("`") and ln[hi:].startswith("`"):  # a pointer in backticks: the pair goes with it
+                lo, hi = lo - 1, hi + 1
+            rest = ln[:lo] + " " + ln[hi:]
+            q = next((next(g for g in qm.groups() if g) for qm in _CITE_QUOTE.finditer(rest)), None)
+            if q is None:
+                j, block = i + 1, []
+                if j < len(lines) and lines[j].lstrip().startswith("```"):
+                    j += 1
+                    while j < len(lines) and not lines[j].lstrip().startswith("```"):
+                        block.append(lines[j])
+                        j += 1
+                else:
+                    while j < len(lines) and lines[j].lstrip().startswith(">"):
+                        block.append(lines[j].lstrip()[1:])
+                        j += 1
+                q = " ".join(block) if block else None
+            if q and len(_squash(q)) >= CITE_MIN:
+                out.append((m.group(1), int(m.group(2)), _squash(q)))
+    return out
+
+
+def check_citations(report_path):
+    """One row per pointer+quote of the report: {arquivo, linha, trecho, estado}, estado `confere`, `nao_achado` or `arquivo_ausente`.
+    The quote must be inside that line of the file (spaces collapsed; a JSON transcript line is also read with its escaped newline and quote undone)."""
+    with open(report_path) as f:
+        pairs = citation_pairs(f.read())
+    base, rows = os.path.dirname(os.path.abspath(report_path)), []
+    for name, n, q in pairs:
+        target = os.path.expanduser(name)
+        found = next((c for c in (target, os.path.join(base, target)) if os.path.isfile(c)), None)
+        state = "arquivo_ausente"
+        if found:
+            state = "nao_achado"
+            try:
+                with open(found, errors="replace") as f:
+                    ln = next((x for k, x in enumerate(f, 1) if k == n), "")
+            except OSError:
+                ln = ""
+            if any(q in _squash(v) for v in (ln, ln.replace("\\n", " ").replace('\\"', '"'))):
+                state = "confere"
+        rows.append({"arquivo": name, "linha": n, "trecho": q, "estado": state})
+    return rows
+
+
+def citations_text(rows):
+    if not rows:
+        return "citações: 0"
+    names = {"confere": "confere", "nao_achado": "not found", "arquivo_ausente": "file missing"}
+    ok = sum(r["estado"] == "confere" for r in rows)
+    return "\n".join([f"citações: {len(rows)} ({ok} confere, {len(rows) - ok} não confere)"] +
+                     [f"  {names[r['estado']]:<13} {r['arquivo']}:{r['linha']}  {r['trecho'][:60]!r}" for r in rows])
+
+
+def flag_citations(r, path):
+    """Right after a report's entries come in: a quote that is not in its transcript line records `citacao_nao_confere` (count + report) and warns the
+    coordinator. No pointers, or all matching, writes nothing."""
+    try:
+        bad = [x for x in check_citations(path) if x["estado"] != "confere"] if path and os.path.isfile(path) else []
+    except (OSError, ValueError):
+        return
+    if not bad:
+        return
+    append_event({"tipo": "citacao_nao_confere", "ref": r["id"], "caminho": path, "n": len(bad)}, new_id=True)
+    g = _manager_cfg()
+    if g and g.get("coordenador"):
+        notify_coordinator(g["coordenador"], f"orq: {len(bad)} citation(s) of {os.path.basename(path)} do not match the transcript "
+                           f"(first: {bad[0]['arquivo']}:{bad[0]['linha']}). Check with: orq retro citacoes {path}")
 
 
 def ingest_automations():
@@ -2118,6 +2826,7 @@ def ingest_automations():
                 continue
             for e in entries:
                 append_event(e, new_id=True)
+            flag_citations(r, run_path(r))
             _cursor_mut(lambda c, i=r["id"]: c["ingest"].__setitem__("runs", (c["ingest"]["runs"] + [i])[-200:]))
         except Exception as e:  # noqa: BLE001 - a poisonous run cannot lock the following ones
             key_name = f"auto:{r.get('id') or r.get('createdAt') if isinstance(r, dict) else r}"
@@ -2262,15 +2971,21 @@ def _payload_branch(b):
     return b if b and not _environment_branch(b) else None
 
 
-def _orq_wt_branch(number):
-    """The branch of the `<ORQ_WT>/<ticket>` convention worktree (or `t<ticket>`), or None. An orq ticket is dispatched with `--worktree
+def _orq_wt(number):
+    """(folder, branch) of the `<ORQ_WT>/<ticket>` convention worktree (or `t<ticket>`), or None. An orq ticket is dispatched with `--worktree
     current`: the dispatch's worktree is the product's, and the one holding the delivery branch is this one."""
     root = WT_ROOT
     for item_name in dict.fromkeys((number, number.lstrip("0"), f"t{number}", f"t{number.lstrip('0')}")):
         d = os.path.join(root, item_name)
         if os.path.isdir(d) and (b := _orq_branch((_git(d, "branch", "--show-current") or "").strip())):
-            return b
+            return d, b
     return None
+
+
+def _orq_wt_branch(number):
+    """The branch of the `<ORQ_WT>/<ticket>` convention worktree, or None."""
+    found = _orq_wt(number)
+    return found and found[1]
 
 
 def _integrator_dispatch(events):
@@ -2284,6 +2999,27 @@ def _integrator_terminal(events):
     """The terminal of the dispatch service called integrador (the last one not released), or None."""
     d = _integrator_dispatch(events)
     return _dispatch_terminal(d.get("run"), d["dispatch"]) if d else None
+
+
+def _delivery_head(branch, commit):
+    """(head, problem) of an orq delivery: `head` is the tip of `branch` now, what the queue and the proofs pin. `problem` when the commit the worker cited exists in the repository
+    but is not in `branch` (the name was swapped); a commit that does not resolve, or a branch that does not exist here, proves nothing against it."""
+    repo = _branch_repo(branch)
+    tip = (_git(repo, "rev-parse", f"refs/heads/{branch}") or "").strip() if repo else ""
+    cited = (_git(repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}") or "").strip() if tip and commit else ""
+    if cited and subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", cited, tip], capture_output=True).returncode:
+        return None, f"commit {commit[:8]} of the worker_done is not in {branch} ({tip[:7]}): wrong branch name?"
+    return tip or None, None
+
+
+def _delivery_head_of_worktree(m, p):
+    """worker_done `succeeded` of a task that is not an orq ticket: pins the head of the dispatch worktree's branch (`prova` event, step delivery), for `pr open` to compare."""
+    if p.get("outcome") != "succeeded" or not p.get("taskId") or any(t.get("task") == p["taskId"] for t in tickets()) or _already_has_event("prova", m["id"]):
+        return
+    wt = _dispatch_worktree(m.get("run_id"), p.get("dispatchId"))
+    branch, head = ((_git(wt, "branch", "--show-current") or "").strip(), (_git(wt, "rev-parse", "HEAD") or "").strip()) if wt else ("", "")
+    if branch and head and not _environment_branch(branch):
+        prove(p["taskId"], "delivery", head, "ok", branch=branch, msg=m["id"])
 
 
 def _orq_delivery(m, p):
@@ -2306,14 +3042,185 @@ def _orq_delivery(m, p):
                       "avisos": [f"delivery of ticket {t['num']} has no branch: it did not enter the integrator queue; `orq integrate queue add <branch> {t['num']}`"]})
         return None
     commit = p.get("commit") or next(iter(SHA_RE.findall(text_value)), None)
-    ev = integrate_queue_add(branch, t["num"])
+    head, problem = _delivery_head(branch, commit)
+    if problem:
+        log(f"orq delivery: ticket {t['num']}: {problem}; it stays out of the integrator queue")
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
+                      "avisos": [f"delivery of ticket {t['num']} did not enter the integrator queue: {problem}; `orq integrate queue add <branch> {t['num']}` once the branch is right"]})
+        return None
+    ev = integrate_queue_add(branch, t["num"], head)
+    if head:
+        prove(p["taskId"], "delivery", head, "ok", ticket=t["num"], branch=branch, msg=m["id"])
     notice = f"orq: ticket {t['num']} entered the queue. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
     h = _integrator_terminal(read_events())
     r = (type_text(h, notice) if h else "sem_integrador")
     if r == "ocupado":
         r = type_text_busy(h, notice)
-    append_event({"tipo": "entrega_orq", "ticket": ev["ticket"], "branch": branch, "worktree": wt, "commit": commit, "msg": m["id"], "dispatch": p.get("dispatchId"), "aviso": r})
+    append_event({"tipo": "entrega_orq", "ticket": ev["ticket"], "branch": branch, "head": head, "worktree": wt, "commit": commit, "msg": m["id"], "dispatch": p.get("dispatchId"), "aviso": r})
     return ev["ticket"]
+
+
+# ---------- red proof of the new tests (ticket 221) ----------
+RED_TIMEOUT_S = 600  # one deadline for the whole proof, shared by every run (what a file leaves is what the next one has)
+RED_STATE = {"ok": "red on base / green on head", "green_on_base": "green on base (proves nothing)", "red_on_head": "red on head", "unverifiable": "not verifiable"}
+RED_ORDER = ("green_on_base", "red_on_head", "unverifiable", "ok")  # the overall result is the first one any file has
+_RED_CITES = re.compile(r"red\s*(?:→|->|-->|-|to)\s*green", re.I)
+
+
+def _glob_hit(path, pattern):
+    """Does `pattern` pick `path`? Without a `/` it is read against the file name (`test_*.py`); `**/x` also picks `x` at the root."""
+    if "/" not in pattern:
+        return fnmatch.fnmatch(os.path.basename(path), pattern)
+    return fnmatch.fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:]))
+
+
+def cites_red_green(path):
+    """Does the `## Acceptance criteria` of the ticket file cite red→green (the ticket asks for tests that fail before the change)?"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return False
+    m = _ACCEPTANCE.search(txt)
+    return bool(m and _RED_CITES.search(re.split(r"^##\s", txt[m.end():], maxsplit=1, flags=re.M)[0]))
+
+
+def _red_merge_base(worktree, base):
+    """The merge-base of HEAD with the local `base` branch (the integrator advances it before the push), otherwise with `origin/<base>`."""
+    for ref in (f"refs/heads/{base}", f"refs/remotes/origin/{base}"):
+        if _git(worktree, "rev-parse", "--verify", "--quiet", ref) is not None:
+            if mb := (_git(worktree, "merge-base", ref, "HEAD") or "").strip():
+                return mb
+    raise ValueError(f"no merge-base between HEAD and {base} in {worktree}: pass --base")
+
+
+def _red_names(worktree, mb, head, file):
+    """The `def test_*` names the branch added to `file` (from the diff against the merge-base), in order."""
+    diff = _git(worktree, "diff", "-U0", mb, head, "--", file) or ""
+    return list(dict.fromkeys(re.findall(r"^\+\s*(?:async\s+)?def (test\w*)\(", diff, re.M)))
+
+
+def _red_run(command, file, test, folder, left):
+    """Exit code of `command` ({file} swapped for the test file, {test} for the test name) in `folder`; None on timeout (the whole process group is killed)."""
+    p = subprocess.Popen(["sh", "-c", command.replace("{file}", shlex.quote(file)).replace("{test}", shlex.quote(test))], cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return p.wait(timeout=max(left, 0.1))
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        return None
+
+
+def _red_link_deps(src, dst):
+    """Links the `node_modules` of `src` (its root and each folder one level down) into the same place of `dst`; True if there was any."""
+    linked = False
+    for sub in ("", *sorted(d for d in os.listdir(src) if not d.startswith(".") and d != "node_modules" and os.path.isdir(os.path.join(src, d)))):
+        nm = os.path.join(src, sub, "node_modules")
+        if os.path.isdir(nm) and os.path.isdir(os.path.join(dst, sub)) and not os.path.lexists(os.path.join(dst, sub, "node_modules")):
+            os.symlink(nm, os.path.join(dst, sub, "node_modules"))
+            linked = True
+    return linked
+
+
+def _red_file(f, test, command, trees, deps, deadline):
+    """{resultado, motivo?} of one test file (or of one test of it): red on base, then green on head."""
+    js = f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs"))
+    if js and not deps and not command:
+        return {"resultado": "unverifiable", "motivo": "no node_modules in the worker worktree"}
+    cmd = command or ("npx --no-install jest {file}" if js else "python3 {file}")
+    for name in ("base", "head"):
+        rc = _red_run(cmd, f, test, trees[name], deadline - time.monotonic())
+        if rc in (None, 126, 127):
+            return {"resultado": "unverifiable", "motivo": "timeout" if rc is None else f"exit {rc}"}
+        if name == "base" and rc == 0:
+            return {"resultado": "green_on_base"}
+    return {"resultado": "ok" if rc == 0 else "red_on_head"}
+
+
+def prove_red(worktree, base, globs, command=None, timeout=RED_TIMEOUT_S):
+    """Does each test file the branch of `worktree` created or changed fail without the change? -> {head, files: [{arquivo, resultado, motivo?}], resultado}.
+
+    A throwaway worktree at the merge-base with `base` gets only the test files of HEAD and runs `command` ({file} is the file; default by extension) there: red is expected.
+    A command with `{test}` runs once per test function the branch added to the file (a monolith such as orq's `test_orq.py` takes minutes as a whole), and each one is a row `file::test`.
+    Then, if it was red, it runs the same in a throwaway worktree at HEAD. A file is `ok` (red on base, green on head), `green_on_base` (proves nothing), `red_on_head` or
+    `unverifiable` (exit 126/127, timeout or a JavaScript file with no `node_modules` to link: never read as a failure of the base). The deadline is one for all the runs.
+    Unit tests only (Jest, pytest/unittest): a Playwright spec or a Meteor integration test is out. # ponytail: the unit is the file, not the test; names inside it need a runner per framework."""
+    head = (_git(worktree, "rev-parse", "HEAD") or "").strip()
+    if not head:
+        raise ValueError(f"{worktree} is not a git worktree")
+    mb = _red_merge_base(worktree, base)
+    changed = (_git(worktree, "diff", "--name-only", "--diff-filter=ACMR", mb, head) or "").splitlines()
+    files = [f for f in changed if any(_glob_hit(f, g) for g in globs)]
+    out = {"head": head, "files": [], "resultado": "no_tests"}
+    if not files:
+        return out
+    deadline, tmp, trees = time.monotonic() + timeout, tempfile.mkdtemp(prefix="orq-red-"), {}
+    try:
+        for name, rev in (("base", mb), ("head", head)):
+            trees[name] = os.path.join(tmp, name)
+            if _git(worktree, "worktree", "add", "--detach", trees[name], rev, timeout=180) is None:
+                raise ValueError(f"could not create the throwaway worktree at {rev[:8]}")
+        for f in files:
+            data = subprocess.run(["git", "-C", worktree, "show", f"{head}:{f}"], capture_output=True, timeout=30).stdout
+            os.makedirs(os.path.dirname(os.path.join(trees["base"], f)), exist_ok=True)
+            with open(os.path.join(trees["base"], f), "wb") as fh:
+                fh.write(data)
+        deps = _red_link_deps(worktree, trees["base"]) & _red_link_deps(worktree, trees["head"])
+        for f in files:
+            for test in (_red_names(worktree, mb, head, f) if "{test}" in (command or "") else []) or [""]:
+                out["files"].append({"arquivo": f"{f}::{test}" if test else f, **_red_file(f, test, command, trees, deps, deadline)})
+    finally:
+        for path in trees.values():
+            _git(worktree, "worktree", "remove", "--force", path, timeout=60)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _git(worktree, "worktree", "prune")
+    got = {r["resultado"] for r in out["files"]}
+    out["resultado"] = next(k for k in RED_ORDER if k in got)
+    return out
+
+
+def _red_worktree(t):
+    """The worktree that holds the ticket's delivery: the `<ORQ_WT>/<ticket>` one, otherwise the dispatch's (worker-list), or None."""
+    if found := _orq_wt(t["num"]):
+        return found[0]
+    d = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == t.get("task")), None)
+    return d and _dispatch_worktree(d.get("run"), d.get("dispatch"))
+
+
+def prove_red_ticket(target, command=None, worktree=None, base=None, timeout=RED_TIMEOUT_S):
+    """`prove_red` for ticket `target` (number or task): the globs and the command come from the `tests` of its project file (default: `test_*.py` for orq's own ticket,
+    `**/*.unit-test.js` for a product's), the base is the project's first environment. Records the `red_proof` event with the head; a file green on base also records a
+    delivery notice that suggests `orq send-back` (it does not send it back by itself). Returns what `prove_red` returned."""
+    t = next((t for t in tickets() if target in (t["num"], t["num"].lstrip("0"), t.get("task"))), None)
+    if not t:
+        raise ValueError(f"{target} is neither a ticket nor the task of one")
+    wt = worktree or _red_worktree(t)
+    if not wt or not os.path.isdir(wt):
+        raise ValueError(f"no worktree for ticket {t['num']}: pass --worktree")
+    ps = projects()
+    name = project_by_folder(ps, os.path.realpath(wt)) or project_by_folder(ps, _repo_root(wt) or wt)
+    cfg = _dict((ps.get(name) or {}).get("tests"))
+    mine = orq_ticket(t["titulo"], name)
+    globs = cfg.get("globs") or (["test_*.py"] if mine else ["**/*.unit-test.js"])
+    r = prove_red(wt, base or repo_flow(wt)["ambientes"][0], globs, command or cfg.get("command") or ("python3 {file} {test}" if mine else None), timeout)  # orq's runner takes the name as a filter
+    d = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == t.get("task")), {})
+    append_event({"tipo": "red_proof", "task": t.get("task"), "ticket": t["num"], "dispatch": d.get("dispatch"), "head": r["head"], "files": r["files"], "resultado": r["resultado"]})
+    green = [f["arquivo"] for f in r["files"] if f["resultado"] == "green_on_base"]
+    if green:
+        append_event({"tipo": "entrega", "dispatch": d.get("dispatch"), "task": t.get("task"), "run": d.get("run"),
+                      "avisos": [f"ticket {t['num']}: the new tests pass on the base, so they prove nothing ({', '.join(green)}): "
+                                 f"suggested `orq send-back {t.get('task') or t['num']} \"write tests that fail without the change: {', '.join(green)}\"`"]})
+    return r
+
+
+def red_proof_bg(ticket):
+    """The ingest of the worker_done of a ticket whose acceptance cites red→green: runs `orq prove-red` in the background (a unit run takes minutes)."""
+    if os.environ.get("ORQ_NO_BG"):
+        return
+    subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "orq.py"), "prove-red", ticket], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _ingest_msg(m, since, already, titles, send=True):
@@ -2327,7 +3234,10 @@ def _ingest_msg(m, since, already, titles, send=True):
     _delivery_proof(m, p)
     try:
         if _delivery_conformance(m, p, send):  # an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
-            _orq_delivery(m, p)
+            queued = _orq_delivery(m, p)
+            _delivery_head_of_worktree(m, p)
+            if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
+                red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
     if p.get("reportPath"):
@@ -2458,6 +3368,9 @@ def ingest_final_reports():
         append_event({"tipo": "worker_done", "msg": msg, "run": run, "task": t.get("task"), "dispatch": dispatch, "outcome": "succeeded", "subject": subject, "origem": "relatorio-final"})
         append_event({"tipo": "entrada", "origem": "relatorio_worker", "texto": subject, "fonte": f"worker {subject}", "caminho": file_path, "ref": msg, "run": run,
                       "task": t.get("task"), **_run_group(run)}, new_id=True)
+        # Orca refused the worker's own worker_done (revoked capability, e.g. after a send_back or a resume): it stays `dispatched` with an idle terminal
+        append_event({"tipo": "alerta", "alerta": "entrega_recusada", "task": t.get("task"), "run": run, "dispatch": dispatch, "msg": msg,
+                      "titulo": f"{subject}: worker_done refused, delivery recorded from {FINAL_REPORT}; stop the idle terminal"})
         with contextlib.suppress(Exception):  # the same check as a real worker_done (ticket 201); a failure only skips it
             _delivery_conformance({"id": msg, "subject": subject, "body": "", "run_id": run}, {"dispatchId": dispatch, "taskId": t.get("task"), "outcome": "succeeded", "reportPath": file_path})
         fresh += 1
@@ -2484,6 +3397,10 @@ def ingest():
                     total += fn()
             except Exception as e:  # noqa: BLE001
                 log(f"ingest {item_name}: {type(e).__name__}: {e}")
+        try:
+            auto_intake()
+        except Exception as e:  # noqa: BLE001
+            log(f"ingest intake: {type(e).__name__}: {e}")
         return total, gates
 
 
@@ -2914,9 +3831,29 @@ def _pr_gh_list(urls):
         if not isinstance(listing, list):
             continue
         findings = {x.get("url"): x for x in listing if isinstance(x, dict)}
+        base_cache = {}
         for u in us:
             seen[u] = findings.get(u) or _pr_state(u)
+            if isinstance(seen[u], dict) and any((c.get("conclusion") or c.get("state")) in CHECK_FAILED for c in seen[u].get("statusCheckRollup") or [] if isinstance(c, dict)):
+                seen[u]["_base"] = _base_red(repo, seen[u].get("baseRefName"), base_cache)
     return seen
+
+
+def _base_red(repo, base, cache):
+    """{falhas: [names of the checks red on the tip of `base`], desde: when the oldest of them finished} or None if gh did not answer. One `gh api` call per repository
+    and base in each poll (`cache`). ponytail: reads the first 100 check runs of the tip, not the status contexts; paginate if a repository passes that."""
+    if not base:
+        return None
+    if (repo, base) not in cache:
+        try:
+            r = subprocess.run([GH, "api", f"repos/{repo}/commits/{base}/check-runs?per_page=100"], capture_output=True, text=True, timeout=PR_GH_S)
+            runs = json.loads(r.stdout).get("check_runs") if r.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+            runs = None
+        red = [c for c in runs if isinstance(c, dict) and (c.get("conclusion") or "").upper() in BASE_RED] if isinstance(runs, list) else None
+        cache[(repo, base)] = None if red is None else {"falhas": sorted({c.get("name") for c in red if c.get("name")}),
+                                                         "desde": min((c.get("completed_at") or "" for c in red), default="") or None}
+    return cache[(repo, base)]
 
 
 def _workflow_of_other_environment(workflow, base, flow_info):
@@ -2928,8 +3865,9 @@ def _workflow_of_other_environment(workflow, base, flow_info):
 
 
 def _gh_ci(seen_item, now_at, flow_info):
-    """{mergeable, falhas, rodando, outro_ambiente, lido_em} of what gh saw of a PR, or None if the response carries neither CI nor mergeable (gh with no response, `pr view`).
-    A workflow check from another environment (e.g. the test environment's on a PR to production) counts neither in falhas nor in rodando: the workflow becomes `outro_ambiente`, only if it failed."""
+    """{mergeable, falhas, rodando, outro_ambiente, lido_em, falhas_na_base?} of what gh saw of a PR, or None if the response carries neither CI nor mergeable (gh with no response, `pr view`).
+    A workflow check from another environment (e.g. the test environment's on a PR to production) counts neither in falhas nor in rodando: the workflow becomes `outro_ambiente`, only if it failed.
+    `falhas_na_base` are the names in falhas that are also red on the base tip (`_base`, from `_base_red`), with `base_vermelha_desde`."""
     if "mergeable" not in seen_item and "statusCheckRollup" not in seen_item:
         return None
     failures, running, other_item = [], [], []
@@ -2949,7 +3887,18 @@ def _gh_ci(seen_item, now_at, flow_info):
             running.append(item_name)
         elif c.get("conclusion") in CHECK_FAILED:
             failures.append(item_name)
-    return {"mergeable": seen_item.get("mergeable") or "UNKNOWN", "falhas": failures, "rodando": running, "outro_ambiente": other_item, "lido_em": now_at}
+    base_item = _dict(seen_item.get("_base"))
+    on_base = [f for f in failures if f in (base_item.get("falhas") or [])]
+    # An empty rollup is not green: no check registered (workflow did not fire, not registered yet, conflicting PR). Only the project's `sem_ci: true` makes it ready.
+    return {"mergeable": seen_item.get("mergeable") or "UNKNOWN", "falhas": failures, "rodando": running, "outro_ambiente": other_item, "lido_em": now_at,
+            "sem_check": "statusCheckRollup" in seen_item and not seen_item["statusCheckRollup"] and not flow_info.get("sem_ci"),
+            **({"falhas_na_base": on_base, "base_vermelha_desde": base_item.get("desde")} if on_base else {})}
+
+
+def _blocked_by_base(ci):
+    """True if the PR has failures and every one of them is also red on the tip of its base: nothing in the PR to fix."""
+    ci = _dict(ci)
+    return bool(ci.get("falhas")) and all(f in (ci.get("falhas_na_base") or []) for f in ci["falhas"])
 
 
 def _gh_state(s):
@@ -3170,9 +4119,25 @@ def _git_wt(wt, *args, timeout=60):
     return subprocess.run([GIT, "-C", wt, *args], capture_output=True, text=True, timeout=timeout)
 
 
-def pr_open(target, title, body_text, environments=None, cwd=None):
+def branch_guard(wt, branch, prod, previous):
+    """Reasons why `branch` must not go out as a feature PR (ticket 227, git flow: born from `origin/<prod>`, receives only code from it): a commit that is only on the
+    local `<prod>` (unpublished work of another subject), or the tip of `origin/<previous>` (the environment before production) inside it without being in `origin/<prod>`.
+    A `merge/<feature>-<env>` branch is exempt from the second rule: it exists to carry the environment."""
+    g = lambda *x: _git_wt(wt, *x)  # noqa: E731
+    reasons = []
+    mine = set(g("rev-list", f"origin/{prod}..{branch}").stdout.split())
+    if only_local := sorted(mine & set(g("rev-list", f"origin/{prod}..{prod}").stdout.split())):
+        reasons.append(f"carries {len(only_local)} commit(s) only on the local {prod}, never pushed to origin/{prod} (e.g. {only_local[0][:7]}): push {prod} or rebase the branch onto origin/{prod}")
+    if previous and not _no_user_prefix(branch).startswith("merge/") and g("merge-base", "--is-ancestor", f"origin/{previous}", branch).returncode == 0 \
+            and g("merge-base", "--is-ancestor", f"origin/{previous}", f"origin/{prod}").returncode != 0:
+        reasons.append(f"carries origin/{previous}, which is not in origin/{prod}: a feature branch gets code from {prod} only, rebase it onto origin/{prod}")
+    return reasons
+
+
+def pr_open(target, title, body_text, environments=None, cwd=None, no_proof=None):
     """Publishes the delivery: strips the user prefix from the branch, checks `git merge-tree` against each environment (a conflict stops before the push), pushes, opens one
-    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Returns (urls, notices); ValueError before touching anything."""
+    PR per environment in the project's order and links each one to the task. `target` is the dispatch (ctx_…) or the branch. Refuses when the branch tip is not the commit the task's last
+    proof pinned (`proof_guard`; `no_proof` is the reason to go ahead anyway). Returns (urls, notices); ValueError before touching anything."""
     text_value = open(body_text).read() if os.path.isfile(body_text) else None
     if not (text_value or "").strip():
         raise ValueError(f"empty or missing body: {body_text}")
@@ -3205,6 +4170,7 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
     phases = phase_check(f"{title}\n{text_value}", scratch_roots([wt]), event_list)  # ticket 201: a PR that says "phase N" carries all of it
     if refusal := phase_refusal(phases):
         raise ValueError(f"{refusal}. Nothing was pushed: finish them, or name the tickets the PR carries without calling it the phase")
+    notices += proof_guard([(wt, branch, proof_head(task, event_list) if task else None, {"task": task})], no_proof)
     flow_info = task_flow(task, event_list) if task else repo_flow(wt)
     envs = environments or ([a for a in flow_info["ambientes"] if a != flow_info["producao"]] or [flow_info["producao"]] if flow_info["fluxo"] == "promocao" else [flow_info["producao"]])
     envs = sorted(dict.fromkeys(envs), key=lambda a: flow_info["ambientes"].index(a) if a in flow_info["ambientes"] else len(flow_info["ambientes"]))
@@ -3214,8 +4180,26 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
         if still_missing:
             raise ValueError(f"{flow_info['producao']} only after {' and '.join(still_missing)} enter(s): no merged PR of {task} there")
     new = _no_user_prefix(branch)
+    prod, ambs = flow_info["producao"], flow_info["ambientes"]
+    previous = ambs[ambs.index(prod) - 1] if prod in ambs and ambs.index(prod) > 0 else None
+    for a in dict.fromkeys([envs[0], prod, *([previous] if previous else [])]):
+        subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+    reasons = branch_guard(wt, branch, prod, previous)
+    try:
+        reasons += audit_publication([f"origin/{envs[0]}..{branch}"], wt, checks=("author", "trailer"))
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"did not audit the commits of {branch}: {(e.stderr or '').strip()[-200:]}")
+    if reasons:
+        raise ValueError("; ".join(reasons) + ". Nothing was pushed")
+    subjects = _git_wt(wt, "log", "--reverse", "--format=%h %s", f"origin/{envs[0]}..{branch}").stdout.splitlines()
+    print(f"{len(subjects)} commit(s) go out from {branch} over origin/{envs[0]}:" + "".join(f"\n  {l}" for l in subjects), file=sys.stderr)
     for a in envs:
         subprocess.run([GIT, "-C", wt, "fetch", "origin", a], capture_output=True, text=True, timeout=60)
+    ui_diff = _touches_ui(task, wt, f"origin/{envs[0]}", branch, event_list)
+    evidence_na = bool(re.match(r"n/a:\s*\S", _section(text_value, "Evidence")))
+    if ui_diff and (not _section(text_value, "Evidence") or re.fullmatch(r"n/a:?", _section(text_value, "Evidence"), re.I)):
+        raise ValueError(f"the diff touches the project's UI paths ({ui_diff}) and the body has no Evidence section with content: write the evidence or `n/a: <reason>`. Nothing was pushed")
+    for a in envs:
         r = _git_wt(wt, "merge-tree", "--write-tree", "--name-only", "--no-messages", f"origin/{a}", branch)
         if r.returncode != 0:
             raise ValueError(f"conflict with {a}" + (f" in: {', '.join(x for x in r.stdout.splitlines()[1:] if x.strip())}" if r.returncode == 1 else f" (merge-tree failed: {r.stderr.strip()[-200:]})") +
@@ -3239,6 +4223,11 @@ def pr_open(target, title, body_text, environments=None, cwd=None):
             queue_auto(pr_link(task, found_matches[-1]))
         elif not task:
             pr_auto(found_matches[-1], head=new, wt=wt)
+        if ui_diff and not evidence_na:
+            entry_event = append_event({"tipo": "entrada", "origem": "evidencia", "texto": f"PR #{found_matches[-1].rsplit('/', 1)[1]} touches UI ({ui_diff})", "fonte": f"PR #{found_matches[-1].rsplit('/', 1)[1]}",
+                                        "ref": found_matches[-1], "task": task}, new_id=True)
+            append_event({"tipo": "obrigacao", "op": "nova", "entrada": entry_event["id"], "chave": "evidencia", "url": found_matches[-1], "task": task,
+                          "texto": f"post the visual evidence: orq pr evidence {found_matches[-1]} --before <dir> --after <dir> [--scenarios <json>]"})
     if phases:
         append_event({"tipo": "fase_declarada", "texto": f"{title}\n{text_value}"[:2000], "urls": urls, "task": task})
     return urls, notices
@@ -3315,6 +4304,124 @@ def pr_production_open():
         if set(entered) == set(before):
             lines.append(_open_production(task, prod, before, [entered[a] for a in before], event_list))
     return [l for l in lines if l]
+
+
+def _section(text_value, name):
+    """The content of the `## <name>` section of a PR body (up to the next heading), stripped; '' if absent or empty."""
+    m = re.search(rf"^#+\s*{name}\b[^\n]*\n(.*?)(?=^#+\s|\Z)", text_value, re.M | re.I | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _touches_ui(task, wt, base, branch, event_list):
+    """The first file of `base...branch` that matches a `caminhos_ui` glob of the task's project (or of the one that holds `wt`), or None."""
+    run = next((e.get("run") for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("task") == task), None) if task else None
+    try:
+        item_name = dispatch_project(None, run) if run else None
+    except ValueError:
+        item_name = None
+    ps = projects()
+    globs = (ps.get(item_name or project_by_folder(ps, os.path.realpath(wt))) or {}).get("caminhos_ui") or []
+    if not globs:
+        return None
+    r = _git_wt(wt, "diff", "--name-only", f"{base}...{branch}")
+    return next((f for f in r.stdout.splitlines() if any(fnmatch.fnmatch(f, g) for g in globs)), None) if r.returncode == 0 else None
+
+
+# ---------- visual evidence of the PR (ticket 219) ----------
+
+EVIDENCE_MARK = "<!-- orq-evidence -->"
+EVIDENCE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm")
+
+
+def _gh_api(*args, fields=()):
+    r = subprocess.run([GH, "api", *args, *[x for k, v in fields for x in ("-f", f"{k}={v}")]], capture_output=True, text=True, timeout=PR_GH_S)
+    if r.returncode:
+        raise ValueError(f"gh api {args[-1]} failed: {(r.stderr or r.stdout).strip()[-200:]}")
+    return json.loads(r.stdout or "null")
+
+
+def _evidence_files(folder):
+    if not os.path.isdir(folder):
+        raise ValueError(f"not a folder: {folder}")
+    return sorted(f for f in os.listdir(folder) if f.lower().endswith(EVIDENCE_EXT) and os.path.isfile(os.path.join(folder, f)))
+
+
+def _evidence_branch(slug, n, files):
+    """Commits `files` ({path: source}) on the orphan branch `evidence/pr-<n>` of `slug` from a throwaway repository, so the PR's worktree is never touched. An existing branch is
+    continued (old SHAs keep working). Returns the commit SHA."""
+    import tempfile
+    branch, url = f"evidence/pr-{n}", f"https://github.com/{slug}.git"
+    with tempfile.TemporaryDirectory() as tmp:
+        g = lambda *a: subprocess.run([GIT, "-C", tmp, *a], capture_output=True, text=True, timeout=120)  # noqa: E731
+        g("init", "-q")
+        g("remote", "add", "origin", url)
+        if g("fetch", "-q", "origin", branch).returncode == 0:
+            g("checkout", "-q", "--detach", "FETCH_HEAD")
+            for f in os.listdir(tmp):
+                if f != ".git":
+                    shutil.rmtree(os.path.join(tmp, f)) if os.path.isdir(os.path.join(tmp, f)) else os.remove(os.path.join(tmp, f))
+        for dest, src in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, dest)), exist_ok=True)
+            shutil.copyfile(src, os.path.join(tmp, dest))
+        g("add", "-A")
+        if g("diff", "--cached", "--quiet").returncode:
+            r = g("-c", "user.name=orq", "-c", "user.email=noreply@orq.invalid", "commit", "-q", "-m", f"docs: evidence of PR #{n}")
+            if r.returncode:
+                raise ValueError(f"evidence commit failed: {r.stderr.strip()[-200:]}")
+            r = g("push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+            if r.returncode:
+                raise ValueError(f"push of {branch} failed: {r.stderr.strip()[-200:]}")
+        return g("rev-parse", "HEAD").stdout.strip()
+
+
+def evidence_verdict(scenarios):
+    """go / no-go / inconclusive / no-surface. 'untested' and a scenario that did not run live never become 'passed' (as in no-mistakes)."""
+    if not scenarios:
+        return "no-surface"
+    if any(s.get("after") == "fail" for s in scenarios):
+        return "no-go"
+    return "go" if all(s.get("after") == "pass" and s.get("live") for s in scenarios) else "inconclusive"
+
+
+def evidence_comment(links, scenarios):
+    """The comment body: the verdict, then a before/after table per scenario (or per image name when the run recorded no scenarios)."""
+    cell = lambda side, name: f"![{name}]({links[side][name]})" if name in links[side] else "—"  # noqa: E731
+    rows = [f"| {s['name']} | {s.get('before', 'untested')} | {s.get('after', 'untested')} | {'live' if s.get('live') else 'not run live'} | {cell('before', s.get('evidence') or '')} | {cell('after', s.get('evidence') or '')} |"
+            for s in scenarios] if scenarios else \
+           [f"| {n} | | | | {cell('before', n)} | {cell('after', n)} |" for n in sorted(set(links["before"]) | set(links["after"]))]
+    return "\n".join([EVIDENCE_MARK, f"## Evidence: {evidence_verdict(scenarios)}", "", "| Scenario | Before | After | Run | Before (image) | After (image) |", "|---|---|---|---|---|---|", *rows])
+
+
+def pr_evidence(target, before, after, scenarios_file=None):
+    """Publishes the PR's before/after evidence: orphan branch `evidence/pr-<n>`, links pinned to the commit SHA (checked with `gh api`), one comment that a re-run updates, and the
+    `evidencia` obligation closed with the comment URL. `target` is the PR URL, its number or the task. Returns the lines to print."""
+    items = _prs_ro()["itens"]
+    it = next((i for i in items if target in (i["url"], str(i.get("numero"))) or i["task"] == target and i["estado"] == "aberto"), None)
+    if not it:
+        raise ValueError(f"no PR linked for {target!r}: pass the URL, the number or the task (orq pr list)")
+    slug = re.search(r"github\.com/([^/]+/[^/]+)/pull/", it["url"]).group(1)
+    n = it["numero"]
+    scenarios = json.load(open(scenarios_file)) if scenarios_file else []
+    if not isinstance(scenarios, list) or any(not isinstance(s, dict) or not s.get("name") for s in scenarios):
+        raise ValueError("--scenarios: a JSON list of {name, before, after, live, evidence}")
+    files = {side: _evidence_files(folder) for side, folder in (("before", before), ("after", after))}
+    if not (files["before"] or files["after"]):
+        raise ValueError("no image or video in the folders")
+    sha = _evidence_branch(slug, n, {f"pr-{n}/{side}-{f}": os.path.join(folder, f) for side, folder in (("before", before), ("after", after)) for f in files[side]})
+    links = {side: {} for side in files}
+    for side in files:
+        for f in files[side]:
+            path = f"pr-{n}/{side}-{f}"
+            meta = _gh_api(f"repos/{slug}/contents/{path}?ref={sha}")
+            if not isinstance(meta, dict) or meta.get("type") != "file" or not meta.get("size"):
+                raise ValueError(f"{path} does not answer as a file at {sha[:9]}")
+            links[side][f] = f"https://github.com/{slug}/blob/{sha}/{path}?raw=true"
+    body = evidence_comment(links, scenarios)
+    old = next((c for c in _gh_api(f"repos/{slug}/issues/{n}/comments?per_page=100") or [] if EVIDENCE_MARK in (c.get("body") or "")), None)
+    c = _gh_api(f"repos/{slug}/issues/comments/{old['id']}", "-X", "PATCH", fields=[("body", body)]) if old else _gh_api(f"repos/{slug}/issues/{n}/comments", fields=[("body", body)])
+    comment_url = c["html_url"]
+    _close_auto("evidencia", it["task"], comment_url, lambda o: o.get("url") == it["url"])
+    return [f"evidence of PR #{n} ({evidence_verdict(scenarios)}): {comment_url}", f"commit {sha}", *(u for side in links for u in links[side].values())]
 
 
 def pr_list(task=None):
@@ -3462,7 +4569,7 @@ def notify_e2e_queue(f=None):
     file_path = _path("e2e-notice.json")
     if _dict(_read_json(file_path)).get("ticket") == f["ticket"]:
         return []
-    if notify_coordinator(g["coordenador"], f"orq: {e2e_line(f)}.") not in ("enviado", "adiado"):
+    if notify_coordinator(g["coordenador"], f"orq: {e2e_line(f)}.", valid_while="e2e_stuck") not in ("enviado", "adiado"):
         return []
     _write_json(file_path, {"ticket": f["ticket"]})
     return [f"E2E queue stuck ({f['ticket']}): notice typed in the coordinator"]
@@ -3585,6 +4692,8 @@ def _apply_prs(d, seen, now_at):
         if i["estado"] == "aberto" and not new:
             ci = _gh_ci(seen_item, now_at, task_flow(i["task"], event_list))
             i.update(**({"ci": ci} if ci else {}), **({"head": seen_item["headRefName"]} if seen_item.get("headRefName") else {}))
+            if ci and not _blocked_by_base(ci):
+                i.pop("base_avisada", None)  # a new block by the base is news again
         if i["estado"] != "aberto" or not new:
             i["base"] = seen_item.get("baseRefName") or i.get("base") if i["estado"] == "aberto" else i.get("base")
             continue
@@ -3603,7 +4712,8 @@ def _apply_prs(d, seen, now_at):
         if i["url"] in already:
             i["avisado"] = True
             continue
-        entry_event = append_event({"tipo": "entrada", "origem": "pr", "texto": text_value, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"]}, new_id=True)
+        entry_event = append_event({"tipo": "entrada", "origem": "pr", "texto": text_value, "fonte": f"PR #{i['numero']}", "ref": i["url"], "task": i["task"],
+                                    **_run_group(_task_run(event_list, i["task"]))}, new_id=True)  # a Run of the group's mate: the PR and its obligations are the mate's (ticket 323)
         i.update(entrada=entry_event["id"], texto=text_value, avisado=False)
         if new == "mergeado":
             tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_CLOSED), None)
@@ -3637,6 +4747,14 @@ def pr_poll(now_at=None, force=False):
         return _mutate_prs(lambda d: _apply_prs(d, seen, now_at)) + clean_closed(now_at, auto=True)
 
 
+def _merge_request(i, obligations):
+    """What the group's mate is asked when a PR of its Run enters a base: the notice with the obligations that are now its own (ticket 339)."""
+    what = ", ".join(f"{o['chave']} ({o['texto']})" for o in obligations)
+    return (f"{i['texto']}. Entry {i['entrada']}. Yours to do" + (f": {what}" if what else " (no obligation)") + ". Check the deploy through quave-one and the errors Slack, "
+            f"and open the PR for the next base if there is one. Close each with `orq fulfill {i['entrada']} <obligation> --proof \"...\"` or "
+            f"`orq defer {i['entrada']} <obligation> --reason \"...\"`; raise to the coordinator only what needs a decision.")
+
+
 def pr_notify():
     """Types into the coordinator a line `orq: PR #N has_entered em <base> …` per resolved PR not yet notified, once (the manager panel calls it on
     every round). Coordinator busy or with a draft: nothing is typed and the next round tries again. With no manager running there is no one to type: the
@@ -3644,7 +4762,7 @@ def pr_notify():
     g = _manager_cfg()
     if not g or not g.get("coordenador"):
         return []
-    line_list = []
+    line_list, owner = [], {e["id"]: e.get("grupo") for e in read_events() if e.get("tipo") == "entrada" and e.get("id")}
     for i in [x for x in _prs_ro()["itens"] if x["estado"] != "aberto" and not x.get("avisado") and x.get("entrada")]:
         def reserve(d, url=i["url"], value=True):
             """Sets/clears the notice under pr.lock; returns False if it was already set (another panel or a restart got there first)."""
@@ -3659,11 +4777,33 @@ def pr_notify():
         # reserve before typing: two panels (or a restart mid-round) do not type the same notice twice
         if not _mutate_prs(reserve):
             continue
-        if notify_coordinator(g["coordenador"], f"orq: {i['texto']}. Entry {i['entrada']}.", context=False) not in ("enviado", "adiado"):  # the "PR: …" in the summary already shows it
+        mate = owner.get(i["entrada"])  # a PR of the group's Run is the mate's: it gets the request, not the coordinator (tickets 323, 339)
+        notice, asked = f"orq: {i['texto']}. Entry {i['entrada']}.", None
+        if mate and (_dict(_mates().get(mate)).get("terminal") or _dict(_mates().get(mate)).get("dormiu")):  # open or asleep (the request wakes it)
+            try:
+                asked = mate_request(mate, _merge_request(i, open_obligations(read_events(), i["entrada"])))
+                intake(i["entrada"], "mate", asked["corr"])  # handed over: the coordinator only sees what the mate raises
+            except ValueError as e:  # the mate did not come up: nothing was recorded, the coordinator gets the notice below
+                log(f"pr_notify: mate {mate} did not take the request ({e})")
+        if asked:
+            failed = False  # a request not typed yet (mate busy) is recorded: the manager delivers it
+        else:
+            failed = notify_coordinator(g["coordenador"], notice, context=False) not in ("enviado", "adiado")  # the "PR: …" in the summary already shows it
+        if failed:
             _mutate_prs(lambda d, f=reserve: f(d, value=False))  # nothing was typed: the next round tries
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
-        line_list.append(f"{i['task']}: PR #{i['numero']} notice typed in the coordinator")
+        line_list.append(f"{i['task']}: PR #{i['numero']} " + (f"request {asked['corr']} sent to the mate {mate}" if asked else "notice typed in the coordinator"))
+    for i in [x for x in _prs_ro()["itens"] if x["estado"] == "aberto" and _blocked_by_base(x.get("ci")) and x.get("base_avisada") != ", ".join(x["ci"]["falhas"])]:
+        key_name = ", ".join(i["ci"]["falhas"])
+        since = i["ci"].get("base_vermelha_desde")
+        _mutate_prs(lambda d, url=i["url"], v=key_name: [x.update(base_avisada=v) for x in d["itens"] if x["url"] == url])  # reserve before typing, as above
+        text_value = f"orq: PR #{i['numero']} blocked by {i.get('base') or 'its base'}: {key_name} red there" + (f" since {since[:10]}" if since else "") + "; not the PR's fault."
+        if notify_coordinator(g["coordenador"], text_value, context=False) not in ("enviado", "adiado"):
+            _mutate_prs(lambda d, url=i["url"]: [x.pop("base_avisada", None) for x in d["itens"] if x["url"] == url])
+            break
+        append_event({"tipo": "pr", "op": "base_vermelha", "task": i["task"], "url": i["url"], "numero": i["numero"], "base": i.get("base"), "falhas": i["ci"]["falhas"], "desde": since})
+        line_list.append(f"{i['task']}: PR #{i['numero']} blocked by the base, notice typed in the coordinator")
     return line_list
 
 
@@ -3692,10 +4832,18 @@ def merge_obligations(i, next_item, tk=None, flow_info=None):
 
 
 def open_obligations(events, entry=None):
-    """The `obligation nova` events with no `done` or `adiada` after them, in the order they were born (of a single entry, with `entry`)."""
-    closed_ids = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") in ("feito", "adiada")}
+    """The `obligation nova` events with no `done`, `adiada` or `repassada` (handed to the mate) after them, in the order they were born (of a single entry, with `entry`)."""
+    closed_ids = {(e.get("entrada"), e.get("chave")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") in ("feito", "adiada", "repassada")}
     return [e for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "nova" and (e.get("entrada"), e.get("chave")) not in closed_ids
             and entry in (None, e.get("entrada"))]
+
+
+def my_obligations(events):
+    """The open obligations of the reader: those of the entries of the mate's group (ORQ_MATE) or, in the coordinator, of the entries without a group (ticket 323).
+    The manager (deploy check, fulfill by id) uses `open_obligations`, which sees them all."""
+    owner = {e["id"]: e.get("grupo") for e in events if e.get("tipo") == "entrada" and e.get("id")}
+    g = os.environ.get("ORQ_MATE") or None
+    return [o for o in open_obligations(events) if owner.get(o["entrada"]) == g]
 
 
 def _by_entry(obligations_open):
@@ -3706,9 +4854,9 @@ def _by_entry(obligations_open):
 
 
 def obligations_line(events):
-    """"A fazer por você: e484 → comentario (…), deploy (…)." from the coordinator's preamble, or empty. The mate does not carry the coordinator's.
+    """"A fazer por você: e484 → comentario (…), deploy (…)." from the reader's preamble (the coordinator's, or the mate's own group), or empty.
     ponytail: no cap of its own; dozens of open obligations make a long line, which is the sign they are being forgotten."""
-    obligations_open = [] if os.environ.get("ORQ_MATE") else open_obligations(events)
+    obligations_open = my_obligations(events)
     if not obligations_open:
         return ""
     return ("To do by you: " + "; ".join(f"{e} → " + ", ".join(f"{o['chave']} ({o['texto']}" + (f"; {m}" if o["chave"] == "limpeza" and (m := _cleanup_reason(events, o.get("task"))) else "") + ")" for o in os_) for e, os_ in _by_entry(obligations_open).items())
@@ -3831,9 +4979,9 @@ def defer_obligation(e, key_name, reason, run=None):
 
 
 def obligations_to_chase(events, now_at, minutes_elapsed=None):
-    """The obligations open for at least `minutes_elapsed` (OBLIGATION_MIN): the coordinator's Stop blocks them (`hook_stop`)."""
+    """The reader's obligations open for at least `minutes_elapsed` (OBLIGATION_MIN): the Stop of the coordinator, and of the mate for its group, blocks them (`hook_stop`)."""
     minutes_elapsed = OBLIGATION_MIN if minutes_elapsed is None else minutes_elapsed
-    return [o for o in open_obligations(events) if (now_at - _dt(o["ts"])).total_seconds() >= minutes_elapsed * 60]
+    return [o for o in my_obligations(events) if (now_at - _dt(o["ts"])).total_seconds() >= minutes_elapsed * 60]
 
 
 def _open_question(events):
@@ -3895,7 +5043,7 @@ def no_terminal_line(open_state):
 def state(entry=None, include_old=False):
     events, cur, open_state = read_events(), _cursor_ro(), _read_json(_path("open.json"))
     txt = summary(events, open_state, _pending_ro(), entry, cursor=cur, turns=_turns_ro(), panel=panel_notice(), include_old=include_old)
-    return "\n".join([*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events), *filter(None, [released_line(events, tickets()), dispatch_wait_line(tickets(), events)])])
+    return "\n".join([*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events), *filter(None, [released_line(events, tickets()), dispatch_wait_line(tickets(), events)]), *wave_lines()])
 
 
 # ---------- digest e modo ausente ----------
@@ -3986,20 +5134,28 @@ def merge_order(groups, ts):
 
 
 def _pr_reading(i, now_at=None):
-    """The CI and the conflict that the poll stored for an open PR: {marcas: [(icon, text)], pronto, velha, idade}. With no reading or with an old reading
+    """The CI and the conflict that the poll stored for an open PR: {marcas: [(icon, text)], pronto, velha, idade, bloqueada_pela_base}. With no reading or with an old reading
     (more than OLD_READ_MIN minutes) the PR does not count as ready. PR already resolved: None."""
     if i.get("estado") != "aberto":
         return None
     ci = _dict(i.get("ci"))
     if not ci:
-        return {"marcas": [("?", "no CI reading")], "pronto": False, "velha": False, "idade": None}
+        return {"marcas": [("?", "no CI reading")], "pronto": False, "velha": False, "idade": None, "bloqueada_pela_base": False}
     now_at = time.time() if now_at is None else now_at
     age = (now_at - (ci.get("lido_em") or 0)) / 60
-    marks = ([("✗", ", ".join(ci["falhas"]))] if ci.get("falhas") else []) + ([("⚠", "conflict")] if ci.get("mergeable") == "CONFLICTING" else []) \
+    on_base = [f for f in ci.get("falhas") or [] if f in (ci.get("falhas_na_base") or [])]
+    own = [f for f in ci.get("falhas") or [] if f not in on_base]
+    base_name = i.get("base") or "base"
+    marks = ([("✗", ", ".join(own))] if own else []) \
+        + ([("✗", f"already red on {base_name}: " + ", ".join(on_base))] if on_base and own else [("⛔", f"blocked by base: red on {base_name}: " + ", ".join(on_base))] if on_base else []) + ([("⚠", "conflict")] if ci.get("mergeable") == "CONFLICTING" else []) \
         + ([("⏳", "CI running")] if ci.get("rodando") else []) + ([("?", "conflict not computed yet")] if ci.get("mergeable") == "UNKNOWN" and not ci.get("falhas") and not ci.get("rodando") else [])
+    if ci.get("sem_check"):
+        linked = i.get("ligado_em")
+        since = f" for {max(0, ((ci.get('lido_em') or now_at) - _dt(linked).timestamp()) / 60):.0f} min" if linked else ""
+        marks.append(("?", f"no check registered{since}"))
     old = age > OLD_READ_MIN
     note = [("ℹ", "failure in another environment: " + ", ".join(ci["outro_ambiente"]))] if ci.get("outro_ambiente") else []  # informs, does not block
-    return {"marcas": (marks or [("✓", "ready")]) + note, "pronto": not marks and not old, "velha": old, "idade": age}
+    return {"marcas": (marks or [("✓", "ready")]) + note, "pronto": not marks and not old, "velha": old, "idade": age, "bloqueada_pela_base": _blocked_by_base(ci)}
 
 
 def _pr_contract(i, now_at=None):
@@ -4010,7 +5166,8 @@ def _pr_contract(i, now_at=None):
     l = _pr_reading(i, now_at)
     if l:
         ci = _dict(i.get("ci"))
-        out.update(mergeable=ci.get("mergeable"), falhas=ci.get("falhas") or [], rodando=ci.get("rodando") or [], lidoEm=ci.get("lido_em"), velha=l["velha"], pronto=l["pronto"])
+        out.update(mergeable=ci.get("mergeable"), falhas=ci.get("falhas") or [], rodando=ci.get("rodando") or [], lidoEm=ci.get("lido_em"), velha=l["velha"], pronto=l["pronto"],
+                   **({"falhasNaBase": ci["falhas_na_base"], "bloqueadaPelaBase": l["bloqueada_pela_base"]} if ci.get("falhas_na_base") else {}))
     return out
 
 
@@ -4224,6 +5381,8 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
     if e2e:  # the E2E queue is one extra line in `running`: `stuck_lock` when it does not move
         running.append({"titulo": e2e_line(e2e).split(". PRESA")[0], "estado": "presa" if e2e["presa"] else "rodando", "desde": None})
     line = [{"ts": e["ts"], **x} for e in events if (e.get("ts") or "") >= since and (x := _log_line(e, title))]
+    if cleaned := clean_summary_line(events, since):  # one line for all the cleaning of the window (ticket 326)
+        line = sorted([*line, cleaned], key=lambda x: x["ts"])
     return {"versao": 1, "geradoEm": now_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(away_alias), "desde": _dict(away_alias).get("ligada_em")},
             "fila": declared or derived, "proximoPasso": next_step, "features": features, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
             "tickets_orq": panel_tickets(ts, open_state),
@@ -4327,19 +5486,87 @@ def _away_marker(hora):
         pass
 
 
+PREFLIGHT_DISK_MIN_GB = 10  # below this much free disk in the orq clone, the night starts with a warning
+PREFLIGHT_WT_MAX = 20  # integration/worker folders in the orq worktree root before the count is worth a warning
+PREFLIGHT_E2E_STUCK_MIN = 120  # an E2E queue owner stopped for more than this many minutes is reported
+
+
+def away_preflight():
+    """`orq doctor away` and what `away on` runs first (ticket 217): what would keep the night from running, with no LLM and no Orca call beyond the worker/terminal lists.
+    Returns {duros, avisos}: hard failures (the manager is not alive or not bound to this coordinator, the harness has no orq hooks), each one ending in the command that fixes it,
+    and warnings (dirty or unpushed live checkout, old dispatches, stuck worktree folders, low disk, stopped E2E queue). Git runs with a 2 s timeout, like `_no_push`."""
+    hard, warn = [], []
+    mine = os.environ.get("ORCA_TERMINAL_HANDLE")
+    g = _manager_cfg()
+    cur = _cursor_ro()
+    if not g:
+        hard.append("no agent manager is bound: `orq start --objective \"<assunto>\"`")
+    elif mine and g.get("coordenador") != mine:
+        hard.append(f"the agent manager is bound to {g.get('coordenador')}, not to this coordinator ({mine}): `orq start --take-over`")
+    else:
+        try:
+            ages = [time.time() - os.path.getmtime(_path(PANEL_ALIVE))]
+        except OSError:
+            ages = []
+        if cur.get("gerente_volta"):
+            ages.append((datetime.now(timezone.utc) - _dt(cur["gerente_volta"])).total_seconds())
+        if not ages or min(ages) > panel_limit_s(g):
+            hard.append("the agent manager shows no recent round (`gerente-vivo` and `gerente_volta` are old or missing): `orq manager spawn`")
+    harness = _this_terminal_harness()
+    if harness and not _hook_commands(HOOKS_FILES[harness]):
+        hard.append(f"{harness} has no orq hooks in {HOOKS_FILES[harness]}: `python3 orq.py install`")
+    try:
+        dirty = subprocess.run(["git", "-C", ORQ_INSTALL, "status", "--short"], capture_output=True, text=True, timeout=2).stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        dirty = []
+    if dirty:
+        warn.append(f"the live checkout of orq is dirty, the integrator will stop on it: {'; '.join(dirty[:5])}" + (f" (+{len(dirty) - 5})" if len(dirty) > 5 else ""))
+    ahead = _no_push()
+    if ahead:
+        warn.append(f"the live checkout of orq has {ahead} commit(s) ahead of upstream that nobody pushed")
+    try:
+        old = len(doctor_old()["antigos"])
+    except Exception as e:  # noqa: BLE001  # a broken Orca read must not stop the night from starting
+        old = 0
+        log(f"away_preflight: doctor_old: {type(e).__name__}: {e}")
+    if old:
+        warn.append(f"{old} old dispatch(es) with no terminal still hold worktrees: `orq doctor old --release`")
+    try:
+        folders = len([d for d in os.listdir(WT_ROOT) if d != "integracao" and os.path.isdir(os.path.join(WT_ROOT, d))])
+    except OSError:
+        folders = 0
+    if folders > PREFLIGHT_WT_MAX:
+        warn.append(f"{folders} folders in {WT_ROOT} (more than {PREFLIGHT_WT_MAX}): `orq worktrees clean`")
+    try:
+        free_gb = shutil.disk_usage(HOME).free / 1e9
+    except OSError:
+        free_gb = None
+    if free_gb is not None and free_gb < PREFLIGHT_DISK_MIN_GB:
+        warn.append(f"only {free_gb:.1f} GB free on the orq disk (less than {PREFLIGHT_DISK_MIN_GB} GB)")
+    q = e2e_queue()
+    if q and q.get("presa") and (q.get("min") or 0) > PREFLIGHT_E2E_STUCK_MIN:
+        warn.append(f"the E2E queue has a stuck owner for {int(q['min'])} min ({q.get('worktree') or q.get('ticket')}): `scripts/e2e-infra.sh lock-status`")
+    return {"duros": hard, "avisos": warn}
+
+
+def away_preflight_lines(r):
+    """The preflight result as text lines (empty when everything is clean)."""
+    return [*[f"refused: {x}" for x in r["duros"]], *[f"warning: {x}" for x in r["avisos"]]]
+
+
 NIGHT_FAILURES = 3  # consecutive failures that close the dispatch (night and away)
 AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:00 local
 
 
-def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES):
+def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None):
     """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
     marked `via: away` so `orq hook external` stays inert): the end time, the dispatch cap and the failure breaker. Already on, it keeps the original
-    `ligada_em` and only re-arms the budget. Returns the stored state."""
+    `ligada_em` and only re-arms the budget. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
     _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
     was = _dict(_cursor_ro().get("ausente"))
     state_ = was or {"ligada_em": now()}
     if not was:
-        _cursor_mut(lambda c: c.__setitem__("ausente", state_))
+        _cursor_mut(lambda c: (c.__setitem__("ausente", state_), preflight is not None and c.__setitem__("preflight", {"ts": state_["ligada_em"], **preflight})))
         _away_marker(_hora_local(state_["ligada_em"]))
         append_event({"tipo": "ausente_ligar"})
     night_on(until_at, max_dispatches, max_failures, via="away")
@@ -4349,7 +5576,7 @@ def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURE
 def away_off():
     """Turns off away mode; returns whether it was on."""
     bound = bool(_dict(_cursor_ro().get("ausente")))
-    _cursor_mut(lambda c: c.pop("ausente", None))
+    _cursor_mut(lambda c: (c.pop("ausente", None), c.pop("preflight", None)))
     _away_marker(None)
     if bound:
         append_event({"tipo": "ausente_desligar"})
@@ -4391,7 +5618,7 @@ def coordinator_stops(evs, end_ts):
     return [x for x in out if (_dt(x[1]) - _dt(x[0])).total_seconds() > LACUNA_S]
 
 
-def away_report(since, live=None, now_at=None):
+def away_report(since, live=None, now_at=None, preflight=None):
     """The absence report in pt-BR lines, only from what orq stores (events.jsonl and the pending item list), no LLM, only with what was born after
     `since`. Sections in order: decisions, problems, coordinator stopped, summaries, deliveries, PRs, tickets, then the morning card's (dispatch stops, dirty
     worktrees, not pushed, manager, log gap, commands to paste); an empty section does not appear. `live` is `_live_states` for the dispatches still running."""
@@ -4407,6 +5634,7 @@ def away_report(since, live=None, now_at=None):
     decisions = [pending_line(i) for i in open_entries if i.get("tipo") == "decisao"]
     ok = lambda e: e.get("outcome") == "succeeded"  # noqa: E731
     sections = [
+        ("Crooked when the night began", [*[f"refused, forced: {x}" for x in _dict(preflight).get("duros", [])], *_dict(preflight).get("avisos", [])]),
         ("Decisions left for you", decisions),
         ("Other open pending items", [f"{i.get('tipo')} {pending_line(i)}" for i in open_entries if i.get("tipo") != "decisao"]),
         ("Problems", [f"worker failed: {_quote(e.get('subject'), 100)}" for e in evs if e.get("tipo") == "worker_done" and not ok(e)]
@@ -4415,7 +5643,7 @@ def away_report(since, live=None, now_at=None):
          + [f"PR closed without merge: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") == "fechou"]
          + [f"coordinator stopped with work waiting, {stop_line(x)}" for x in stops if x[2] == "trabalho_esperando"]),
         ("Coordinator stopped", [stop_line(x) for x in stops]),
-        ("Summaries", [f"{_hora_local(e['ts'])} {_quote(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo" and e.get("texto")]),
+        ("Summaries", [f"{_hora_local(e['ts'])} {_quote(e.get('texto'), 400)}" for e in evs if e.get("tipo") == "resumo_add" and e.get("texto")]),
         ("Worker deliveries", [_quote(e.get("subject"), 100) for e in evs if e.get("tipo") == "worker_done" and ok(e)]),
         ("PRs", [f"{'opened' if e['op'] == 'ligar' else 'merged into ' + str(e.get('base'))}: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") in ("ligar", "entrou")]),
         ("Tickets", [f"{'opened' if e['op'] == 'novo' else 'closed'} {e.get('ticket')}" + (f": {_quote(e.get('titulo'), 80)}" if e.get("titulo") else "")
@@ -4446,24 +5674,35 @@ def write_away_report(line_list):
     return path
 
 
-def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES):
+def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES, force=False):
     """`orq away` / `/away`: turns away mode on, off or shows it; without op it toggles. Returns the lines to print.
     On, the flags set the night budget (`--until` default 08:00, `--max-dispatches` default none, `--max-failures` default 3); on again with no flag keeps the budget as it is.
+    Turning on runs `away_preflight` first (`ORQ_AWAY_PREFLIGHT=off` skips it): a hard failure refuses and names the fix, `force` turns on anyway and logs `away_preflight_forcado`;
+    warnings go in the text and in cursor.json for the report.
     On turning off it shows the link to the 8765 panel, the count and the absence report (written to a file; the path goes last); it does not open a tab."""
     cur = _dict(_cursor_ro().get("ausente"))
     op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
     if op == "status":
         return away_lines(_cursor_ro())[:1]
     if op == "on":
+        pre, notes = None, []
+        if not cur and os.environ.get("ORQ_AWAY_PREFLIGHT") != "off":
+            pre = away_preflight()
+            notes = away_preflight_lines(pre)
+            if pre["duros"] and not force:
+                return [*notes, "away mode stays off; fix the above or pass --force"]
         if not cur or not night_active(_cursor_ro()) or until_at or max_dispatches is not None or max_failures != NIGHT_FAILURES:
-            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures)
+            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures, pre)
+        if pre and pre["duros"]:
+            append_event({"tipo": "away_preflight_forcado", "duros": pre["duros"]})
         since = _hora_local(_dict(_cursor_ro().get("ausente")).get("ligada_em"))
-        return [f"away mode on since {since}; the digest records each reply", *night_lines(_cursor_ro(), read_events())[1:]]
+        return [f"away mode on since {since}; the digest records each reply", *notes, *night_lines(_cursor_ro(), read_events())[1:]]
     n = len(digest_generate()[0]["linha"]) if cur else 0
+    pre = _dict(_cursor_ro().get("preflight"))
     away_off()
     if not cur:
         return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}"]
-    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]))
+    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]), preflight=pre)
     file_path = write_away_report(rel)
     digest_generate()  # atual.json already carries the report
     return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}", "", *rel, "", f"Report saved to {file_path}; hand it to the user in the first reply."]
@@ -4866,12 +6105,30 @@ def _external_denied(ev, cur):
     return "git reset --hard in the main checkout"
 
 
+def _full_suite(cmd):
+    """Does `cmd` run the whole test_orq.py, with options but no test name? (ticket 328: the worker runs `orq test --affected`)."""
+    for seg in cmdnorm.segments(cmd):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        i = next((k for k, t in enumerate(toks) if t.endswith("test_orq.py") and (k == 0 or os.path.basename(toks[k - 1]).startswith("python"))), None)
+        rest = toks[i + 1:] if i is not None else None
+        if rest is not None and not [t for k, t in enumerate(rest) if not t.startswith("-") and not (k and rest[k - 1] in ("-j", "--jobs", "--map"))]:
+            return True
+    return False
+
+
 def hook_external(ev, run):
     """PreToolUse of Bash, in every session (workers included): with night mode on it denies push, PR merge, deploy, commit without hook,
     `orca worktree rm --force` and `git reset --hard` on the main checkout. The message says to park the work and how to turn it off. When off, nothing changes.
-    Night or not, it warns when a worker_done leaves with no `orq check-delivery` passing on the current report (ticket 329)."""
-    item_name = _external_denied(ev, _cursor_ro())
+    Night or not, it warns a worker that runs the whole suite (ticket 328) and any worker_done that leaves with no `orq check-delivery` passing on the current report (ticket 329)."""
+    cur = _cursor_ro()
+    item_name = _external_denied(ev, cur)
     if not item_name:
+        if _dict(cur.get("papeis")).get(ev.get("session_id") or "") == "worker" and _full_suite(_dict(ev.get("tool_input")).get("command") or ""):
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": f"{MARK} the whole test_orq.py takes minutes and competes with the other "
+                    "workers for CPU: run `orq test --affected` (the tests your diff touches); the integrator runs the full suite (notice, nothing was blocked)."}}
         if d := _done_unchecked(ev):  # ticket 329: a warning, never a block (Orca spends the capability at the first worker_done)
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": (
                 f"{MARK} this worker_done of {d} goes out with no passing `orq check-delivery` on the current report: if the `## Conformance` lines are incomplete, orq sends the delivery back "
@@ -5055,9 +6312,9 @@ def heartbeat_blocker(ev, run):
 
 
 def inbox_in_prompt(run_id):
-    """The context lines for the Orca notice of `run_id` (ticket 182): the hook itself does the `orq inbox --ack` (with the ingest of 171, binding the
-    coordinator to the Run and restoring the link) and brings each message whole. If the read fails, only the command hint comes back, for the coordinator to run."""
-    tip = [f"orq: read and confirm the inbox with `orq inbox {run_id} --ack` (binds the coordinator to the Run and restores the link)"]
+    """The context lines for the Orca notice of `run_id` (ticket 182): the hook itself does the `orq inbox --ack` (with the ingest of 171, without binding
+    the coordinator to a Run it does not command, ticket 336) and brings each message whole. If the read fails, only the command hint comes back, for the coordinator to run."""
+    tip = [f"orq: read the inbox with `orq inbox {run_id} --ack` (does not bind the Run)"]
     try:
         header, *msgs = inbox(run_id, ack=True, detail=True)
     except TimeoutError:
@@ -5065,7 +6322,7 @@ def inbox_in_prompt(run_id):
     except Exception as e:  # noqa: BLE001 - fail-open: without reading, the coordinator gets the hint
         log(f"inbox in prompt: {type(e).__name__}: {e}")
         return tip
-    return [f"orq: the hook read and confirmed the inbox (nothing to run). {header}", *msgs] if msgs else tip  # nothing to show (empty, or only heartbeats): the old hint
+    return [f"orq: the hook read the inbox (nothing to run). {header}", *msgs] if msgs else tip  # nothing to show (empty, or only heartbeats): the old hint
 
 
 ONLY_ORQ_COMMAND = re.compile(r"\s*/away(\s+\w+)?\s*$")
@@ -5107,6 +6364,8 @@ def hook_prompt(ev, run):
                             **({"com_aviso": True} if with_notice else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, new_id=True)
     if ONLY_ORQ_COMMAND.match(text_value):  # `/away` and `/away status` ask for no effect: they close on their own
         intake(entry["id"], "conversa", note="orq command")
+    with contextlib.suppress(Exception):  # the notices orq types and the entries it already knows the effect of (ticket 337)
+        auto_intake()
     check_manager_bg()
     ctx = state(entry)
     if not os.environ.get("ORQ_MATE") and (deferred := context_notices()):  # the notice queue belongs to the coordinator
@@ -5167,7 +6426,7 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
         return f"{without} worker(s) lost the terminal without worker_done: `orq resume --dry-run`, then `orq resume`"
     for a in agent_rows:
         n = dispatch_index.get(a.get("dispatch")) or dispatch_index.get(a.get("task"))
-        if a.get("estado") == "entregue" and n and n not in integration and (by_num.get(n) or {}).get("status") != STATUS_CLOSED:
+        if a.get("estado") == "entregue" and not a.get("segurada") and n and n not in integration and (by_num.get(n) or {}).get("status") != STATUS_CLOSED:
             return f"worker {a['dispatch']} delivered ticket {n} and the delivery was not integrated: `orq integrate queue add <branch> {n}`, then release the worker"
     if pending_item:
         return pending_item
@@ -5271,7 +6530,19 @@ def record_coordinator_resume():
         append_event({"tipo": "coordenador_retomou"})
 
 
+def _check_manager_hook():
+    """The dead-manager check on the hook path: fail-open, and the hook's alarm still cuts it."""
+    try:
+        check_manager_bg()
+    except TimeoutError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log(f"check_manager_bg: {type(e).__name__}: {e}")
+
+
 def hook_stop(ev, run):
+    if not os.environ.get("ORQ_MATE"):
+        _check_manager_hook()  # an idle coordinator with the away mode on has no prompt: the Stop is the turn it still has
     out = _hook_stop(ev, run)
     if not os.environ.get("ORQ_MATE") and not (out or {}).get("decision") == "block":
         try:
@@ -5280,43 +6551,64 @@ def hook_stop(ev, run):
             raise
         except Exception as e:  # noqa: BLE001 - fail-open like the digest
             log(f"coordenador_parou: {type(e).__name__}: {e}")
+    if not os.environ.get("ORQ_MATE") and not (out or {}).get("decision") == "block":
+        try:
+            give_run_back_to_manager()
+        except TimeoutError:
+            raise
+        except Exception as e:  # noqa: BLE001 - fail-open like the digest
+            log(f"devolver_run: {type(e).__name__}: {e}")
     return out
+
+
+def give_run_back_to_manager():
+    """The Stop that ends the turn gives the manager back the Run the coordinator took with `run-use` (dispatch, `ticket new`, steer on a Run of the manager's):
+    Orca binds one Run per terminal, so without this the manager's queue stays without commanding it (ticket 347)."""
+    g = _manager_cfg()
+    if not g or g.get("coordenador") != os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return
+    own = _own_run()
+    if own in g["runs"]:
+        manager_bind(g["gerente"], [own])
+        append_event({"tipo": "gerente", "op": "devolver", "terminal": g["gerente"], "run": own})
 
 
 def _hook_stop(ev, run):
     # an entry with no intake in the turn (same session) or open for more than INTAKE_OLD_MIN always blocks, via _gate_blocks; the others only with `stop_bloqueia`
-    if not os.environ.get("ORQ_MATE"):  # the mate's end of turn is not the coordinator's reply to the absent user
+    mate = os.environ.get("ORQ_MATE")
+    if not mate:  # the mate's end of turn is not the coordinator's reply to the absent user
         digest_no_stop(ev)
-    events, now_at = read_events(), datetime.now(timezone.utc)
+    events, now_at = read_events(), now_dt()
     without = open_entries(events)
-    old_entries = [] if os.environ.get("ORQ_MATE") else obligations_to_chase(events, now_at)
-    blocker = None if os.environ.get("ORQ_MATE") else away_blocker(events, now_at)
-    if not without and not old_entries and not blocker:
+    old_entries = obligations_to_chase(events, now_at)
+    asked = [p for p in mate_pending(events, _mates(), now_at) if p["grupo"] == mate and p["estado"] != "escalado"] if mate else []  # the mate answers before it stops (ticket 323)
+    blocker = None if mate else away_blocker(events, now_at)
+    if not without and not old_entries and not asked and not blocker:
         return None
-    msg = MARK
+    msg, session, gate_ids = MARK, (ev.get("session_id") or "")[:8], []
     if without:
         ids = [e["id"] for e in without]
-        append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": (ev.get("session_id") or "")[:8]})
+        append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": session})
         rec = recovered_cursor(_cursor_ro(), now_at)
         quoted = ", ".join(f"{e['id']} ({_quote(e.get('texto'))!r})" for e in without[:3]) + (f" +{len(without) - 3}" if len(without) > 3 else "")
         msg += f" {len(ids)} entry(ies) without effect: {quoted}. Use: orq intake <e> task|steer|pend|decision|conversation|discarded [ref]" + (f" [notice] {recovered_notice(rec)}" if rec else "")
-        session = (ev.get("session_id") or "")[:8]
-        if not os.environ.get("ORQ_MATE"):
-            if not machine_cfg()["stop_bloqueia"]:  # only what the user said in this turn, or what has been open for a long time
-                ids = [e["id"] for e in without if e.get("origem", "usuario") == "usuario" and (
-                    (session and e.get("sessao") == session) or ((t := _ts(e.get("ts"))) and (now_at - t).total_seconds() > INTAKE_OLD_MIN * 60))]
-            if ids:
-                if _gate_blocks(session, ids):
-                    return {"decision": "block", "reason": msg}
-                append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": session})
+        if not mate and not machine_cfg()["stop_bloqueia"]:  # only what the user said in this turn, or what has been open for a long time; the mate has no absent user: every entry of the group
+            ids = [e["id"] for e in without if e.get("origem", "usuario") == "usuario" and (
+                (session and e.get("sessao") == session) or ((t := _ts(e.get("ts"))) and (now_at - t).total_seconds() > INTAKE_OLD_MIN * 60))]
+        gate_ids += ids
     if old_entries:
         msg += (f" Obligation open for more than {OBLIGATION_MIN:g} min: " + ", ".join(f"{o['entrada']} {o['chave']} ({o['texto']})" for o in old_entries[:4])
                 + (f" +{len(old_entries) - 4}" if len(old_entries) > 4 else "") + ': orq fulfill <e> <obligation> --proof "…" or orq defer <e> <obligation> --reason "…" (a deploy that is still building can be deferred).')
-        ids, session = [f"{o['entrada']}:{o['chave']}" for o in old_entries], (ev.get("session_id") or "")[:8]
-        if _gate_blocks(session, ids):
+        gate_ids += [f"{o['entrada']}:{o['chave']}" for o in old_entries]
+    if asked:
+        msg += (" Request from the coordinator without a reply: " + ", ".join(f"{p['corr']} ({_quote(p['texto'])!r})" for p in asked[:3]) + (f" +{len(asked) - 3}" if len(asked) > 3 else "")
+                + f". Answer each with `orq mate raise --corr {asked[0]['corr']} --type answer --text \"…\"` before you stop.")
+        gate_ids += [p["corr"] for p in asked]
+    if gate_ids:
+        if _gate_blocks(session, gate_ids):
             return {"decision": "block", "reason": msg}
-        append_event({"tipo": "gate_falhou", "abertas": ids, "sessao": session})
-    return {**({"systemMessage": msg} if without or old_entries else {}), **({"decision": "block", "reason": blocker} if blocker else {})}
+        append_event({"tipo": "gate_falhou", "abertas": gate_ids, "sessao": session})
+    return {**({"systemMessage": msg} if without or old_entries or asked else {}), **({"decision": "block", "reason": blocker} if blocker else {})}
 
 
 def _ask_data(ev):
@@ -5546,6 +6838,8 @@ def hook_session(ev, run):
     """SessionStart: injects the state and the open tickets so the new session resumes without anyone telling it anything."""
     if not os.path.exists(_path("open.json")):
         refresh_bg()  # with no cache the summary says "refresh em andamento" (refresh in progress): it asks for the refresh (B27)
+    if not os.environ.get("ORQ_MATE"):
+        _check_manager_hook()
     ctx = session_context()
     if other_handoff := _coordinator_handoff_to(ev):
         ctx += "\n\n" + other_handoff
@@ -5717,7 +7011,13 @@ def run_hook(kind, harness="claude"):
         if run is None:
             sid = ev.get("session_id") or ""
             if kind in ("prompt", "stop") and _roles().get(sid) == "worker":
-                record_turn(kind, ev, harness)  # the worker only records the turn: no Orca, no Run
+                record_turn(kind, ev, harness)  # the worker records the turn: no Run
+                if kind == "prompt" and (origin_name(ev.get("prompt")) == "orca" or (ev.get("prompt") or "").startswith(STEER_LINE)):
+                    try:
+                        if out := worker_ack(ev):
+                            print(json.dumps(out, ensure_ascii=False))
+                    except Exception as e:  # noqa: BLE001 - fail-open: without the ack the worker reads as before
+                        log(f"worker ack: {type(e).__name__}: {e}")
             if kind == "guard" and ev.get("tool_name") == "AskUserQuestion" and _roles().get(sid) == "worker":
                 print(json.dumps(guard_worker(), ensure_ascii=False))  # without Orca: the box opens in the terminal, where only whoever is watching sees it
                 return 0
@@ -5866,6 +7166,11 @@ def _run_group(run):
     return next(({"grupo": g} for g, m in _mates().items() if run in (_dict(m).get("runs") or [])), {})
 
 
+def _task_run(events, task):
+    """The Run that dispatched `task`, or None."""
+    return next((e.get("run") for e in reversed(events) if e.get("tipo") == "despacho" and e.get("task") == task), None)
+
+
 def mate_pending(event_list, mates, now_at):
     """Requests to the mate without a correlated answer, with the state: a_entregar (to deliver), aguardando (waiting), reenviar (resend), escalar (escalate) or escalado (escalated). Pure.
 
@@ -5908,9 +7213,9 @@ def _request_text(corr, text_value, deadline, again=False):
     return f"orq ▸ request {corr}{' again, no reply on the channel' if again else ''} from the coordinator: {text_value}{answer_text}"
 
 
-def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=None):
+def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=None, fila=None):
     """Records the request (`mate_pedido`, corr pN) before typing it into the mate's terminal; if the mate is in the middle of a turn, the manager delivers it later.
-    `responde`: the entry the mate raised and this request answers (the decision coming back); it closes with the `mate` effect."""
+    `responde`: the entry the mate raised and this request answers (the decision coming back); it closes with the `mate` effect. `fila`: the dispatch queue item the request came from."""
     if group_name not in groups():
         raise ValueError(f"group {group_name} does not exist in {GROUPS_DIR}/")
     m0 = _dict(_mates().get(group_name))
@@ -5929,7 +7234,7 @@ def mate_request(group_name, text_value, deadline=REQUEST_DEADLINE_S, responde=N
     with _lock("cursor.lock"):
         n = 1 + max((int(e["corr"][1:]) for e in read_events() if e.get("tipo") == "mate_pedido" and re.fullmatch(r"p\d+", str(e.get("corr")))), default=0)
         corr = f"p{n}"
-        _write_event({"tipo": "mate_pedido", "corr": corr, "grupo": group_name, "texto": text_value[:2000], "prazo": deadline, **({"responde": responde} if responde else {})})
+        _write_event({"tipo": "mate_pedido", "corr": corr, "grupo": group_name, "texto": text_value[:2000], "prazo": deadline, **({"responde": responde} if responde else {}), **({"fila": fila} if fila else {})})
     if responde:
         intake(responde, "mate", corr)
     before = now()  # the mate's hook records the turn start before the typing returns: the delivery counts from before it
@@ -6026,6 +7331,11 @@ def mate_open(group_name):
     return {"grupo": group_name, "terminal": new, "retomado": bool(m.get("sessao"))}
 
 
+def _mate_turn_since(mate, since):
+    """Did the mate's hooks record a turn that started at or after `since`? A mate that answers nothing and has none is not loading them (ticket 323)."""
+    return any(isinstance(t, list) and t and _ts(t[0]) and _ts(t[0]) >= (_ts(since) or _ts(t[0])) for t in _dict(mate).get("turnos") or [])
+
+
 def mate_lap():
     """One round of the manager over the mates: delivers the request that was waiting for the mate to be free, resends once what blew the deadline, escalates once what blew
     it again, notifies the coordinator of each new startup and of the mate that went down (once per terminal). Returns one line per action."""
@@ -6043,7 +7353,8 @@ def mate_lap():
             append_event({"tipo": "mate_reenvio", "corr": p["corr"], "ts": before})
             line_list.append(f"mate {p['grupo']}: {p['corr']} resent")
         elif p["estado"] == "escalar" and coord_handle and notify_coordinator(coord_handle, f"orq ▸ mate {p['grupo']} did not answer request {p['corr']} ({_quote(p['texto'])!r}) "
-                                                                               f"even after the repost. See terminal {terminal}.") in DELIVERED:
+                                                                               f"even after the repost. See terminal {terminal}." + (" (no turn recorded: orq doctor hooks)"
+                                                                                if not _mate_turn_since(mates.get(p["grupo"]), p.get("ts")) else "")) in DELIVERED:
             append_event({"tipo": "mate_escalado", "corr": p["corr"]})
             line_list.append(f"mate {p['grupo']}: {p['corr']} escalated to the coordinator")
     until_at = _cursor_ro().get("mate_avisada_ate")
@@ -6316,6 +7627,69 @@ def guard_mate():
     reason = (f"{MARK} the secondmate does not ask the user: raise the decision with `orq mate raise --type decision --text \"<question and options, with the recommended one>\"`; "
               "the answer comes back as `orq ▸ request pN`.")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
+
+
+# ---------- automatic intake (ticket 337) ----------
+
+AUTO_NOTICES = ("orq: machine under pressure",)  # typed by the panel and absent from ORQ_NOTICES: the hook records them as user entries nobody decides on
+AUTO_MATE_TYPES = ("resposta", "resumo")  # what the mate raises to inform; decisao, bloqueio and pr ask the coordinator for something
+MATE_OBLIGATIONS = ("deploy", "proximo")  # what a mate request about a merged PR takes over (check the deploy, open the next base's PR)
+
+
+def _auto_effect(e, ctx):
+    """(effect, note) already known for the open coordinator entry `e`, or None when it asks for a decision. `ctx` is `auto_intake`'s view of the log."""
+    origin = e.get("origem") or "usuario"
+    if origin == "relatorio_worker":
+        if d := ctx["queued"].get(e.get("ref")):
+            return "descartado", f"delivery entered the integrator queue (ticket {d['ticket']}, {d['branch']})"
+        if e.get("ref") in ctx["sent_back"]:
+            return "descartado", "delivery sent back to the worker (conformance): the new report replaces this one"
+    elif origin == "pr" and e.get("ref") in ctx["merged"]:
+        open_ones = open_obligations(ctx["events"], e["id"])
+        if open_ones:
+            number = (re.search(r"#(\d+)", e.get("fonte") or "") or [None, ""])[1]
+            cite = re.compile(rf"\b{e['id']}\b|{re.escape(e['ref'])}|#{number}(?!\d)" if number else rf"\b{e['id']}\b|{re.escape(e['ref'])}")
+            request = next((x for x in ctx["events"] if x.get("tipo") == "mate_pedido" and (x.get("ts") or "") >= (e.get("ts") or "") and cite.search(x.get("texto") or "")), None)
+            taken = [o for o in open_ones if o["chave"] in MATE_OBLIGATIONS] if request else []
+            for o in taken:
+                append_event({"tipo": "obrigacao", "op": "repassada", "entrada": e["id"], "chave": o["chave"], "grupo": request["grupo"], "corr": request["corr"], "auto": True})
+            if not taken or len(taken) < len(open_ones):
+                return None  # what the mate does not take stays with the coordinator, who fulfils or defers it
+            return "conversa", f"obligations handed to mate {request['grupo']} ({request['corr']})"
+        return "conversa", "PR merged; no obligation left for the coordinator"
+    elif origin == "mate" and e.get("tipo_mate") in AUTO_MATE_TYPES and _entry_number(e) <= ctx["told"]:
+        return "conversa", f"mate {e.get('mate')} {e['tipo_mate']} already shown to the coordinator"
+    elif origin == "usuario" and (e.get("texto") or "").lstrip().startswith(AUTO_NOTICES):
+        return "conversa", "machine pressure notice: the manager already holds the dispatches"
+    return None
+
+
+def auto_intake():
+    """Closes with a note, through `intake`, the open coordinator entries whose effect orq already knows (ticket 337): a worker report whose delivery entered the integrator queue or went
+    back to the worker (`descartado`), a merged PR with nothing left for the coordinator, or whose deploy and next-base obligations went to a mate that was asked about it
+    (`conversa`), a mate's answer or summary the manager already showed (`conversa`), and the machine-pressure notice (`conversa`). What asks for a decision stays open: a new
+    user request, a mate's decision or block, a PR it raised. Runs at the end of every ingest and in the prompt hook. Returns how many entries it closed.
+    ponytail: the mate request is matched by the entry id, the PR URL or `#number` in its text; a request that names none of them leaves the entry to the coordinator."""
+    events = read_events()
+    told = _cursor_ro().get("mate_avisada_ate")
+    ctx = {"events": events, "told": told if isinstance(told, int) else 0,
+           "queued": {e["msg"]: e for e in events if e.get("tipo") == "entrega_orq" and e.get("msg")},
+           "sent_back": {e["msg"] for e in events if e.get("tipo") == "conformidade" and e.get("enviado") and e.get("msg")},
+           "merged": {e.get("url") for e in events if e.get("tipo") == "pr" and e.get("op") == "entrou"}}
+    closed_ids = {x.get("entrada") for x in events if x.get("tipo") == "intake"}
+    n = 0
+    for e in events:
+        if e.get("tipo") != "entrada" or not e.get("id") or e["id"] in closed_ids or e.get("grupo"):
+            continue
+        found = _auto_effect(e, ctx)
+        if not found:
+            continue
+        try:
+            intake(e["id"], found[0], note=found[1])
+            n += 1
+        except ValueError as err:
+            log(f"auto intake of {e['id']}: {err}")
+    return n
 
 
 # ---------- comandos ----------
@@ -6638,9 +8012,10 @@ def free_terminal(handle):
 NOTICE_MAX = 150  # ceiling on what `type_text` and `type_text_busy` send (firstmate #6240: the ~290-character notice did not reach the panel on every re-tap)
 
 
-def _short(text_value):
-    """The text to type, with at most NOTICE_MAX characters. What goes past the cap goes whole into `HOME/notices/<hash>.txt` (same text, same
-    file) and what is typed carries the start of it and the full path: `<start>… full_text em <path>`."""
+def _short(text_value, valid_while=None):
+    """The text to type, with at most NOTICE_MAX characters. What goes past the cap goes whole into `HOME/avisos/<hash>.txt` (same text, same
+    file) and what is typed carries the start of it and the full path: `<start>… full_text em <path>`. Next to it, `<hash>.json` keeps `valid_while` (a NOTICE_CONDITIONS
+    name, or null: only the age expires it): `orq clean` removes the notice when the condition stops holding (ticket 326)."""
     if len(text_value) <= NOTICE_MAX:
         return text_value
     folder = os.path.join(HOME, "avisos")
@@ -6648,17 +8023,18 @@ def _short(text_value):
     os.makedirs(folder, exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(text_value + "\n")
+    _write_json(file_path[:-4] + ".json", {"valid_while": valid_while, "ts": now()})
     end = f"… full text at {file_path}"
     return text_value[: max(0, NOTICE_MAX - len(end))].rstrip() + end
 
 
-def type_text(handle, text_value):
+def type_text(handle, text_value, valid_while=None):
     """Types `text_value` + Enter into the terminal's agent, once. Returns `enviado` (sent), `ocupado`/`draft` (nothing was typed: repeat later) or
     `failed` (Orca refused: nothing was typed). The box is read twice, with NOTICE_GAP_S between them (ticket 82: a user who starts typing
     between the read and the send had the notice on top of their text). tui-idle alone misleads (satisfied at the start of the turn and for about 20 s of the turn, checked
     on the real Orca on 09/29): what really blocks is the send's `agent_prompt_blocked`, which Orca returns with the agent in the middle of a turn. If Orca observes the submission and did not see the turn start, it sends a lone Enter (on an empty box
     it does nothing); a send timeout counts as sent, because the text may have gone out and repeating would stack it."""
-    text_value = _short(text_value)
+    text_value = _short(text_value, valid_while)
     if reason := free_terminal(handle):
         return reason
     time.sleep(NOTICE_GAP_S)
@@ -6691,12 +8067,12 @@ def _turn_screen_without_draft(handle):
     return not ((t.get("draft") or "").strip() or any(screen_question(tail, h) for h in HARNESS) or "esc to interrupt" not in "\n".join(map(str, tail[-15:])))
 
 
-def type_text_busy(handle, text_value):
+def type_text_busy(handle, text_value, valid_while=None):
     """Types `text_value` + Enter into an agent in the middle of a turn, for Claude Code to queue and inject into the next tool result (10/01).
 
     Only with the spinner on the screen, no draft in the box and no menu waiting for a human answer, in both reads (NOTICE_GAP_S between them, ticket 82):
     in all three cases it returns `ocupado` without typing. Returns `ocupado_digitado`, or `ocupado` if Orca blocked the send (agent_prompt_blocked) or it failed."""
-    text_value = _short(text_value)
+    text_value = _short(text_value, valid_while)
     if not _turn_screen_without_draft(handle):
         return "ocupado"
     time.sleep(NOTICE_GAP_S)
@@ -6714,7 +8090,7 @@ def type_text_busy(handle, text_value):
 def active_coordinator(now_at=None, minutes_elapsed=None):
     """True if the user's last prompt is newer than `minutes_elapsed` (COORDINATOR_IDLE_MIN): the coordinator has someone there, and typing into it lands in the middle of what they are writing."""
     minutes_elapsed = COORDINATOR_IDLE_MIN if minutes_elapsed is None else minutes_elapsed
-    now_at = now_at or datetime.now(timezone.utc)
+    now_at = now_at or now_dt()
     last_by_header = next((e["ts"] for e in reversed(read_events()) if e.get("tipo") == "entrada" and e.get("origem") == "usuario" and e.get("ts") and not e.get("grupo")), None)  # the mate's does not
     return bool(last_by_header) and (now_at - _dt(last_by_header)).total_seconds() < minutes_elapsed * 60
 
@@ -6728,7 +8104,7 @@ def _notify_mac(text_value):
                        capture_output=True, timeout=3, check=False)
 
 
-def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None):
+def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None, valid_while=None):
     """Delivers a notice to the coordinator without typing over someone who is writing (tickets 82, 107 and 182). With away mode on it types when the coordinator is idle
     (the old-prompt guard and the `type_text` draft guard apply). With away mode off the old-prompt guard is dropped (ticket 182: deliveries sat waiting for the user's next message):
     it types when the coordinator is stopped and the prompt box is empty; with a draft or a turn in progress it holds. Returns `enviado` (typed), `adiado`
@@ -6736,10 +8112,11 @@ def notify_coordinator(handle, text_value, context=True, minutes_elapsed=None):
     shows, and `deliver_notices` types it if the coordinator goes idle) or, with away on, the `type_text` reason (nothing went out: retry later). `adiado` already counts as delivered."""
     away = bool(_dict(_cursor_ro().get("ausente")))
     if not away or not active_coordinator(minutes_elapsed=minutes_elapsed):
-        result = type_text(handle, text_value)
+        result = type_text(handle, text_value, *([valid_while] if valid_while else []))  # the condition only travels when there is one: callers and tests patch type_text with two arguments
         if away or result == "enviado":
             return result
-    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text_value, "ts": now(), "contexto": context, **({"minutos": minutes_elapsed} if minutes_elapsed is not None else {})}))
+    _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text_value, "ts": now(), "contexto": context, **({"minutos": minutes_elapsed} if minutes_elapsed is not None else {}),
+                                                              **({"valid_while": valid_while} if valid_while else {})}))
     _notify_mac(text_value)
     return "adiado"
 
@@ -6752,7 +8129,7 @@ def deliver_notices():
         return []
     away = bool(_dict(_cursor_ro().get("ausente")))
     a = next((x for x in queue if not (away and active_coordinator(minutes_elapsed=x.get("minutos")))), None)  # the wake-up notice (2 min) does not wait behind a 10 one
-    if not a or type_text(g["coordenador"], a["texto"]) != "enviado":
+    if not a or type_text(g["coordenador"], a["texto"], *([a["valid_while"]] if a.get("valid_while") else [])) != "enviado":
         return []
     _cursor_mut(lambda c: c.__setitem__("avisos", [x for x in c.get("avisos") or [] if x != a]))
     return ["deferred notice typed into the coordinator, idle"]
@@ -6864,7 +8241,7 @@ def wake_stopped(now_at=None):
     is stopped at the prompt → types a short notice into it, once per reason every WAKE_REPEAT_MIN. The Stop only runs when the coordinator finishes a turn; without a
     new message there is no turn (ticket 174: the integrator cycle, a service worker without capability, went 5 h with nobody seeing it). Only with away on (ticket 107).
     Coordinator busy or with a draft: nothing is marked and the next tick tries again. A reason that goes away resets the count. Returns the panel lines."""
-    g, now_at = _manager_cfg(), now_at or datetime.now(timezone.utc)
+    g, now_at = _manager_cfg(), now_at or now_dt()
     if not g or not g.get("coordenador") or not away_enabled():
         return []
     events = read_events()
@@ -6959,7 +8336,7 @@ def redeliver_steers(now_at=None):
 
     Only touches Orca with an overdue steer (STEER_READ_S after sending or after the last retype, and after the end of the worker's turn if it ended after that). A message with `read` in the inbox or cited in the
     worker's transcript (read_in_transcript): `steer_fim` (read).
-    A dispatch that already delivered: `steer_fim` (closed). Worker `stopped` (stopped; turn ended, per the hooks): retypes the notice with `type_text`, which does not type
+    A dispatch that already delivered: `steer_fim` (closed). Worker `stopped` (stopped; turn ended, per the hooks): retypes the steer's line (the notice, for a short one) with `type_text`, which does not type
     over a turn in progress or a draft and so does not spend the attempt. After STEER_ATTEMPTS retypes without a read it records the
     alert `steer_nao_lido` (summary and `orq agents`) and the steer leaves tracking. A busy worker gets nothing, as with the steer; a worker `perguntando` (asking; open question) neither: no notice and no alert."""
     now_at = now_at or datetime.now(timezone.utc)
@@ -6988,17 +8365,29 @@ def redeliver_steers(now_at=None):
         elif s["tentativas"] >= STEER_ATTEMPTS:
             append_event({"tipo": "alerta", "alerta": "steer_nao_lido", **base})
             line_list.append(f"{st.get('task')}: steer not read after {s['tentativas']} notices (alert recorded)")
-        elif agent_row["estado"] == "parado" and type_text(agent_row["terminal"], _worker_notice(agent_row["terminal"])) == "enviado":
+        elif agent_row["estado"] == "parado" and type_text(agent_row["terminal"], st.get("linha") or _worker_notice(agent_row["terminal"])) == "enviado":
             append_event({"tipo": "steer_reentrega", **base, "tentativa": s["tentativas"] + 1})
             line_list.append(f"{st.get('task')}: steer not read, notice retyped ({s['tentativas'] + 1}/{STEER_ATTEMPTS})")
     return line_list
 
 
+def _steer_receipt(target, text_value):
+    """`orq reply <task|msg_id> "<text>"` run by the worker: the receipt of its open steer (`steer_fim` read, source reply), or None if the target is no open steer."""
+    m, s = next(((m, s) for m, s in open_steers(read_events(), datetime.now(timezone.utc)).items() if target in (m, s["steer"].get("task"))), (None, None))
+    if not s:
+        return None
+    st = s["steer"]
+    return append_event({"tipo": "steer_fim", "msg_id": m, "task": st.get("task"), "dispatch": st.get("dispatch"), "run": st.get("run"), "motivo": "lido", "fonte": "reply", "texto": text_value})
+
+
 def reply_to(msg_id, text_value):
     """Replies to a worker's message (`orca orchestration reply`) through the manager's handle, first binding the message's Run.
+    A task or message id with an open steer is the worker confirming it (`_steer_receipt`): no Orca call.
 
     Orca only lets you reply from the terminal bound to the message's Run (consumer_fenced with the manager on another Run, seen on 29/09): the run comes from the inbox
     row and `orca()` binds the manager to it. A Run that neither the manager nor the coordinator holds is refused with the missing `run-use`."""
+    if receipt := _steer_receipt(msg_id, text_value):
+        return receipt
     line = next((x for x in orca("inbox", "--limit", "200", timeout=20)["messages"] if isinstance(x, dict) and x.get("id") == msg_id), None)
     if not line:
         raise ValueError(f"message {msg_id} is not among the 200 newest in the inbox")
@@ -7024,6 +8413,13 @@ WAITING_BLOCK = """## Waiting
 - External waits (CI, PR, merge) go inside a single blocking command, with the tool's maximum timeout (600000 ms in Bash): `gh pr checks --watch`, or `until <check>; do sleep 30; done`.
 - If the command returns with no change, repeat the same command, with no check between runs.
 - Never background it to poll. Do not wrap `npm run test-app-e2e` or `scripts/e2e-infra.sh` in a loop of your own: the E2E queue already waits inside the command."""
+
+# Ticket 221: the rule of the tests, after the waiting block in every spec and every ticket task (`orq prove-red` checks the red from the delivery).
+TEST_BLOCK = """## Tests
+
+- Do not write a test whose only proof is reading or grepping the source text of the code: run the interface and check the observable behavior.
+- A new test must fail without the change: see it red before it goes green. `orq prove-red` runs it against the base when you deliver."""
+SPEC_BLOCKS = f"{WAITING_BLOCK}\n\n{TEST_BLOCK}"
 
 ORQ_WT_TITLE = "## orq worktree"  # the block that the dispatch of one of orq's own tickets appends to the spec (ticket 136)
 
@@ -7051,6 +8447,19 @@ def steer(task, text_value, run=None, entry=None):
         return _steer(task, text_value, target, entry, request)
 
 
+def _steer_line(task, body_text):
+    """(what goes in the message, the file or None): an adjustment over STEER_FILE_MIN goes whole to STEERS/<task>-<n>.md and the message carries one line with the path
+    and the request for `orq reply` (at most NOTICE_MAX with the usual paths, so `type_text` sends it whole; Orca's typed notice cuts the body at 300 characters, and a worker that does not ack rereads the oldest message: the text must fit)."""
+    if len(body_text) <= STEER_FILE_MIN:
+        return body_text, None
+    os.makedirs(STEERS, exist_ok=True)
+    n = len(glob.glob(os.path.join(glob.escape(STEERS), f"{glob.escape(task)}-*.md"))) + 1
+    file_path = os.path.join(STEERS, f"{task}-{n}.md")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(body_text + "\n")
+    return f'{STEER_LINE}{file_path}. Read it, then: orq reply {task} "<plan>"', file_path
+
+
 def _steer(task, text_value, target, entry, request):
     """The steer body, with the `target` Run already commanded by the coordinator (or with the refusal that explains what is missing)."""
     fenced = f"the coordinator must command the worker's Run: {bind_tip(target)}"
@@ -7060,12 +8469,14 @@ def _steer(task, text_value, target, entry, request):
     if not t:
         raise ValueError(f"task {task} does not exist in Run {target}")
     body_text = text_value if request is None else f"{text_value}\n\n{REQUEST_TITLE} (addition)\n{request}"
+    line, steer_file = _steer_line(task, body_text)
+    extra = {"arquivo": steer_file, "linha": line} if steer_file else {}
     if t.get("dispatch_id") in _hibernated():  # no terminal to receive it: the resume carries the adjustment (even for an already delivered task, which the hibernated worker can still follow)
-        r = wake(t["dispatch_id"], f"coordinator adjustment: {body_text}")
+        r = wake(t["dispatch_id"], f"coordinator adjustment: {line}")
         if r["estado"] == "falhou":
             raise ValueError(f"the worker is hibernated and did not wake: {r['aviso']}")
         ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": target, "texto": text_value, "acordado": r["estado"],
-                           **({"pedido": request} if request is not None else {})})
+                           **({"pedido": request} if request is not None else {}), **extra})
         if entry:
             intake(entry, "steer", task, run=target)
         return ev
@@ -7075,7 +8486,7 @@ def _steer(task, text_value, target, entry, request):
         raise ValueError(f"task {task} is {t.get('status')}, not dispatched: no worker to receive the adjustment")
     try:
         res = orca("send", "--run", target, "--to", f"dispatch:{t['dispatch_id']}", "--subject", "Adjustment",
-                   "--body", body_text, "--priority", "high", timeout=10)
+                   "--body", line, "--priority", "high", timeout=10)
     except RuntimeError as e:
         raise ValueError(fenced if "consumer_fenced" in str(e) else str(e))
     msg = res.get("message") or res
@@ -7085,11 +8496,11 @@ def _steer(task, text_value, target, entry, request):
     handle = _dispatch_terminal(target, t["dispatch_id"])
     delivery = "orca" if _orca_notified(msg.get("id")) else type_text(handle, _worker_notice(handle)) if handle else "sem_terminal"
     if delivery == "ocupado":
-        delivery = type_text_busy(handle, _adjustment_notice(handle, text_value))
+        delivery = type_text_busy(handle, line if steer_file else _adjustment_notice(handle, text_value))
         if delivery == "ocupado_digitado":
             append_event({"tipo": "steer_digitado_ocupado", "task": task, "dispatch": t["dispatch_id"], "run": target, "msg_id": msg.get("id")})
     ev = append_event({"tipo": "steer", "task": task, "dispatch": t["dispatch_id"], "run": target, "texto": text_value, "msg_id": msg.get("id"),
-                       **({"pedido": request} if request is not None else {}), **({"aviso_terminal": delivery} if delivery != "ocupado" else {})})
+                       **({"pedido": request} if request is not None else {}), **({"aviso_terminal": delivery} if delivery != "ocupado" else {}), **extra})
     if entry:
         intake(entry, "steer", task, run=target)
     return ev
@@ -7099,7 +8510,7 @@ MSG_REDISPATCH = ("The coordinator sent your delivery back. Orca revoked the cap
                   "capability) arrives in this terminal in a moment, followed by the reason. Do nothing until it arrives; send the new worker_done with the new preamble's command.")
 
 
-def send_back(target, reason, run=None):
+def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
     worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
     terminal running the worker's session (the live one, the hibernated one woken, or `claude --resume` in the same worktree when it is gone) and sends the reason to the new dispatch.
@@ -7108,6 +8519,8 @@ def send_back(target, reason, run=None):
     run_ = default_run(run)
     if not run_:
         raise ValueError("no Run bound: pass --run and run run-use --id <r>")
+    if achado:  # `--achado`: the reason cites a review finding, so it carries the invariant rule
+        reason = f"{reason} {INVARIANT_RULE}"
     with _no_run(run_):
         t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
         if not t:  # task-list zeroes the dispatch_id of the completed task (ticket created with the backlog on); worker-list, which `agents` reads, still links task and dispatch
@@ -7134,7 +8547,7 @@ def send_back(target, reason, run=None):
                 cp = _checkpoint(d)
             except (RuntimeError, subprocess.TimeoutExpired):
                 cp = {"head": None, "sujo": None}
-            line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": d, "cwd": cwd, "terminal": handle}
+            line = {"dispatch": d, "task": t["id"], "run": run_, "titulo": _dispatch_title(run_, t["id"], d), "cwd": cwd, "terminal": handle}
             r = _start_session(line, tn["sessao"], tn.get("modelo"), cp, f"start another worker with: orq relaunch {d} --note 'the session could not be resumed'", MSG_REDISPATCH,
                               tn.get("harness") or "claude", None)
             if r["estado"] == "falhou":
@@ -7161,6 +8574,26 @@ def send_back(target, reason, run=None):
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             notice = f"reason not delivered ({e}): orq steer {t['id']} \"<reason>\""
         return {**ev, **({"aviso_terminal": notice} if notice not in ("enviado", "ocupado_digitado") else {})}
+
+
+def hold(target, reason=None, release=False):
+    """`orq hold <ticket|dispatch|task> --reason R`: the delivery stays unintegrated on purpose, so the away Stop and the manager's "Delivered, not released" notice stop asking;
+    `orq agents` shows R and for how long. Kept by ticket, so a new dispatch of the same ticket inherits it. `release` puts the delivery back in the queue of charges.
+    ValueError if `target` is no known ticket or dispatch, there is no reason, or there is nothing held to release."""
+    events = read_events()
+    dispatch_info = next((e for e in reversed(events) if e.get("tipo") == "despacho" and target in (e.get("dispatch"), e.get("task"))), None)
+    ticket = next((t["num"] for t in tickets() if t["num"] in (target, target.lstrip("0"))), None) or (dispatch_info or {}).get("ticket")
+    if not ticket and not dispatch_info:
+        raise ValueError(f"{target} is neither a ticket nor a dispatch")
+    key = str(ticket or dispatch_info["dispatch"])
+    ev = {"tipo": "segurar_solta" if release else "segurar", "ticket": ticket or None, "dispatch": (dispatch_info or {}).get("dispatch"), "task": (dispatch_info or {}).get("task")}
+    if release:
+        if key not in _held(events):
+            raise ValueError(f"{target} is not held")
+        return append_event(ev)
+    if not (reason or "").strip():
+        raise ValueError("--reason is required: it is what `orq agents` shows for the held delivery")
+    return append_event({**ev, "motivo": reason.strip()})
 
 
 # ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
@@ -7597,8 +9030,8 @@ def _write(path, txt):
 
 
 def read_ticket(path):
-    """{num, arquivo, titulo, status, blocked_by, run, task, modelo, effort} from the header of a `NN-slug.md` ticket (`Modelo:` and `Effort:` are optional: what orq
-    dispatches on its own when the ticket is released); raises OSError or ValueError if unreadable."""
+    """{num, arquivo, titulo, status, blocked_by, run, task, modelo, effort, projeto} from the header of a `NN-slug.md` ticket (`Modelo:`, `Effort:` and `Project:` are optional:
+    what orq dispatches on its own when the ticket is released, and the project it starts in); raises OSError or ValueError if unreadable."""
     with open(path, encoding="utf-8") as f:
         txt = f.read()
     cab = _header(txt)
@@ -7609,7 +9042,8 @@ def read_ticket(path):
             "status": _campo(cab, "Status") or "?", "blocked_by": [n.zfill(2) for n in re.findall(r"\d+", _campo(cab, "Blocked by") or "")],
             "run": _campo(cab, "Run") or None, "task": _campo(cab, "Task") or None, "modelo": _campo(cab, "Model") or _campo(cab, "Modelo") or None, "effort": _campo(cab, "Effort") or None,
             "despacho": _campo(cab, "Dispatch") or _campo(cab, "Despacho") or None, "espera": _campo(cab, "Waiting") or _campo(cab, "Espera") or None,
-            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None}
+            "projeto": _campo(cab, "Project") or _campo(cab, "Projeto") or None,
+            "issue": int(m.group(1)) if (m := re.search(r"^issue:[ \t]*#?(\d+)", cab, re.M | re.I)) else None, "scratch": _campo(cab, "Scratch") or None, "wave": None, "role": None}  # waves live only in the backlog (ticket 342)
 
 
 def _tickets_in_backlog():
@@ -7706,9 +9140,9 @@ def _waiting_ticket_line(t, integration, events, without_push):
     return ticket_line(t, dispatch_wait(t, integration, events, without_push) if t["status"] == STATUS_NEW and not t["blocked_by"] else None)
 
 
-def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None):
-    """The optional fields that say how the ticket is launched: Modelo, Effort, Despacho and Espera (ticket 142), in the order the header and the backlog store them."""
-    return {k: " ".join(v.split()) for k, v in (("modelo", model), ("effort", effort), ("despacho", dispatch_mode), ("espera", waiting)) if v}
+def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None, project=None):
+    """The optional fields that say how the ticket is launched: Modelo, Effort, Despacho, Espera (ticket 142) and Project (ticket 315), in the order the header and the backlog store them."""
+    return {k: " ".join(v.split()) for k, v in (("modelo", model), ("effort", effort), ("despacho", dispatch_mode), ("espera", waiting), ("projeto", project)) if v}
 
 
 def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
@@ -7720,7 +9154,7 @@ def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
                 *(x for b in blockers for x in ("--blocked-by", f"t{b}")), "--body", body_text)
 
 
-def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None):
+def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=None, dispatch_mode=None, waiting=None, project=None, wave=None, after=None):
     """Creates `ISSUES/NN-<slug>.md` from the title and the spec file, and the Orca task (`--task-title` equal to the title, a short `--spec` that
     points to the file, `--deps` with the tasks of the Blocked by still open). The `task_id` stays in the ticket, which is the only source of the content.
 
@@ -7729,7 +9163,11 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
 
     With tickets in the backlog (M5) the file is only the text (`# NN: título` and the sections, without Status, Blocked by, Run or Task) and the state goes to the backlog item `tNN`,
     written after the task: if the `add` fails, the file goes away and the task is completed with `desfeito` (undone). `model`, `effort`, `dispatch_mode` and `waiting` are the
-    optional header fields (or the item's meta).
+    optional header fields (or the item's meta). `project` (`Project:`) is where the released ticket starts: `--project`, otherwise the Run's, otherwise the one that contains the
+    coordinator's cwd; with none, no line (ticket 315).
+
+    `wave` N (or `after` <milestone>, which names the wave through its milestone; ticket 342) puts the task in a wave: it is blocked by the wave's milestone and the wave's join becomes
+    blocked by it. Only with tickets in the backlog; a wave whose join already closed takes no more tasks.
     """
     title = " ".join((title or "").split())
     if not title:
@@ -7737,7 +9175,6 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     no_backlog = _tickets_in_backlog()
     if no_backlog and (p := backlog.problem_title(title)):
         raise ValueError(p)
-    meta = _meta_ticket(model, effort, dispatch_mode, waiting)
     try:
         with open(os.path.expanduser(spec_file), encoding="utf-8") as f:
             body_text = f.read().strip()
@@ -7751,7 +9188,26 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         body_text = f"## What to build\n\n{body_text}"
     existing = {t["num"]: t for t in tickets()}
     blockers = list(dict.fromkeys(n.zfill(2) for n in re.findall(r"\d+", blocked_by or "")))
+    join = None
+    if wave or after:
+        if not no_backlog:
+            raise ValueError("waves live in the backlog: set ORQ_BACKLOG and ORQ_BACKLOG_TICKETS")
+        if after:
+            m = existing.get(str(after).strip().zfill(2))
+            if not m or m.get("role") != "milestone":
+                raise ValueError(f"--after takes the number of a wave's milestone, and {after} is not one (orq wave list)")
+            wave = m["wave"]
+        w = next((x for x in waves() if x["wave"] == int(wave)), None)
+        if not w:
+            raise ValueError(f"wave {wave} does not exist: create it with orq wave new \"<name>\"")
+        if w["join"]["status"] == STATUS_CLOSED:
+            raise ValueError(f"wave {wave} is closed (its join {w['join']['num']} already closed): put the task in a later wave")
+        blockers = list(dict.fromkeys([*blockers, w["milestone"]["num"]]))
+        join = w["join"]["num"]
     target = default_run(run)
+    meta = _meta_ticket(model, effort, dispatch_mode, waiting, dispatch_project(project, target))
+    if join:  # the wave of the task (ticket 342), after the meta that ticket 315 builds from the target Run
+        meta = {**meta, "wave": str(wave)}
     deps, notices = [], []
     for n in blockers:
         t = existing.get(n)
@@ -7772,12 +9228,12 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         with _lock("ticket.lock"):  # B25: two simultaneous `ticket new` do not pick the same number
             number = f"{_largest_ticket() + 1:02d}"
             path = os.path.join(ISSUES, f"{number}-{_slug(title)}.md")
-            cab = "" if no_backlog else f"\nStatus: {STATUS_NEW}\nBlocked by: {', '.join(blockers) or '(nenhum)'}\nRun: {target}\n" + "".join(f"{k.capitalize()}: {v}\n" for k, v in meta.items())
+            cab = "" if no_backlog else f"\nStatus: {STATUS_NEW}\nBlocked by: {', '.join(blockers) or '(nenhum)'}\nRun: {target}\n" + "".join(f"{'Project' if k == 'projeto' else k.capitalize()}: {v}\n" for k, v in meta.items())
             txt = f"# {number}: {title}\n{cab}\n{body_text}\n"
             with open(path, "x", encoding="utf-8") as f:
                 f.write(txt)
         try:
-            res = orca("task-create", "--spec", f"Leia e execute o ticket {path}\n\n{WAITING_BLOCK}", "--task-title", title, "--run", target,
+            res = orca("task-create", "--spec", f"Leia e execute o ticket {path}\n\n{SPEC_BLOCKS}", "--task-title", title, "--run", target,
                        *(["--deps", json.dumps(deps)] if deps else []), timeout=20)
             task = (res.get("task") or res).get("id")
             if not task:
@@ -7789,6 +9245,11 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         if no_backlog:
             try:
                 _backlog_ticket_add(number, title, blockers, path, task, target, meta)
+                if join:  # the join waits for this task too
+                    try:
+                        backlog.cli(BACKLOG, "block", f"t{join}", "--by", f"t{number}")
+                    except backlog.BacklogError as e:
+                        notices.append(f"the join {join} of wave {wave} does not wait for this ticket ({e}): tasks-axi block t{join} --by t{number}")
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.remove(path)
@@ -7822,9 +9283,10 @@ def ticket_close(numero, answer):
     if _tickets_in_backlog():
         backlog.cli(BACKLOG, "done", _item_of_ticket(n)["id"], "--no-prune")
         try:
-            with open(t["arquivo"], encoding="utf-8") as f:
-                txt = f.read()
-            _write(t["arquivo"], txt.rstrip("\n") + f"\n\n## Answer\n\n{answer_text}\n")
+            if not t.get("role"):  # a wave's milestone or join has no spec file
+                with open(t["arquivo"], encoding="utf-8") as f:
+                    txt = f.read()
+                _write(t["arquivo"], txt.rstrip("\n") + f"\n\n## Answer\n\n{answer_text}\n")
         except (OSError, TypeError) as e:  # the item is already Done: the answer stays in the log and in the notice
             notice = f"the ## Answer did not make it into the ticket file ({getattr(e, 'strerror', None) or 'ticket without a spec'}): {_quote(answer_text, 80)}"
     else:
@@ -7853,7 +9315,8 @@ def ticket_close(numero, answer):
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in released]})
     for o in [o for o in open_obligations(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
         _close_obligation(o, "feito", prova=f"ticket {n} {STATUS_CLOSED}")  # orq fulfils it on its own and only records it
-    return {"ticket": n, "status": STATUS_CLOSED, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": closed_item, "aviso": notice, "liberados": released}
+    swept = wave_sweep()  # the close may have emptied the blockers of a join or of the next wave's milestone
+    return {"ticket": n, "status": STATUS_CLOSED, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": closed_item, "aviso": notice, "liberados": released, **({"ondas": swept} if swept else {})}
 
 
 def ticket_edit(numero, **fields):
@@ -7881,11 +9344,85 @@ def ticket_edit(numero, **fields):
     return {"ticket": n, "campos": sorted(fresh)}
 
 
-def _released_worktree(t):
-    """(worktree, name) with which the released ticket goes up from the queue: `current` for an orq ticket (its worktree block already says where to work) and, for a
-    project one, a new worktree with `--name` from the title (kebab, no accents, up to 40 letters): Orca refuses new-top-level without a name. An invalid Run project raises ValueError."""
-    project = dispatch_project(None, t["run"])
-    if orq_ticket(t["titulo"], project):
+# ---------- waves and milestones (ticket 342): the delivery order as layers of the backlog ----------
+
+def waves():
+    """The waves, by number: [{wave, milestone, join, tasks}], each a ticket of `tickets()` (`tasks` is the list of those that carry `wave: N` and no role).
+
+    Wave N is the milestone (blocks the wave's tasks), the tasks and the join (blocked by the milestone and by every task). The next wave's milestone is blocked by this join, so the delivery
+    order is the order of the waves and the PRs' merge order (`merge_order`, from `Blocked by`) follows it with no extra rule."""
+    found = {}
+    for t in tickets():
+        if t.get("wave"):
+            w = found.setdefault(t["wave"], {"wave": t["wave"], "milestone": None, "join": None, "tasks": []})
+            if t["role"] == "milestone":
+                w["milestone"] = t
+            elif t["role"] == "join":
+                w["join"] = t
+            else:
+                w["tasks"].append(t)
+    return [found[k] for k in sorted(found) if found[k]["milestone"] and found[k]["join"]]
+
+
+def wave_new(name):
+    """Creates wave N+1: the milestone (blocked by the previous wave's join, if any) and the join (blocked by the milestone, so an empty wave does not close). The tickets are
+    plain backlog tickets with no spec and no Orca task; `ticket new --wave N` puts the tasks in. Returns {wave, milestone, join}."""
+    name = " ".join((name or "").split())
+    if not name:
+        raise ValueError("wave without a name")
+    if not _tickets_in_backlog():
+        raise ValueError("waves live in the backlog: set ORQ_BACKLOG and ORQ_BACKLOG_TICKETS")
+    if p := backlog.problem_title(name):
+        raise ValueError(p)
+    with _lock("ticket.lock"):  # the same lock as ticket new: no number is picked twice
+        ws = waves()
+        number = max((w["wave"] for w in ws), default=0) + 1
+        milestone, join = (f"{_largest_ticket() + k:02d}" for k in (1, 2))
+        for num, role, blockers in ((milestone, "milestone", [ws[-1]["join"]["num"]] if ws else []), (join, "join", [milestone])):
+            backlog.cli(BACKLOG, "add", f"t{num}", f"Wave {number}: {name} ({role})", "--kind", "ticket", *(x for b in blockers for x in ("--blocked-by", f"t{b}")),
+                        "--body", backlog.body_with_meta({"wave": number, "role": role}, None, backlog.META_TICKET))
+    append_event({"tipo": "ticket", "op": "onda", "onda": number, "marco": milestone, "juncao": join, "titulo": name})
+    wave_sweep()
+    return {"wave": number, "milestone": milestone, "join": join}
+
+
+def wave_sweep():
+    """Closes the milestones and joins whose blockers are all integrated, one by one (each close can free the next), and returns their numbers. A join with no task never closes:
+    an empty wave waits for its tasks. Nothing to do without waves, and the hooks pay one read of the backlog for it."""
+    closed = []
+    if not _tickets_in_backlog():
+        return closed
+    while True:
+        t = next((x for w in waves() for x in (w["milestone"], w["join"]) if x["status"] != STATUS_CLOSED and not x["blocked_by"] and (x["role"] == "milestone" or w["tasks"])), None)
+        if not t:
+            return closed
+        ticket_close(t["num"], "every blocker integrated")  # recurses into wave_sweep; the loop reads the backlog again and ends
+        closed.append(t["num"])
+
+
+def _wave_name(milestone):
+    return re.sub(r"^Wave \d+: | \(milestone\)$", "", milestone["titulo"])
+
+
+def wave_lines():
+    """One line per wave for `orq status` and the panel: closed (its join integrated), open (the milestone closed, tasks running) or waiting (blocked by the previous wave), with the
+    tasks integrated out of the total, what blocks the wave and the tasks still open. Empty without waves."""
+    out = []
+    for w in waves():
+        done = [t for t in w["tasks"] if t["status"] == STATUS_CLOSED]
+        state = "closed" if w["join"]["status"] == STATUS_CLOSED else "open" if w["milestone"]["status"] == STATUS_CLOSED else "waiting"
+        rest = [t["num"] for t in w["tasks"] if t["status"] != STATUS_CLOSED]
+        waits = w["milestone"]["blocked_by"]
+        out.append(f"wave {w['wave']} {_quote(_wave_name(w['milestone']), 40)}: {state}, {len(done)}/{len(w['tasks'])} integrated"
+                   + (f"; waits for {', '.join(waits)}" if waits else "") + (f"; open: {', '.join(rest)}" if rest else ""))
+    return out
+
+
+def _released_worktree(t, project):
+    """(worktree, name) with which the released ticket goes up from the queue: `current` for an orq ticket with no project (its worktree block already says where to work) and, for
+    a project one, a new worktree in the project's repo with `--name` from the title (kebab, no accents, up to 40 letters): Orca refuses new-top-level without a name. `current`
+    would be the manager terminal's worktree, which may be another project's (ticket 315)."""
+    if not project and orq_ticket(t["titulo"]):
         return "current", None
     return "new-top-level", _slug(t["titulo"])[:40].strip("-")
 
@@ -7905,7 +9442,7 @@ def _release_dependents(n, before=None):
     no_backlog = _tickets_in_backlog()
     depended = {x["num"] for x in (before or ts) if n in x["blocked_by"]}
     for t in ts:
-        if (t["num"] not in depended if no_backlog else n not in t["blocked_by"]) or t["status"] == STATUS_CLOSED:
+        if (t["num"] not in depended if no_backlog else n not in t["blocked_by"]) or t["status"] == STATUS_CLOSED or t.get("role"):  # a wave's milestone or join is closed by `wave_sweep`, never dispatched
             continue
         remaining_blocks = [b for b in t["blocked_by"] if b != n and status.get(b) != STATUS_CLOSED]
         if not no_backlog:
@@ -7927,8 +9464,10 @@ def _release_dependents(n, before=None):
             notices.append(f"ticket {t['num']} (P{priority}) released, outside the dispatch queue ({waiting}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3 and t["task"] and t["run"] and t["modelo"] and t["effort"] in HARNESS["claude"]["efforts"]:
             try:
-                wt, item_name = _released_worktree(t)
-                item["fila"] = _enqueue_dispatch(f"ticket {n} resolved: released {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority, "claude")["fila"]
+                project = dispatch_project(t["projeto"], t["run"])  # resolved now, in the coordinator's process: the manager never guesses it from its own cwd
+                wt, item_name = _released_worktree(t, project)
+                item["fila"] = _enqueue_dispatch(f"ticket {n} resolved: released {t['num']}", t["run"], t["titulo"], None, t["modelo"], t["effort"], wt, item_name, None, None, t, priority,
+                                                 "claude", project)["fila"]
             except (OSError, ValueError) as e:
                 notices.append(f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3:
@@ -8064,6 +9603,14 @@ def doctor_old_text(r, release_=False):
     return "\n".join(ls) or "no old dispatch left unreleased"
 
 
+def mate_hooks_problems():
+    """A project of a group whose settings turn every hook off (`disableAllHooks`) leaves its mate with no turn, no Stop and no guard (ticket 323). Settings that only add hooks do not remove the global ones."""
+    return [f"mate {g}: {f} sets disableAllHooks, so the mate's hooks (prompt, stop, guard) do not run"
+            for g, cfg in groups().items() for project in cfg.get("projetos") or []
+            for f in (os.path.join(os.path.expanduser(project), ".claude", n) for n in ("settings.json", "settings.local.json"))
+            if _dict(_read_json(f)).get("disableAllHooks") is True]
+
+
 def doctor_hooks(pin=False):
     """`orq doctor hooks`: per harness hooks file that exists, the problems with the interpreter of orq's hooks; with `pin`, writes the absolute Python first. Exit 1 while there is a problem."""
     broken = 0
@@ -8076,6 +9623,10 @@ def doctor_hooks(pin=False):
         problems = hooks_python_problems(agent)
         broken += len(problems)
         print("\n".join(f"{agent}: {x}" for x in problems) or f"{agent}: hooks ok")
+    mate_problems = mate_hooks_problems()
+    broken += len(mate_problems)
+    if mate_problems:
+        print("\n".join(mate_problems))
     if pin:
         print("orq link: " + ("wrapper written" if pin_orq_link() else "unchanged"))
     return 1 if broken else 0
@@ -8352,9 +9903,14 @@ def agents(run=None, include_all=False, now_at=None):
                         {d: a["pergunta"] for d, a in screens_read.items() if a["pergunta"]}, hib, limits={d: a["limite"] for d, a in screens_read.items() if a["limite"]},
                         paused=_dict(_cursor_ro().get("pausados")))
     unread_ids = {e.get("dispatch") for e in recent_alerts(events, now_at, agent_rows) if e.get("alerta") == "steer_nao_lido"}
+    sent_at = {}
+    for s in open_steers(events, now_at).values():
+        sent_at.setdefault(s["steer"].get("dispatch"), s["steer"]["ts"])  # the oldest open one
     for a in agent_rows:
         if a["dispatch"] in unread_ids:
             a["alerta"] = "steer not read"
+        elif a["dispatch"] in sent_at and a.get("estado") not in ("entregue", "liberado"):
+            a["steer_sem_recibo_min"] = int((now_at - _ts(sent_at[a["dispatch"]])).total_seconds() // 60)
         a["prioridade"] = priority_of(events, a["task"], a["dispatch"], a.get("titulo"))
     return agent_rows if include_all else [a for a in agent_rows if not (a.get("titulo") or "").startswith(PROOF_PREFIX)]
 
@@ -8403,13 +9959,18 @@ def agents_text(agent_rows):
             p = a["pergunta"]
             line_list.append(f"            QUESTION ON SCREEN ({p['tipo']}): {p['texto']} [{' | '.join(f'{n}) {r}' for n, r in p['opcoes'])}]")
             line_list.append(f'            -> orq answer-screen {a["task"]} <option>')
+        if a.get("steer_sem_recibo_min") is not None:
+            line_list.append(f"            steer without receipt for {a['steer_sem_recibo_min']} min")
         if a.get("alerta"):
-            line_list.append(f"            ALERT: {a['alerta']} (the worker did not read the adjustment after {STEER_ATTEMPTS} notices; a check without --ack hides the new messages)")
+            line_list.append(f"            ALERT: {a['alerta']} (the worker did not read the adjustment after {STEER_ATTEMPTS} retype; a check without --ack hides the new messages)")
         if a["estado"] == "sem_terminal":
             line_list.append("            -> orq resume --dry-run (the terminal vanished before worker_done; the steer has nowhere to land)")
         elif a["estado"] in ("travado", "nao_comecou", "parado"):
             line_list.append(f'            -> orq steer {a["task"]} "<ajuste>" --run {a["run"]}')
         elif a["estado"] == "entregue":
+            if a.get("segurada"):
+                since = _ts(a["segurada"].get("ts"))
+                line_list.append(f"            HELD: {a['segurada'].get('motivo')}" + (f" (for {_duration((datetime.now(timezone.utc) - since).total_seconds())})" if since else "") + f" -> orq hold {a['task']} --release")
             line_list.append(f"            -> orq release {a['dispatch']}" if not a.get("retido") else f"            retained: {a['retido']} (orq release does not close it)")
         elif a["estado"] == "hibernado":
             line_list.append(f"            -> orq wake {a['task']} (steer and reply also wake it)")
@@ -8679,6 +10240,16 @@ def _dispatch_worker(dispatch, run=None):
     if not w:
         raise ValueError(f"dispatch {dispatch} does not appear in the worker-list: orq only controls workers of Orca Runs")
     return w
+
+
+def stamp_identity(path, source):
+    """Writes `source`'s effective `user.name`/`user.email` into the git config of the worktree `path` (the pre-commit refuses any other author). No-op without a path or an email."""
+    if not path or not os.path.isdir(path):
+        return
+    for key in ("user.name", "user.email"):
+        val = (_git(source, "config", key) or "").strip()
+        if val:
+            subprocess.run(["git", "-C", path, "config", key, val], capture_output=True, check=False)
 
 
 def _checkpoint(dispatch):
@@ -9557,6 +11128,14 @@ def _file_environments(d):
     return branches, (marked or branches[-1:])[0], flow or ("promocao" if len(branches) > 1 else "direto"), None
 
 
+def _file_tests(v):
+    """The `tests` of a project file as {globs, command?} (`orq prove-red`): a list of globs or `{"globs": [...], "command": "..."}`; anything else is None (the default applies)."""
+    v = {"globs": v} if isinstance(v, list) else v
+    c = v.get("command") or v.get("comando") if isinstance(v, dict) else None  # to_pt reads the file's `command` as `comando`
+    ok = isinstance(v, dict) and isinstance(v.get("globs"), list) and v["globs"] and all(isinstance(g, str) and g for g in v["globs"])
+    return {"globs": v["globs"], "command": c if isinstance(c, str) and c.strip() else None} if ok else None
+
+
 def projects():
     """The ORQ_HOME/projects/<name>.json files, read on every call (no cache): {nome: {"repo", "harness", "grupo", "ambientes", "producao", "fluxo", "e2e_queue", "transcritos", "erro"}}.
 
@@ -9585,7 +11164,10 @@ def projects():
                 f"{without_text} is not a path (text)" if without_text else env_error)
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
-                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None}
+                         "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
+                         "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
+                         "tests": _file_tests(d.get("tests")),
+                         "sem_ci": d.get("sem_ci") is True}
     return findings
 
 
@@ -9617,8 +11199,9 @@ def run_store_project(run, item_name):
     return append_event({"tipo": "run_projeto", "run": run, "projeto": item_name})
 
 
-def dispatch_project(item_name=None, run=None):
-    """A dispatch's project: `--project`, otherwise the one the Run holds, otherwise the one that contains the cwd (or its main checkout), otherwise None.
+def dispatch_project(item_name=None, run=None, use_cwd=True):
+    """A dispatch's project: `--project`, otherwise the one the Run holds, otherwise the one that contains the cwd (or its main checkout), otherwise None. The manager passes
+    `use_cwd=False`: its cwd says nothing about the item it starts (ticket 315).
 
     A name requested or stored in the Run that no longer exists or is invalid is refused: falling back to the cwd would start the worker in the wrong repository."""
     ps = projects()
@@ -9630,6 +11213,8 @@ def dispatch_project(item_name=None, run=None):
         if ps[item_name]["erro"]:
             raise ValueError(f"{origin_name} points to project {item_name}, whose file is invalid: {ps[item_name]['erro']}")
         return item_name
+    if not use_cwd:
+        return None
     cwd = os.path.realpath(os.getcwd())
     return project_by_folder(ps, cwd) or (project_by_folder(ps, _repo_root(cwd) or cwd) if ps else None)
 
@@ -9645,7 +11230,7 @@ def project_flow(item_name):
     environment, the default branch of the repo's remote (the project folder, or the cwd), with a direct flow; `declarado` says which of the two."""
     d = projects().get(item_name) or {}
     if d.get("ambientes") and not d.get("erro"):
-        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True}
+        return {"ambientes": d["ambientes"], "producao": d["producao"], "fluxo": d["fluxo"], "declarado": True, "sem_ci": d.get("sem_ci", False)}
     default = default_branch((d.get("repo") and repo_folder(d["repo"])) or os.getcwd())
     return {"ambientes": [default], "producao": default, "fluxo": "direto", "declarado": False}
 
@@ -9887,6 +11472,153 @@ def add_project(target, item_name=None, harness=None, group_name=None, proposal_
         os.replace(tmp, yaml_path)
     return {**out, "registrado_no_orca": registrar, "arquivo_novo": not does_exist}
 
+# ---------- orq test (ticket 328) ----------
+
+TEST_MAP = os.environ.get("ORQ_TEST_MAP") or os.path.join(PLAN, "test-map.json")  # the functions each test runs: the integrator's full run writes it (test_orq.py --map), outside git
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+TOP_DEF = ("FunctionDef", "AsyncFunctionDef", "ClassDef")
+
+
+def _diff_ranges(diff):
+    """{path: ([new (first, last)], [old (first, last)])} of a `git diff -U0` text; a side of a hunk with 0 lines has no range on that side."""
+    out, path = {}, None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = line.split(" b/", 1)[-1]
+            out.setdefault(path, ([], []))
+        elif path and (m := HUNK.match(line)):
+            o, oc, n, nc = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
+            if nc:
+                out[path][0].append((n, n + nc - 1))
+            if oc:
+                out[path][1].append((o, o + oc - 1))
+    return out
+
+
+def _top(src):
+    """The top-level statements of a module's source ([] if it does not parse), each with its first line (decorators included)."""
+    import ast  # late import: only `orq test` parses code (ticket 49: the hooks' 100 ms)
+    try:
+        return [(min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])]), st) for st in ast.parse(src).body]
+    except (SyntaxError, ValueError):
+        return []
+
+
+def _touched(src, ranges):
+    """What the line ranges touch at the top of a module: (defs and classes, module names assigned, loose). Loose is a module-level statement that is
+    neither, like an import or an `if`: then no map says which tests it reaches. The module docstring counts as nothing."""
+    import ast
+    defs, names, loose = set(), set(), False
+    for i, (first, st) in enumerate(_top(src)):
+        if not any(a <= st.end_lineno and b >= first for a, b in ranges):
+            continue
+        if type(st).__name__ in TOP_DEF:
+            defs.add(st.name)
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names |= {n.id for t in getattr(st, "targets", [getattr(st, "target", None)]) for n in ast.walk(t) if isinstance(n, ast.Name)}
+        elif not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
+            loose = True
+    return defs, names, loose
+
+
+def _using(top, names):
+    """The top-level defs and classes of a parsed module that use one of `names`, as a name or as an attribute (`orq_mod.X`)."""
+    import ast
+    return {st.name for _, st in top if type(st).__name__ in TOP_DEF and names and
+            any(getattr(n, "id", None) in names or (isinstance(n, ast.Attribute) and n.attr in names) for n in ast.walk(st))}
+
+
+def affected_tests(root, base, test_map):
+    """The test_orq.py tests that the diff of the tree `root` against `base` touches: {tests (None: only the full suite is safe), reasons, precompact}.
+
+    A changed def or class of a .py reaches the tests that ran it (the map: {tests: {test: ["file:function"]}}); a module-level name reaches it through the
+    defs that use it; a test changed or new in test_orq.py always runs. A file the map does not know (a script run without coverage, a non-.py) reaches the
+    tests whose source mentions its name; an untracked file counts as new. Full suite: no map, a failed diff, a loose module-level line (import, `if`),
+    a .py the map does not know that no test mentions, or a changed def that already existed and that no test in the map ran (untested, run only at
+    import like orqpaths, or newer than the map). Limit: a module-level name used only through another module name (A = B + 1) is followed one level."""
+    diff = _git(root, "diff", "-U0", "--no-color", "--no-renames", base, "--")
+    untracked = (_git(root, "ls-files", "--others", "--exclude-standard") or "").split("\n")
+    by_fn = {}
+    for t, fns in _dict(_dict(test_map).get("tests")).items():
+        for f in fns:
+            by_fn.setdefault(f, set()).add(t)
+    if diff is None or not by_fn:
+        return {"tests": None, "reasons": [f"git diff {base} failed" if diff is None else f"no test map in {TEST_MAP}: the integrator's full run writes it"], "precompact": False}
+    try:
+        tests_src = open(os.path.join(root, "test_orq.py"), encoding="utf-8").read()
+    except OSError:
+        tests_src = ""
+    t_top, lines = _top(tests_src), tests_src.splitlines()
+    all_tests = {st.name for _, st in t_top if type(st).__name__ in TOP_DEF and st.name.startswith("test_")}
+
+    def via_tests_file(defs, names=frozenset()):
+        defs = set(defs) | _using(t_top, names)
+        return {d for d in defs if d in all_tests} | {t for d in defs for t in by_fn.get(f"test_orq.py:{d}", ())}
+
+    def mentioning(needle):
+        hits = [(first, st) for first, st in t_top if needle in "\n".join(lines[first - 1:st.end_lineno])]
+        return via_tests_file({st.name for _, st in hits if type(st).__name__ in TOP_DEF}, _touched(tests_src, [(f, st.end_lineno) for f, st in hits])[1])
+
+    picked, reasons, precompact = set(), [], False
+    changed = {**_diff_ranges(diff), **{u: ([(1, 10 ** 9)], []) for u in untracked if u}}  # an untracked file is new from its first line
+    for path, (new, old) in sorted(changed.items()):
+        precompact |= path in ("precompact.py", "test_precompact.py", "fail_safe.py")
+        if not path.endswith(".py"):
+            hits = mentioning(os.path.basename(path))
+            picked |= hits
+            reasons.append(f"{path}: {len(hits)} tests mention it")
+            continue
+        try:
+            cur = open(os.path.join(root, path), encoding="utf-8").read()
+        except OSError:
+            cur = ""
+        prev = _git(root, "show", f"{base}:{path}") or ""
+        (d1, n1, l1), (d2, n2, l2) = _touched(cur, new), _touched(prev, old)
+        if l1 or l2:
+            return {"tests": None, "reasons": reasons + [f"{path}: a module-level line outside any def (import, if...): full suite"], "precompact": precompact}
+        names = n1 | n2
+        defs = d1 | d2 | _using(_top(cur), names) | _using(_top(prev), names)
+        hits = {t for d in defs for t in by_fn.get(f"{path}:{d}", ())} | via_tests_file(defs if path == "test_orq.py" else set(), names)
+        if path != "test_orq.py" and not any(k.startswith(path + ":") for k in by_fn):
+            hits |= mentioning(os.path.basename(path))
+            if not hits and path not in ("precompact.py", "test_precompact.py"):
+                return {"tests": None, "reasons": reasons + [f"{path}: not in the test map and no test mentions it: full suite"], "precompact": precompact}
+        prev_defs = {st.name for _, st in _top(prev) if type(st).__name__ in TOP_DEF}
+        uncovered = [] if path in ("precompact.py", "test_precompact.py") else sorted(d for d in defs if d in prev_defs and not by_fn.get(f"{path}:{d}") and d not in all_tests)  # precompact has its own suite
+        if uncovered:  # no test ran it, or it runs only at import (orqpaths, fail_safe), or the map is older than it: only the full suite proves it
+            return {"tests": None, "reasons": reasons + [f"{path}: no test in the map ran {', '.join(uncovered)}: full suite"], "precompact": precompact}
+        picked |= hits
+        reasons.append(f"{path}: {', '.join(sorted(defs | names)) or 'no code'} -> {len(hits)} tests")
+    return {"tests": picked & all_tests, "reasons": reasons, "precompact": precompact}
+
+
+def run_tests(affected=False, base=None, jobs=None, names=(), test_map=None, dry_run=False, cwd=None):
+    """`orq test`: runs test_orq.py of the clone or worktree of the cwd (-j, names); with `affected`, only the tests the diff against `base` touches
+    (default: the merge-base with origin/main, uncommitted changes included), plus test_precompact.py when precompact changed. Returns the exit code."""
+    root = (_git(cwd or os.getcwd(), "rev-parse", "--show-toplevel") or "").strip()
+    if not root or not os.path.exists(os.path.join(root, "test_orq.py")):
+        raise ValueError("orq test runs inside a clone or worktree of orq (there is no test_orq.py here)")
+    cmd, precompact = [sys.executable, "test_orq.py", *(["-j", str(jobs)] if jobs else []), *names], False
+    if affected:
+        base = base or (_git(root, "merge-base", "HEAD", "origin/main") or "").strip() or BRANCH_NO_REMOTE
+        r = affected_tests(root, base, _read_json(test_map or TEST_MAP))
+        print("\n".join(f"orq test: {x}" for x in r["reasons"]), file=sys.stderr)
+        precompact = r["precompact"]
+        if r["tests"] is None:
+            print("orq test: running the full suite", file=sys.stderr)
+        elif not r["tests"] and not precompact:
+            print(f"orq test: the diff against {base} touches no test")
+            return 0
+        else:
+            print(f"orq test: {len(r['tests'])} affected tests (diff against {base})", file=sys.stderr)
+            cmd += sorted(r["tests"])
+    runs = ([cmd] if not affected or r["tests"] is None or r["tests"] else []) + ([[sys.executable, "test_precompact.py"]] if precompact else [])
+    if dry_run:
+        print("\n".join(shlex.join(c[1:]) for c in runs))
+        return 0
+    return next((rc for rc in (subprocess.run(c, cwd=root).returncode for c in runs) if rc), 0)  # a suite killed by a signal is negative: still a failure
+
+
 def orq_ticket(title, project=None):
     """True if the dispatch touches orq itself: project `orq`, or a title that starts with `orq` (`orq: ...`, `orq ...`)."""
     return project == "orq" or bool(re.match(r"orq\b", (title or "").strip(), re.I))
@@ -9898,7 +11630,8 @@ def orq_worktree_block(number=None):
     live, wt = ORQ_INSTALL, os.path.join(WT_ROOT, n)
     return (f"{ORQ_WT_TITLE}\n\nNever commit on `main` of the live checkout `{live}`: the integrator advances that `main`, and the pre-commit hook refuses the commit.\n"
             f"Create the worktree `{wt}` from `origin/main` on a branch of its own (`git -C {live} worktree add -b <type>/<description> {wt} origin/main`) "
-            "and work and commit only in it.\n")
+            "and work and commit only in it.\n"
+            "Run `orq test --affected` (the tests your diff touches), not the whole `python3 test_orq.py`: the integrator runs the full suite.\n")
 
 
 def _with_orq_block(txt, number=None):
@@ -9916,6 +11649,12 @@ def _gate_backlog(tk):
         raise ValueError(f"ticket {tk['num']} is on hold ({h['motivo']}{', until ' + h['until'] if h.get('until') else ''}): tasks-axi unhold t{tk['num']}")
     if tk["blocked_by"]:
         raise ValueError(f"ticket {tk['num']} is blocked by {', '.join(tk['blocked_by'])}: close the blockers first")
+
+
+def _ticket_project(number):
+    """The `Project:` of ticket `number`, or None (no such ticket, no line)."""
+    n = str(number).strip().zfill(2)
+    return next((t["projeto"] for t in tickets() if t["num"] == n), None)
 
 
 def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=None, base_branch=None, entry=None, ticket=None, priority_level=None, agent=None, project=None, _draining=False, service=False, direct=None):
@@ -9938,8 +11677,12 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
     """
     if priority_level is not None and priority_level not in (1, 2, 3):
         raise ValueError("--priority expects 1 (high), 2 or 3 (low)")
+    project = project or (_ticket_project(ticket) if ticket else None)  # --projeto, then the ticket's `Project:`
     explicit_project = bool(project or (run and run_project(run)))
-    project = dispatch_project(project, run)  # --projeto, the Run's, the cwd's; with none, the dispatch is the usual one
+    project = dispatch_project(project, run, use_cwd=not _draining)  # then the Run's, the cwd's; with none, the dispatch is the usual one
+    if _draining and not project and projects():
+        raise ValueError("queue item without a project: the manager does not guess one from its own cwd, "
+                         f"dispatch it by hand with {_abandoned_command({'run': run, 'ticket': ticket, 'titulo': title, 'modelo': model, 'effort': effort}).replace('orq dispatch', 'orq dispatch --project <name>', 1)}")
     repo = projects()[project]["repo"] if project else None
     if not agent:  # --agente wins; without it the project's harness holds, and without a project the usual claude
         agent = projects()[project]["harness"] if project else "claude"
@@ -10010,7 +11753,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             spec = (f"{head}\n\n{REQUEST_TITLE}\n{request}\n\nWhat the coordinator wrote below does not replace it: done is checked against this request.\n\n"
                     f"{rest.lstrip(chr(10))}")
         if spec is not None:
-            spec = f"{spec.rstrip()}\n\n{WAITING_BLOCK}\n"
+            spec = f"{spec.rstrip()}\n\n{SPEC_BLOCKS}\n"
         environment = night_environment() if night_active(_cursor_ro()) else None  # at night the worker comes up with no git prompt (credential, pinentry)
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
         items, real, scratch = dispatch_conformance(spec, title, scratch_roots([folder]), tk and tk["arquivo"])  # ticket 201: what the delivery must prove
@@ -10048,6 +11791,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
               **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
+    with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError, OSError):
+        stamp_identity(_checkpoint(dispatch)["caminho"], folder)  # ticket 348: the worker commits as the project's author, not as Git's default
     if agent == "codex":
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError):
             trusted += trust_codex(_checkpoint(dispatch)["caminho"])  # the worktree Orca created
@@ -10244,6 +11989,8 @@ def manager_check():
     live = _alive_terminals()
     ck = {"ts": time.time(), "terminal": g["gerente"], "morto": live is not None and g["gerente"] not in live}
     _write_json(_path(PANEL_CHECK), ck)
+    if ck["morto"] and g.get("coordenador") == os.environ.get("ORCA_TERMINAL_HANDLE"):
+        manager_respawn_alone(g["gerente"])
     return ck
 
 
@@ -10771,6 +12518,26 @@ def dispatch_queue_rm(id_, op="removido", **extra):
     return found_item
 
 
+def dispatch_queue_priority(id_, value):
+    """`orq dispatch-queue priority <id> <1-3>`: changes the priority of a queue item, keeping its `ts` (the order is priority, then oldest). The coordinator or the mate that
+    owns the item; the event carries the author. The P1 rules (ahead of the queue and the worker ceiling, not the memory floor or the expensive ceiling) are the ones of `machine_bar_item`."""
+    if value not in (1, 2, 3):
+        raise ValueError("the priority is 1 (high), 2 or 3 (low)")
+    author = os.environ.get("ORQ_MATE") or "coordinator"
+
+    def muda(item_list):
+        it = next((i for i in item_list if i.get("id") == id_), None)
+        if not it:
+            raise ValueError(f"{id_} is not in the dispatch queue (ids: {', '.join(i.get('id') for i in item_list) or 'none'})")
+        if author != "coordinator" and it.get("mate") != author:
+            raise ValueError(f"{id_} belongs to {it.get('mate') or 'the coordinator'}: only it (or the coordinator) changes its priority")
+        before, it["prioridade"] = it.get("prioridade") or 2, value
+        return it, before
+    it, before = _dispatch_queue_mut(muda)
+    order = [i["id"] for i in dispatch_queue_items()]
+    return append_event({"tipo": "dispatch_queue_priority", "id": id_, "valor": value, "de": before, "autor": author, "posicao": order.index(id_) + 1})
+
+
 def _enqueue_dispatch(reason, run, title, spec, model, effort, worktree, name, base_branch, entry, tk, priority, agent, project=None, service=False):
     """The dispatch that did not fit: stores the request (the spec in a copy under ORQ_HOME) and returns the `orq dispatch_worker` response in place of the worker ids."""
     import uuid
@@ -10844,6 +12611,20 @@ def _abandoned_command(it):
     return "orq dispatch " + (f"--run {it['run']} " if it.get("run") else "") + f"--title {shlex.quote(it.get('titulo') or '')} --spec-file <spec>"
 
 
+def _mate_owning(run):
+    """The group whose mate owns the Run (the Runs its dispatches opened, `_mate_mut(run=)`), or None: the coordinator and the manager do not command it."""
+    return next((g for g, m in _mates().items() if run and run in (_dict(m).get("runs") or [])), None)
+
+
+def _forward_to_mate(it, group_name):
+    """A queue item of a Run the mate owns (the coordinator cannot start it): becomes an `orq mate request` with the dispatch command, and leaves the queue without counting as giving up.
+    Raises ValueError if the mate cannot take the request (the item stays and follows the normal path)."""
+    cmd = f"{_abandoned_command(it)} --priority {it['prioridade']}" + (f" --worktree {it['worktree']}" if it.get("worktree") else "")
+    r = mate_request(group_name, f"dispatch queue item {it['id']} in your Run {it['run']}, which the coordinator does not command: `{cmd}`. Answer with the worker's dispatch id.", fila=it["id"])
+    dispatch_queue_rm(it["id"], "mate", grupo=group_name, corr=r["corr"])
+    return f"queue: {it['titulo']} went to mate {group_name} ({r['corr']})"
+
+
 def _notify_abandoned(it, failures, error, cmd):
     """Types into the coordinator, once (the item leaves the queue on giving up), that the queue gave up on the item, with the error and the command to dispatch by hand. The away Stop
     keeps charging until the item is dispatched (away_abandoned). Coordinator busy or no manager: only the Stop remains."""
@@ -10895,6 +12676,10 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
             dispatch_queue_rm(it["id"], "saiu", motivo="the dispatch already finished or already came back")
             line_list.append(f"queue: {it['titulo']} left (the dispatch already finished or already came back)")
             continue
+        if it["tipo"] == "despacho" and it.get("ticket") and not it.get("mate") and (owner := _mate_owning(it.get("run"))):  # ticket 351: the mate's Run is not the coordinator's to start
+            with contextlib.suppress(ValueError):
+                line_list.append(_forward_to_mate(it, owner))
+                continue
         exempt = (only_exempt or machine_slot(it.get("modelo"), occupancy, cfg)) and (bool(it.get("servico")) or it.get("prioridade") == 1) and exempt_run(it.get("run"), cfg)  # only asks Orca when there is something to exempt
         if only_exempt and not exempt:
             continue
@@ -10946,7 +12731,7 @@ def _machine_notify(reason, in_queue, cfg, cause=(None, None)):
     peso = f" Background processes: {', '.join(f'{t} {n}' for t, n in children.items())}." if children else ""
     text_value = (f"orq: machine under pressure ({reason}). The load comes from outside orq ({cause[1]}): pausing a worker does not help. The manager holds new dispatches ({in_queue} in the dispatch queue)."
              if outside else f"orq: machine under pressure ({reason}). The manager stopped starting workers ({in_queue} in the dispatch queue).{peso}{tip}")
-    if notify_coordinator(g["coordenador"], text_value) not in ("enviado", "adiado"):
+    if notify_coordinator(g["coordenador"], text_value, valid_while="machine_pressure") not in ("enviado", "adiado"):
         return []
     _cursor_mut(lambda c: c.__setitem__("maquina_aviso", {"ts": now(), "motivo": reason}))
     append_event({"tipo": "maquina_aviso", "motivo": reason, "na_fila": in_queue, **({"causa": cause[0]} if cause[0] else {}), **({"sugerido": target["task"]} if target else {}),
@@ -11068,6 +12853,17 @@ def dispatch_session(dispatch, agent, timeout=15):
         return {}
     h = next((h for h in hits if _dict(h.get("evidence")).get("role") == "user" and h.get("sessionId")), None)
     return {"sessao": h["sessionId"], "cwd": h.get("cwd"), "transcrito": _dict(h.get("source")).get("filePath")} if h else {}
+
+
+def _dispatch_title(run, task, dispatch):
+    """The terminal title of a dispatch that comes back: the title of its `despacho` event, else the Orca task's, else the dispatch id."""
+    ev = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == dispatch and e.get("titulo")), {})
+    if ev.get("titulo"):
+        return ev["titulo"]
+    try:
+        return next((t.get("task_title") for t in orca("task-list", "--run", run, timeout=20)["tasks"] if t["id"] == task and t.get("task_title")), dispatch)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError, KeyError):
+        return dispatch
 
 
 def _start_session(line, session, model, cp, tip, msg=MSG_CONTINUE, agent="claude", effort=None):
@@ -11921,7 +13717,7 @@ def wake(target, text_value=None):
     d, p = next(((d, p) for d, p in _hibernated().items() if target in (d, p.get("task"))), (None, None))
     if not d:
         raise ValueError(f"{target} is not hibernated")
-    line = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p.get("titulo") or d, "cwd": p["cwd"], "terminal": p["terminal"]}
+    line = {"dispatch": d, "task": p["task"], "run": p["run"], "titulo": p.get("titulo") or _dispatch_title(p["run"], p["task"], d), "cwd": p["cwd"], "terminal": p["terminal"]}
     if not os.path.isdir(p["cwd"]):
         return {**line, "estado": "sem_worktree", "aviso": f"the folder {p['cwd']} does not exist: nothing was started"}
     try:
@@ -12024,9 +13820,9 @@ def manager_release(parados):
                 append_event({"tipo": "gerente", "op": "soltar", "terminal": g["gerente"], "run": r, "motivo": reason})
 
 
-def _touches_panel():
+def _touches_panel(name=PANEL_ALIVE):
     """Marks `manager-alive` now: the panel is alive, even in the middle of a slow round (the panel shell only touches it between one round and the next)."""
-    p = _path(PANEL_ALIVE)
+    p = _path(name)
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "a"):
@@ -12043,6 +13839,30 @@ def _write_round(secs):
         _write_json(_path(MANAGER), {**{k: v for k, v in g.items() if k != "run"}, "voltas_s": [*loops[-(REMEMBERED_ROUNDS - 1):], round(secs, 1)]})
 
 
+def round_record(error=None):
+    """Counts a manager round in gerente.json (ticket 229). A failure bumps `falhas_seguidas`, keeps `ultimo_erro` (200 chars) and, at the FAILING_ROUNDS-th
+    in a row, writes one `gerente_falha` event per episode; a good round writes `gerente_recuperado` if an episode was open, zeroes the count and touches
+    `manager-ok`. Returns True when the round was good."""
+    with manager_lock():
+        g = _manager_cfg()
+        if g:
+            n = g.get("falhas_seguidas") or 0
+            rest = {k: v for k, v in g.items() if k not in ("run", "ultimo_erro", "falhas_seguidas")}
+            if error:
+                n += 1
+                _write_json(_path(MANAGER), {**rest, "falhas_seguidas": n, "ultimo_erro": str(error)[:200]})
+                if n == FAILING_ROUNDS:
+                    append_event({"tipo": "gerente_falha", "terminal": g["gerente"], "falhas": n, "erro": str(error)[:200]})
+            else:
+                _write_json(_path(MANAGER), rest)
+                if n >= FAILING_ROUNDS:
+                    append_event({"tipo": "gerente_recuperado", "terminal": g["gerente"]})
+        if not error:
+            _touches_panel(PANEL_OK)
+            _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # the morning card reads here whether the manager did its job
+    return not error
+
+
 def manager_absorb():
     """One round of the agent manager panel, in its terminal: goes through the bound Runs (one `run-use` per Run, Orca binds one per terminal),
     absorbs heartbeat and, when a batch with something else is left over, types into the coordinator a notice in Orca's format, once per batch of
@@ -12053,7 +13873,6 @@ def manager_absorb():
     g = _manager_cfg()
     if not g or g.get("gerente") != os.environ.get("ORCA_TERMINAL_HANDLE"):
         return "agent manager off (orq manager bind --terminal <this terminal>, on the coordinator)"
-    _cursor_mut(lambda c: c.__setitem__("gerente_volta", now()))  # the morning card reads here whether the manager was alive
     start_time = time.time()
     _touches_panel()
     bound_run = bool(g["runs"])  # gerente.json from ticket 17 (no runs): the Run is the one bound to the terminal, no rotating
@@ -12062,9 +13881,15 @@ def manager_absorb():
         return "agent manager has no bound Run: run orq manager bind again on the coordinator"
     notices, now_at = _manager_notices(), time.time()
     stuck_items = [r for r in runs if r in notices and 0 <= now_at - notices[r].get("ts", 0) < MANAGER_STUCK_S][:1]
-    line_list, pending_messages = [], {}
+    line_list, pending_messages, round_errors = [], {}, []
     for r in [*stuck_items, *(x for x in runs if x not in stuck_items)]:
-        line, msgs = _absorb_run(r, bound_run)
+        try:
+            line, msgs = _absorb_run(r, bound_run)
+        except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:  # ticket 229: one Run failing doesn't take the other Runs or the next steps down
+            round_errors.append(f"{r}: {type(e).__name__}: {e}")
+            _touches_panel()
+            line_list.append(f"{r}: absorb failed ({type(e).__name__})")
+            continue
         _touches_panel()  # the loop back under heavy load takes over 60 s: the stamp can't wait for the end of it
         seen = set(notices.get(r, {}).get("vistos") or [])
         ids = sorted(str(m.get("id")) for m in msgs) if msgs else []
@@ -12116,6 +13941,10 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
+        line_list += [] if os.environ.get("ORQ_NO_CLEAN") else clean_round()
+    except Exception as e:  # noqa: BLE001 - the cleaning doesn't take down the panel; the next loop tries
+        log(f"clean: {type(e).__name__}: {e}")
+    try:
         line_list += hooks_broken_round()
     except Exception as e:  # noqa: BLE001 - the warning about hooks doesn't take down the panel; the next loop tries
         log(f"hooks quebrados: {type(e).__name__}: {e}")
@@ -12145,6 +13974,7 @@ def manager_absorb():
         log(f"mates dormir: {type(e).__name__}: {e}")
     _touches_panel()
     _write_round(time.time() - start_time)
+    round_record(round_errors[0] if round_errors else None)
     return "\n".join(line_list)
 
 
@@ -12160,6 +13990,23 @@ SERVE_BUSY = 3  # exit code of `orq manager absorver` with serve alive: the pane
 LAUNCHD_LABEL = "com.orq.gerente"
 LAUNCH_AGENTS = os.environ.get("ORQ_LAUNCH_AGENTS") or os.path.expanduser("~/Library/LaunchAgents")
 LAUNCHCTL = os.environ.get("ORQ_LAUNCHCTL") or "launchctl"
+
+
+def _launchd_event(op, **extra):
+    """Ticket 316: every launchctl call and every SIGTERM on the serve leaves a `launchd` event with who asked (pid, parent, cwd, command), so the next time the
+    job vanishes from launchd the log names the author. Logging never blocks the call itself."""
+    with contextlib.suppress(Exception):
+        parent = subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True, timeout=5).stdout.strip()
+        append_event({"tipo": "launchd", "op": op, "pid": os.getpid(), "ppid": os.getppid(), "parent": parent, "cwd": os.getcwd(), "argv": " ".join(sys.argv), **extra})
+
+
+def _launchctl(op, *args):
+    """The only point that touches the real launchctl (as `orca()` is for Orca). Under the test suite (ORQ_TESTING) a missing ORQ_LAUNCHCTL fails loud: a test
+    that reaches the real launchd would unload the live manager job (ticket 316: `serve --stop` in a test bootout'd com.orq.gerente)."""
+    if os.environ.get("ORQ_TESTING") and not os.environ.get("ORQ_LAUNCHCTL"):
+        raise RuntimeError(f"launchctl {op}: ORQ_TESTING is set and ORQ_LAUNCHCTL points at no fake; a test must not reach the real launchd")
+    _launchd_event(op, args=list(args))
+    return subprocess.run([LAUNCHCTL, op, *args], capture_output=True, text=True, timeout=30)
 
 
 def serve_owner():
@@ -12207,7 +14054,7 @@ def manager_state_write(line_list):
         log(f"gerente estado: agentes: {type(e).__name__}: {e}")
         agent_rows = None
     _write_json(_path(SERVE_STATE), {"ts": now(), "pid": int(os.environ.get("ORQ_SERVE_PID") or 0) or None, "terminal": _manager_cfg().get("gerente"),
-                                      "linhas": [x for x in line_list.splitlines() if x], "agentes": agent_rows,
+                                      "linhas": [x for x in line_list.splitlines() if x], "agentes": agent_rows, "ondas": wave_lines(),
                                       "maquina": {"cfg": machine_cfg(), "leitura": machine_read()}})
 
 
@@ -12245,13 +14092,17 @@ def manager_serve(loops=None):
             _touches_panel()  # like the panel's shell: the stamp goes out before orq, holds even with orqlib broken
             g = _manager_cfg()
             e = {**env, **({"ORCA_TERMINAL_HANDLE": g["gerente"]} if g else {})}
+            before = _manager_cfg().get("falhas_seguidas") or 0
             try:
                 r = subprocess.run([sys.executable, orq_py, "gerente", "absorver", "--estado"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=300)
                 line = (r.stdout + r.stderr).strip()
+                if r.returncode and (_manager_cfg().get("falhas_seguidas") or 0) <= before:  # the child died before counting itself (import broke, uncaught error)
+                    round_record((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
                 if n % SERVE_DIGEST_ROUNDS == 1:
                     subprocess.run([sys.executable, orq_py, "digest"], stdin=subprocess.DEVNULL, capture_output=True, env=e, timeout=120)
             except (OSError, subprocess.TimeoutExpired) as x:
                 line = f"volta falhou: {type(x).__name__}: {x}"
+                round_record(line)
             _serve_log(f"volta {n} ({time.time() - start_time:.1f} s): " + " | ".join(line.splitlines()))
             end = time.time() + SERVE_LAP_S
             while not stop and (loops is None or n < loops) and time.time() < end:
@@ -12267,9 +14118,10 @@ def manager_serve(loops=None):
 def serve_stop(wait_s=15):
     """For the serve: through launchd when installed (KeepAlive would start it again; it returns at the next login), otherwise SIGTERM on the pid. Waits for the lock to release."""
     if os.path.exists(_plist_serve()):
-        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+        _launchctl("bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}")
     pid = serve_owner()
     if pid and pid > 0:
+        _launchd_event("stop", target=pid)
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
     end = time.time() + wait_s
@@ -12281,18 +14133,19 @@ def serve_stop(wait_s=15):
 
 
 def serve_install():
-    """Writes the launchd agent (starts at login, KeepAlive restarts it if it dies) and loads it. The environment is the current PATH and ORQ_HOME; no ORCA_*."""
+    """Writes the launchd agent (starts at login, KeepAlive restarts it if it dies) and loads it. The environment is the current PATH and ORQ_HOME; no ORCA_*. It runs in orq's
+    clone (`WorkingDirectory`): without it launchd starts in `/`, and nothing the manager starts may take its project from there (ticket 315)."""
     os.makedirs(LAUNCH_AGENTS, exist_ok=True)
     os.makedirs(os.path.dirname(_path(SERVE_LOG)), exist_ok=True)
     import plistlib
     pl = {"Label": LAUNCHD_LABEL, "ProgramArguments": [sys.executable, os.path.join(orqpaths.CODE, "orq.py"), "gerente", "serve"],
           "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ORQ_HOME": HOME}, "RunAtLoad": True, "KeepAlive": True,
-          "ThrottleInterval": 30, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
+          "ThrottleInterval": 30, "WorkingDirectory": orqpaths.CODE, "StandardOutPath": _path(SERVE_LOG), "StandardErrorPath": _path(SERVE_LOG)}
     with open(_plist_serve(), "wb") as f:
         plistlib.dump(pl, f)
     target = f"gui/{os.getuid()}"
-    subprocess.run([LAUNCHCTL, "bootout", f"{target}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)  # already loaded: reload with the new plist
-    r = subprocess.run([LAUNCHCTL, "bootstrap", target, _plist_serve()], capture_output=True, text=True, timeout=30)
+    _launchctl("bootout", f"{target}/{LAUNCHD_LABEL}")  # already loaded: reload with the new plist
+    r = _launchctl("bootstrap", target, _plist_serve())
     if r.returncode:
         raise ValueError(f"launchctl bootstrap failed: {(r.stderr or r.stdout).strip()}")
     return serve_status()
@@ -12300,7 +14153,7 @@ def serve_install():
 
 def serve_uninstall():
     if os.path.exists(_plist_serve()):
-        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True, timeout=30)
+        _launchctl("bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}")
         os.remove(_plist_serve())
     return serve_status()
 
@@ -12760,7 +14613,8 @@ NM_MODEL, NM_EFFORT = "claude-sonnet-5-5", "low"  # the cheap review; the config
 NM_CONFIG = f"agent: claude\nagent_config:\n  claude:\n    model: {NM_MODEL}\n    effort: {NM_EFFORT}\nauto_fix:\n  review: 0\nintent:\n  enabled: false\n"
 NM_SKIP = "test,document,lint,push,pr,ci"  # what remains is the rebase and the review; test brings up a stack outside the E2E queue, push and pr belong to the coordinator
 NM_WAIT_S = 720  # `axi run` waits until the first gate (--wait); the process gets slack on top
-NM_INTENT_MAX = 6000
+NM_INTENT_MAX = 49122  # bytes: the ceiling of no-mistakes for `--intent -` (>= v1.86.0); past it, it refuses instead of cutting
+NM_INTENT_KEEP = ("What to build", "Acceptance criteria")  # what survives when the ticket is past the ceiling
 REVIEW = "revisao-nm.json"  # [{pid, task, ts}]: the reviews in progress, which count as an expensive slot
 
 
@@ -12772,6 +14626,25 @@ def _nm_model():
     except OSError:
         m = None
     return (m.group(1) if m else NM_MODEL), NM_EFFORT
+
+
+def _nm_intent(titulo, corpo):
+    """The whole ticket as the review intent. Past NM_INTENT_MAX bytes keeps only the title, `## What to build` and `## Acceptance criteria`; still past it, raises ValueError (never cuts)."""
+    intent = f"{titulo}\n\n## {corpo}"
+    if len(intent.encode()) > NM_INTENT_MAX:
+        keep = [x for x in f"## {corpo}".split("\n## ") if x.removeprefix("## ").startswith(NM_INTENT_KEEP)]
+        intent = f"{titulo}\n\n" + "\n\n".join(x if x.startswith("## ") else f"## {x}" for x in keep)
+    if len(intent.encode()) > NM_INTENT_MAX:
+        raise ValueError(f"the intent has {len(intent.encode())} bytes even with only the title, What to build and Acceptance criteria; no-mistakes takes {NM_INTENT_MAX}: shorten the ticket")
+    return intent
+
+
+def _nm_version():
+    """`no-mistakes --version` (first line), or '' when it can't be read."""
+    try:
+        return subprocess.run([NM_BIN, "--version"], capture_output=True, text=True, timeout=10).stdout.strip().split("\n")[0]
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
 
 
 def _ongoing_reviews():
@@ -12821,12 +14694,50 @@ def _nm_usage(since):
     return {"achados": ach or 0, "tokens": {"entrada": entry_event or 0, "saida": sai or 0, "cache_lido": cl or 0, "cache_criado": cc or 0}}
 
 
-def review(task):
-    """`orq review <task>`: only the no-mistakes review in the task's worktree, with the cheap model from orq's NM_HOME.
+NM_DECISIONS_MAX = 4096  # the "decisions already taken" section of the intent
+INVARIANT_RULE = ("Fix the invariant, not the instance: before editing, write down the invariant the finding violates, list every place it holds (other path, other command, "
+                  "other consumer) and fix all of them in this same round, without building new machinery.")
 
-    `task` is the task id or the ticket number. Refuses on `pause` or `segura` from `orq usage` (any priority: the review is optional spend), under machine
-    pressure and without an expensive slot. The `--intent` is the ticket text (or the dispatch title). Returns {task, worktree, modelo, effort, duracao_s, achados, tokens, saida}
-    and records `revisao_nm` in events.jsonl. `output` is what `axi run` printed: the findings and the gate it stopped at."""
+
+def parse_decision(spec):
+    """`"<finding>=corrigir|ignorar[:reason]"` -> (finding, "corrigir"|"ignorar", reason); ValueError if it does not have that form."""
+    achado, _, rest = spec.partition("=")
+    decisao, _, reason = rest.partition(":")
+    if not achado.strip() or decisao.strip() not in ("corrigir", "ignorar"):
+        raise ValueError(f"--decidir expects \"<file:line or finding id>=corrigir|ignorar[:reason]\", got {spec!r}")
+    return achado.strip(), decisao.strip(), reason.strip()
+
+
+def review_intent(intent, decisions, new_commits):
+    """The ticket `intent` plus, when there are any, the recorded decisions of the branch (latest per finding, within NM_DECISIONS_MAX, oldest first) and the commits made
+    after the last reviewed head (`new_commits`: ["<sha> <subject>"]). Without either the intent comes back unchanged."""
+    out, size, kept = intent, 0, {}
+    for d in reversed(decisions):
+        kept.setdefault(d["achado"], d)
+    lines = []
+    for d in kept.values():  # newest first: what overflows the budget is the oldest
+        line = f"- {d['achado']}: {d['decisao']}" + (f" ({d['motivo']})" if d.get("motivo") else "")
+        if size + len(line) + 1 > NM_DECISIONS_MAX:
+            break
+        lines.append(line)
+        size += len(line) + 1
+    if lines:
+        out += ("\n\n## Decisions already taken, do not reopen\nThe coordinator decided these findings on earlier reviews of this branch; a recorded decision outranks the "
+                "intent text above. `ignorar` = discarded, do not report it again; `corrigir` = accepted, check it was fixed.\n" + "\n".join(reversed(lines)))
+    if new_commits:
+        out += ("\n\n## Commits since the last review\nThese commits are new code: review them with the same rigor as the rest. Fix summaries and tests from the same cycle "
+                "are claims, not proof.\n" + "\n".join(f"- {c}" for c in new_commits[:30]))
+    return out
+
+
+def _review_branch(wt, task):
+    """(branch, head) of the worktree; the branch falls back to the task id when git does not answer."""
+    branch = (_git(wt, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+    return (branch if branch and branch != "HEAD" else task), (_git(wt, "rev-parse", "HEAD") or "").strip() or None
+
+
+def _review_target(task):
+    """(ticket, task id, dispatch event, worktree) of `task` (id or ticket number); ValueError if it has no dispatch or the worktree is gone."""
     tk = next((t for t in tickets() if task in (t["num"], t["task"]) or task.zfill(2) == t["num"]), None)
     task = tk["task"] if tk and tk["task"] else task
     ev = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("task") == task), None)
@@ -12835,12 +14746,35 @@ def review(task):
     wt = _worker_path(orca("worker-show", "--dispatch", ev["dispatch"], timeout=10))
     if not wt or not os.path.isdir(wt):
         raise ValueError(f"Orca does not give the worktree of dispatch {ev['dispatch']} ({wt or 'no path'}): was the folder already cleaned?")
+    return tk, task, ev, wt
+
+
+def review_decide(task, specs):
+    """`orq review <task> --decidir ...`: records one `achado_decisao` per spec on the task's branch and returns the events; the review itself does not run."""
+    _, task, _, wt = _review_target(task)
+    branch, _ = _review_branch(wt, task)
+    decisions = [parse_decision(s) for s in specs]
+    return [append_event({"tipo": "achado_decisao", "task": task, "branch": branch, "achado": a, "decisao": d, "motivo": m}) for a, d, m in decisions]
+
+
+def review(task):
+    """`orq review <task>`: only the no-mistakes review in the task's worktree, with the cheap model from orq's NM_HOME.
+
+    `task` is the task id or the ticket number. Refuses on `pause` or `segura` from `orq usage` (any priority: the review is optional spend), under machine
+    pressure and without an expensive slot. The intent is the whole ticket text (or the dispatch title), through stdin (`--intent -`), never cut. Returns {task, worktree, modelo, effort, duracao_s, intent_bytes, nm_versao, achados, tokens, saida}
+    and records `revisao_nm` in events.jsonl. `output` is what `axi run` printed: the findings and the gate it stopped at."""
+    tk, task, ev, wt = _review_target(task)
     usage_check(2)
     if tk:
         body_text = open(tk["arquivo"], encoding="utf-8").read().split("\n## ", 1)
-        intent = f"{tk['titulo']}\n\n## {body_text[1]}"[:NM_INTENT_MAX] if len(body_text) > 1 else tk["titulo"]
+        intent = _nm_intent(tk["titulo"], body_text[1]) if len(body_text) > 1 else tk["titulo"]
     else:
         intent = ev.get("titulo") or task
+    branch, head = _review_branch(wt, task)
+    events = read_events()
+    last = next((e for e in reversed(events) if e.get("tipo") == "revisao_nm" and e.get("branch") == branch and e.get("head") and not e.get("erro")), None)
+    new_commits = [c for c in (_git(wt, "rev-list", "--reverse", "--format=%h %s", "--no-commit-header", f"{last['head']}..HEAD") or "").splitlines() if c] if last else []
+    intent = review_intent(intent, [e for e in events if e.get("tipo") == "achado_decisao" and e.get("branch") == branch], new_commits)
     model, effort = _nm_model()
     os.makedirs(NM_HOME, exist_ok=True)
     if not os.path.exists(os.path.join(NM_HOME, "config.yaml")):
@@ -12848,12 +14782,12 @@ def review(task):
             f.write(NM_CONFIG)
     env = {**os.environ, "NM_HOME": NM_HOME}
     _review_slot(task)
-    t0, start_time, error, output = int(time.time()), time.monotonic(), None, ""
+    t0, start_time, error, output, nm_version = int(time.time()), time.monotonic(), None, "", _nm_version()
     try:
         init = subprocess.run([NM_BIN, "init"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)  # per repository; repeating is harmless
         if init.returncode and "already" not in (init.stdout + init.stderr).lower():
             raise RuntimeError(f"no-mistakes init failed: {(init.stderr or init.stdout).strip()[-300:]}")
-        r = subprocess.run([NM_BIN, "axi", "run", "--intent", intent, "--skip", NM_SKIP, "--wait", f"{NM_WAIT_S}s"], cwd=wt, env=env,
+        r = subprocess.run([NM_BIN, "axi", "run", "--intent", "-", "--skip", NM_SKIP, "--wait", f"{NM_WAIT_S}s"], cwd=wt, env=env, input=intent,
                            capture_output=True, text=True, timeout=NM_WAIT_S + 60)
         output = r.stdout.strip()
         if r.returncode:
@@ -12865,10 +14799,13 @@ def review(task):
             subprocess.run([NM_BIN, "axi", "abort"], cwd=wt, env=env, capture_output=True, text=True, timeout=60)
         _loose_review()
     usage = _nm_usage(t0)
-    res = {"task": task, "worktree": wt, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), **usage, "saida": output}
-    append_event({"tipo": "revisao_nm", **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
+    head = (_git(wt, "rev-parse", "HEAD") or "").strip() or None
+    res = {"task": task, "worktree": wt, "head": head, "modelo": model, "effort": effort, "duracao_s": round(time.monotonic() - start_time, 1), "intent_bytes": len(intent.encode()), "nm_versao": nm_version, **usage, "saida": output}
+    append_event({"tipo": "revisao_nm", "branch": branch, **{k: v for k, v in res.items() if k != "saida"}, **({"erro": error} if error else {})})
     if error:
         raise RuntimeError(error)
+    if head:
+        prove(task, "review", head, "findings" if usage["achados"] else "ok")
     return res
 
 
@@ -12886,8 +14823,9 @@ def _implicit(effect, ref=None, run=None):
 
 
 FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays the pt name, which the rest of the code reads
+    "aplicar": "apply", "somente": "only", "linhas-de-teste": "test-lines",
     "titulo": "title", "spec-arquivo": "spec-file", "detalhe": "detail", "frente": "stream", "comando": "command", "espera": "waiting", "ate": "until",
-    "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "motivo": "reason",
+    "desde": "since", "todas": "all", "todos": "all", "resposta": "answer", "entrada": "entry", "nota": "note", "prova": "proof", "sem-prova": "no-proof", "motivo": "reason",
     "tipo": "type", "forcar": "force", "abrir": "open", "passo": "step", "nome": "name", "por": "why", "agente": "agent", "objetivo": "objective",
     "assumir": "take-over", "noite": "night", "parada": "stopped-by", "modelo": "model", "para": "to", "max-despachos": "max-dispatches",
     "max-falhas": "max-failures", "projeto": "project", "prioridade": "priority", "servico": "service", "pergunta": "question", "opcao": "option",
@@ -12895,11 +14833,12 @@ FLAG_EN = {  # --pt -> --en (phase 1 of the migration to English); dest stays th
     "ate-prioridade": "up-to-priority", "grupo": "group", "prazo": "deadline", "responde": "answers", "sem-gh": "no-gh",
     "sem-transcritos": "no-transcripts", "gravar": "save", "corpo": "body", "ambientes": "environments", "ultimos": "last", "fechados": "closed",
     "destino": "dest", "substituir-orca-yaml": "replace-orca-yaml", "despacho": "dispatch", "parar": "stop", "instalar": "install",
-    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours"}
+    "desinstalar": "uninstall", "voltas": "rounds", "estado": "state", "liberar": "release", "horas": "hours", "antes": "before", "depois": "after", "cenarios": "scenarios"}
 ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the dest)
+    "aplicar": "apply", "somente": "only", "linhas-de-teste": "test_lines",
     "titulo": "title", "spec-arquivo": "spec_file", "detalhe": "detail", "frente": "workstream", "comando": "command", "espera": "waiting", "ate":
     "until_at", "desde": "since", "todas": "all_listing", "todos": "include_all", "resposta": "answer_text", "entrada": "entry", "nota": "note",
-    "prova": "proof", "motivo": "reason", "tipo": "type_name", "forcar": "force", "abrir": "open_page", "passo": "step", "nome": "item_name", "por":
+    "prova": "proof", "sem-prova": "no_proof", "motivo": "reason", "tipo": "type_name", "forcar": "force", "abrir": "open_page", "passo": "step", "nome": "item_name", "por":
     "by", "agente": "agent", "objetivo": "objective", "assumir": "take_over", "noite": "night", "parada": "stopped_by", "modelo": "model", "para":
     "to_", "max-despachos": "max_dispatches", "max-falhas": "max_failures", "projeto": "project", "prioridade": "priority_level", "servico":
     "service", "pergunta": "question", "opcao": "option", "recomendada": "recommended", "espera-min": "wait_min", "sem-poll": "without_poll",
@@ -12907,7 +14846,7 @@ ARG_DEST = {  # flag key in pt -> the attribute the parsed arguments carry (the 
     "sem-gh": "without_gh", "sem-transcritos": "without_transcripts", "gravar": "write_out", "corpo": "body_text", "ambientes": "environments",
     "ultimos": "last_n", "fechados": "closed_items", "destino": "destination", "substituir-orca-yaml": "replace_orca_yaml", "despacho":
     "dispatch_mode", "parar": "stop", "instalar": "install", "desinstalar": "uninstall", "voltas": "loops", "estado": "state", "liberar": "release",
-    "horas": "max_age_hours"}
+    "horas": "max_age_hours", "antes": "before", "depois": "after", "cenarios": "scenarios"}
 FLAG_ALIASES = {f"--{pt}": f"--{en}" for pt, en in FLAG_EN.items()}
 ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the English command (op) or "<command> <op>" (acao)
     "": {"feito": "fulfill", "adiar": "defer", "fila": "queue", "ausente": "away", "responder": "reply", "iniciar": "start", "ocupadas": "busy",
@@ -12916,11 +14855,11 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "projetos": "projects", "projeto": "project", "fluxo": "flow", "ciclo": "cycle", "integrar": "integrate", "lavish-resposta": "lavish-answer",
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
-         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "devolver": "send-back", "revisar": "review", "caixa": "inbox",
-         "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase"},
+         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "limpar-residuos": "clean", "devolver": "send-back", "segurar": "hold", "provar-red": "prove-red", "revisar": "review", "caixa": "inbox",
+         "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase", "onda": "wave"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
-    "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink"},
+    "pr": {"ligar": "link", "abrir": "open", "lista": "list", "desligar": "unlink", "evidencia": "evidence"},
     "queue": {"feito": "done", "lista": "list"},
     "away": {"ligar": "on", "desligar": "off"},
     "alert": {"visto": "seen"},
@@ -12932,12 +14871,13 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "integrate": {"fila": "queue", "concluir": "conclude"},
     "integrate queue": {"lista": "list"},
     "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
+    "wave": {"novo": "new", "lista": "list"},
     "manager": {"ligar": "bind", "desligar": "unbind", "checar": "check", "subir": "spawn", "absorver": "absorb", "intervalo": "interval"},
     "doctor": {"antigos": "old"},
-    "dispatch-queue": {"lista": "list", "descartar": "discard"},
+    "dispatch-queue": {"lista": "list", "descartar": "discard", "prioridade": "priority"},
        "worktrees": {"limpar": "clean"},
     "mate": {"abrir": "open", "dormir": "sleep", "pedir": "request", "subir": "raise", "pedidos": "requests"},
-    "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept"},
+    "retro": {"lacunas": "gaps", "rejeitar": "reject", "aceitar": "accept", "citacoes": "citations"},
 }
 # the `choices` values (pt -> en): the CLI accepts both and delivers the pt one, which is what the code records today
 STOP_EN = {"orcamento": "budget", "decisao": "decision", "limite": "limit"}
@@ -13021,6 +14961,17 @@ def parser():
     dv.add_argument("target")
     dv.add_argument("reason")
     dv.add_argument("--run")
+    dv.add_argument("--achado", action="store_true", help="the reason cites a review finding: adds the invariant rule (write the invariant, list every place it holds, fix all in one round)")
+    pr_ = sub.add_parser("prove-red", aliases=["provar-red"], help="orq prove-red <ticket|task> [--command CMD]: runs the test files the branch created or changed against the merge-base with the base (red expected) and then on the head, and records the `red_proof` event")
+    pr_.add_argument("target")
+    _arg(pr_, "comando", help="the test command, {file} is the file (default: python3 {file} for .py, npx --no-install jest {file} for JavaScript; the project's `tests.command` otherwise)")
+    pr_.add_argument("--worktree", help="the worktree with the delivery (default: <ORQ_WT>/<ticket> or the dispatch's)")
+    pr_.add_argument("--base", help="the base branch (default: the project's first environment)")
+    pr_.add_argument("--timeout", type=int, default=RED_TIMEOUT_S, help="seconds for the whole proof")
+    hd = sub.add_parser("hold", aliases=["segurar"], help="orq hold <ticket|dispatch> --reason \"...\": a delivery held on purpose leaves the away Stop and the manager's notice and shows in `orq agents` with the reason; --release brings it back")
+    hd.add_argument("target")
+    _arg(hd, "motivo", help="why the delivery is not integrated (required unless --release)")
+    hd.add_argument("--release", action="store_true", help="puts the held delivery back in the queue of charges")
     cd = sub.add_parser("check-delivery", help="orq check-delivery [--dispatch <id>] [--report-path <file>]: reads the report against the numbered items of the spec and lists what has no proof; run it before the worker_done (exit 1 with something missing)")
     cd.add_argument("--dispatch", help="default: the dispatch of this terminal")
     cd.add_argument("--report-path", help="default: final-report.md of the cwd")
@@ -13052,14 +15003,25 @@ def parser():
     _arg(po, "corpo", required=True, help="file with the PR body (sections of the /pr skill)")
     _arg(po, "ambientes", help="comma-separated branches; default: the project environments before production")
     po.add_argument("--cwd", help="where to find the worktree when the target is a branch")
+    _arg(po, "sem-prova", metavar="REASON", help="goes ahead although the branch has commits after the last proof or is not its descendant; the reason goes to the `prova` event")
+    pe = pr.add_parser("evidence", aliases=["evidencia"], help="orq pr evidence <pr|task> --before DIR --after DIR [--scenarios JSON]: publishes the before/after images on evidence/pr-<n> and comments the table on the PR")
+    pe.add_argument("target")
+    _arg(pe, "antes", required=True)
+    _arg(pe, "depois", required=True)
+    _arg(pe, "cenarios", help="JSON list of {name, before, after, live, evidence}")
     pr.add_parser("list", aliases=["lista"], help="the linked PRs (of one task, with --task)").add_argument("--task")
     pd2 = pr.add_parser("unlink", aliases=["desligar"], help="orq pr unlink <task> <url>: removes the PR from the task")
     pd2.add_argument("task")
     pd2.add_argument("url")
     _arg(pr.add_parser("poll", help="asks gh for the open PRs; a merge or a close becomes an entry, once"), "forcar", action="store_true", help="ignores the minimum interval")
-    lf = sub.add_parser("clean", aliases=["limpar"], help="orq clean --closed [--dry-run]: right away cleans the worktree and branches of the tasks whose PRs are all closed without merge")
-    _arg(lf, "fechados", action="store_true", required=True)
-    lf.add_argument("--dry-run", action="store_true", help="only shows what it would delete")
+    lf = sub.add_parser("clean", aliases=["limpar", "limpar-residuos"], help="orq clean [--apply] [--only CATEGORY,...] [--test-lines]: lists the residue with no owner (old notices, state leftovers, integrated worktrees and branches, "
+                        "backups); --apply removes it. --closed [--dry-run]: right away cleans the worktree and branches of the tasks whose PRs are all closed without merge")
+    _arg(lf, "fechados", action="store_true")
+    _arg(lf, "aplicar", action="store_true", help="removes what the list shows (without it, only lists)")
+    _arg(lf, "somente", help=f"comma-separated categories: {', '.join(CLEAN_CATEGORIES)}")
+    _arg(lf, "linhas-de-teste", action="store_true", help="with --apply: also removes the test lines from events.jsonl, after a backup of the log (the user's approval)")
+    lf.add_argument("--dry-run", action="store_true", help="only shows what it would delete (the default of the new mode)")
+    lf.add_argument("--json", action="store_true")
     dg = sub.add_parser("digest", help="writes digest/atual.json (the panel contract): merge queue, features, pending items, what happened and live workers")
     _arg(dg, "desde", help="ISO timestamp (YYYY-MM-DDTHH:MM:SSZ) instead of the moment away mode turned on or the user's last message")
     dg.add_argument("--html", action="store_true", help="also writes the page digest/<date>.html")
@@ -13078,6 +15040,7 @@ def parser():
     _arg(aw, "ate", help="on: end of the budget, next HH:MM local (default 08:00)")
     _arg(aw, "max-despachos", type=int, help="on: dispatch cap (default none)")
     _arg(aw, "max-falhas", type=int, default=NIGHT_FAILURES, help="on: consecutive worker failures that stop dispatching (default 3)")
+    _arg(aw, "forcar", action="store_true", help="with on, turns it on even when the preflight refuses (logs away_preflight_forcado)")
     sub.add_parser("steers", help="redelivers the notice of the adjustments the stopped worker did not read and records the alert on the third failure (the manager panel already does it)")
     rp = sub.add_parser("reply", aliases=["responder"], help="answers a worker's question through the manager, binding the message's Run first")
     rp.add_argument("msg_id")
@@ -13201,6 +15164,16 @@ def parser():
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
+    igk = ig.add_parser("check", help="orq integrate check <branch>... [--no-proof REASON]: what integrar.py runs before merging; refuses a queued branch whose tip is not the commit its delivery proved")
+    igk.add_argument("branches", nargs="+")
+    _arg(igk, "sem-prova", metavar="REASON", help="goes ahead without the proof; the reason goes to the `prova` event")
+    te = sub.add_parser("test", help="orq test [--affected] [--base <ref>] [-j N] [name...]: runs test_orq.py of this worktree; --affected only the tests the diff touches")
+    te.add_argument("--affected", action="store_true", help="only the tests the diff against --base touches (the test map in plan/test-map.json)")
+    te.add_argument("--base", help="the diff base (default: the merge-base with origin/main)")
+    te.add_argument("-j", "--jobs", type=int)
+    te.add_argument("--map", help="the test map to read (default: plan/test-map.json)")
+    te.add_argument("--dry-run", action="store_true", help="prints the commands instead of running them")
+    te.add_argument("names", nargs="*")
     wl = sub.add_parser("worktrees", help="orq worktrees clean [--dry-run]: removes the ORQ_WT worktrees already contained in origin/main").add_subparsers(dest="op", required=True)
     wl.add_parser("clean", aliases=["limpar"], help="removes the ORQ_WT worktrees already contained in origin/main").add_argument("--dry-run", action="store_true")
     au = sub.add_parser("audit-publication", aliases=["auditar-publicacao"], help="orq audit-publication <base>..<head>: refuses a wrong author, trailer, forbidden term and code without a README before publishing main")
@@ -13214,9 +15187,15 @@ def parser():
     for k, h in (("modelo", "the model the released ticket starts with on its own"), ("despacho", "`manual[, reason]`: never starts on its own"), ("espera", "`integrador vazio`")):
         _arg(tn, k, help=h)
     tn.add_argument("--effort", help="its effort")
+    _arg(tn, "projeto", help="the project the released ticket starts in (`Project:`); without it the Run's or the coordinator's cwd project applies")
+    tn.add_argument("--wave", type=int, help="puts the task in wave N: blocked by the wave's milestone, and the wave's join waits for it (ticket 342)")
+    tn.add_argument("--after", help="the number of a wave's milestone: same as --wave of that wave")
     tf = tk.add_parser("close", aliases=["fechar"], help="writes the Answer, sets resolved and completes the task")
     tf.add_argument("numero")
     tf.add_argument("--answer", required=True, help="text or the path of a file")
+    wv = sub.add_parser("wave", aliases=["onda"], help="the delivery order in waves: each wave is a milestone that blocks its parallel tasks and a join that every task blocks").add_subparsers(dest="op", required=True)
+    wv.add_parser("new", aliases=["novo"], help="creates the next wave's milestone and join").add_argument("name")
+    wv.add_parser("list", aliases=["lista"], help="the waves, what each waits for and the tasks still open").add_argument("--json", action="store_true")
     dc = sub.add_parser("doctor", help="checks orq's state against Orca and fixes what it can").add_subparsers(dest="op", required=True)
     dt = dc.add_parser("tasks", help="completes the blocked/pending task of a resolved ticket (supersededBy) and lists the one with no ticket")
     dt.add_argument("--dry-run", action="store_true", help="only lists")
@@ -13226,6 +15205,7 @@ def parser():
     _arg(da, "horas", type=float, default=24, help="minimum age of the dispatch (default 24)")
     da.add_argument("--ticket", action="append", default=[], help="only this ticket (repeatable)")
     da.add_argument("--json", action="store_true")
+    dc.add_parser("away", help="the away-mode preflight (what `away on` checks first): hard failures exit 1, warnings only print; it turns nothing on")
     dh = dc.add_parser("hooks", help="checks the interpreter of each orq hook (it must import orqlib: Python 3.12+); --pin writes the absolute path into the hook commands and the `orq` link")
     dh.add_argument("--pin", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
@@ -13306,18 +15286,22 @@ def parser():
     rv = sub.add_parser("review", aliases=["revisar"], help="only the no-mistakes review in the task's worktree (ticket 146), with the cheap model of orq's NM_HOME; refuses on usage pause/hold and with no expensive slot")
     rv.add_argument("task", help="the task id or the ticket number")
     rv.add_argument("--json", action="store_true")
+    rv.add_argument("--decidir", "--decide", action="append", metavar="FINDING=corrigir|ignorar[:reason]", help="records a decision on a finding of this branch (repeatable) and does not run the review; the next review gets it in the intent")
     mq = sub.add_parser("machine", aliases=["maquina"], help="the machine budget (ticket 79): what it has now, what orq decides and the slots. `orq machine set <key> <value>` adjusts maquina.json")
     mq.add_argument("op", nargs="?", choices=["set"])
     mq.add_argument("key_name", nargs="?")
     mq.add_argument("value", nargs="?", help="as JSON: 4, true, [\"claude-opus-*\"]")
     mq.add_argument("--json", action="store_true")
-    fd = sub.add_parser("dispatch-queue", aliases=["fila-despacho"], help="the dispatches and resumes waiting for a slot on the machine: list | rm <id>").add_subparsers(dest="op", required=True)
+    fd = sub.add_parser("dispatch-queue", aliases=["fila-despacho"], help="the dispatches and resumes waiting for a slot on the machine: list | rm <id> | priority <id> <1|2|3>").add_subparsers(dest="op", required=True)
     fd.add_parser("list", aliases=["lista"], help="the dispatches in the queue").add_argument("--json", action="store_true")
     fd.add_parser("rm").add_argument("id")
+    fp = fd.add_parser("priority", aliases=["prioridade"], help="changes the priority (1 high to 3 low) of a queue item (fdXXXXXX), keeping its place by entry date")
+    fp.add_argument("id")
+    fp.add_argument("value", type=int, choices=[1, 2, 3])
     dc = fd.add_parser("discard", aliases=["descartar"], help="marks the `desistiu` give-up as resolved: takes the item off the away Stop")
     dc.add_argument("id")
     _arg(dc, "motivo", required=True)
-    cx = sub.add_parser("inbox", aliases=["caixa"], help="reads the Orca inbox (check) and with --ack acknowledges it in the same generation; returns the binding to the previous Run")
+    cx = sub.add_parser("inbox", aliases=["caixa"], help="reads the Orca inbox; with --ack acknowledges what the coordinator or the manager commands in the same generation and never binds another Run")
     cx.add_argument("run", nargs="?")
     cx.add_argument("--ack", action="store_true")
     _arg(cx, "todas", action="store_true", help="goes through the Runs with an unread message")
@@ -13348,8 +15332,8 @@ def parser():
     _arg(rr, "desde", help="start of the window (date or ISO)")
     _arg(rr, "ate", help="end of the window (default: now)")
     _arg(rr, "projeto", help="only the cases whose path, title or task contains the snippet")
-    rr.add_argument("op", nargs="?", choices=["gaps", "lacunas", "reject", "rejeitar", "accept", "aceitar"], metavar="{gaps,reject,accept}",
-                    help="gaps: the ledger of gaps kept between rounds; reject <id> --reason T: the proposal only comes back with more sessions; accept <id> --ticket N: the gap is covered when the ticket closes")
+    rr.add_argument("op", nargs="?", choices=["gaps", "lacunas", "reject", "rejeitar", "accept", "aceitar", "citations", "citacoes"], metavar="{gaps,reject,accept,citations}",
+                    help="gaps: the ledger of gaps kept between rounds; reject <id> --reason T: the proposal only comes back with more sessions; accept <id> --ticket N: the gap is covered when the ticket closes; citations <report.md>: checks the report's quotes against the transcript lines they point to (exit 1 if one does not match)")
     rr.add_argument("ref", nargs="?", help="the gap id (reject, accept)")
     rr.add_argument("--ticket", help="accept: the ticket that answers the gap")
     rr.add_argument("--json", action="store_true")
@@ -13429,10 +15413,12 @@ def main(argv=None):
             elif a.op == "auto":
                 print(json.dumps(pr_auto(a.url, a.head, a.wt, a.cwd), ensure_ascii=False))
             elif a.op == "open":
-                urls, notices = pr_open(a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd)
+                urls, notices = pr_open(a.target, a.title, a.body_text, [x for x in (a.environments or "").split(",") if x] or None, a.cwd, a.no_proof)
                 for av in notices:
                     print(f"warning: {av}", file=sys.stderr)
                 print("\n".join(urls))
+            elif a.op == "evidence":
+                print("\n".join(pr_evidence(a.target, a.before, a.after, a.scenarios)))
             elif a.op == "unlink":
                 pr_unlink(a.task, a.url)
                 print(f"PR unlinked from {a.task}")
@@ -13441,13 +15427,19 @@ def main(argv=None):
             else:
                 print("\n".join(pr_poll(force=a.force)) or "no changes in the PRs")
         elif a.cmd == "send-back":
-            print(json.dumps(send_back(a.target, a.reason, a.run), ensure_ascii=False))
+            print(json.dumps(send_back(a.target, a.reason, a.run, a.achado), ensure_ascii=False))
         elif a.cmd == "check-delivery":
             r = check_delivery_report(a.dispatch, a.report_path)
             print("delivery complete: every item has a proof" if r["ok"] else "no `## Conformance` line with a proof for:\n" + "\n".join(f"- {x}" for x in r["faltando"]))
             return 0 if r["ok"] else 1
         elif a.cmd == "accept-delivery":
             print(json.dumps(accept_delivery(a.target, a.by, a.summary, a.run), ensure_ascii=False))
+        elif a.cmd == "prove-red":
+            r = prove_red_ticket(a.target, a.command, a.worktree, a.base, a.timeout)
+            print("\n".join([f"{f['arquivo']}: {RED_STATE[f['resultado']]}" + (f" ({f['motivo']})" if f.get("motivo") else "") for f in r["files"]]
+                             or ["no test file created or changed by the branch"]) + f"\nhead {r['head'][:8]}: {r['resultado']}")
+        elif a.cmd == "hold":
+            print(json.dumps(hold(a.target, a.reason, a.release), ensure_ascii=False))
         elif a.cmd == "steer":
             ev = steer(a.task, a.text_value, a.run, a.entry)
             print(json.dumps(ev, ensure_ascii=False))
@@ -13459,8 +15451,15 @@ def main(argv=None):
             print(json.dumps(reply_to(a.msg_id, a.text_value), ensure_ascii=False))
         elif a.cmd == "alert":
             print(json.dumps(append_event({"tipo": "alerta_visto", "task": a.task}), ensure_ascii=False))
-        elif a.cmd == "clean":
+        elif a.cmd == "clean" and a.closed_items:
             print("\n".join(clean_closed(dry=a.dry_run)) or "no task with all PRs closed without merge")
+        elif a.cmd == "clean":
+            only = [c for c in (a.only or "").split(",") if c] or None
+            if bad := [c for c in only or [] if c not in CLEAN_CATEGORIES]:
+                raise ValueError(f"unknown category {bad[0]!r}; the ones that exist: {', '.join(CLEAN_CATEGORIES)}")
+            plan = clean_plan(only=only)
+            result = clean_apply(plan, approve_test_lines=a.test_lines) if a.apply and not a.dry_run else None
+            print(json.dumps({"plan": plan, **({"result": result} if result else {})}, ensure_ascii=False) if a.json else clean_text(clean_plan(only=only) if result else plan, result))
         elif a.cmd == "busy":
             print("\n".join(sorted(busy_worktrees())))
         elif a.cmd == "install":
@@ -13531,7 +15530,7 @@ def main(argv=None):
                 away_off()
             print("\n".join(away_lines(_cursor_ro())))
         elif a.cmd == "away":
-            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures)))
+            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures, a.force)))
         elif a.cmd == "remind":
             words = a.op_or_text
             if words[0] in ("list", "lista"):
@@ -13602,6 +15601,9 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"warning: {x}", file=sys.stderr)
+        elif a.cmd == "integrate" and a.op == "check":
+            for x in integrate_proof(a.branches, a.no_proof):
+                print(f"warning: {x}", file=sys.stderr)
         elif a.cmd == "integrate" and a.action == "add":
             print(json.dumps(integrate_queue_add(a.branch, a.ticket), ensure_ascii=False))
         elif a.cmd == "integrate" and a.action == "rm":
@@ -13609,6 +15611,8 @@ def main(argv=None):
         elif a.cmd == "integrate":
             item_list = list(integration_queue().values())
             print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(f"{i['ticket']} {i['branch']} (since {_hora_local(i['ts'])})" for i in item_list) or "integrator queue empty")
+        elif a.cmd == "test":
+            return run_tests(a.affected, a.base, a.jobs, a.names, a.map, a.dry_run)
         elif a.cmd == "worktrees":
             r = clean_orq_worktrees(dry_run=a.dry_run)
             print(f"{'would remove' if a.dry_run else 'removed'}: {len(r['removidas'])}; kept: {len(r['ficaram'])}" + (f"; bundle {r['bundle']}" if r["bundle"] else ""))
@@ -13630,6 +15634,10 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join(f"phase {c['fase']} of {c['plano']}: " + (f"missing {', '.join(c['faltando'])}" if c["faltando"] else "complete")
                                                                          for c in r) or "no plan with tickets of the cited phase")
             return 1 if phase_refusal(r) else 0
+        elif a.cmd == "doctor" and a.op == "away":
+            r = away_preflight()
+            print("\n".join(away_preflight_lines(r)) or "away preflight clean")
+            return 1 if r["duros"] else 0
         elif a.cmd == "doctor" and a.op == "hooks":
             return doctor_hooks(a.pin)
         elif a.cmd == "doctor" and a.op == "old":
@@ -13638,9 +15646,15 @@ def main(argv=None):
         elif a.cmd == "doctor":
             r = doctor_tasks(a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_tasks_text(r, a.dry_run))
+        elif a.cmd == "wave":
+            if a.op == "new":
+                print(json.dumps(wave_new(a.name), ensure_ascii=False))
+            else:
+                print(json.dumps([{"wave": w["wave"], "milestone": w["milestone"]["num"], "join": w["join"]["num"], "tasks": [t["num"] for t in w["tasks"]]} for w in waves()], ensure_ascii=False) if a.json
+                      else "\n".join(wave_lines()) or "no wave")
         elif a.cmd == "ticket":
             if a.op == "new":
-                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting)
+                r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting, a.project, a.wave, a.after)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicit("tarefa", r["task"], r["run"])
             elif a.op == "edit":
@@ -13697,6 +15711,8 @@ def main(argv=None):
                 print(line)
                 if a.state:
                     manager_state_write(line)
+                if (_manager_cfg().get("falhas_seguidas") or 0) and _manager_cfg().get("gerente") == os.environ.get("ORCA_TERMINAL_HANDLE"):
+                    return 1  # a failed round (ticket 229): the shell must not touch manager-ok
         elif a.cmd == "resume" and a.paused:
             r = {"gerente": None, "workers": resume_paused(a.run, a.force)}
             print(json.dumps(r, ensure_ascii=False) if a.json else resume_text(r))
@@ -13715,7 +15731,7 @@ def main(argv=None):
             r = pause_workers(a.tasks, a.up_to_priority, a.run, a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else pause_text(r))
         elif a.cmd == "priority":
-            print(json.dumps(set_priority(a.task, a.value), ensure_ascii=False))
+            print(json.dumps(dispatch_queue_priority(a.task, a.value) if re.fullmatch(r"fd[0-9a-f]{6}", a.task) else set_priority(a.task, a.value), ensure_ascii=False))
         elif a.cmd == "groups" and (a.title or a.cwd or a.group_name):
             item_name, reason = group_of(groups(), a.title, a.cwd, a.group_name)
             t = item_name and _dict(_mates().get(item_name)).get("terminal")
@@ -13738,8 +15754,12 @@ def main(argv=None):
             ps = [p for p in mate_pending(read_events(), _mates(), datetime.now(timezone.utc)) if not a.group_name or p["grupo"] == a.group_name]
             print("\n".join(f"{p['corr']} {p['grupo']} {p['estado']}: {_quote(p['texto'])}" for p in ps) or "no unanswered request")
         elif a.cmd == "review":
-            r = review(a.task)
-            print(json.dumps(r, ensure_ascii=False) if a.json else review_text(r))
+            if a.decidir:
+                evs = review_decide(a.task, a.decidir)
+                print(json.dumps(evs, ensure_ascii=False) if a.json else "\n".join(f"recorded: {e['achado']} = {e['decisao']} (branch {e['branch']})" for e in evs))
+            else:
+                r = review(a.task)
+                print(json.dumps(r, ensure_ascii=False) if a.json else review_text(r))
         elif a.cmd == "machine" and a.op == "set":
             if not a.key_name or a.value is None:
                 raise ValueError("orq machine set <key> <value>")
@@ -13754,6 +15774,8 @@ def main(argv=None):
             if not dispatch_queue_rm(a.id):
                 raise ValueError(f"{a.id} is not in the dispatch queue")
             print(f"{a.id} left the dispatch queue")
+        elif a.cmd == "dispatch-queue" and a.op == "priority":
+            print(json.dumps(dispatch_queue_priority(a.id, a.value), ensure_ascii=False))
         elif a.cmd == "dispatch-queue" and a.op == "discard":
             if not any(e.get("tipo") == "despacho_fila" and e.get("op") == "desistiu" and e.get("id") == a.id for e in read_events()):
                 raise ValueError(f"{a.id} has no recorded give-up")
@@ -13762,7 +15784,8 @@ def main(argv=None):
         elif a.cmd == "dispatch-queue":
             item_list = dispatch_queue_items()
             print(json.dumps(item_list, ensure_ascii=False) if a.json else "\n".join(
-                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')}) since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
+                f"{n} {i['id']} P{i.get('prioridade') or 2} {i['tipo']} {i.get('titulo')} ({i.get('modelo')})"
+                f"{''.join(f' {k} {i[k]}' for k in ('task', 'ticket', 'mate') if i.get(k))} since {i.get('ts')}: {i.get('motivo')}" for n, i in enumerate(item_list, 1)) or "dispatch queue empty")
         elif a.cmd == "usage":
             u = plan_usage(agent=a.agent)
             level, reason, _ = usage_level(u)
@@ -13770,6 +15793,12 @@ def main(argv=None):
                   f"{level}" + (f": {reason}" if reason else "") + (f" (week {u['semana']}%, 5 h {u['cinco_h']}%)" if u else " (no fresh HUD frame)"))
         elif a.cmd == "audit-answers":
             print(audit_answers(a.session), end="")
+        elif a.cmd == "retro" and a.op == "citations":
+            if not a.ref:
+                raise ValueError("usage: orq retro citacoes <report.md>")
+            rows = check_citations(a.ref)
+            print(json.dumps(rows, ensure_ascii=False) if a.json else citations_text(rows))
+            return int(any(x["estado"] != "confere" for x in rows))
         elif a.cmd == "retro":
             print(retro_cmd(a))
         else:

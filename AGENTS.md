@@ -14,4 +14,4 @@ Run this when the user asks to set orq up, or when `orq` is not on `PATH` in a s
 
 ## Changing orq
 
-The live clone runs the hooks and the manager panel, so work happens in a worktree of your own (`git worktree add -b <type>/<description> .worktrees/<ticket> origin/main`) and the live `main` moves only through `scripts/integrar.py`. Done when `python3 test_orq.py && python3 test_precompact.py` is green in that worktree.
+The live clone runs the hooks and the manager panel, so work happens in a worktree of your own (`git worktree add -b <type>/<description> .worktrees/<ticket> origin/main`) and the live `main` moves only through `scripts/integrar.py`. Done when `orq test --affected` and `python3 test_noite_replay.py` are green in that worktree; the integrator runs the night replay and the full suite.

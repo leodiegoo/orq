@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Tests for orq (slices 1 and 3). Run with `python3 test_orq.py`: ORQ_HOME in a temporary directory and ORQ_ORCA on a fake Orca."""
+import ast
+import argparse
 import contextlib
+import glob
 import hashlib
 import json
 import os
 import pathlib
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,18 +23,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORQ = os.path.join(HERE, "orq.py")
 CLEAN_SCRIPT = os.path.join(HERE, "hooks", "limpar-mergeados-hook.py")
 sys.path.insert(0, HERE)
+# hermetic: nothing of the caller's orq, Orca or harness environment reaches a test (a worker's ORQ_HOOK_TIMEOUT=15 turned the 3 s alarm into 15 s, ticket 328)
+CALLER_ENV = {k: os.environ.pop(k) for k in sorted(os.environ) if k.startswith(("ORQ_", "ORCA_", "CLAUDE", "CODEX_"))}
+# every test's temporary files, the subprocesses' too, in one folder the runner removes at the end. Under /tmp: shorter than macOS's TMPDIR, so the paths that
+# go into a 150-character notice or a socket stay short
+SUITE_TMP = tempfile.tempdir = os.environ["TMPDIR"] = tempfile.mkdtemp(prefix="oq", dir="/tmp" if os.path.isdir("/tmp") else None)
+os.environ["ORQ_HOME"] = os.path.join(SUITE_TMP, "orq-home")  # in-process orq writes here: never to the live clone's events.jsonl (ticket 216 found 88 test lines there)
+# before the import: orqlib reads ORQ_LINK and ORQ_AVISO_GAP_S at load, and in-process tests saw the real link and a 3 s gap per notice (ticket 328)
+os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
+os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
+os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
+os.environ["ORQ_NO_CLEAN"] = "1"  # the manager round does not run orq clean in a test that did not ask for it (ticket 326); the clean tests call clean_round themselves
+os.environ["ORQ_TESTING"] = "1"  # orqlib._launchctl fails loud without an ORQ_LAUNCHCTL fake: no test unloads the live com.orq.gerente (ticket 316)
+os.environ["ORQ_LAUNCH_AGENTS"] = os.path.join(tempfile.mkdtemp(), "LaunchAgents")  # nor does it see the real plist, so `serve --stop` in a test finds nothing to bootout
+os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
+os.environ["ORQ_AWAY_PREFLIGHT"] = "off"  # `away on` does not check the real machine in the older tests (ticket 217); the preflight tests turn it on
+os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
+os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
 import orq as orq_mod  # noqa: E402
 import orqlib  # noqa: E402
 if "ORQ_BACKLOG" not in os.environ:
     orq_mod.BACKLOG = None  # the machine's backlog.path (ticket 167) does not turn the backlog on in in-process tests
 if "ORQ_BACKLOG_TICKETS" not in os.environ:
     orq_mod.BACKLOG_TICKETS = None  # nem o backlog.tickets (ticket 102)
-os.environ["ORQ_LINK"] = os.path.join(tempfile.mkdtemp(), "orq")  # `orq start` pins the interpreter in the orq link: never the real ~/.local/bin/orq (ticket 247)
-os.environ["ORQ_PYTHON"] = sys.executable  # the interpreter `orq start` writes into the hooks: the one running the suite
-os.environ["ORQ_ALARME"] = "off"  # no test pops a real macOS notification (ticket 228); the ones that test it point ORQ_OSASCRIPT at a recorder
-os.environ["ORQ_SEM_PUSH"] = "0"  # no test reads orq's real git (ticket 180)
-os.environ["ORQ_AVISO_GAP_S"] = "0"  # the second mailbox read doesn't wait in tests
-os.environ["E2E_LOCK_DIR"] = "/nonexistent/e2e-queue"  # the digest and status in tests don't read the machine's real queue
 orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
 orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")  # likewise: the real hooks.json has an orq hook and may be untrusted  # no test writes to the real ~/.codex/config.toml
 
@@ -102,7 +118,7 @@ if sys.argv[1] == "account":
     print(json.dumps({"ok": True, "result": {"rateLimits": read_value("account.json", {})}})); sys.exit(0)
 if sys.argv[1] == "terminal" and cmd == "create":
     # orca terminal create: grava no create.log, dá o handle term_ret<N> e o põe no terminals.json (ticket 48); FAKE_FAIL_CREATE_PATH falha nessa worktree
-    if os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", ""):
+    if os.environ.get("FAKE_FAIL") == "create" or (os.environ.get("FAKE_FAIL_CREATE_PATH") and os.environ["FAKE_FAIL_CREATE_PATH"] in opt("--worktree", "")):
         failure("selector_not_found")
     open(os.path.join(d, "create.log"), "a").write(json.dumps(a) + "\\n")
     new = "term_ret%d" % len(ler_linhas("create.log"))
@@ -206,7 +222,9 @@ if cmd == "check":
     # confirmadas do mesmo tipo; o check repete a entrega em aberto até o --ack; o --ack confirma o lote e já devolve o próximo;
     # confirmar de novo o mesmo id repete a entrega atual; id desconhecido é stale_delivery
     target = opt("--run")
-    if bound is None or (target and target != bound):
+    if opt("--terminal") and not target:
+        target = "term:" + opt("--terminal")  # o worker lê a própria caixa (`check --terminal`): o run_id "term:<handle>" guarda as mensagens dele; não depende de Run ligado
+    elif bound is None or (target and target != bound):
         print(json.dumps({"ok": False, "error": {"code": "consumer_fenced", "message": "This coordinator terminal is no longer bound to Run " + str(target)}})); sys.exit(0)
     if os.environ.get("FAKE_FAIL_ACK") and "--ack" in a:
         failure("falhou --ack")
@@ -378,6 +396,8 @@ elif cmd == "worker-start":
     n = len(ws) + 1
     tid = opt("--task") or "task_novo%d" % n  # --task despacha uma task que já existe (a do ticket) em vez de criar outra
     new = {"handle": "term_novo%d" % n, "run": run or bound, "task": tid, "status": "dispatched"}
+    if os.environ.get("FAKE_WT"):  # worktree que o Orca criou para o worker
+        new["worktree"] = os.environ["FAKE_WT"]
     if opt("--retry-of"):  # como o Orca real (30/09): a retentativa reaproveita a worktree que o --worktree nomeia e sobe com o perfil pedido
         new.update({"worktree": opt("--worktree", "").split("::", 1)[-1], "modelo": opt("--model"), "effort": opt("--effort"), "agente": opt("--agent")})
     ws.insert(0, new)
@@ -473,7 +493,7 @@ class Env:
         os.chmod(self.bin, 0o755)
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
-                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
+                    "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_STEERS": os.path.join(t, "steers"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
                     "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.machine()
@@ -1781,11 +1801,11 @@ def test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm():
     p = subprocess.Popen([sys.executable, ORQ, "hook", "stop"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=a.env)
     try:
-        assert p.wait(timeout=8) == 0
+        assert p.wait(timeout=15) == 0
     finally:
         p.stdin.close()
     dt = time.time() - t
-    assert 2.7 < dt < 3.6 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
+    assert 2.7 < dt < 8 and "orq: hooks broken (TimeoutError" in json.loads(p.stdout.read())["systemMessage"], dt  # the first failure warns (ticket 228)
     assert "TimeoutError: hook stop passou de 3s" in a.log()
 
 
@@ -1797,7 +1817,7 @@ def test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm():
         t = time.time()
         r = a.prompt("oi")
         dt = time.time() - t
-    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 3.6, (dt, r)
+    assert r.returncode == 0 and "orq: hooks broken (TimeoutError" in json.loads(r.stdout)["systemMessage"] and 2.7 < dt < 8, (dt, r)  # the ceiling only proves the cut: under load the start alone takes seconds (ticket 328)
     assert "TimeoutError: hook prompt passou de 3s" in a.log()
     assert a.events() == []
 
@@ -2200,9 +2220,10 @@ def test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pen
     a = Env()
     q = _gate_pending(a)
     t = time.time()
-    # run-current + inbox take 2.4 s; the pending item is written; gate-resolve starts and the 3 s ceiling wins inside it
-    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP="1.2")
-    assert r.returncode == 0 and time.time() - t < 4.5, r
+    # the pending item is written; gate-resolve hangs and the hook's ceiling wins inside it. Only gate-resolve is slow, with a 6 s ceiling: under load
+    # the calls before it take seconds, and a sleep on every call would let the alarm land before the write (ticket 328)
+    r = a.orq("hook", "ask", stdin=_ask(q, {q[0]["question"]: "Sim"}), FAKE_SLEEP_CMD="gate-resolve:30", ORQ_HOOK_TIMEOUT="6")
+    assert r.returncode == 0 and time.time() - t < 12, r
     assert "gate-resolve gate_1: TimeoutError" in a.log(), a.log()
     assert "gate-dec" not in _pending_ids(a), "a pendência foi fechada"
     assert not [g for g in _gates_log(a) if g[0] == "gate-resolve"], "o gate ficou pendente"
@@ -2655,8 +2676,8 @@ def test_guard_fails_open_and_logs():
     b = Env(run="run_a")
     _workers(b, ("w1", "run_b", "dispatched"))
     t = time.time()
-    r = _guard(b, FAKE_SLEEP="6")
-    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 4.5 and "hook guard" in b.log()
+    r = _guard(b, FAKE_SLEEP="30")  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
+    assert (r.returncode, r.stdout) == (0, "") and time.time() - t < 9 and "hook guard" in b.log()
     c = Env(run="run_a")
     _workers(c, ("w1", "run_b", "dispatched"))
     c.env["ORQ_ORCA"] = "/nao/existe/orca"
@@ -2701,7 +2722,7 @@ def _no_tip(output):
     if not (output or "").strip():
         return ""
     ctx = json.loads(output).get("hookSpecificOutput", {}).get("additionalContext", "")
-    rest = [l for l in ctx.splitlines() if not l.startswith("orq: read and confirm the inbox with `orq inbox ")]
+    rest = [l for l in ctx.splitlines() if not l.startswith("orq: read the inbox with `orq inbox ")]
     return "\n".join(rest)
 
 
@@ -2772,9 +2793,10 @@ def test_heartbeat_unknown_kind_passes():
 def test_heartbeat_run_different_from_the_linked_passes_and_the_hook_confirms_only_the_heartbeat():
     a = Env(run="run_a")
     a.inbox(_hb("lendo"), run="run_b")
+    _global_box336(a)
     r = a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`.")
     assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
-    assert a.states() == {"msg_1": "acked"}, "ticket 182: the hook binds the coordinator to the Run, reads and confirms; heartbeats alone do not become context"
+    assert a.states() == {"msg_1": "unread"}, "ticket 336: the hook does not bind the coordinator to a Run it does not command; heartbeats alone do not become context"
 
 
 def test_heartbeat_notice_without_run_passes():
@@ -2785,12 +2807,12 @@ def test_heartbeat_notice_without_run_passes():
 
 
 def test_heartbeat_orca_down_passes():
-    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:6"}):
+    for failure in ({"FAKE_FAIL": "check"}, {"FAKE_CRASH": "1"}, {"FAKE_SLEEP_CMD": "check:30"}):  # far beyond the 3 s alarm, so the ceiling holds under load (ticket 328)
         a = Env(**failure)
         a.inbox(_hb("lendo"))
         t = time.time()
         r = a.prompt(NOTICE_A)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 4.5, (failure, r)
+        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and time.time() - t < 9, (failure, r)
         assert set(a.states().values()) == {"unread"}, failure
         assert not [e for e in a.events() if e["tipo"] == "heartbeat_absorvido"]
 
@@ -3741,7 +3763,7 @@ def test_dispatch_runs_worker_start_with_model_and_effort_and_returns_the_ids():
     (arg,) = _log(a, "started.log")
     assert arg[:1] == ["worker-start"] and arg[arg.index("--run") + 1] == "run_a" and arg[arg.index("--agent") + 1] == "claude"
     assert arg[arg.index("--model") + 1] == "claude-sonnet-5-5" and arg[arg.index("--effort") + 1] == "medium"
-    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.WAITING_BLOCK + "\n"
+    assert arg[arg.index("--task-title") + 1] == "Ticket 05" and arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.SPEC_BLOCKS + "\n"
     assert "--worktree" not in arg
     (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
     assert (ev["run"], ev["task"], ev["dispatch"], ev["titulo"], ev["modelo"], ev["effort"], ev["terminal"]) == \
@@ -3772,14 +3794,14 @@ def test_dispatch_with_entry_puts_the_literal_request_at_the_top_of_the_spec():
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
     assert spec == ('# Ticket 05\n\n## User request\ncria o ticket 05, com "aspas" e acento\n\n'
-                    'What the coordinator wrote below does not replace it: done is checked against this request.\n\nFaça X.\n\n' + orq_mod.WAITING_BLOCK + "\n"), spec
+                    'What the coordinator wrote below does not replace it: done is checked against this request.\n\nFaça X.\n\n' + orq_mod.SPEC_BLOCKS + "\n"), spec
 
 
 def test_dispatch_without_entry_only_appends_the_waiting_block_to_the_spec():
     a = Env(run="run_a")
     _dispatch(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
-    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.WAITING_BLOCK + "\n"
+    assert arg[arg.index("--spec") + 1] == "# Ticket 05\n\nFaça X.\n\n" + orq_mod.SPEC_BLOCKS + "\n"
 
 
 def test_dispatch_entry_with_untitled_spec_puts_the_request_after_the_title_orq_adds():
@@ -3795,7 +3817,7 @@ def test_dispatch_puts_the_waiting_block_at_the_end_of_the_spec_once():
     _dispatch(a, spec=_spec(a, "# Ticket 05\n\nFaça X.\n"))
     (arg,) = _log(a, "started.log")
     spec = arg[arg.index("--spec") + 1]
-    assert spec.count("## Waiting") == 1 and spec.rstrip().endswith("already waits inside the command."), spec
+    assert spec.count("## Waiting") == 1 and spec.rstrip().endswith(orq_mod.TEST_BLOCK) and spec.index("## Waiting") < spec.index("## Tests"), spec
     for rule in ("end the turn", "600000 ms", "repeat the same command", "Never background"):
         assert rule in spec, rule
 
@@ -3954,7 +3976,8 @@ def test_notice_from_other_run_with_other_message_passes():
         a = Env(run="run_a")
         _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -5, 900), _hb_inbox(a, "ctx_9", "x", -3, 901, type_name=type_name))
         r = a.prompt(NOTICE_B)
-        assert (r.returncode, _no_tip(r.stdout)) == (0, "") and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
+        assert r.returncode == 0 and not _blocked(r) and not [e for e in a.events() if e["tipo"] == "heartbeat_visto"], (type_name, r)
+        assert "msg_hb901" in _hook_ctx(r), "ticket 336: it passes with the message read from the global inbox, no Run bound"
 
 
 def test_notice_from_other_run_without_recent_message_passes():
@@ -3995,8 +4018,8 @@ def test_heartbeat_from_blocked_other_run_does_not_lose_the_worker_done_that_arr
     a.inbox(("worker_done", {"taskId": "t", "dispatchId": "ctx_9"}), run="run_b")
     _inbox(a, _hb_inbox(a, "ctx_9", "fase-4", -8, 900), {**_hb_inbox(a, "ctx_9", "", -2, 901, type_name="worker_done")})
     r = a.prompt(NOTICE_B)
-    assert "msg_2 worker_done" in _hook_ctx(r), "the worker_done wakes, already read (ticket 182)"
-    assert set(a.states().values()) == {"acked"}, "the hook confirmed the Run's inbox"
+    assert "msg_hb901 worker_done" in _hook_ctx(r), "the worker_done wakes, already read (ticket 182)"
+    assert set(a.states().values()) == {"unread"}, "ticket 336: the hook reads the global inbox and confirms nothing in a Run the coordinator does not command"
     a.set("run.json", {"id": "run_b"})  # o coordenador faz run-use no Run: a caixa sai inteira, lote a lote
     got = subprocess.run([a.bin, "orchestration", "check", "--run", "run_b", "--all", "--json"], env=a.env, capture_output=True, text=True)
     assert [m["type"] for m in json.loads(got.stdout)["result"]["messages"]] == ["heartbeat", "worker_done"]
@@ -4628,7 +4651,7 @@ def test_review5_m11_notice_from_other_run_with_old_unread_worker_done_passes_ev
     a = Env(run="run_a")
     _inbox(a, _hb_inbox(a, "ctx_9", "", -200, 900, type_name="worker_done"), _hb_inbox(a, "ctx_9", "fase-4", -30, 901))
     r = a.prompt(NOTICE_B)
-    assert (r.returncode, _no_tip(r.stdout)) == (0, ""), r
+    assert r.returncode == 0 and not _blocked(r) and "msg_hb900 worker_done" in _hook_ctx(r), r
     assert not [e for e in a.events() if e["tipo"] == "heartbeat_visto"]
     b = Env(run="run_a")  # a worker_done already read does not hold: the notice was its own and it was confirmed
     _inbox(b, {**_hb_inbox(b, "ctx_9", "", -200, 900, type_name="worker_done"), "read": 1}, _hb_inbox(b, "ctx_9", "fase-4", -30, 901))
@@ -4851,7 +4874,7 @@ def test_review6_b31_orca_timeout_comes_from_environment_and_runner_shows_end_of
                        env={**os.environ, "ORQ_ORCA_TIMEOUT": "7.5"})
     assert r.stdout.strip() == "7.5", r
     assert orq_mod.TIMEOUT_ORCA == float(os.environ.get("ORQ_ORCA_TIMEOUT") or 2.5)
-    assert "str(e)[-400:]" in open(__file__).read().split('if __name__ == "__main__":')[-1], "o runner tem de mostrar o fim da mensagem (B40)"  # the assert line stays before __main__
+    assert "str(e)[-400:]" in open(__file__).read().split("\ndef _run_child(")[-1].split("\ndef ")[0], "o runner tem de mostrar o fim da mensagem (B40)"  # each test's child (ticket 328)
     assert Env().env["ORQ_ORCA_TIMEOUT"] == "10"
 
 
@@ -5184,6 +5207,16 @@ def test_manager_absorb_drops_the_notice_run_after_the_deadline():
     assert a.states()["msg_2"] == "acked" and len(_log(a, "send.log")) == 1, "a entrega em aberto não é avisada de novo"
 
 
+def test_ticket347_coordinator_stop_gives_the_run_bound_by_run_use_back_to_the_manager():
+    a = Env()
+    _multi(a, {"run_a": "term_coord", "run_b": "term_ger"}, ["run_a", "run_b"])  # the coordinator ran run-use on run_a, which the manager held
+    assert _stop_gate(a) == {}
+    assert _binds(a)["run_a"] == "term_ger", "Orca binds the manager to one Run at a time: it comes back to the one the coordinator took"
+    assert [(e["op"], e["run"]) for e in a.events() if e["tipo"] == "gerente" and e["op"] == "devolver"] == [("devolver", "run_a")]
+    n = len(a.events())
+    assert _stop_gate(a) == {} and len(a.events()) == n, "with the manager back on the Run the next Stop does nothing"
+
+
 def test_manager_unlink_gives_back_one_run_or_all():
     a = Env()
     _multi(a, {"run_a": None, "run_b": "term_ger", "run_c": None}, ["run_a", "run_b", "run_c"])
@@ -5409,7 +5442,7 @@ def test_ticket74_steer_to_worker_mid_turn_types_notice_with_summary_and_records
     assert ev["aviso_terminal"] == "ocupado_digitado", ev
 
 
-def test_ticket74_typed_notice_has_the_cap_and_file_stores_summary_up_to_300_chars_in_one_line():
+def test_ticket74_typed_notice_has_the_cap_and_a_long_adjustment_goes_to_its_file_with_a_one_line_notice():
     a = Env()
     a.set("busy.json", ["term_w1"])
     a.set("screens.json", {"term_w1": ["esc to interrupt"]})
@@ -5420,8 +5453,9 @@ def test_ticket74_typed_notice_has_the_cap_and_file_stores_summary_up_to_300_cha
     (env,) = _sent_notices(a, "term_w1")
     text_value = env[env.index("--text") + 1]
     assert "\n" not in text_value and len(text_value) <= orq_mod.NOTICE_MAX, text_value  # ticket 98: what was typed fits within the cap
-    full_text = open(text_value.split("full text at ")[1], encoding="utf-8").read()  # and the quoted file keeps the summary of the adjustment (STEER_NOTICE_MAX)
-    assert "x" * 250 in full_text and "x" * 301 not in full_text, full_text
+    assert text_value.startswith(orq_mod.STEER_LINE), text_value  # ticket 350: over 250 characters the notice is the line with the path, not a cut of the text
+    full_text = open(text_value[len(orq_mod.STEER_LINE):].split(". Read it")[0], encoding="utf-8").read()
+    assert "x" * 900 in full_text, full_text
 
 
 def test_ticket74_steer_to_busy_worker_does_not_type_over_draft_or_menu():
@@ -5525,7 +5559,7 @@ def test_ticket134_round_with_ten_unchanged_runs_queries_orca_only_on_first():
 
 
 def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
-    a = Env(ORCA_TERMINAL_HANDLE="term_ger", ORQ_RUN_PARADO_CACHE_S="0.5")
+    a = Env(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger", "run_b": None}, ["run_a", "run_b"])
     a.set("runs.json", [_active_run(a), _active_run(a, "run_b")])
     a.orq("gerente", "absorver")
@@ -5533,7 +5567,8 @@ def test_ticket134_run_that_really_stopped_is_still_detected_after_expiry():
     a.set("tasks_run_b.json", [{"id": "task_x", "status": "completed", "created_at": OLD, "completed_at": "2026-09-01T10:05:00Z"}])
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a", "run_b"], "dentro da validade o cache segura a soltura"
-    time.sleep(0.6)
+    cache = os.path.join(a.home, "run-parado.json")
+    _write_state(cache, {r: t - 600 for r, t in _read_state(cache).items()})  # the validity runs out in the cache's clock, not in a 0.5 s sleep a loaded machine overruns (ticket 328)
     a.orq("gerente", "absorver")
     assert _manager_runs(a) == ["run_a"], "vencida a validade, o Run parado é solto"
 
@@ -5919,18 +5954,18 @@ def _typed_26(a):
     return [e[e.index("--text") + 1] for e in _sent_notices(a, "term_w1")]
 
 
-def test_ticket26_no_reading_after_90_s_with_stopped_worker_retypes_notice():
+def test_ticket26_no_reading_after_5_min_with_stopped_worker_retypes_notice():
     a = Env()
     _steer_26(a)
-    assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "menos de 90 s: ainda dá tempo de ler"
-    _age_26(a, 100)
+    assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "menos de 300 s: ainda dá tempo de ler"
+    _age_26(a, 350)
     r = a.orq("steers")
     assert r.returncode == 0, r.stderr
     (text_value,) = _typed_26(a)
     assert text_value.startswith("You have 1 orchestration message.") and "check --terminal term_w1" in text_value, text_value
     (ev,) = [e for e in a.events() if e["tipo"] == "steer_reentrega"]
     assert (ev["msg_id"], ev["dispatch"], ev["tentativa"]) == ("msg_9", "ctx_1", 1), ev
-    assert _typed_26(a) == [text_value] and a.orq("steers").returncode == 0 and len(_typed_26(a)) == 1, "a tentativa recomeça a contagem dos 90 s"
+    assert _typed_26(a) == [text_value] and a.orq("steers").returncode == 0 and len(_typed_26(a)) == 1, "a tentativa recomeça a contagem dos 300 s"
 
 
 def test_ticket26_busy_worker_receives_nothing():
@@ -5948,21 +5983,20 @@ def test_ticket26_busy_worker_receives_nothing():
     assert not [e for e in b.events() if e["tipo"] == "alerta"]
 
 
-def test_ticket26_third_failure_writes_alert_and_stops_typing():
+def test_ticket26_failed_retry_writes_alert_and_stops_typing():
     a = Env()
     _steer_26(a)
-    for _ in range(3):
-        _age_26(a, 100)
-        assert a.orq("steers").returncode == 0
-    assert len(_typed_26(a)) == 3 and not [e for e in a.events() if e["tipo"] == "alerta"], "três tentativas, ainda sem alerta"
-    _age_26(a, 100)
+    _age_26(a, 350)
+    assert a.orq("steers").returncode == 0
+    assert len(_typed_26(a)) == 1 and not [e for e in a.events() if e["tipo"] == "alerta"], "uma tentativa, ainda sem alerta"
+    _age_26(a, 350)
     r = a.orq("steers")
     assert "steer not read" in r.stdout, r.stdout
     (al,) = [e for e in a.events() if e["tipo"] == "alerta"]
     assert (al["alerta"], al["task"], al["dispatch"], al["run"], al["msg_id"]) == ("steer_nao_lido", "task_rodando", "ctx_1", "run_a", "msg_9"), al
-    _age_26(a, 100)
+    _age_26(a, 350)
     a.orq("steers")
-    assert len(_typed_26(a)) == 3 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
+    assert len(_typed_26(a)) == 1 and len([e for e in a.events() if e["tipo"] == "alerta"]) == 1, "depois do alerta nada mais é digitado nem gravado"
     assert "steer not read" in a.orq("status").stdout, "o resumo carrega o alerta"
     agent_row = _agents(a)["ctx_1"]
     assert agent_row["alerta"] == "steer not read", agent_row
@@ -5974,29 +6008,28 @@ def test_ticket26_third_failure_writes_alert_and_stops_typing():
 def test_ticket118_worker_with_open_question_receives_neither_notice_nor_alert():
     a = Env()
     _steer_26(a)
-    for _ in range(3):
-        _age_26(a, 100)
-        assert a.orq("steers").returncode == 0
-    assert len(_typed_26(a)) == 3
+    _age_26(a, 350)
+    assert a.orq("steers").returncode == 0
+    assert len(_typed_26(a)) == 1
     _inbox(a, _ask_question(950, "ctx_1"), {"id": "msg_9", "run_id": "run_a", "type": "status", "priority": "high", "subject": "Ajuste", "body": "x",
                                           "payload": None, "from_handle": "term_coord", "to_handle": "dispatch:ctx_1", "read": 0, "sequence": 900,
                                           "created_at": _iso(-5), "delivered_at": None})
-    _age_26(a, 100)
+    _age_26(a, 350)
     r = a.orq("steers")
     assert r.returncode == 0 and "steer not read" not in r.stdout, r.stdout
     assert not [e for e in a.events() if e["tipo"] == "alerta"], "a pergunta aberta é a razão do silêncio: sem alerta"
-    assert len(_typed_26(a)) == 3
+    assert len(_typed_26(a)) == 1
 
 
 def test_ticket26_no_redelivery_after_reading():
     a = Env()
     _steer_26(a)
-    _age_26(a, 100)
+    _age_26(a, 350)
     a.orq("steers")
     assert len(_typed_26(a)) == 1
     _line_26(a, read_text=1)  # o worker rodou o check
     for _ in range(4):
-        _age_26(a, 100)
+        _age_26(a, 350)
         assert a.orq("steers").returncode == 0
     assert len(_typed_26(a)) == 1 and not [e for e in a.events() if e["tipo"] == "alerta"], "lido: sem nova tentativa e sem alerta"
     assert [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "orca")]
@@ -6020,13 +6053,13 @@ def test_ticket26_worker_that_read_by_check_without_ack_counts_as_read_by_transc
     a = Env()
     _steer_26(a)  # read stays 0: the worker's check did not confirm the delivery (seen in the real Orca)
     env = _transcribed_26(a, 'tool_result {"messages": [{"id": "msg_9", "subject": "Ajuste"}]}')
-    _age_26(a, 100)
+    _age_26(a, 350)
     assert a.orq("steers", **env).returncode == 0
     assert _typed_26(a) == [] and [(e["motivo"], e["fonte"]) for e in a.events() if e["tipo"] == "steer_fim"] == [("lido", "transcrito")]
     b = Env()
     _steer_26(b)
     env = _transcribed_26(b, "o worker rodou outra coisa e não viu o ajuste")
-    _age_26(b, 100)
+    _age_26(b, 350)
     assert b.orq("steers", **env).returncode == 0 and len(_typed_26(b)) == 1, "transcrito sem o id: não leu"
 
 
@@ -6072,7 +6105,7 @@ def test_ticket26_manager_panel_redelivers_every_round():
     a.set("busy.json", [])
     _stopped_26(a)
     _line_26(a)
-    _age_26(a, 100)
+    _age_26(a, 350)
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0 and len(_typed_26(a)) == 1 and "task_rodando" in r.stdout and "retyped" in r.stdout, (r.stdout, r.stderr)
 
@@ -6086,10 +6119,10 @@ def test_ticket99_tolerance_runs_from_end_of_turn_that_exceeded_tolerance():
         _line_26(a)
         _age_26(a, 500)  # the steer went out 500 s ago, the long turn only ended now
         return a
-    a = envs(70)  # idle (>= STOPPED_S) but within the 90 s of the end of the turn
+    a = envs(70)  # idle (>= STOPPED_S) but within the 300 s of the end of the turn
     assert a.orq("steers").returncode == 0 and _typed_26(a) == [], "turno acabou há 70 s: ainda dentro da tolerância"
-    b = envs(100)
-    assert b.orq("steers").returncode == 0 and len(_typed_26(b)) == 1, "turno acabou há 100 s sem leitura: redigita"
+    b = envs(350)
+    assert b.orq("steers").returncode == 0 and len(_typed_26(b)) == 1, "turno acabou há 350 s sem leitura: redigita"
     c = envs(70)
     env = _transcribed_26(c, "msg_9 lida")
     _write_state(os.path.join(c.home, "turnos.json"), {"ctx_1": {"task": "task_rodando", "sessao": "sess26", "inicio": now_iso(-600), "fim": now_iso(-70)}})
@@ -6097,7 +6130,130 @@ def test_ticket99_tolerance_runs_from_end_of_turn_that_exceeded_tolerance():
 
 
 def test_ticket26_named_constants():
-    assert (orq_mod.STEER_READ_S, orq_mod.STEER_ATTEMPTS) == (90, 3)
+    assert (orq_mod.STEER_READ_S, orq_mod.STEER_ATTEMPTS, orq_mod.STEER_FILE_MIN) == (300, 1, 250)
+
+
+LONG_350 = "ajuste longo: " + "x" * 586  # 600 characters: more than Orca's notice carries
+
+
+def _long_steer_350(a, text_value=LONG_350, **env):
+    """A steer of `text_value` to the idle worker term_w1 that Orca did not notify (orq types the notice); returns the finished command."""
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_rodando", "dispatch": "ctx_1", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"}])
+    a.set("terminals.json", ["term_w1", "term_coord"])
+    _steer_env(a)
+    r = a.orq("steer", "task_rodando", text_value, **env)
+    assert r.returncode == 0, r.stderr
+    _line_26(a)
+    _stopped_26(a)
+    return r
+
+
+def _worker_box_350(a, *batches):
+    """The mailbox of worker term_w1 with `batches` (one message each, a different type per batch, so Orca delivers each one alone), oldest first."""
+    for i, (type_name, body_text) in enumerate(batches):
+        a.inbox((type_name, {}), run="term:term_w1")
+        cx = json.load(open(os.path.join(a.fake, "mailbox.json")))
+        cx["msgs"][-1].update({"id": f"msg_w{i}", "subject": type_name, "body": body_text})
+        json.dump(cx, open(os.path.join(a.fake, "mailbox.json"), "w"))
+
+
+def _worker_check_350(a):
+    """What the worker sees on its own `orca orchestration check --terminal term_w1` (the batch Orca replays)."""
+    p = subprocess.run([a.bin, "orchestration", "check", "--terminal", "term_w1", "--json"], capture_output=True, text=True, env={**a.env, "ORCA_TERMINAL_HANDLE": "term_w1"})
+    return json.loads(p.stdout)["result"]
+
+
+def test_ticket350_worker_hook_acks_old_batches_so_long_steer_arrives_whole():
+    a = Env()
+    _long_steer_350(a)
+    (sent,) = _sent(a)
+    body_text = sent[sent.index("--body") + 1]
+    _worker_box_350(a, ("status", "velha 1"), ("dispatch", "velha 2"), ("status", "velha 3"), ("handoff", body_text))
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    notice = "You have 1 orchestration message. Run `orca orchestration check --terminal term_w1`."
+    r = a.orq("hook", "prompt", stdin=json.dumps({"prompt": notice, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert r.returncode == 0, r.stderr
+    seen = _worker_check_350(a)["messages"]
+    assert [m["id"] for m in seen] == ["msg_w3"], "the worker's first re-read brings the newest message, not the oldest unconfirmed batch"
+    (arquivo,) = glob.glob(os.path.join(a.tmp.name, "steers", "task_rodando-*.md"))
+    assert seen[0]["body"] == body_text and arquivo in body_text and "orq reply" in body_text and len(body_text) <= 250, body_text
+    assert open(arquivo, encoding="utf-8").read().startswith(LONG_350), "the whole adjustment is in the file"
+    assert [a.states()[f"msg_w{i}"] for i in range(3)] == ["acked"] * 3 and a.states()["msg_w3"] != "acked", "the newest stays unconfirmed for the worker's own check"
+
+
+def test_ticket350_worker_hook_shows_old_message_the_worker_never_saw():
+    a = Env()
+    _worker_box_350(a, ("status", "ajuste que o worker nunca viu"), ("handoff", "novo"))
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    notice = "You have 1 orchestration message. Run `orca orchestration check --terminal term_w1`."
+    r = a.orq("hook", "prompt", stdin=json.dumps({"prompt": notice, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert "ajuste que o worker nunca viu" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"], r.stdout
+    assert a.states()["msg_w0"] == "acked"
+
+
+def test_ticket350_worker_hook_also_acks_on_the_retyped_steer_line_and_ignores_plain_prompts():
+    a = Env()
+    _worker_box_350(a, ("status", "velha"), ("handoff", "nova"))
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
+    hook = lambda prompt: a.orq("hook", "prompt", stdin=json.dumps({"prompt": prompt, "session_id": "abcdef123456"}), ORCA_TERMINAL_HANDLE="term_w1")
+    assert hook("continua o que estava fazendo").returncode == 0 and a.states()["msg_w0"] != "acked", "a plain prompt does not touch Orca"
+    assert hook(orq_mod.STEER_LINE + '/x/task_rodando-1.md. Read it, then: orq reply task_rodando "<plan>"').returncode == 0
+    assert a.states()["msg_w0"] == "acked" and a.states()["msg_w1"] != "acked"
+
+
+def test_ticket350_short_steer_goes_as_it_is_and_long_ones_number_their_files():
+    a = Env()
+    _long_steer_350(a, "use o índice novo")
+    (sent,) = _sent(a)
+    assert sent[sent.index("--body") + 1] == "use o índice novo" and not os.path.exists(os.path.join(a.tmp.name, "steers"))
+    _long_steer_350(a)
+    _long_steer_350(a, LONG_350.replace("x", "y"))
+    assert sorted(os.path.basename(f) for f in glob.glob(os.path.join(a.tmp.name, "steers", "*.md"))) == ["task_rodando-1.md", "task_rodando-2.md"]
+    assert [e["file"] for e in map(lambda e: json.loads(e), open(os.path.join(a.home, "events.jsonl"))) if e.get("type") == "steer" and e.get("file")] == [
+        os.path.join(a.tmp.name, "steers", "task_rodando-1.md"), os.path.join(a.tmp.name, "steers", "task_rodando-2.md")]
+
+
+def test_ticket350_no_receipt_in_5_min_types_the_same_line_then_second_miss_is_a_user_alert():
+    a = Env()
+    _long_steer_350(a)
+    typed_first = _typed_26(a)
+    _age_26(a, 250)
+    assert a.orq("steers").returncode == 0 and _typed_26(a) == typed_first, "under 5 min: still time to read"
+    _age_26(a, 100)
+    r = a.orq("steers")
+    assert r.returncode == 0, r.stderr
+    (steer_ev,) = [e for e in a.events() if e["tipo"] == "steer"]
+    typed = _typed_26(a)
+    assert len(typed) == len(typed_first) + 1 and typed[-1].startswith(steer_ev["linha"][:100]), typed
+    assert [e["tentativa"] for e in a.events() if e["tipo"] == "steer_reentrega"] == [1], "the retry goes to the timeline"
+    _age_26(a, 350)
+    assert "steer not read" in a.orq("steers").stdout
+    assert [e["alerta"] for e in a.events() if e["tipo"] == "alerta"] == ["steer_nao_lido"] and len(_typed_26(a)) == len(typed), "no third typing: it became the user's entry"
+
+
+def test_ticket350_worker_orq_reply_is_the_receipt():
+    a = Env()
+    _long_steer_350(a)
+    _age_26(a, 350)
+    r = a.orq("reply", "task_rodando", "li o arquivo, sigo")
+    assert r.returncode == 0, r.stderr
+    (fim,) = [e for e in a.events() if e["tipo"] == "steer_fim"]
+    assert (fim["motivo"], fim["fonte"], fim["task"]) == ("lido", "reply", "task_rodando"), fim
+    a.orq("steers")
+    assert not [e for e in a.events() if e["tipo"] in ("steer_reentrega", "alerta")]
+
+
+def test_ticket350_agents_shows_steer_without_receipt_per_worker():
+    a = Env()
+    _long_steer_350(a)
+    assert "steer without receipt" not in a.orq("agents").stdout or "for 0 min" in a.orq("agents").stdout
+    _age_26(a, 400)
+    out = a.orq("agents").stdout
+    assert "steer without receipt for 6 min" in out, out
+    a.orq("reply", "task_rodando", "ok")
+    assert "steer without receipt" not in a.orq("agents").stdout
 
 
 def test_ticket26_reply_links_question_run_and_replies_through_manager():
@@ -6276,6 +6432,10 @@ def _repo_git(tmp, dirty=False):
     open(os.path.join(repo, "f"), "w").write("x")
     g("add", "f")
     g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    for i in range(50):  # a short sha of only digits (1 in 27) is not a sha to SHA_RE: the PR test went red at random (ticket 328)
+        if orq_mod.SHA_RE.fullmatch(g("rev-parse", "--short=7", "HEAD")):
+            break
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--amend", "-qm", f"c{i}")
     if dirty:
         open(os.path.join(repo, "novo"), "w").write("y")
     return repo, g("rev-parse", "--short=7", "HEAD")
@@ -7112,6 +7272,20 @@ def test_night_external_hook_stays_under_100_ms():
     assert time.time() - t0 < 0.1
 
 
+
+def test_ticket328_worker_running_the_whole_suite_gets_a_notice_not_a_block():
+    a = Env(run="run_a")
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {"s1": "worker"}})
+    for cmd in ("python3 test_orq.py", "cd wt && rtk python3 test_orq.py -j 4", "python3 /x/test_orq.py --map m.json && python3 test_precompact.py"):
+        out = _external(a, cmd)
+        assert out and "orq test --affected" in out["additionalContext"] and "permissionDecision" not in out, cmd
+    for cmd in ("python3 test_orq.py test_x", "python3 test_orq.py -j 2 ticket328", "orq test --affected", "python3 test_precompact.py", "git commit -m 'python3 test_orq.py'",
+                "cat test_orq.py", "git diff test_orq.py", "wc -l test_orq.py"):
+        assert _external(a, cmd) is None, cmd
+    _write_state(os.path.join(a.home, "cursor.json"), {"papeis": {}})
+    assert _external(a, "python3 test_orq.py") is None, "the coordinator and the integrator's script are not warned"
+
 def _no_git_env(a, **env):
     """Removes from the test environment the git variables the developer's session may have (GIT_CONFIG_*, GIT_TERMINAL_PROMPT)."""
     for k in [k for k in a.env if k.startswith("GIT_CONFIG_") or k == "GIT_TERMINAL_PROMPT"]:
@@ -7467,6 +7641,10 @@ try:
     data = json.load(open(os.path.join(d, "gh.json")))
 except OSError:
     data = {}
+if sys.argv[1] == "api":
+    if "api:" + sys.argv[2] not in data:
+        sys.stderr.write("HTTP 404"); sys.exit(1)
+    print(json.dumps(data["api:" + sys.argv[2]])); sys.exit(0)
 if sys.argv[2] == "list":
     repo = sys.argv[sys.argv.index("--repo") + 1]
     so_abertos = "--state" in sys.argv and sys.argv[sys.argv.index("--state") + 1] == "open"
@@ -7506,11 +7684,11 @@ def _gh_calls(a):
     return _log(a, "gh.log")
 
 
-def _neo(a):
+def _neo(a, sem_ci=False):
     """The three-environment project file (development, staging, main), found by cwd: the git flow the PR tests always assumed."""
     os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
     with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
-        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao"}, f)
+        json.dump({"repo": f"path:{os.getcwd()}", "ambientes": [{"branch": "development"}, {"branch": "staging"}, {"branch": "main", "producao": True}], "fluxo": "promocao", **({"sem_ci": True} if sem_ci else {})}, f)
 
 
 def _prs_env(**env):
@@ -8229,10 +8407,10 @@ def _ck(item_name, conclusion="SUCCESS", status="COMPLETED"):
     return {"__typename": "CheckRun", "name": item_name, "status": status, "conclusion": conclusion}
 
 
-def _ci_queue(**by_pr):
+def _ci_queue(sem_ci=False, **by_pr):
     """Two PRs (1216 and 1220) in two steps; each PR reads the given `mergeable` and checks and the poll runs once."""
     a = Env(run="run_a")
-    _neo(a)
+    _neo(a, sem_ci)
     _gh(a)
     for url, k in ((PR1, "pr1"), (PR2, "pr2")):
         _pr(a, url, "OPEN", "development", **{"mergeable": "MERGEABLE", "statusCheckRollup": [_ck("lint")], "headRefName": "feat/" + k, **by_pr.get(k, {})})
@@ -8259,6 +8437,30 @@ def test_queue_list_shows_the_red_check_by_name_the_conflict_and_the_ci_running(
     assert "#1216 open ✗ lint, e2e" in l1, l1
     assert "#1220 open ⚠ conflict ⏳ CI running" in l2, l2
     assert end == "Next to merge: no step ready"
+
+
+def test_ticket223_empty_rollup_is_not_ready_and_says_how_long_without_check():
+    a = _ci_queue(pr1={"statusCheckRollup": []})
+    out = a.orq("fila", "lista").stdout
+    assert "no check registered for" in out and "min" in out, out
+    assert "Next to merge: step 2" in out, out  # step 1 is not ready, step 2 is
+
+
+def test_ticket223_empty_rollup_is_ready_when_the_project_declares_sem_ci():
+    a = _ci_queue(sem_ci=True, pr1={"statusCheckRollup": []})
+    out = a.orq("fila", "lista").stdout
+    assert "no check registered" not in out and "Next to merge: step 1" in out, out
+
+
+def test_ticket223_checks_that_show_up_in_a_sem_ci_project_still_count():
+    a = _ci_queue(sem_ci=True, pr1={"statusCheckRollup": [_ck("lint", "FAILURE")]})
+    out = a.orq("fila", "lista").stdout
+    assert "✗ lint" in out and "Next to merge: step 2" in out, out
+
+
+def test_ticket223_one_green_check_is_still_ready():
+    out = _ci_queue().orq("fila", "lista").stdout
+    assert "no check registered" not in out and "Next to merge: step 1" in out, out
 
 
 def _ckw(item_name, workflow, conclusion="SUCCESS"):
@@ -8386,6 +8588,70 @@ def test_away_on_and_off_store_the_state_and_the_log():
     assert [e["tipo"] for e in a.events() if e["tipo"].startswith("ausente")] == ["ausente_ligar", "ausente_desligar"]
 
 
+def _away_is_on(a):
+    """Is away on? A refused `away on` writes no cursor.json at all."""
+    return os.path.exists(os.path.join(a.home, "cursor.json")) and bool(_cursor(a).get("ausente"))
+
+
+def _preflight_env(manager=True, hooks=True, dirty=False, **env):
+    """An Env where the away preflight is clean: manager bound to term_coord with a fresh stamp, orq hooks in the Claude settings, a clean git checkout as ORQ_INSTALL."""
+    t = tempfile.mkdtemp()
+    live = os.path.join(t, "live")
+    subprocess.run(["git", "init", "-q", live], check=True)
+    subprocess.run(["git", "-C", live, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    if dirty:
+        open(os.path.join(live, "sujo.txt"), "w").write("x")
+    settings = os.path.join(t, "settings.json")
+    json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3 /x/orq.py hook stop"}]}]}} if hooks else {}, open(settings, "w"))
+    a = Env(ORQ_AWAY_PREFLIGHT="on", ORQ_INSTALL=live, ORQ_CLAUDE_SETTINGS=settings, CLAUDECODE="1", ORQ_PYTHON=sys.executable, **env)
+    if manager:
+        os.makedirs(a.home, exist_ok=True)
+        _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a"]})
+        open(os.path.join(a.home, "gerente-vivo"), "w").close()
+    return a
+
+
+def test_away_preflight_clean_turns_on_without_a_warning_and_doctor_away_turns_nothing_on():
+    a = _preflight_env()
+    r = a.orq("doctor", "away")
+    assert r.returncode == 0 and "away preflight clean" in r.stdout and not _away_is_on(a), r
+    r = a.orq("away", "on")
+    assert r.returncode == 0 and "away mode on" in r.stdout and "warning" not in r.stdout and "refused" not in r.stdout, r
+    assert _cursor(a)["preflight"]["duros"] == [] and _cursor(a)["preflight"]["avisos"] == []
+
+
+def test_away_preflight_dirty_live_checkout_warns_naming_the_file():
+    a = _preflight_env(dirty=True)
+    r = a.orq("away", "on")
+    assert r.returncode == 0 and "away mode on" in r.stdout and "warning" in r.stdout and "sujo.txt" in r.stdout, r
+    assert "sujo.txt" in json.dumps(_cursor(a)["preflight"]["avisos"])
+
+
+def test_away_preflight_dead_manager_refuses_and_force_turns_on_and_logs_the_event():
+    a = _preflight_env()
+    os.utime(os.path.join(a.home, "gerente-vivo"), (1, 1))
+    r = a.orq("away", "on")
+    assert "refused" in r.stdout and "orq manager spawn" in r.stdout and not _away_is_on(a), r
+    r = a.orq("away", "on", "--force")
+    assert r.returncode == 0 and "refused" in r.stdout and _cursor(a)["ausente"]["ligada_em"], r
+    assert [e["tipo"] for e in a.events() if e["tipo"] == "away_preflight_forcado"] == ["away_preflight_forcado"]
+    off = a.orq("away", "off").stdout
+    assert "Crooked when the night began" in off and "refused, forced" in off
+
+
+def test_away_preflight_manager_bound_to_another_coordinator_refuses():
+    a = _preflight_env()
+    _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_other", "gerente": "term_ger", "runs": ["run_a"]})
+    r = a.orq("away", "on")
+    assert "term_other" in r.stdout and "--take-over" in r.stdout and not _away_is_on(a), r
+
+
+def test_away_preflight_missing_hooks_refuses():
+    a = _preflight_env(hooks=False)
+    r = a.orq("away", "on")
+    assert "no orq hooks" in r.stdout and "orq.py install" in r.stdout and not _away_is_on(a), r
+
+
 def test_away_toggles_and_accepts_on_off_status_without_removing_away_mode():
     a = Env(run="run_a")
     assert "away mode on" in a.orq("away").stdout and _cursor(a)["ausente"]["ligada_em"]
@@ -8405,9 +8671,11 @@ def test_away_off_delivers_the_absence_report_only_with_the_away_window():
     a.orq("away", "on")
     a.set("../pendencias.json", {"itens": [{"id": "freio", "tipo": "decisao", "titulo": "Escolher o freio", "link": "http://127.0.0.1:4387/session/x"}]})
     new, old_value = "2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z"
-    evs = [{"ts": old_value, "tipo": "resumo", "texto": "de antes do away"},
-           {"ts": new, "tipo": "pend", "op": "add", "pend": "freio"},
-           {"ts": new, "tipo": "resumo", "texto": "Fechei o passo 1"},
+    os.makedirs(os.path.join(a.tmp.name, "repo"))
+    _project(a, "app", {"repo": f"path:{os.path.join(a.tmp.name, 'repo')}"})
+    for when, text_value in ((old_value, "de antes do away"), (new, "Fechei o passo 1")):  # the summary as `orq summary add` writes it, never by hand (ticket 216)
+        assert a.orq("resumo", "add", text_value, "--projeto", "app", ORQ_AGORA=when).returncode == 0
+    evs = [{"ts": new, "tipo": "pend", "op": "add", "pend": "freio"},
            {"ts": new, "tipo": "worker_done", "outcome": "succeeded", "subject": "ticket 7 pronto"},
            {"ts": new, "tipo": "worker_done", "outcome": "failed", "subject": "ticket 8 quebrou"},
            {"ts": new, "tipo": "pr", "op": "entrou", "url": PR1, "base": "main", "numero": 1},
@@ -8722,10 +8990,16 @@ def _context(a):
     return json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
 
 
+def _respawn_state(a, terminal="term_ger", attempts=3, seconds_ago=0):
+    """The manager-respawn.json of ticket 230: `attempts` on-its-own respawns of `terminal`, the last one `seconds_ago` ago."""
+    _write_state(os.path.join(a.home, "manager-respawn.json"), {"terminal": terminal, "tentativas": attempts, "ts": time.time() - seconds_ago})
+
+
 def test_it_should_warn_on_the_prompt_when_the_manager_terminal_is_gone_and_say_how_to_raise_it():
     a = Env(run="run_a")
     _manager(a)
     a.set("terminals.json", ["term_coord"])  # the manager's terminal vanished from Orca
+    _respawn_state(a)  # the on-its-own respawns (ticket 230) already failed: only the manual notice is left
     _panel_touched(a, 200)
     _context(a)  # the first check runs outside the hook
     ctx = _context(a)
@@ -8736,6 +9010,7 @@ def test_it_should_not_ask_the_orca_while_the_manager_stamp_is_fresh_nor_more_th
     a = Env(run="run_a")
     _manager(a)
     a.set("terminals.json", ["term_coord"])
+    _respawn_state(a)  # without it the first check would bring the manager back up (ticket 230) and the next prompt would check again
     _panel_touched(a, 20)
     for _ in range(3):
         assert "sumiu" not in _context(a)
@@ -8872,7 +9147,7 @@ def test_it_should_tell_the_coordinator_once_when_the_e2e_queue_is_stuck():
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as queue:
         before, dig = orq_mod.HOME, orq_mod.type_text
         sent = []
-        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: sent.append((h, t)) or "enviado"
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t, *_: sent.append((h, t)) or "enviado"
         try:
             _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
             _away_on(home)
@@ -8993,7 +9268,7 @@ def test_it_should_type_a_queued_notice_only_after_the_coordinator_is_idle_for_n
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as queue:
         before, dig = orq_mod.HOME, orq_mod.type_text
         sent = []
-        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: sent.append(t) or "enviado"
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t, *_: sent.append(t) or "enviado"
         try:
             _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
             _away_on(home)
@@ -9012,7 +9287,7 @@ def test_it_should_keep_the_queued_notice_when_the_idle_coordinator_is_busy_or_h
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as queue:
         before, dig = orq_mod.HOME, orq_mod.type_text
         answers = iter(["rascunho", "enviado"])
-        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: next(answers)
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t, *_: next(answers)
         try:
             _write_state(os.path.join(home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
             _away_on(home)
@@ -9107,7 +9382,7 @@ def test_it_should_notify_on_macos_only_when_the_config_turns_it_on():
         open(fake, "w").write(f"#!/bin/sh\necho \"$@\" >> {log}\n")
         os.chmod(fake, 0o755)
         os.environ["ORQ_OSASCRIPT"] = fake
-        orq_mod.HOME, orq_mod.type_text = home, lambda h, t: "rascunho"  # the notice is held (a draft in the box), so the macOS one is the only alert
+        orq_mod.HOME, orq_mod.type_text = home, lambda h, t, *_: "rascunho"  # the notice is held (a draft in the box), so the macOS one is the only alert
         try:
             _user_spoke(home, 1)
             cfg = {"coordenador": "term_c", "gerente": "term_g", "runs": []}
@@ -10200,6 +10475,44 @@ def test_ticket79_queue_item_that_fails_three_times_leaves_and_the_one_held_by_u
     assert not _queue79(b) and [e["op"] for e in b.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu" and not _log(b, "started.log")
 
 
+def _mate_queue351(a, run, **extra):
+    """The mate `orq` is alive and owns `run`; the dispatch queue holds one item of that Run (the coordinator queued it, so it carries no `mate`)."""
+    _group(a)
+    _manager(a)
+    _fleet79(a)
+    _mate_alive(a)
+    c = _read_state(os.path.join(a.home, "cursor.json"))
+    c["mates"]["orq"]["runs"] = ["run_mate"]
+    _write_state(os.path.join(a.home, "cursor.json"), c)
+    item = {"id": "fd351", "tipo": "despacho", "run": run, "titulo": "orq: Ticket 88", "modelo": SONNET, "effort": "medium", "prioridade": 1, "ticket": "88", "worktree": "current", "ts": "2026-10-02T10:00:00Z", "falhas": 0}
+    _write_state(os.path.join(a.home, "fila-despacho.json"), {"itens": [{**item, **extra}]})
+
+
+def test_ticket351_queue_item_of_a_mate_run_goes_to_the_mate_instead_of_giving_up():
+    a = _panel79()
+    _mate_queue351(a, "run_mate")
+    r = a.orq("gerente", "absorver")
+    assert r.returncode == 0, r.stderr
+    assert not _queue79(a) and not _log(a, "started.log"), "the item left the queue and the coordinator started nothing"
+    ev = a.events()
+    assert not [e for e in ev if e["tipo"] == "despacho_fila" and e["op"] == "desistiu"], "forwarding to the mate is not giving up"
+    assert [e["op"] for e in ev if e["tipo"] == "despacho_fila"][-1] == "mate", ev
+    (pedido,) = [e for e in ev if e["tipo"] == "mate_pedido"]
+    assert pedido["grupo"] == "orq" and pedido["fila"] == "fd351", pedido
+    cmd = f"orq dispatch --run run_mate --ticket 88 --model {SONNET} --effort medium --priority 1 --worktree current"
+    assert cmd in pedido["texto"], pedido["texto"]
+    assert any("request p1" in " ".join(e) for e in _sent_notices(a, "term_mate")), "the mate's terminal received the request"  # the typed text is cut at NOTICE_MAX; the event keeps it whole
+
+
+def test_ticket351_queue_item_of_the_coordinator_run_keeps_giving_up_after_three_errors():
+    a = _panel79()
+    _mate_queue351(a, "run_a")
+    for _ in range(orq_mod.QUEUE_FAILURES):
+        a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL=SONNET)
+    assert not _queue79(a) and [e["op"] for e in a.events() if e["tipo"] == "despacho_fila"][-1] == "desistiu"
+    assert not [e for e in a.events() if e["tipo"] == "mate_pedido"], "a Run the mate does not own never goes to it"
+
+
 def test_ticket79_real_system_reading_has_four_measures_on_macos():
     if sys.platform != "darwin":
         return
@@ -11012,6 +11325,27 @@ def test_ticket55_main_only_advances_by_fast_forward_after_the_tests():
     assert not os.path.exists(os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")), "worktree removida depois de entrar"
 
 
+def test_ticket216_a_red_night_replay_keeps_main_and_leaves_a_pending_line_the_manager_reads():
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    integrate, cycles = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integracao", "ciclos.log")
+    before = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrate, "um"], cwd=alive, env={**env, "ORQ_REPLAY": "false"}, capture_output=True, text=True)
+    assert r.returncode != 0 and "night replay failing" in r.stderr and g("rev-parse", "HEAD").stdout == before, r.stdout + r.stderr
+    (line,) = open(cycles).read().splitlines()
+    assert line.startswith("[PENDENTE: main did not advance, night replay failed]") and "integra/um" in line, line
+    cycles_before = orq_mod.CYCLES_LOG
+    orq_mod.CYCLES_LOG = cycles
+    try:
+        assert orq_mod._integrator_pending([])["linha"] == line, "the manager's ticket 137 reader turns it into a notice"
+    finally:
+        orq_mod.CYCLES_LOG = cycles_before
+    shutil.rmtree(os.path.join(env["ORQ_WT_DIR"], "integra-um"))
+    g("worktree", "prune")
+    g("branch", "-D", "integra/um")
+    r = subprocess.run([sys.executable, integrate, "um"], cwd=alive, env={**env, "ORQ_REPLAY": "true"}, capture_output=True, text=True)
+    assert r.returncode == 0 and re.search(r"night replay ok in \d+\.\d s", r.stdout), r.stdout + r.stderr
+
+
 def test_ticket55_advance_refuses_forgotten_conflict_marker():
     alive, env, g = _alive_repo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
     integrate = os.path.join(alive, "scripts", "integrar.py")
@@ -11027,6 +11361,26 @@ def test_ticket55_advance_refuses_forgotten_conflict_marker():
     r = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
     assert r.returncode == 0 and open(os.path.join(alive, "nota.txt")).read() == "a\num e dois\nc\n", r.stdout + r.stderr
 
+
+
+def test_ticket328_advance_after_a_conflict_only_in_tests_or_docs_runs_the_affected_tests():
+    light = {"um": {"README.md": "um\n", "x.txt": "1\n"}, "dois": {"README.md": "dois\n"}}
+    for branches, resolved, expected in ((light, "README.md", "affected"), ({"um": {"nota.txt": "um\n"}, "dois": {"nota.txt": "dois\n"}}, "nota.txt", "full")):
+        alive, env, g = _alive_repo55(branches)
+        integrate, wt = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integra-um-dois")
+        ran = os.path.join(alive, "..", "ran.txt")  # the tests run in the worktree, which goes away
+        env = {**env, "ORQ_TESTES": f"echo full > {ran}", "ORQ_TESTES_AFETADOS": f"echo affected > {ran}"}
+        r = subprocess.run([sys.executable, integrate, "um", "dois"], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode != 0 and "conflict" in r.stderr, r.stderr
+        open(os.path.join(wt, resolved), "w").write("um e dois\n")
+        g("commit", "-qam", "resolve", cwd=wt)
+        r = subprocess.run([sys.executable, integrate, "--avancar", wt], cwd=alive, env=env, capture_output=True, text=True)
+        assert r.returncode == 0 and open(ran).read() == expected + "\n", (expected, r.stdout + r.stderr)
+        assert ("running the affected tests" in r.stdout) == (expected == "affected"), r.stdout
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    ran = os.path.join(alive, "..", "ran.txt")
+    r = subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "um"], cwd=alive, env={**env, "ORQ_TESTES": f"echo full > {ran}"}, capture_output=True, text=True)
+    assert r.returncode == 0 and open(ran).read() == "full\n", "a cycle without a conflict runs the full suite once, on the final tree"
 
 def test_ticket55_hook_with_failed_import_exits_0_with_no_output_and_writes_the_log():
     t = tempfile.mkdtemp()
@@ -11611,7 +11965,7 @@ def test_mate_return_does_not_renotify_old_escalation_over_fifty():
         f.write("".join(json.dumps({"tipo": "entrada", "id": f"e{i}", "origem": "mate", "mate": "orq", "tipo_mate": "resumo", "texto": f"r{i}", "ts": _z(i)}) + "\n"
                         for i in range(1, 56)))
     with InProcess(a):
-        for _ in range(55):
+        for _ in range(2):  # one lap notifies the 55 and the next ones must notify nothing: a list capped at 50 re-notifies on the second (ticket 328: 55 laps took 175 s)
             orq_mod.mate_lap()
         assert orq_mod.mate_lap() == []
     texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
@@ -11642,6 +11996,205 @@ def test_mate_queue_drains_with_the_current_mate_terminal():
         finally:
             orq_mod.dispatch_worker = before
     assert seen_item["h"] == "term_mate_novo", seen_item
+
+
+# ---- ticket 323: the mate's Stop carries the group's obligations and open requests ----
+
+def _mate_stop(a, **env):
+    return a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}), ORQ_MATE="orq", **env)
+
+
+def _group_pr_env(**env):
+    """Env where task_feat1 was dispatched by the mate's Run: the PR it merges belongs to the group."""
+    a = _prs_env(ORQ_OBRIGACAO_MIN="0", **env)
+    _group(a)
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"terminal": "term_mate", "runs": ["run_mate"], "turnos": []}}}, f)
+    with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"ts": "2026-09-30T10:00:00Z", "tipo": "despacho", "task": "task_feat1", "run": "run_mate", "dispatch": "ctx_m1"}) + "\n")
+    return a
+
+
+def test_ticket323_group_pr_obligation_is_chased_in_the_mate_stop_and_fulfill_closes_it():
+    a = _group_pr_env()
+    e = _merge_main(a)
+    entry_event = next(x for x in a.events() if x.get("tipo") == "entrada" and x["id"] == e)
+    assert entry_event["grupo"] == "orq", entry_event
+    assert "decision" not in json.loads(_stop(a).stdout or "{}"), "the coordinator does not chase the group's obligation"
+    assert orq_mod.open_entries(a.events()) == [], "nor does it see the group's entry"
+    out = json.loads(_mate_stop(a).stdout)
+    assert out["decision"] == "block" and "Obligation open" in out["reason"] and f"{e} deploy" in out["reason"] and "orq fulfill" in out["reason"], out
+    for key_name in ("deploy", "comentario"):
+        assert a.orq("feito", e, key_name, "--prova", "v1", ORQ_MATE="orq").returncode == 0
+    assert a.orq("adiar", e, "limpeza", "--motivo", "depois", ORQ_MATE="orq").returncode == 0
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "closed by the mate: the Stop lets it through"
+
+
+def test_ticket323_group_obligation_shows_in_the_mate_prompt_and_not_in_the_coordinators():
+    a = _group_pr_env()
+    e = _merge_main(a)
+    notice = f"orq: PR #1282 entered main. Entry {e}."
+    assert f"To do by you: {e} →" in _ctx(a.prompt(notice, ORQ_MATE="orq"))
+    assert "To do by you" not in (a.prompt(notice).stdout or "")
+
+
+# ---- ticket 339: the merge notice of a group's PR goes to the mate as a request ----
+
+def _group_merge(mate):
+    """The 02/10 case: a PR of a task dispatched by the group's Run enters main; the manager panel runs one round."""
+    a = _group_pr_env(ORCA_TERMINAL_HANDLE="term_ger")
+    _multi(a, {"run_a": "term_ger"}, ["run_a"])
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"runs": ["run_mate"], "turnos": [], "sessao": "sess-mate", "cwd": a.home, **mate}}, "ausente": {"ligada_em": "2026-10-01T12:00:00Z"}}, f)
+    a.set("terminals.json", ["term_ger", "term_coord", *([mate["terminal"]] if mate.get("terminal") else [])])
+    a.set("screens.json", {"term_ret1": ["❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)"]})
+    e = _merge_main(a)
+    assert a.orq("gerente", "absorver").returncode == 0
+    return a, e
+
+
+def _mate_text(a):
+    return [_whole_notice(c[c.index("--text") + 1]) for c in _log(a, "send.log") if "--text" in c and c[c.index("--terminal") + 1] != "term_coord"]
+
+
+def test_ticket339_group_pr_merge_asks_the_mate_with_its_obligations_and_the_coordinator_sees_nothing():
+    a, e = _group_merge({"terminal": "term_mate"})
+    (text_value,) = _mate_text(a)
+    assert text_value.startswith("orq ▸ request p1") and "PR #1282 entered main" in text_value and f"Entry {e}" in text_value, text_value
+    for key_name in ("deploy", "comentario", "limpeza"):
+        assert key_name in text_value, (key_name, text_value)
+    assert "quave-one" in text_value and "errors Slack" in text_value and f"orq fulfill {e}" in text_value, text_value
+    assert not _sent_notices(a), "the coordinator is not typed the notice of the group's PR"
+    (p,) = [x for x in a.events() if x.get("tipo") == "mate_pedido"]
+    assert p["grupo"] == "orq" and p["corr"] == "p1", p
+    (closing,) = [x for x in a.events() if x.get("tipo") == "intake" and x.get("entrada") == e]
+    assert closing["efeito"] == "mate" and closing["ref"] == "p1", closing
+    assert orq_mod.open_entries(a.events()) == [] and "To do by you" not in (a.prompt("e agora?").stdout or "")
+    assert f"To do by you: {e} →" in _ctx(a.prompt("e agora?", ORQ_MATE="orq")), "the obligations stay the mate's"
+    assert a.orq("gerente", "absorver").returncode == 0 and len(_mate_text(a)) == 1, "once"
+
+
+def test_ticket339_group_pr_merge_wakes_a_sleeping_mate_instead_of_falling_back_to_the_coordinator():
+    a, e = _group_merge({"terminal": None, "dormiu": "2026-10-01T12:00:00Z"})
+    texts = _mate_text(a)
+    assert len(texts) == 2 and "secondmate of group orq" in texts[0] and texts[1].startswith("orq ▸ request p1") and f"Entry {e}" in texts[1], texts
+    assert not _sent_notices(a) and any(x.get("tipo") == "mate_acordou" for x in a.events())
+
+
+def test_ticket339_group_pr_merge_without_an_open_or_sleeping_mate_stays_with_the_coordinator():
+    a, e = _group_merge({"terminal": None})
+    assert not _mate_text(a) and not any(x.get("tipo") == "mate_pedido" for x in a.events())
+    (notice,) = _sent_notices(a)
+    assert f"Entry {e}" in notice[notice.index("--text") + 1], notice
+
+
+def _mate_requests(a, evs):
+    _mate_alive(a)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(x) + "\n" for x in evs))
+
+
+def test_ticket323_open_request_blocks_the_mate_stop_up_to_the_cap_and_then_releases_with_notice():
+    a = Env()
+    _group(a)
+    _mate_requests(a, _request())  # delivered long ago, no reply: the deadline is blown (state reenviar)
+    for _ in range(2):
+        out = json.loads(_mate_stop(a).stdout)
+        assert out["decision"] == "block" and "p1" in out["reason"] and "orq mate raise --corr p1" in out["reason"], out
+    out = json.loads(_mate_stop(a).stdout)
+    assert "decision" not in out and "p1" in out["systemMessage"], out
+    assert [x for x in a.events() if x["tipo"] == "gate_falhou"], "the spent budget leaves the event"
+
+
+def test_ticket323_answered_or_foreign_request_does_not_block_the_mate_stop():
+    a = Env()
+    _group(a)
+    answered = [*_request(), {"tipo": "entrada", "id": "e9", "origem": "mate", "mate": "orq", "corr": "p1", "ts": _z(15)}]
+    _mate_requests(a, answered)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}")
+    other_one = [{**x, "grupo": "dados"} for x in _request()]
+    _mate_requests(a, other_one)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "another group's request is not this mate's"
+    escalated = [*_request(), {"tipo": "mate_reenvio", "corr": "p1", "ts": _z(600)}, {"tipo": "mate_escalado", "corr": "p1", "ts": _z(900)}]
+    _mate_requests(a, escalated)
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}"), "already escalated: nothing left for the mate to do before stopping"
+
+
+def test_ticket323_mate_entry_without_effect_blocks_the_mate_stop():
+    a = Env()
+    _group(a)
+    a.prompt("trabalho do mate", ORQ_MATE="orq")
+    out = json.loads(_mate_stop(a).stdout)
+    assert out["decision"] == "block" and "without effect" in out["reason"] and "orq intake" in out["reason"], out
+    (entry_event,) = [e for e in a.events() if e.get("tipo") == "entrada"]
+    assert a.orq("intake", entry_event["id"], "conversation", ORQ_MATE="orq").returncode == 0
+    assert "decision" not in json.loads(_mate_stop(a).stdout or "{}")
+
+
+def test_ticket323_night_externals_and_question_guard_hold_in_the_mate():
+    a = Env(run="run_a")
+    _group(a)
+    ev = {"session_id": "abcdef123456", "tool_name": "AskUserQuestion", "tool_input": {"questions": []}}
+    out = json.loads(a.orq("hook", "guard", stdin=json.dumps(ev), ORQ_MATE="orq").stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "orq mate raise --type decision" in out["permissionDecisionReason"], out
+    _night(a)
+    for cmd in ("git push origin main", "gh pr merge 12 --squash"):
+        ev = {"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": "abcdef123456", "cwd": a.tmp.name}
+        out = json.loads(a.orq("hook", "externas", stdin=json.dumps(ev), ORQ_MATE="orq").stdout)["hookSpecificOutput"]
+        assert out["permissionDecision"] == "deny", cmd
+
+
+def test_ticket323_doctor_hooks_warns_when_project_settings_of_the_group_turn_hooks_off():
+    a = Env()
+    _group(a)
+    os.makedirs(os.path.join(a.home, ".claude"), exist_ok=True)
+    with open(os.path.join(a.home, ".claude", "settings.local.json"), "w") as f:
+        json.dump({"disableAllHooks": True}, f)
+    r = a.orq("doctor", "hooks")
+    assert r.returncode == 1 and "mate orq" in r.stdout and "disableAllHooks" in r.stdout, r.stdout + r.stderr
+
+
+def test_ticket323_request_escalation_tells_the_coordinator_when_the_mate_recorded_no_turn():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    evs = [*_request(), {"tipo": "mate_reenvio", "corr": "p1", "ts": _z(600)}]
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(x) + "\n" for x in evs))
+    with InProcess(a):
+        assert any("p1 escalated" in x for x in orq_mod.mate_lap())
+    texts = [c[c.index("--text") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert "no turn" in texts[0] and "orq doctor hooks" in texts[0], texts
+
+
+def test_ticket323_mate_prompt_absorbs_heartbeat_batches_and_shows_worker_done_whole():
+    a = Env()
+    _group(a)
+    a.inbox(_hb("lendo"))
+    out = json.loads(a.prompt(NOTICE_A, ORQ_MATE="orq").stdout)
+    assert out["decision"] == "block" and "heartbeats absorbed" in out["reason"], out
+    b = Env()
+    _group(b)
+    _delivery141(b, body="sem texto", branch="fix/da-caixa")
+    b.inbox(_hb("lendo"), ("worker_done", {"taskId": "task_t141", "dispatchId": "ctx_term_w1", "outcome": "succeeded", "branch": "fix/da-caixa"}))
+    _body182(b, "msg_2", "entreguei o ticket. " + "x" * 2000)
+    ctx = _ctx182(b.prompt(NOTICE_A, ORQ_MATE="orq"))
+    assert "msg_2 worker_done" in ctx and "entreguei o ticket." in ctx and "x" * 1400 in ctx and "1 heartbeat" in ctx and "lendo" not in ctx, ctx
+
+
+def test_ticket323_group_pr_notice_is_typed_into_the_mate_and_not_the_coordinator():
+    a = _group_pr_env()
+    _merge_main(a)
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    a.set("terminals.json", ["term_mate", "term_coord"])
+    with InProcess(a):
+        assert any("mate orq" in x for x in orq_mod.pr_notify())
+    targets = [c[c.index("--terminal") + 1] for c in (json.loads(x) for x in open(os.path.join(a.fake, "send.log"))) if "--text" in c]
+    assert targets == ["term_mate"], targets
 
 
 # ---- ticket 94: project files (ORQ_HOME/projects/<name>.json) ----
@@ -11860,6 +12413,96 @@ def test_ticket95_enqueued_request_carries_project_and_worktree_for_manager_to_r
     assert r.returncode == 0 and "Ticket 05 started" in r.stdout, r.stdout + r.stderr
     (arg,) = _log(a, "started.log")
     assert arg[arg.index("--repo") + 1] == "path:/r/p" and arg[arg.index("--worktree") + 1] == "new-top-level", arg
+
+
+# ---- ticket 315: the queue keeps the ticket's project; the service cwd never picks it ----
+
+def _two_projects315(a):
+    """Projects `a` and `b` on real repos; returns their folders."""
+    repo_a, repo_b = _repo95(a, "proj-a"), _repo95(a, "proj-b")
+    _project(a, "a", {"repo": "path:" + repo_a})
+    _project(a, "b", {"repo": "path:" + repo_b})
+    return repo_a, repo_b
+
+
+def _blocked315(a, header=""):
+    _tk105(a, "87", "Bloqueador", "claimed", task="task_87")
+    _tk105(a, "88", "Ticket do projeto", is_blocked="87", task="task_88", extra=MODEL105 + header)
+    _tasks105(a, ("task_87", "dispatched"), ("task_88", "blocked"))
+
+
+def test_ticket315_released_ticket_of_project_a_starts_in_a_with_the_service_cwd_in_b():
+    a = _panel79()
+    _manager(a)
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a, "Project: a\n")
+    r = a.orq("ticket", "fechar", "87", "--answer", "feito", cwd=repo_b)  # the coordinator is in B; the header says A
+    assert r.returncode == 0, r.stderr
+    (it,) = _queue79(a)
+    assert (it["projeto"], it["worktree"]) == ("a", "new-top-level") and it["nome"], it
+    r = a.orq("gerente", "absorver", cwd=repo_b)  # the service runs in B
+    assert r.returncode == 0 and "started" in r.stdout, r.stdout + r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a and arg[arg.index("--worktree") + 1] == "new-top-level", arg
+
+
+def test_ticket315_released_ticket_without_header_takes_the_project_of_the_coordinator_cwd():
+    a = _panel79()
+    _manager(a)
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a)
+    assert a.orq("ticket", "fechar", "87", "--answer", "feito", cwd=repo_a).returncode == 0
+    (it,) = _queue79(a)
+    assert it["projeto"] == "a", it
+    assert a.orq("gerente", "absorver", cwd=repo_b).returncode == 0
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a, arg
+
+
+def test_ticket315_dispatch_ticket_uses_the_project_of_its_header():
+    a = Env(run="run_a")
+    repo_a, repo_b = _two_projects315(a)
+    _blocked315(a, "Project: a\n")
+    _tk105(a, "89", "Solto", task="task_89", extra=MODEL105 + "Project: a\n")
+    _tasks105(a, ("task_89", "pending"))
+    r = a.orq("despachar", "--run", "run_a", "--ticket", "89", "--modelo", "claude-sonnet-5-5", "--effort", "medium", cwd=repo_b)
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--repo") + 1] == "path:" + repo_a, arg
+
+
+def test_ticket315_manager_refuses_an_item_without_project_instead_of_using_its_cwd():
+    a = _panel79()
+    _manager(a)
+    _, repo_b = _two_projects315(a)
+    _fleet79(a, live=[(f"Vivo {n}", SONNET) for n in range(4)])
+    out = json.loads(a.orq("despachar", "--run", "run_a", "--titulo", "Sem projeto", "--spec-arquivo", _spec(a), "--modelo", SONNET, "--effort", "medium",
+                           cwd=a.tmp.name).stdout)  # the coordinator is outside every project
+    assert out["estado"] == "enfileirado", out
+    (it,) = _queue79(a)
+    assert not it.get("projeto"), it
+    _release79(a, "term_v0")
+    r = a.orq("gerente", "absorver", cwd=repo_b)  # the manager sits inside project b: it must not adopt it
+    assert not _log(a, "started.log"), "nothing starts in the manager's cwd"
+    assert "without a project" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert len(_queue79(a)) == 1 and _queue79(a)[0]["falhas"] == 1, "the item stays and counts the failure until the queue gives up and warns the coordinator"
+
+
+def test_ticket315_ticket_new_writes_the_project_of_the_cwd_and_project_overrides_it():
+    a = Env(run="run_a")
+    repo_a, repo_b = _two_projects315(a)
+    n1 = json.loads(_new(a, "Do cwd", cwd=repo_a).stdout)["ticket"]
+    n2 = json.loads(_new(a, "Declarado", "--project", "b", cwd=repo_a).stdout)["ticket"]
+    assert "\nProject: a\n" in _read_text(a, n1) and "\nProject: b\n" in _read_text(a, n2)
+    assert _ticket_project315(a, n1) == "a" and _ticket_project315(a, n2) == "b"
+    n3 = json.loads(_new(a, "Fora de projeto", cwd=a.tmp.name).stdout)["ticket"]
+    assert "Project:" not in _read_text(a, n3), "no project found: no line"
+    r = _new(a, "Projeto que nao existe", "--project", "zzz")
+    assert r.returncode == 1 and "zzz" in r.stderr, r
+
+
+def _ticket_project315(a, number):
+    return orq_mod.read_ticket(_ticket(a, number))["projeto"]
 
 
 # ---------- orq perguntar: decision through Lavish in both harnesses (ticket 75) ----------
@@ -13012,7 +13655,7 @@ def test_ticket107_without_away_mode_a_held_notice_reaches_the_next_prompt():
     a = Env()
     with tempfile.TemporaryDirectory() as queue:
         before, dig = orq_mod.HOME, orq_mod.type_text
-        orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t: "rascunho"  # ticket 182: away off tries to type, and the draft holds it
+        orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t, *_: "rascunho"  # ticket 182: away off tries to type, and the draft holds it
         try:
             os.makedirs(a.home, exist_ok=True)
             _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
@@ -13941,12 +14584,54 @@ def test_ticket128_serve_install_writes_launchd_and_uninstall_removes_it():
     assert pl["ProgramArguments"][-2:] == ["gerente", "serve"] and pl["ProgramArguments"][1].endswith("orq.py"), pl
     assert pl["KeepAlive"] and pl["RunAtLoad"] and pl["EnvironmentVariables"]["ORQ_HOME"] == a.home, pl
     assert pl["StandardErrorPath"] == os.path.join(a.home, "logs", "gerente.log"), pl
+    assert pl["WorkingDirectory"] == orq_mod.orqpaths.CODE, "the service runs in orq's clone, not wherever launchd starts it (ticket 315)"
     assert not [k for k in pl["EnvironmentVariables"] if k.startswith("ORCA_")], "o handle do coordenador não vai para o launchd"
     assert json.loads(a.orq("gerente", "serve", "--status", **env).stdout)["instalado"]
     assert a.orq("gerente", "serve", "--desinstalar", **env).returncode == 0
     assert not os.path.exists(os.path.join(agents_dir, orq_mod.LAUNCHD_LABEL + ".plist"))
     call_list = open(os.path.join(t, "launchctl.log")).read()
     assert "bootstrap" in call_list and "bootout" in call_list, call_list
+
+
+def _fake_launchctl316(t):
+    lctl = os.path.join(t, "launchctl")
+    with open(lctl, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {t}/launchctl.log\n")
+    os.chmod(lctl, 0o755)
+    return lctl
+
+
+def test_ticket316_serve_stop_without_a_launchctl_fake_never_reaches_the_real_one():
+    a = Env(run="run_a")
+    t = os.path.dirname(a.home)
+    agents_dir = os.path.join(t, "LaunchAgents")
+    os.makedirs(agents_dir)
+    open(os.path.join(agents_dir, orq_mod.LAUNCHD_LABEL + ".plist"), "w").close()  # the plist exists, as the real one does on the machine
+    _fake_launchctl316(t)  # a launchctl on PATH: what `serve --stop` would have called
+    r = a.orq("gerente", "serve", "--parar", ORQ_LAUNCH_AGENTS=agents_dir, PATH=t + os.pathsep + os.environ["PATH"], ORQ_LAUNCHCTL="")
+    assert r.returncode != 0 and "ORQ_LAUNCHCTL" in r.stderr, (r.returncode, r.stderr)
+    assert not os.path.exists(os.path.join(t, "launchctl.log")), "o launchctl real (do PATH) foi chamado por um teste"
+
+
+def test_ticket316_every_launchctl_call_and_stop_records_its_caller():
+    a = Env(run="run_a")
+    t = os.path.dirname(a.home)
+    env = {"ORQ_LAUNCH_AGENTS": os.path.join(t, "LaunchAgents"), "ORQ_LAUNCHCTL": _fake_launchctl316(t)}
+    _manager(a)
+    p = _serve128(a)
+    try:
+        assert a.orq("gerente", "serve", "--instalar", cwd=t, **env).returncode == 0
+        assert a.orq("gerente", "serve", "--parar", cwd=t, **env).returncode == 0
+        p.wait(timeout=15)
+    finally:
+        p.kill()
+    assert a.orq("gerente", "serve", "--desinstalar", cwd=t, **env).returncode == 0
+    evs = [e for e in a.events() if e.get("tipo") == "launchd"]
+    assert [e["op"] for e in evs] == ["bootout", "bootstrap", "bootout", "stop", "bootout"], evs
+    for e in evs:
+        assert e["pid"] and e["ppid"] and e["parent"] and os.path.realpath(e["cwd"]) == os.path.realpath(t), e
+        assert e["argv"].endswith("orq.py gerente serve --instalar") or "--parar" in e["argv"] or "--desinstalar" in e["argv"], e
+    assert evs[3]["target"] == p.pid, "the stop names the pid it sent SIGTERM to"
 
 
 # ---- ticket 96: E2E queue and transcripts come from the project file ----
@@ -14349,9 +15034,9 @@ def test_ticket101_whole_backlog_reader_fits_the_hook_cap():
               "bloqueios": [f"t{n - 1}"] if n else [], "since": "2026-10-01", "closed": "2026-10-01", "corpo": f"spec: issues/{n}.md\norca: task_{n} run_{n}"} for n in range(600)]
     p = os.path.join(tempfile.mkdtemp(), "backlog.md")
     open(p, "w").write(backlog_mod.emit(item_list))
-    t0 = time.perf_counter()
+    t0 = time.process_time()  # the CPU the parse costs: wall time on a loaded machine (other suites, -j 4) also counts the waits for a core (ticket 328)
     read_handles = backlog_mod.read_value(p)
-    ms = (time.perf_counter() - t0) * 1000
+    ms = (time.process_time() - t0) * 1000
     assert len(read_handles) == 600 and ms < 40, f"{ms:.1f} ms para 600 itens: o teto do hook é 100 ms com tudo junto"
 
 
@@ -14802,6 +15487,39 @@ def test_it_should_be_that_the_pre_commit_refuses_main_of_the_live_checkout_but_
         assert "refused" not in subprocess.run(["sh", hook], cwd=wt, capture_output=True, text=True, env={**os.environ, "ORQ_INTEGRADOR": ""}).stderr
 
 
+def test_it_should_be_that_the_pre_commit_refuses_an_author_or_committer_outside_the_noreply():
+    hook = os.path.join(HERE, "githooks", "pre-commit")
+    with tempfile.TemporaryDirectory() as t:
+        repo, _ = _repo_git(t)
+        subprocess.run(["git", "-C", repo, "checkout", "-qb", "feat/x"], check=True)
+        env = {**os.environ, "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull, "ORQ_INTEGRADOR": "", "ORQ_TERMOS": os.path.join(t, "nao-existe.txt")}
+        run = lambda **e: subprocess.run(["sh", hook], cwd=repo, capture_output=True, text=True, env={**env, **e})  # noqa: E731
+        git = lambda *x: subprocess.run(["git", "-C", repo, "config", *x], check=True)  # noqa: E731
+        git("user.name", "Leo")
+        git("user.email", "noreply@orq.local")
+        r = run()
+        assert r.returncode == 1 and "git config user.email" in r.stderr and "noreply@orq.local" in r.stderr, r.stderr
+        git("user.email", "1+leo@users.noreply.github.com")
+        assert "not the project's noreply" not in run().stderr  # passes the identity check (the audience script is not in this temp repo)
+        r = run(GIT_COMMITTER_EMAIL="x@y.z")  # author fine, committer wrong
+        assert r.returncode == 1 and "GIT_COMMITTER_IDENT" in r.stderr, r.stderr
+        assert run(ORQ_AUTOR="2+other@users.noreply.github.com").returncode == 1  # the configured one wins over the pattern
+
+
+def test_it_should_be_that_a_dispatch_writes_user_name_and_email_into_the_worker_worktree():
+    a = Env(run="run_a")
+    with tempfile.TemporaryDirectory() as t:
+        wt = os.path.join(t, "wt")
+        subprocess.run(["git", "init", "-q", wt], check=True)
+        cfg = os.path.join(t, "gitconfig")
+        open(cfg, "w").write("[user]\n\tname = Leo\n\temail = 1+leo@users.noreply.github.com\n")
+        r = a.orq("despachar", "--run", "run_a", "--titulo", "Ajuste o widget", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium",
+                  cwd=t, FAKE_WT=wt, GIT_CONFIG_GLOBAL=cfg)
+        assert r.returncode == 0, r.stderr
+        got = subprocess.run(["git", "-C", wt, "config", "--local", "--get-regexp", "^user\\."], capture_output=True, text=True).stdout
+        assert "user.name Leo" in got and "user.email 1+leo@users.noreply.github.com" in got, got
+
+
 def _publication_repo(t):
     """Temporary repo with a noreply author and orq.py linked by symlink (the pre-push looks for it at the root); returns (repo, env, base)."""
     repo = os.path.join(t, "pub")
@@ -14998,6 +15716,87 @@ def test_ticket143_pr_open_main_only_after_staging_enters():
     assert r.returncode == 1 and "staging" in r.stderr and not _log143(a, "gh.log"), r
 
 
+# ---------- ticket 227: orq pr abrir audits the commits and the branch ----------
+
+def _repo227(t):
+    """(clone, g, env): origin with main, development and staging (same tip), a clone on a feature branch; noreply author, forbidden terms naming the product."""
+    env = {**os.environ, "ORQ_TERMOS": os.path.join(t, "termos.txt"), "ORQ_AUTOR": "", "GIT_CONFIG_GLOBAL": os.devnull}
+    open(env["ORQ_TERMOS"], "w").write("acmeapp\n")
+    run = lambda *x, **e: subprocess.run(list(x), capture_output=True, text=True, check=True, env={**env, **e}).stdout.strip()  # noqa: E731
+    origin, clone = os.path.join(t, "origin.git"), os.path.join(t, "clone")
+    run("git", "init", "-q", "--bare", "-b", "main", origin)
+    run("git", "clone", "-q", origin, clone)
+    g = lambda *x, **e: run("git", "-C", clone, *x, **e)  # noqa: E731
+    g("config", "user.name", "Leo")
+    g("config", "user.email", "1+leo@users.noreply.github.com")
+    g("checkout", "-q", "-b", "main")
+    open(os.path.join(clone, "f"), "w").write("x")
+    g("add", "f")
+    g("commit", "-qm", "chore: base")
+    for b in ("main", "development", "staging"):
+        g("push", "-q", "origin", f"main:{b}")
+    g("fetch", "-q", "origin")
+    g("checkout", "-q", "-b", "feat/x", "origin/main")
+    return clone, g, env
+
+
+def _commit227(clone, g, msg="feat: x", **e):
+    open(os.path.join(clone, "f"), "a").write("y")
+    g("commit", "-qam", msg, **e)
+
+
+def _guard227(clone, g, env, branch="feat/x"):
+    old = dict(os.environ)
+    os.environ.update({k: env[k] for k in ("ORQ_TERMOS", "ORQ_AUTOR", "GIT_CONFIG_GLOBAL")})
+    try:
+        return (orqlib.branch_guard(clone, branch, "main", "staging")
+                + orqlib.audit_publication([f"origin/development..{branch}"], clone, checks=("author", "trailer")))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+
+
+def test_ticket227_pr_open_audit_refuses_wrong_author_and_trailer_but_not_the_product_name():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        _commit227(clone, g, "feat: acmeapp checkout")  # product name in the message: only orq's own repo forbids it
+        assert _guard227(clone, g, env) == []
+        _commit227(clone, g, "feat: y", GIT_AUTHOR_EMAIL="noreply@anthropic.com")
+        assert "noreply@anthropic.com" in " ".join(_guard227(clone, g, env))
+        g("commit", "--amend", "-qC", "HEAD", "--reset-author")
+        _commit227(clone, g, "feat: z\n\nCo-Authored-By: Claude <noreply@anthropic.com>")
+        assert "Co-Authored-By" in " ".join(_guard227(clone, g, env))
+
+
+def test_ticket227_pr_open_guard_refuses_local_only_main_commit_and_the_environment_inside_the_feature():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        g("checkout", "-q", "main")
+        _commit227(clone, g, "fix: local only")  # on main, never pushed
+        g("checkout", "-q", "-b", "feat/x2")  # born from the local main
+        assert "only on the local main" in " ".join(_guard227(clone, g, env, "feat/x2"))
+        g("checkout", "-q", "-b", "feat/dev", "origin/main")
+        g("checkout", "-q", "-b", "stg", "origin/staging")
+        _commit227(clone, g, "feat: staging only")
+        g("push", "-q", "origin", "stg:staging")
+        g("fetch", "-q", "origin")
+        g("checkout", "-q", "feat/dev")
+        g("merge", "-q", "--no-edit", "origin/staging")
+        assert "origin/staging" in " ".join(_guard227(clone, g, env, "feat/dev"))
+        g("branch", "-m", "merge/dev-staging")
+        assert orqlib.branch_guard(clone, "merge/dev-staging", "main", "staging") == []
+
+
+def test_ticket227_pr_open_clean_branch_passes_and_lists_the_commits():
+    with tempfile.TemporaryDirectory() as t:
+        clone, g, env = _repo227(t)
+        _commit227(clone, g, "feat: one")
+        _commit227(clone, g, "fix: two")
+        assert _guard227(clone, g, env) == []
+        a = _open_pr143()
+        r = _open_pr(a, "--ambientes", "development")
+        assert r.returncode == 0 and "commit(s) go out" in r.stderr, r
+
+
 # ---------- ticket 142: Despacho: manual e Espera: integrador vazio ----------
 
 def _case_142(a, extra):
@@ -15050,6 +15849,13 @@ def _box140(a, runs=("run_a", "run_b"), bound="run_a"):
     a.env["ORCA_TERMINAL_HANDLE"] = "term_outro"  # the coordinator's terminal comes from orq's state, not from the env
 
 
+def _global_box336(a):
+    """Mirrors the fake mailbox into Orca's global inbox (`inbox --full`): the unread messages of every Run, as the real Orca lists them."""
+    box = json.load(open(os.path.join(a.fake, "mailbox.json")))["msgs"]
+    a.set("inbox.json", {"result": {"messages": [{k: v for k, v in m.items() if k not in ("status", "delivery", "gen")} | {"sequence": i + 1, "read": int(m["status"] == "acked")}
+                                                   for i, m in enumerate(box)]}})
+
+
 def test_ticket140_inbox_reads_and_acks_in_same_generation():
     a = Env()
     _box140(a)
@@ -15091,13 +15897,14 @@ def test_ticket171_inbox_with_ack_ingests_worker_done_and_manager_does_not_dupli
 
 
 
-def test_ticket140_inbox_of_other_run_restores_binding_to_previous():
+def test_ticket140_inbox_of_other_run_reads_without_binding_it():
     a = Env()
     _box140(a, bound="run_a")
     a.inbox(("worker_done", {"taskId": "task_b"}), run="run_b")
+    _global_box336(a)
     r = a.orq("caixa", "run_b", "--ack")
     assert r.returncode == 0 and "msg_1 worker_done" in r.stdout, (r.stdout, r.stderr)
-    assert _binds(a) == {"run_a": "term_coord", "run_b": None}, "o vínculo voltou ao Run em que o coordenador estava"
+    assert _binds(a) == {"run_a": "term_coord", "run_b": None} and not _log(a, "binds.log"), "ticket 336: o Run alheio não é ligado, nem para voltar"
 
 
 def test_ticket140_inbox_all_walks_runs_with_message():
@@ -15106,11 +15913,11 @@ def test_ticket140_inbox_all_walks_runs_with_message():
     a.inbox(("worker_done", {"taskId": "task_a"}), run="run_b")
     a.inbox(("escalation", {"taskId": "task_c"}), run="run_c")
     a.set("inbox.json", {"result": {"messages": [
-        {"id": "msg_1", "to_handle": "run:run_b", "read": 0, "sequence": 1}, {"id": "msg_2", "to_handle": "run:run_c", "read": 0, "sequence": 2}]}})
+        {"id": "msg_1", "to_handle": "run:run_b", "type": "worker_done", "read": 0, "sequence": 1}, {"id": "msg_2", "to_handle": "run:run_c", "type": "escalation", "read": 0, "sequence": 2}]}})
     r = a.orq("caixa", "--todas", "--ack")
     assert r.returncode == 0, r.stderr
     assert "run_b: 1" in r.stdout and "run_c: 1" in r.stdout and "run_a" not in r.stdout, r.stdout
-    assert set(a.states().values()) == {"acked"} and _binds(a)["run_a"] == "term_coord"
+    assert _binds(a) == {"run_a": "term_coord", "run_b": None, "run_c": None} and not _log(a, "binds.log")
 
 
 def test_ticket140_inbox_counts_heartbeat_without_listing_body():
@@ -15452,7 +16259,11 @@ def test_ticket218_a_set_over_the_limit_is_refused_and_becomes_a_pending_item():
 FAKE_NM146 = """#!/usr/bin/env python3
 import json, os, sqlite3, sys, time
 d = os.environ["FAKE_DIR"]
-open(os.path.join(d, "nm.log"), "a").write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "nm_home": os.environ.get("NM_HOME")}) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("no-mistakes version v1.86.0 (abc1234) 2026-10-01")
+    sys.exit(0)
+stdin = sys.stdin.read() if sys.argv[1:3] == ["axi", "run"] else None
+open(os.path.join(d, "nm.log"), "a").write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "nm_home": os.environ.get("NM_HOME"), "stdin": stdin}) + "\\n")
 if sys.argv[1:3] == ["axi", "run"]:
     con = sqlite3.connect(os.path.join(os.environ["NM_HOME"], "state.sqlite"))
     con.execute("create table if not exists agent_invocations (started_at integer, input_tokens integer, output_tokens integer, cache_read_tokens integer, cache_creation_tokens integer, finding_count integer)")
@@ -15502,7 +16313,8 @@ def test_ticket146_review_runs_only_review_in_task_worktree_with_orq_nm_home():
     assert init["args"] == ["init"] and init["cwd"] == os.path.realpath(a.wt), init
     assert run["args"][:2] == ["axi", "run"] and run["cwd"] == os.path.realpath(a.wt), run
     assert run["args"][run["args"].index("--skip") + 1] == "test,document,lint,push,pr,ci"
-    assert "Revisar so o review" in run["args"][run["args"].index("--intent") + 1] and "Acceptance criteria" in run["args"][run["args"].index("--intent") + 1]
+    assert run["args"][run["args"].index("--intent") + 1] == "-", "o intent vai por stdin, não pelo argv"
+    assert "Revisar so o review" in run["stdin"] and "Acceptance criteria" in run["stdin"]
     assert abort["args"] == ["axi", "abort"] and abort["cwd"] == os.path.realpath(a.wt), "a run parada no gate é abortada: a branch volta a ser do worker"
     assert run["nm_home"] == a.env["ORQ_NM_HOME"] != os.path.expanduser("~/.no-mistakes"), "o NM_HOME é o do orq"
     assert "claude-sonnet-5-5" in open(os.path.join(a.env["ORQ_NM_HOME"], "config.yaml")).read()
@@ -15518,6 +16330,48 @@ def test_ticket146_review_writes_nm_review_with_duration_findings_and_tokens():
     assert e["task"] == "task_term_r1" and e["modelo"] == "claude-sonnet-5-5" and e["achados"] == 1 and e["duracao_s"] >= 0, e
     assert e["tokens"] == {"entrada": 8, "saida": 200, "cache_lido": 1500000, "cache_criado": 165000} and "erro" not in e, e
     assert not os.path.exists(os.path.join(a.home, "revisao-nm.json")) or _read_state(os.path.join(a.home, "revisao-nm.json")) == [], "o slot foi solto"
+
+
+def _long_ticket224(a, extra_boilerplate=0, what=0):
+    path = os.path.join(a.env["ORQ_ISSUES"], "146-t.md")
+    t = open(path).read().replace("\nx\n", "\n" + "x" * what + "\n", 1)
+    open(path, "w").write(t + "\n## Worktree do orq\n\n" + "w" * extra_boilerplate + "\n\n## Answer\n\nz\n")
+
+
+def test_ticket224_review_passes_8kb_ticket_whole_through_stdin_with_acceptance_criteria():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, extra_boilerplate=8000)
+    assert a.orq("revisar", "146").returncode == 0
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert len(run["stdin"].encode()) > 8000 and "## Acceptance criteria\n\n- [ ] y" in run["stdin"] and "## Worktree do orq" in run["stdin"] and run["stdin"].rstrip().endswith("z"), "inteiro, sem corte"
+
+
+def test_ticket224_review_over_ceiling_drops_only_boilerplate_sections():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, extra_boilerplate=50000)
+    assert a.orq("revisar", "146").returncode == 0
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert "## What to build" in run["stdin"] and "## Acceptance criteria\n\n- [ ] y" in run["stdin"] and "Worktree do orq" not in run["stdin"] and "## Answer" not in run["stdin"], run["stdin"]
+    assert run["stdin"].startswith("Revisar so o review")
+
+
+def test_ticket224_review_refuses_when_what_to_build_and_criteria_still_pass_ceiling():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _long_ticket224(a, what=50000)
+    r = a.orq("revisar", "146")
+    assert r.returncode == 1 and "shorten the ticket" in r.stderr and not _log(a, "nm.log"), r
+
+
+def test_ticket224_review_event_has_intent_bytes_and_no_mistakes_version():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    assert a.orq("revisar", "146").returncode == 0
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    (run,) = [x for x in _log(a, "nm.log") if x["args"][:2] == ["axi", "run"]]
+    assert e["intent_bytes"] == len(run["stdin"].encode()) > 0 and e["nm_versao"].startswith("no-mistakes version v1.86.0"), e
 
 
 def test_ticket146_review_no_mistakes_failure_writes_error_and_exits_with_1():
@@ -15547,6 +16401,82 @@ def test_ticket146_review_task_without_dispatch_refuses():
     assert r.returncode == 1 and "has no dispatch" in r.stderr and not _log(a, "nm.log"), r
 
 
+# ---------- ticket 225: review loop with recorded decisions and the invariant on send-back ----------
+
+def _git225(wt, *args):
+    return subprocess.run(["git", "-C", wt, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _env225():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    _git225(a.wt, "init", "-q", "-b", "feat/x")
+    _git225(a.wt, "commit", "-q", "--allow-empty", "-m", "first")
+    return a
+
+
+def _intent225(a):
+    return _log(a, "nm.log")[-2]["stdin"]  # the intent goes through stdin since 224 (`--intent -`)
+
+
+def test_ticket225_review_intent_is_pure_and_unchanged_without_decisions_or_commits():
+    assert orq_mod.review_intent("base", [], []) == "base"
+    d = [{"achado": "a.py:1", "decisao": "ignorar", "motivo": "by design"}, {"achado": "a.py:1", "decisao": "corrigir"}, {"achado": "b.py:2", "decisao": "ignorar"}]
+    out = orq_mod.review_intent("base", d, ["abc123 fix x"])
+    assert "Decisions already taken, do not reopen" in out and "- b.py:2: ignorar" in out and "- a.py:1: corrigir" in out and "by design" not in out, out  # latest per finding
+    assert "## Commits since the last review" in out and "- abc123 fix x" in out
+    big = [{"achado": f"f{i}", "decisao": "ignorar", "motivo": "x" * 200} for i in range(40)]
+    sec = orq_mod.review_intent("", big, []).split("\n", 3)[3] if False else orq_mod.review_intent("", big, [])
+    assert len(sec) < orq_mod.NM_DECISIONS_MAX + 400 and "f39" in sec and "f0:" not in sec, "the budget drops the oldest"
+    assert orq_mod.parse_decision("a.py:3=ignorar:legacy: ok") == ("a.py:3", "ignorar", "legacy: ok")
+    try:
+        orq_mod.parse_decision("a.py:3=talvez")
+        raise AssertionError("accepted a bad decision")
+    except ValueError:
+        pass
+
+
+def test_ticket225_ignored_finding_shows_in_next_review_of_the_branch_and_not_in_another_branch():
+    a = _env225()
+    r = a.orq("revisar", "task_term_r1", "--decidir", "a.py:1=ignorar:by design", "--decidir", "b.py:2=corrigir")
+    assert r.returncode == 0, r.stderr
+    (e1, e2) = [e for e in a.events() if e["tipo"] == "achado_decisao"]
+    assert (e1["branch"], e1["achado"], e1["decisao"], e1["motivo"]) == ("feat/x", "a.py:1", "ignorar", "by design") and e2["decisao"] == "corrigir", (e1, e2)
+    assert not _log(a, "nm.log"), "--decidir does not run the review"
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    intent = _intent225(a)
+    assert "Decisions already taken" in intent and "- a.py:1: ignorar (by design)" in intent and "- b.py:2: corrigir" in intent, intent
+    _git225(a.wt, "checkout", "-q", "-b", "feat/other")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    assert "Decisions already taken" not in _intent225(a), "another branch does not inherit the decisions"
+
+
+def test_ticket225_commits_after_the_last_reviewed_head_get_their_section_and_otherwise_the_intent_is_unchanged():
+    a = _env225()
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    first = _intent225(a)
+    assert "Commits since" not in first and "Decisions already" not in first
+    (rev,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert rev["branch"] == "feat/x" and rev["head"] == _git225(a.wt, "rev-parse", "HEAD"), rev
+    assert a.orq("revisar", "task_term_r1").returncode == 0 and _intent225(a) == first, "no decision, no new commit: same intent"
+    _git225(a.wt, "commit", "-q", "--allow-empty", "-m", "fix: the finding")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    intent = _intent225(a)
+    assert "## Commits since the last review" in intent and "fix: the finding" in intent and "first" not in intent.split("## Commits since")[1], intent
+
+
+def test_ticket225_send_back_with_achado_carries_the_invariant_rule_and_without_it_does_not():
+    a = Env()
+    a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"}])
+    a.set("terminals.json", ["term_w0", "term_coord"])
+    _steer_env(a)
+    assert a.orq("devolver", "task_feita", "plain reason").returncode == 0
+    assert orq_mod.INVARIANT_RULE not in _sent(a)[-1][_sent(a)[-1].index("--body") + 1]
+    assert a.orq("devolver", "task_feita", "finding a.py:1", "--achado").returncode == 0
+    body = _sent(a)[-1][_sent(a)[-1].index("--body") + 1]
+    assert "finding a.py:1" in body and orq_mod.INVARIANT_RULE in body, body
+
+
 def test_ticket165_returned_delivery_leaves_stop_until_new_worker_done():
     from datetime import datetime, timezone
     now_at = datetime.now(timezone.utc)
@@ -15561,6 +16491,52 @@ def test_ticket165_returned_delivery_leaves_stop_until_new_worker_done():
     new = sent_back + [{"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m2"}]
     (r2,) = orq_mod.reassess([r], new, now_at, integration={})
     assert r2["estado"] == "entregue" and next_item([r2], new), "worker_done novo volta a ser entrega a integrar"
+
+
+# ---------- ticket 340: a delivery held on purpose (the 02/10 case: 214, 209 and 226 kept charging the Stop) ----------
+
+def test_ticket340_held_delivery_leaves_stop_and_notice_shows_reason_and_follow_up_inherits():
+    from datetime import datetime, timezone
+    now_at = datetime.now(timezone.utc)
+    ev = [{"tipo": "despacho", "dispatch": "d1", "task": "t1", "ticket": "50"}, {"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m1"}]
+    row = {"dispatch": "d1", "task": "t1", "estado": "entregue"}
+    next_item = lambda r, events: orq_mod.next_without_user(tks=[_tk126("50", "claimed")], agent_rows=r, integration={}, queue=[], events=events, cfg=orq_mod.machine_cfg(), without_push=0)
+    notice = lambda events: orq_mod.alive_line(events, {"agentes": [row]}, now_at)
+    assert "delivered ticket 50" in next_item([row], ev) and "Delivered, not released: 1" in notice(ev), "without the hold the Stop and the manager charge it"
+    held = ev + [{"tipo": "segurar", "ticket": "50", "dispatch": "d1", "task": "t1", "motivo": "waits for the 329 decision", "ts": "2026-10-02T12:00:00Z"}]
+    (r,) = orq_mod.reassess([row], held, now_at, integration={})
+    assert r["estado"] == "entregue" and r["segurada"]["motivo"] == "waits for the 329 decision"
+    assert next_item([r], held) is None and "Delivered, not released" not in notice(held), "held: out of the Stop and of the notice"
+    follow = held + [{"tipo": "despacho", "dispatch": "d2", "task": "t2", "ticket": "50"}, {"tipo": "worker_done", "dispatch": "d2", "task": "t2", "msg": "m2"}]
+    (r2,) = orq_mod.reassess([{"dispatch": "d2", "task": "t2", "estado": "entregue"}], follow, now_at, integration={})
+    assert r2["segurada"]["motivo"] == "waits for the 329 decision" and next_item([r2], follow) is None, "the follow-up of the ticket inherits the reason"
+    freed = held + [{"tipo": "segurar_solta", "ticket": "50", "dispatch": "d1", "task": "t1"}]
+    (r3,) = orq_mod.reassess([row], freed, now_at, integration={})
+    assert "segurada" not in r3 and "delivered ticket 50" in next_item([r3], freed), "--release puts it back in the queue of charges"
+    sent_back = held + [{"tipo": "devolver", "dispatch": "d1", "task": "t1"}, {"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m3"}]
+    (r4,) = orq_mod.reassess([row], sent_back, now_at, integration={})
+    assert "segurada" not in r4, "send-back (329) drops the hold: the redone delivery is charged again"
+
+
+def test_ticket340_hold_command_records_reason_shows_it_in_agents_and_release_undoes_it():
+    a = Env()
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "retained",
+                            "reason": "user_takeover", "ownership": "user_owned", "release": "retained", "release_reason": "user_takeover", "release_ownership": "user_owned"}])
+    a.set("runs.json", [{"id": "run_a", "objective": "A"}])
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "despacho", "dispatch": "ctx_term_w1", "task": "task_w1", "ticket": "50", "ts": "2026-10-02T10:00:00Z"}) + "\n")
+    assert a.orq("hold", "ctx_term_w1").returncode == 1, "no reason, no hold"
+    assert a.orq("hold", "ctx_fantasma", "--reason", "x").returncode == 1
+    assert a.orq("hold", "ctx_term_w1", "--release").returncode == 1, "nothing held to release"
+    r = a.orq("hold", "ctx_term_w1", "--reason", "waits for the 329 decision")
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "segurar"]
+    assert (ev["ticket"], ev["dispatch"], ev["motivo"]) == ("50", "ctx_term_w1", "waits for the 329 decision") and ev["ts"], ev
+    panel = a.orq("agents").stdout
+    assert "HELD: waits for the 329 decision (for " in panel and "orq hold task_w1 --release" in panel, panel
+    assert a.orq("hold", "task_w1", "--release").returncode == 0 and [e["tipo"] for e in a.events()][-1] == "segurar_solta"
+    assert "HELD" not in a.orq("agents").stdout
 
 
 def test_ticket165_steer_on_completed_task_suggests_orq_give_back():
@@ -15597,6 +16573,28 @@ def test_ticket177_give_back_accepts_delivered_dispatch_that_task_list_does_not_
         r = a.orq("devolver", target, "refaça")
         assert r.returncode == 0, (target, r.stderr)
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_0", "ctx_0"]
+def test_ticket335_send_back_resumed_terminal_carries_ticket_title():
+    a = Env(run="run_a")
+    _outage48(a)
+    a.set("workers.json", [_w48("term_w1", status="completed")])
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["esc to interrupt"]})
+    r = a.orq("devolver", "ctx_term_w1", "refaça")
+    assert r.returncode == 0, r.stderr
+    (c,) = _log(a, "create.log")
+    assert c[c.index("--title") + 1] == "Ticket 99 (resumed)", c
+
+
+def test_ticket335_refused_worker_done_after_resume_alerts_coordinator():
+    a = Env()
+    _reserve92(a)
+    assert a.orq("ingest").returncode == 0
+    (al,) = [e for e in a.events() if e["tipo"] == "alerta" and e["alerta"] == "entrega_recusada"]
+    assert (al["dispatch"], al["task"]) == ("ctx_92", "task_92") and "worker_done refused" in al["titulo"], al
+    a.orq("ingest")
+    assert len([e for e in a.events() if e.get("alerta") == "entrega_recusada"]) == 1, "o segundo ingest não repete"
+
+
 # ---------- ticket 155: an obligation orq can prove closes on its own ----------
 
 def _py155(a, code):
@@ -15929,12 +16927,7 @@ def test_ticket170_released_orq_ticket_raises_from_queue_with_worktree_current()
 
 
 def test_ticket170_released_project_ticket_raises_with_kebab_title_name_without_accents():
-    before = orq_mod.dispatch_project
-    orq_mod.dispatch_project = lambda item_name=None, run=None: "projeto-x"
-    try:
-        wt, item_name = orq_mod._released_worktree({"run": "run_a", "titulo": "Ação nº 3: relatório de variação muito longo para caber"})
-    finally:
-        orq_mod.dispatch_project = before
+    wt, item_name = orq_mod._released_worktree({"run": "run_a", "titulo": "Ação nº 3: relatório de variação muito longo para caber"}, "projeto-x")
     assert wt == "new-top-level" and item_name == "acao-no-3-relatorio-de-variacao-muito-lo" and len(item_name) <= 40, (wt, item_name)
 
 
@@ -16718,6 +17711,7 @@ def test_ticket176_live_dispatch_and_recent_worktree_stay_even_if_integrated():
 # --- ticket 129: commands, flags and values in English, the pt names as aliases ---
 
 PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, flag and choices value
+    ("limpar-residuos --aplicar --somente notices --linhas-de-teste", "clean --apply --only notices --test-lines"),
     ("feito e1 o1 --prova p", "fulfill e1 o1 --proof p"),
     ("fase t --json", "phase t --json"),
     ("adiar e1 o1 --motivo m", "defer e1 o1 --reason m"),
@@ -16730,9 +17724,13 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("pend edit x --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend edit x --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
     ("backlog mover 1 2 --grupo g", "backlog move 1 2 --group g"),
     ("devolver t m", "send-back t m"),
+    ("segurar t --motivo m", "hold t --reason m"),
     ("steer t txt --entrada e1", "steer t txt --entry e1"),
     ("pr ligar t http://u --nota n", "pr link t http://u --note n"),
+    ("pr abrir feat/x --titulo T --corpo b.md --sem-prova m", "pr open feat/x --title T --body b.md --no-proof m"),
+    ("integrar check feat/x --sem-prova m", "integrate check feat/x --no-proof m"),
     ("pr abrir d --titulo T --corpo c.md --ambientes a,b", "pr open d --title T --body c.md --environments a,b"),
+    ("pr evidencia 7 --antes a --depois d --cenarios c.json", "pr evidence 7 --before a --after d --scenarios c.json"),
     ("pr lista --task t", "pr list --task t"),
     ("pr desligar t http://u", "pr unlink t http://u"),
     ("pr poll --forcar", "pr poll --force"),
@@ -16778,6 +17776,8 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("integrar concluir --hash h b1 b2", "integrate conclude --hash h b1 b2"),
     ("auditar-publicacao a..b", "audit-publication a..b"),
     ("ticket novo --titulo T --spec-arquivo s.md --modelo m --despacho manual --espera e", "ticket new --title T --spec-file s.md --model m --dispatch manual --waiting e"),
+    ("onda novo X", "wave new X"),
+    ("onda lista --json", "wave list --json"),
     ("ticket fechar 1 --answer a", "ticket close 1 --answer a"),
     ("ticket editar 1 --modelo m --despacho d --espera e", "ticket edit 1 --model m --dispatch d --waiting e"),
     ("ticket lista --todos", "ticket list --all"),
@@ -16824,6 +17824,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("retro lacunas --json", "retro gaps --json"),
     ("retro rejeitar g --motivo m", "retro reject g --reason m"),
     ("retro aceitar g --ticket 3", "retro accept g --ticket 3"),
+("retro citacoes rel.md", "retro citations rel.md"),
     ("intake e1 tarefa", "intake e1 task"),
     ("intake e1 decisao", "intake e1 decision"),
     ("intake e1 conversa --nota n", "intake e1 conversation --note n"),
@@ -16831,6 +17832,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("hook lugar", "hook place"),
     ("hook externas", "hook external"),
     ("hook prligar", "hook prlink"),
+    ("provar-red 05", "prove-red 05"),
 ]
 
 
@@ -16877,7 +17879,8 @@ def test_ticket129_help_of_each_command_shows_en_with_pt_in_parentheses():
                 continue  # away, night, backlog: op is a positional choices, with no help line per value
             help_text = parent.format_help()
             for pt, en in tab.items():
-                assert f"{en} ({pt})" in help_text, (key_name, pt, en)
+                group = re.search(rf"\b{re.escape(en)} \(([^)]*)\)", help_text)  # `clean (limpar, limpar-residuos)`: one English name may carry several pt aliases
+                assert group and pt in [x.strip() for x in group.group(1).split(",")], (key_name, pt, en)
     finally:
         os.environ.pop("COLUMNS") if ant is None else os.environ.__setitem__("COLUMNS", ant)
 
@@ -17199,6 +18202,12 @@ def test_it_should_give_the_same_segments_for_a_command_with_and_without_rtk_or_
     assert cmdnorm.segments("echo 'git push'") == ["echo \"\""] and cmdnorm.segments("git commit -F - <<'EOF'\nx\ngit push\nEOF") == ["git commit -F -"]
 
 
+def _hook_in_process(a, fn, cmd, cwd):
+    """A PreToolUse Bash hook's verdict computed in this process (ticket 328: hundreds of subprocesses only to parse commands); the routing has its own tests."""
+    with InProcess(a):
+        return (fn({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": "s1", "cwd": cwd}, None) or {}).get("hookSpecificOutput")
+
+
 def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     _night(a)
@@ -17206,22 +18215,25 @@ def test_it_should_give_night_external_the_same_verdict_with_and_without_rtk():
         bare = cmd.removeprefix("rtk ")
         for pre in PREFIXES_250:
             for wrapped in (pre + bare, f"for b in a b; do {pre}{bare}; done", f"if true; then {pre}{bare}; fi"):
-                out = _external(a, wrapped)
+                out = _hook_in_process(a, orq_mod.hook_external, wrapped, a.tmp.name)
                 assert out and out["permissionDecision"] == "deny", wrapped
     for cmd in ("git status", "gh pr view 12", "git commit -m x"):
         for pre in PREFIXES_250:
-            assert _external(a, pre + cmd) is None, pre + cmd
+            assert _hook_in_process(a, orq_mod.hook_external, pre + cmd, a.tmp.name) is None, pre + cmd
+    assert _external(a, "rtk git push")["permissionDecision"] == "deny", "and through the hook"
 
 
 def test_it_should_give_place_the_same_verdict_with_and_without_rtk():
     a = Env(run="run_a")
     a.prompt("oi")
     p, _ = _repo(a.tmp.name, branch="feat/outra")
+    place = lambda cmd: (_hook_in_process(a, orq_mod.hook_place, cmd, p) or {}).get("additionalContext", "")  # noqa: E731
     for pre in PREFIXES_250:
         for cmd in ("git commit -m x", "git push", "git -C /r commit"):
-            assert "wrong place" in _notice(_place(a, p, cmd=pre + cmd)), pre + cmd
-            assert "wrong place" in _notice(_place(a, p, cmd=f"for b in a; do {pre}{cmd}; done")), pre + cmd
-        assert _notice(_place(a, p, cmd=pre + "git status")) == "", pre
+            assert "wrong place" in place(pre + cmd), pre + cmd
+            assert "wrong place" in place(f"for b in a; do {pre}{cmd}; done"), pre + cmd
+        assert place(pre + "git status") == "", pre
+    assert "wrong place" in _notice(_place(a, p, cmd="rtk git push")), "and through the hook"
 
 
 def test_it_should_give_the_worker_routing_guard_the_same_verdict_with_and_without_rtk():
@@ -17372,14 +18384,30 @@ def test_ticket182_worker_question_carries_the_msg_id_and_the_reply_command():
     assert "uso a coluna a ou b?" in ctx and 'orq reply msg_1 "' in ctx, ctx
 
 
-def test_ticket182_notice_from_another_run_reads_and_restores_the_link():
+def test_ticket182_notice_from_another_run_reads_without_taking_the_link():
     a = Env()
     _multi(a, {"run_a": "term_coord", "run_b": None})
     a.inbox(("escalation", {"taskId": "task_b"}), run="run_b")
     _body182(a, "msg_1", "travei no merge")
+    _global_box336(a)
     ctx = _ctx182(a.prompt("You have 1 orchestration message. Run `orca orchestration check --run run_b`."))
     assert "msg_1 escalation" in ctx and "travei no merge" in ctx, ctx
-    assert a.states() == {"msg_1": "acked"} and _binds(a)["run_a"] == "term_coord", _binds(a)
+    assert a.states() == {"msg_1": "unread"} and _binds(a) == {"run_a": "term_coord", "run_b": None}, _binds(a)
+
+
+def test_ticket336_notice_for_the_run_the_manager_holds_does_not_steal_it():
+    """02/10: the manager terminal held run_a (not yet in gerente.json) and the hook's `orq inbox run_a --ack` did `run-use` as the coordinator, so the
+    dispatch queue failed with "the dispatch is for Run run_a, which the coordinator does not command"."""
+    a = Env(run=None)
+    _multi(a, {"run_a": "term_ger", "run_b": None}, runs=[])
+    a.inbox(("worker_done", {"taskId": "task_1", "outcome": "succeeded"}), ("question", {"taskId": "task_1"}))
+    _body182(a, "msg_2", "uso a coluna a ou b?")
+    _global_box336(a)
+    ctx = _ctx182(a.prompt(NOTICE_A))
+    assert "msg_2 question" in ctx and "uso a coluna a ou b?" in ctx and 'orq reply msg_2 "' in ctx, ctx
+    assert _binds(a) == {"run_a": "term_ger", "run_b": None}, "o gerente continua com o Run"
+    assert not _log(a, "binds.log") and a.states() == {"msg_1": "unread", "msg_2": "unread"}, "nenhum run-use, nada confirmado por quem não comanda o Run"
+    assert [e["msg"] for e in a.events() if e["tipo"] == "worker_done"] == ["msg_1"], "o ingest do worker_done roda mesmo assim"
 
 
 def test_ticket182_read_failure_keeps_the_command_hint():
@@ -18003,7 +19031,7 @@ def test_ticket215_card_gap_that_opens_on_a_coordinator_stop_is_not_the_machine_
 
 
 def test_ticket215_without_the_new_events_the_report_is_the_old_one():
-    out = _away215(Env(run="run_a"), {"ts": D215 + "01:00:00Z", "tipo": "resumo", "texto": "Fechei o passo 1"})
+    out = _away215(Env(run="run_a"), {"ts": D215 + "01:00:00Z", "tipo": "resumo_add", "texto": "Fechei o passo 1"})
     assert "Summaries (1):" in out and "Fechei o passo 1" in out, out
     for title in ("Coordinator stopped", "Dispatch stops", "Dirty worktrees", "Not pushed", "Manager", "Log gap", "To paste"):
         assert title not in out, (title, out)
@@ -18489,6 +19517,1858 @@ def test_ticket201_doctor_finds_the_scratch_left_ready_in_a_phase_declared_integ
     assert found == [("01", True), ("04", False)], found
     r = a.orq("phase", "#2039 fase 1")
     assert r.returncode == 1 and "missing 04" in r.stdout, r.stdout
+# ---------- ticket 219: visual evidence of the PR ----------
+
+FAKE_GH219 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+a = sys.argv[1:]
+open(os.path.join(d, "gh.log"), "a").write(json.dumps(a) + "\\n")
+data = json.load(open(os.path.join(d, "gh.json")))
+state_file = os.path.join(d, "comments.json")
+comments = json.load(open(state_file)) if os.path.exists(state_file) else []
+body = next((x[5:] for x in a if x.startswith("body=")), None)
+if a[0] == "pr" and a[1] == "view":
+    print(json.dumps(data[a[2]]))
+elif "/contents/" in a[1]:
+    print(json.dumps({"type": "file", "size": 5}))
+elif a[1].endswith("/comments?per_page=100"):
+    print(json.dumps(comments))
+elif "/issues/comments/" in a[1]:
+    c = next(c for c in comments if str(c["id"]) == a[1].rsplit("/", 1)[1])
+    c["body"] = body
+    json.dump(comments, open(state_file, "w")); print(json.dumps(c))
+else:
+    c = {"id": len(comments) + 1, "body": body, "html_url": "https://github.com/acme/app/pull/300#issuecomment-%d" % (len(comments) + 1)}
+    json.dump(comments + [c], open(state_file, "w")); print(json.dumps(c))
+"""
+PR219 = "https://github.com/acme/app/pull/300"
+
+
+def _ui219(diff="web/app/page.tsx", evidence="y"):
+    a = _open_pr143()
+    with open(os.path.join(a.tmp.name, "git143"), "a") as f:
+        f.write('elif a[0] == "diff":\n    print(os.environ.get("FAKE_DIFF", ""))\n')
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json")) as f:
+        project = json.load(f)
+    with open(os.path.join(a.home, "projects", "tres-ambientes.json"), "w") as f:
+        json.dump({**project, "caminhos_ui": ["web/app/**"]}, f)
+    a.env["FAKE_DIFF"] = diff
+    open(a.body_text, "w").write(f"## Summary\nx\n\n## Evidence\n{evidence}\n\n## Merge Danger\nz\n")
+    return a
+
+
+def test_ticket219_pr_open_refuses_empty_evidence_when_diff_touches_ui_paths():
+    a = _ui219(evidence="")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 1 and "Evidence" in r.stderr and "web/app/page.tsx" in r.stderr, r
+    assert not [c for c in _log143(a, "git.log") if c[0] == "push"] and not _log143(a, "gh.log"), "nothing goes up"
+
+
+def test_ticket219_pr_open_accepts_na_with_reason_and_opens_no_obligation():
+    a = _ui219(evidence="n/a: copy change only")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    assert not [e for e in a.events() if e.get("tipo") == "obrigacao"]
+    a = _ui219(evidence="n/a:")
+    assert _open_pr(a, "--ambientes", "development").returncode == 1, "n/a without a reason is empty"
+
+
+def test_ticket219_pr_open_ignores_evidence_when_diff_has_no_ui_path():
+    a = _ui219(diff="server/x.py", evidence="")
+    assert _open_pr(a, "--ambientes", "development").returncode == 0
+
+
+def test_ticket219_pr_open_with_ui_diff_creates_the_evidencia_obligation():
+    a = _ui219()
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    (o,) = [e for e in a.events() if e.get("tipo") == "obrigacao" and e["op"] == "nova"]
+    assert (o["chave"], o["url"], o["task"]) == ("evidencia", PR219, "task_feat"), o
+
+
+def _evidence219(extra_obligation=True):
+    a = Env(run="run_a")
+    _neo(a)
+    path = os.path.join(a.tmp.name, "gh219")
+    open(path, "w").write(FAKE_GH219)
+    os.chmod(path, 0o755)
+    a.env["ORQ_GH"] = path
+    remote = os.path.join(a.tmp.name, "remote.git")
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    a.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{remote}.insteadOf", GIT_CONFIG_VALUE_0="https://github.com/acme/app.git")
+    a.remote = remote
+    _pr(a, PR219)
+    assert a.orq("pr", "ligar", "task_feat", PR219).returncode == 0
+    for side in ("antes", "depois"):
+        os.makedirs(os.path.join(a.tmp.name, side))
+        open(os.path.join(a.tmp.name, side, "home.png"), "wb").write(side.encode())
+    a.dirs = [os.path.join(a.tmp.name, "antes"), os.path.join(a.tmp.name, "depois")]
+    a.scenarios = os.path.join(a.tmp.name, "cenarios.json")
+    json.dump([{"name": "home", "before": "fail", "after": "pass", "live": True, "evidence": "home.png"},
+               {"name": "settings", "before": "untested", "after": "untested", "live": False}], open(a.scenarios, "w"))
+    if extra_obligation:
+        with open(os.path.join(a.home, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"tipo": "entrada", "id": "e900", "origem": "evidencia", "texto": "x", "task": "task_feat"}) + "\n")
+            f.write(json.dumps({"tipo": "obrigacao", "op": "nova", "entrada": "e900", "chave": "evidencia", "texto": "x", "task": "task_feat", "url": PR219}) + "\n")
+    return a
+
+
+def _evidence219_run(a):
+    return a.orq("pr", "evidencia", PR219, "--antes", a.dirs[0], "--depois", a.dirs[1], "--cenarios", a.scenarios)
+
+
+def _remote219(a, *args):
+    return subprocess.run(["git", "-C", a.remote, *args], capture_output=True, text=True).stdout.split()
+
+
+def test_ticket219_pr_evidence_creates_orphan_branch_pins_links_to_sha_and_comments_once():
+    a = _evidence219()
+    r = _evidence219_run(a)
+    assert r.returncode == 0, r.stderr
+    (sha,) = _remote219(a, "rev-parse", "evidence/pr-300")
+    assert _remote219(a, "rev-list", "--parents", "evidence/pr-300") == [sha], "orphan branch: one commit with no parent"
+    assert _remote219(a, "ls-tree", "-r", "--name-only", sha) == ["pr-300/after-home.png", "pr-300/before-home.png"]
+    comments = json.load(open(os.path.join(a.fake, "comments.json")))
+    assert len(comments) == 1 and f"blob/{sha}/pr-300/after-home.png?raw=true" in comments[0]["body"], comments
+    assert "## Evidence: inconclusive" in comments[0]["body"] and "not run live" in comments[0]["body"], comments[0]["body"]
+    assert f"ref={sha}" in open(os.path.join(a.fake, "gh.log")).read(), "each file is checked at the SHA"
+    r2 = _evidence219_run(a)
+    assert r2.returncode == 0 and len(json.load(open(os.path.join(a.fake, "comments.json")))) == 1, "re-running updates, does not duplicate"
+    assert _remote219(a, "rev-parse", "evidence/pr-300") == [sha], "same files, same commit"
+    open(os.path.join(a.dirs[1], "home.png"), "wb").write(b"changed")
+    assert _evidence219_run(a).returncode == 0
+    (new,) = _remote219(a, "rev-parse", "evidence/pr-300")
+    assert new != sha and _remote219(a, "rev-list", "--parents", new) == [new, sha, sha], "the old SHA stays in history"
+
+
+def test_ticket219_pr_evidence_closes_the_evidencia_obligation_with_the_comment_url():
+    a = _evidence219()
+    assert _evidence219_run(a).returncode == 0
+    (done,) = [e for e in a.events() if e.get("tipo") == "obrigacao" and e["op"] == "feito"]
+    assert (done["chave"], done["prova"]) == ("evidencia", PR219 + "#issuecomment-1"), done
+
+
+def test_ticket219_evidence_verdict_never_turns_untested_or_not_live_into_pass():
+    v = orq_mod.evidence_verdict
+    assert v([]) == "no-surface"
+    assert v([{"after": "pass", "live": True}]) == "go"
+    assert v([{"after": "pass", "live": False}]) == "inconclusive"
+    assert v([{"after": "untested", "live": True}]) == "inconclusive"
+    assert v([{"after": "pass", "live": True}, {"after": "fail", "live": True}]) == "no-go"
+def _base_runs(a, base, **by_name):
+    """The check runs on the tip of `base` as `gh api repos/acme/app/commits/<base>/check-runs` returns them: {name: (conclusion, completed_at)}."""
+    data = _log_json(a, "gh.json", {})
+    data[f"api:repos/acme/app/commits/{base}/check-runs?per_page=100"] = {"check_runs": [{"name": n, "conclusion": c, "completed_at": t} for n, (c, t) in by_name.items()]}
+    a.set("gh.json", data)
+
+
+def _prs_by_number(a):
+    return {i["numero"]: i for i in _read_state(os.path.join(a.home, "prs.json"))["itens"]}
+
+
+def test_ticket220_failure_also_red_on_the_base_tip_blocks_the_pr_by_the_base_not_the_pr():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("lint"), _ck("deploy-oci-tests", "FAILURE")])
+    _pr(a, PR2, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint", "FAILURE"), _ck("deploy-oci-tests", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-09-21T10:00:00Z"), "lint": ("success", "2026-09-21T10:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    prs = _prs_by_number(a)
+    assert prs[1216]["ci"]["falhas_na_base"] == ["deploy-oci-tests"] and prs[1216]["ci"]["base_vermelha_desde"] == "2026-09-21T10:00:00Z", prs[1216]["ci"]
+    assert orq_mod._blocked_by_base(prs[1216]["ci"]) and not orq_mod._blocked_by_base(prs[1220]["ci"]), "lint is red only in the PR"
+    r1, r2 = orq_mod._pr_reading(prs[1216]), orq_mod._pr_reading(prs[1220])
+    assert r1["marcas"] == [("⛔", "blocked by base: red on development: deploy-oci-tests")] and not r1["pronto"] and r1["bloqueada_pela_base"], r1
+    assert r2["marcas"] == [("✗", "lint"), ("✗", "already red on development: deploy-oci-tests")] and not r2["bloqueada_pela_base"], r2
+    assert len([c for c in _gh_calls(a) if c[0] == "api"]) == 1, "one call per repository and base, not per PR"
+
+
+def test_ticket220_failure_only_in_the_pr_stays_a_failure_and_a_green_or_unreadable_base_adds_nothing():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("lint", "FAILURE")])
+    _pr(a, PR2, "OPEN", "staging", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint", "FAILURE")])
+    _base_runs(a, "development", lint=("success", "2026-09-21T10:00:00Z"))  # staging: gh api answers 404
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    for i in _prs_by_number(a).values():
+        assert i["ci"]["falhas"] == ["lint"] and "falhas_na_base" not in i["ci"], i["ci"]
+        assert orq_mod._pr_reading(i)["marcas"] == [("✗", "lint")]
+
+
+def test_ticket220_cancelled_run_on_the_base_is_not_red_and_a_green_pr_never_reads_its_base():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("e2e", "FAILURE")])
+    _pr(a, PR2, "OPEN", "staging", mergeable="MERGEABLE", headRefName="feat/b", statusCheckRollup=[_ck("lint")])
+    _base_runs(a, "development", e2e=("cancelled", "2026-09-21T10:00:00Z"))
+    a.orq("pr", "ligar", "task_a", PR1)
+    a.orq("pr", "ligar", "task_b", PR2)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert "falhas_na_base" not in _prs_by_number(a)[1216]["ci"]
+    assert [c[1] for c in _gh_calls(a) if c[0] == "api"] == ["repos/acme/app/commits/development/check-runs?per_page=100"], "the green PR's base is not read"
+
+
+def test_ticket220_coordinator_is_told_once_with_since_when_the_base_is_red_and_again_only_after_it_cleared():
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("deploy-oci-tests", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-09-21T10:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    before, dig = orq_mod.HOME, orq_mod.type_text
+    sent = []
+    orq_mod.HOME, orq_mod.type_text = a.home, lambda h, t: sent.append(t) or "enviado"
+    try:
+        _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_c", "gerente": "term_g", "runs": []})
+        _away_on(a.home)
+        assert len(orq_mod.pr_notify()) == 1 and len(sent) == 1, sent
+        assert "PR #1216 blocked by development: deploy-oci-tests red there since 2026-09-21;" in sent[0], sent
+        assert orq_mod.pr_notify() == [] and len(sent) == 1, "once"
+        assert a.orq("pr", "poll", "--forcar").returncode == 0 and orq_mod.pr_notify() == [] and len(sent) == 1, "still red, same checks: no new notice"
+        _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="feat/a", statusCheckRollup=[_ck("deploy-oci-tests")])
+        assert a.orq("pr", "poll", "--forcar").returncode == 0 and "base_avisada" not in _prs_by_number(a)[1216], "cleared: the flag resets"
+    finally:
+        orq_mod.HOME, orq_mod.type_text = before, dig
+
+
+def test_ticket220_pr_1285_shape_pr_green_except_the_check_that_the_base_has_failed_for_weeks():
+    """PR #1285: its own jobs pass; deploy-oci-tests fails on the PR and on the base (71 of 91 runs since 21/08). The poll calls the base red and the PR blocked."""
+    a = Env(run="run_a")
+    _neo(a)
+    _gh(a)
+    _pr(a, PR1, "OPEN", "development", mergeable="MERGEABLE", headRefName="leodiegoo/ci-pr-1285-merge",
+        statusCheckRollup=[_ckw("web-pr-checks", "Web PR Checks"), _ckw("deploy-oci-tests", "Web Deploy Pipeline", "FAILURE")])
+    _base_runs(a, "development", **{"deploy-oci-tests": ("failure", "2026-08-21T09:00:00Z"), "web-pr-checks": ("success", "2026-10-01T09:00:00Z")})
+    a.orq("pr", "ligar", "task_a", PR1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    i = _prs_by_number(a)[1216]
+    assert i["ci"]["falhas"] == ["deploy-oci-tests"] and i["ci"]["falhas_na_base"] == ["deploy-oci-tests"] and i["ci"]["base_vermelha_desde"] == "2026-08-21T09:00:00Z"
+    assert orq_mod._pr_contract(i)["bloqueadaPelaBase"] is True
+# ---------- ticket 222: the proof pinned to the head ----------
+
+def _git222(repo, *args):
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", repo, *args], env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _commit222(repo, text_value, msg):
+    open(os.path.join(repo, "f"), "a").write(text_value)
+    _git222(repo, "add", "-A")
+    _git222(repo, "commit", "-qm", msg)
+    return _git222(repo, "rev-parse", "HEAD")
+
+
+def _repo222(base, branch="feat/orq-x"):
+    """Repository with `branch` carrying one commit on top of main. Returns (repo, sha of the branch)."""
+    repo = os.path.join(base, "repo222")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    _commit222(repo, "a\n", "base")
+    _git222(repo, "checkout", "-qb", branch)
+    return repo, _commit222(repo, "b\n", "feat: the delivery")
+
+
+def _queue222(a, branch, head, ticket="07"):
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "integrar-fila.json"), {"itens": [{"branch": branch, "ticket": ticket, "ts": "2026-01-01T00:00:00Z", **({"head": head} if head else {})}]})
+
+
+def test_ticket222_integrate_check_equal_head_passes_and_commit_after_the_proof_is_refused_with_the_list():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", head)
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 0 and not r.stderr, r
+    _commit222(repo, "c\n", "fix: sneaked in after the review")
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 1 and "sneaked in after the review (t)" in r.stderr and "orq review" in r.stderr and "--no-proof" in r.stderr, r
+    assert not [e for e in a.events() if e["tipo"] == "prova"], "recusar não grava nada"
+
+
+def test_ticket222_integrate_check_refuses_amend_and_no_proof_goes_ahead_and_records_the_reason():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", head)
+    _git222(repo, "commit", "-q", "--amend", "-m", "feat: amended")
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 1 and "not a descendant" in r.stderr, r
+    r = a.orq("integrar", "check", "feat/orq-x", "--sem-prova", "amended the message only")
+    assert r.returncode == 0 and "amended the message only" in r.stderr, r
+    (e,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (e["passo"], e["resultado"], e["motivo"], e["ticket"], e["anterior"]) == ("no_proof", "waived", "amended the message only", "07", head), e
+    assert e["head"] == _git222(repo, "rev-parse", "feat/orq-x")
+
+
+def test_ticket222_integrate_check_without_recorded_head_or_outside_the_queue_only_warns():
+    repo, _ = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _queue222(a, "feat/orq-x", None)
+    r = a.orq("integrar", "check", "feat/orq-x")
+    assert r.returncode == 0 and "no proven commit" in r.stderr, r
+    r = a.orq("integrar", "check", "main")
+    assert r.returncode == 0 and not r.stderr, "fora da fila: o integrador segue como antes"
+
+
+def test_ticket222_integrar_py_refuses_before_creating_the_worktree():
+    alive, env, g = _alive_repo55({"feat/b1": {"b1.txt": "1\n"}})
+    head = g("rev-parse", "feat/b1").stdout.strip()
+    g("checkout", "-q", "feat/b1")
+    open(os.path.join(alive, "b1.txt"), "a").write("2\n")
+    g("commit", "-qam", "after the review")
+    g("checkout", "-q", "main")
+    os.makedirs(env["ORQ_HOME"])
+    json.dump({"itens": [{"branch": "feat/b1", "ticket": "07", "ts": "2026-01-01T00:00:00Z", "head": head}]}, open(os.path.join(env["ORQ_HOME"], "integrar-fila.json"), "w"))
+    integrate = os.path.join(alive, "scripts", "integrar.py")
+    before = g("rev-parse", "HEAD").stdout
+    r = subprocess.run([sys.executable, integrate, "feat/b1"], cwd=alive, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "after the review" in r.stderr and not os.path.exists(env["ORQ_WT_DIR"]), r.stdout + r.stderr
+    r = subprocess.run([sys.executable, integrate, "feat/b1", "--sem-prova", "reviewed by hand"], cwd=alive, env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and g("rev-parse", "HEAD").stdout != before, r.stdout + r.stderr
+
+
+def test_ticket222_worker_done_records_the_head_in_the_queue_item_and_the_events():
+    repo, head = _repo222(tempfile.mkdtemp())
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, branch="feat/orq-x", commit=head)
+    assert a.orq("ingest").returncode == 0
+    (item,) = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
+    assert item["head"] == head, item
+    (e,) = [e for e in a.events() if e["tipo"] == "entrega_orq"]
+    assert e["head"] == head, e
+    (pv,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (pv["task"], pv["passo"], pv["head"], pv["resultado"]) == ("task_t141", "delivery", head, "ok"), pv
+
+
+def test_ticket222_worker_done_with_a_commit_that_is_not_in_the_branch_does_not_enter_the_queue():
+    repo, _ = _repo222(tempfile.mkdtemp())
+    _git222(repo, "checkout", "-q", "main")
+    _git222(repo, "checkout", "-qb", "feat/outra")
+    other = _commit222(repo, "x\n", "feat: other work")
+    a = Env(run="run_a", ORQ_REPOS=repo)
+    _delivery141(a, branch="feat/orq-x", commit=other)
+    assert a.orq("ingest").returncode == 0
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "nome de branch trocado: fica fora da fila"
+    (e,) = [e for e in a.events() if e["tipo"] == "entrega" and "wrong branch name" in str(e.get("avisos"))]
+    assert not [e for e in a.events() if e["tipo"] == "prova"], e
+
+
+def _open_pr222(wt_branch="feat/algo"):
+    a = _open_pr143(branch=wt_branch)
+    wt = os.path.join(a.tmp.name, "wt")
+    subprocess.run(["git", "init", "-q", "-b", "main", wt], check=True)
+    _commit222(wt, "a\n", "base")
+    _git222(wt, "checkout", "-qb", wt_branch)
+    head = _commit222(wt, "b\n", "feat: the work")
+    return a, wt, head
+
+
+def test_ticket222_pr_open_passes_on_the_proven_head_and_refuses_commits_after_it_and_amend():
+    a, wt, head = _open_pr222()
+    a.events_add = lambda **ev: open(os.path.join(a.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    a.events_add(tipo="prova", task="task_feat", passo="review", head=head, resultado="ok", ts="2026-01-01T00:00:00Z")
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0, r.stderr
+    _commit222(wt, "c\n", "fix: after the proof")
+    b, wt2, head2 = _open_pr222()
+    b.events_add = lambda **ev: open(os.path.join(b.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    b.events_add(tipo="prova", task="task_feat", passo="review", head=head2, resultado="ok", ts="2026-01-01T00:00:00Z")
+    _commit222(wt2, "c\n", "fix: after the proof")
+    r = _open_pr(b, "--ambientes", "development")
+    assert r.returncode == 1 and "fix: after the proof (t)" in r.stderr and "orq review" in r.stderr, r
+    assert not [c for c in _log143(b, "git.log") if c[0] == "push"] and not _log143(b, "gh.log"), "nada sobe"
+    r = _open_pr(b, "--ambientes", "development", "--sem-prova", "docs only")
+    assert r.returncode == 0 and "docs only" in r.stderr, r
+    (e,) = [e for e in b.events() if e["tipo"] == "prova" and e["passo"] == "no_proof"]
+    assert (e["task"], e["motivo"], e["anterior"]) == ("task_feat", "docs only", head2), e
+    c, wt3, head3 = _open_pr222()
+    c.events_add = lambda **ev: open(os.path.join(c.home, "events.jsonl"), "a").write(json.dumps(ev) + "\n")
+    c.events_add(tipo="prova", task="task_feat", passo="review", head=head3, resultado="ok", ts="2026-01-01T00:00:00Z")
+    _git222(wt3, "commit", "-q", "--amend", "-m", "feat: rewritten")
+    r = _open_pr(c, "--ambientes", "development")
+    assert r.returncode == 1 and "not a descendant" in r.stderr, r
+
+
+def test_ticket222_pr_open_without_a_recorded_head_only_warns():
+    a, wt, head = _open_pr222()
+    r = _open_pr(a, "--ambientes", "development")
+    assert r.returncode == 0 and "no proven commit" in r.stderr, r
+
+
+def test_ticket222_review_records_the_proof_at_the_worktree_head():
+    a = _env146()
+    _usage51(a, week=50, five_h=10)
+    subprocess.run(["git", "init", "-q", "-b", "main", a.wt], check=True)
+    head = _commit222(a.wt, "a\n", "feat: reviewed")
+    assert a.orq("revisar", "task_term_r1").returncode == 0
+    (pv,) = [e for e in a.events() if e["tipo"] == "prova"]
+    assert (pv["task"], pv["passo"], pv["head"], pv["resultado"]) == ("task_term_r1", "review", head, "findings"), pv
+    (e,) = [e for e in a.events() if e["tipo"] == "revisao_nm"]
+    assert e["head"] == head, e
+# ---------- ticket 216: the producer→consumer contract and the suite's isolation from the real log ----------
+
+# event type -> who reads it: the Stop (`hook_stop`) or the manager's wake-up (`wake_stopped`), with everything they call. The test rebuilds this table from the
+# code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
+# integrator never writes, with tests that wrote it by hand.
+EVENTOS_LIDOS = {
+    "alerta": "wake_stopped", "alerta_visto": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
+    "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
+    "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
+    "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
+    "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
+    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "resposta": "wake_stopped",
+    "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
+    "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
+    "clean_run": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
+    "segurar": "hook_stop wake_stopped", "segurar_solta": "hook_stop wake_stopped",
+}
+NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
+
+
+def _type_strings(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.IfExp):  # `{"tipo": "a" if c else "b"}` writes both
+        return _type_strings(node.body) + _type_strings(node.orelse)
+    return [s for x in node.elts for s in _type_strings(x)] if isinstance(node, (ast.Tuple, ast.List, ast.Set)) else []
+
+
+def _reads_type(node):
+    """`x.get("tipo")` or `x["tipo"]`."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args and _type_strings(node.args[0]) == ["tipo"]) or (
+        isinstance(node, ast.Subscript) and _type_strings(node.slice) == ["tipo"])
+
+
+def _reachable(defs, roots):
+    """The module-level functions and names reachable from `roots` through any name they load (calls, references, the hooks table)."""
+    seen, queue = set(), list(roots)
+    while queue:
+        n = queue.pop()
+        if n in seen or n not in defs:
+            continue
+        seen.add(n)
+        queue += [x.id for x in ast.walk(defs[n]) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)]
+    return seen
+
+
+def event_contract(source):
+    """({type: readers} of what hook_stop and wake_stopped compare `tipo` with, {types written by a `{"tipo": ...}` literal reachable from main}) of orqlib's source.
+    # ponytail: static, by name; a type built at runtime (`{"tipo": kind}`) is not seen, nor is a command the real flow never calls (the replay covers that)."""
+    tree = ast.parse(source)
+    defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    defs.update({t.id: n for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name) and t.id not in defs})
+    reads = {}
+    for root in ("hook_stop", "wake_stopped"):
+        for name in _reachable(defs, [root]):
+            for x in ast.walk(defs[name]):
+                if isinstance(x, ast.Compare) and _reads_type(x.left):
+                    for kind in (s for c in x.comparators for s in _type_strings(c)):
+                        reads.setdefault(kind, set()).add(root)
+    written = {s for name in _reachable(defs, ["main"]) for x in ast.walk(defs[name]) if isinstance(x, ast.Dict)
+               for k, v in zip(x.keys, x.values) if k is not None and _type_strings(k) == ["tipo"] for s in _type_strings(v)}
+    return reads, written
+
+
+def contract_gaps(source):
+    """What breaks the contract: a type read with nobody writing it, a read missing from EVENTOS_LIDOS, an entry nobody reads any more."""
+    reads, written = event_contract(source)
+    reads = {k: v for k, v in reads.items() if k not in NOT_EVENTS}
+    return ([f"{k}: read by {' '.join(sorted(v))} and no command writes it" for k, v in sorted(reads.items()) if k not in written]
+            + [f"{k}: read by {' '.join(sorted(v))}, missing from EVENTOS_LIDOS" for k, v in sorted(reads.items()) if k not in EVENTOS_LIDOS]
+            + [f"{k}: in EVENTOS_LIDOS and nobody reads it" for k in sorted(set(EVENTOS_LIDOS) - set(reads))]
+            + [f"{k}: EVENTOS_LIDOS says {EVENTOS_LIDOS[k]!r}, the code {' '.join(sorted(reads[k]))!r}" for k in sorted(set(EVENTOS_LIDOS) & set(reads))
+               if set(EVENTOS_LIDOS[k].split()) != reads[k]])
+
+
+def test_ticket216_every_event_the_stop_and_the_manager_read_has_a_real_producer():
+    assert contract_gaps(open(os.path.join(HERE, "orqlib.py")).read()) == []
+
+
+def test_ticket216_a_new_stop_read_of_an_event_nobody_writes_fails_the_contract():
+    source = open(os.path.join(HERE, "orqlib.py")).read().replace(
+        "def hook_stop(ev, run):\n", 'def hook_stop(ev, run):\n    [e for e in read_events() if e.get("tipo") == "evento_fantasma"]\n', 1)
+    assert contract_gaps(source) == ["evento_fantasma: read by hook_stop and no command writes it", "evento_fantasma: read by hook_stop, missing from EVENTOS_LIDOS"]
+
+
+def _real_logs():
+    """The live events.jsonl files a test must never touch: the clone's (the default ORQ_HOME since ticket 124) and the old install's."""
+    return [os.path.join(orqlib.orqpaths.main_checkout(HERE), "events.jsonl"), os.path.join(orqlib.orqpaths.LEGACY_LINK, "events.jsonl")]
+
+
+def log_snapshot(paths):
+    """{path: (size, sha256)} of each log that exists."""
+    out = {}
+    for p in paths:
+        with contextlib.suppress(OSError):
+            data = open(p, "rb").read()
+            out[p] = (len(data), hashlib.sha256(data).hexdigest())
+    return out
+
+
+
+
+def log_leaks(before):
+    """What the suite did to the real logs since `before`: rewritten (the old bytes changed) or a line from this run appended. The live coordinator, and the suites of
+    other worktrees, keep appending while it runs, so a new line alone is not a leak: only one carrying the name of a temporary folder this run created.
+    # ponytail: a leaked event with no path in it passes; a per-run marker in every event if that ever bites."""
+    out = []
+    for p, (size, digest) in before.items():
+        try:
+            data = open(p, "rb").read()
+        except OSError:
+            out.append(f"{p}: gone")
+            continue
+        if len(data) < size or hashlib.sha256(data[:size]).hexdigest() != digest:
+            out.append(f"{p}: rewritten during the suite")
+            continue
+        names = set(os.listdir(SUITE_TMP)) if os.path.isdir(SUITE_TMP) else set()  # every test folder lives inside the suite's one (ticket 328)
+        out += [f"{p}: test line appended: {x[:160]}" for x in data[size:].decode("utf-8", "replace").splitlines()
+                if any(n in names for n in re.findall(r"tmp[\w-]{8}", x))]
+    return out
+
+
+def test_ticket216_the_leak_check_catches_a_test_line_and_ignores_the_coordinator():
+    p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+    open(p, "w").write('{"ts": "2026-10-02T09:00:00Z", "type": "entry"}\n')
+    before = log_snapshot([p])
+    open(p, "a").write('{"ts": "2026-10-02T09:01:00Z", "type": "coordinator_answer"}\n')
+    assert log_leaks(before) == [], "the live coordinator's own line is not a leak"
+    open(p, "a").write(json.dumps({"type": "processes", "worktree": os.path.join(tempfile.mkdtemp(), "wt147")}) + "\n")
+    assert len(log_leaks(before)) == 1 and "wt147" in log_leaks(before)[0]
+    open(p, "w").write("")
+    assert log_leaks(before) == [f"{p}: rewritten during the suite"]
+
+
+# ---- ticket 221: orq proves the red of the new tests against the base ----
+
+def _red_repo(tmp, base_files, branch_files):
+    """A repository with `main` (base_files) and a branch `feat/x` (branch_files) on top of it."""
+    repo = os.path.join(tmp, "repo")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+
+    def commit(files, message):
+        for name, content in files.items():
+            os.makedirs(os.path.dirname(os.path.join(repo, name)), exist_ok=True)
+            with open(os.path.join(repo, name), "w") as f:
+                f.write(content)
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message], check=True)
+
+    commit(base_files, "base")
+    subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "feat/x"], check=True)
+    commit(branch_files, "feature")
+    return repo
+
+
+RED_BASE = {"mod.py": "def f():\n    return 1\n", "test_base.py": "import mod\nassert mod.f() == 1\n"}
+RED_BRANCH = {"mod.py": "def f():\n    return 2\n", "test_new.py": "import mod\nassert mod.f() == 2\n", "test_old.py": "import mod\nassert mod.f() in (1, 2)\n",
+              "test_bad.py": "assert False\n", "notes.txt": "x"}
+
+
+def test_ticket221_prove_red_tells_red_on_base_green_on_base_and_red_on_head():
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, RED_BRANCH)
+    r = orq_mod.prove_red(repo, "main", ["test_*.py"])
+    assert {f["arquivo"]: f["resultado"] for f in r["files"]} == {"test_new.py": "ok", "test_old.py": "green_on_base", "test_bad.py": "red_on_head"}, r
+    assert r["resultado"] == "green_on_base", "a file that proves nothing decides the overall result"
+    assert r["head"] == subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.count("\n") == 1, "the throwaway worktrees are gone"
+    assert open(os.path.join(repo, "mod.py")).read().endswith("return 2\n"), "the worker worktree is not touched"
+    assert orq_mod.prove_red(repo, "main", ["test_new.py"])["resultado"] == "ok"
+    assert orq_mod.prove_red(repo, "main", ["*.md"]) == {"head": r["head"], "files": [], "resultado": "no_tests"}
+
+
+def test_ticket221_prove_red_command_that_does_not_exist_or_times_out_is_unverifiable_not_a_base_failure():
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, RED_BRANCH)
+    r = orq_mod.prove_red(repo, "main", ["test_new.py"], "orq-no-such-command-221 {file}")
+    assert r["files"] == [{"arquivo": "test_new.py", "resultado": "unverifiable", "motivo": "exit 127"}] and r["resultado"] == "unverifiable", r
+    slow = orq_mod.prove_red(repo, "main", ["test_new.py"], "sleep 30 # {file}", timeout=1)
+    assert slow["files"][0]["resultado"] == "unverifiable" and slow["files"][0]["motivo"] == "timeout", slow
+    js = orq_mod.prove_red(_red_repo(tempfile.mkdtemp(), {"a.js": "x"}, {"a.unit-test.js": "x"}), "main", ["**/*.unit-test.js"])
+    assert js["files"][0]["resultado"] == "unverifiable" and "node_modules" in js["files"][0]["motivo"], js
+
+
+def test_ticket221_prove_red_links_node_modules_of_the_worker_worktree():
+    repo = _red_repo(tempfile.mkdtemp(), {"web/a.js": "x"}, {"web/a.unit-test.js": "x"})
+    os.makedirs(os.path.join(repo, "web", "node_modules"))
+    open(os.path.join(repo, "web", "node_modules", "seen"), "w").close()
+    r = orq_mod.prove_red(repo, "main", ["**/*.unit-test.js"], 'test -e web/node_modules/seen && test "$(basename "$PWD")" = head')
+    assert r["files"][0]["resultado"] == "ok", "linked in the base tree (red only because of the name) and in the head tree: " + str(r)
+
+
+def test_ticket221_glob_and_acceptance_citation():
+    assert orq_mod._glob_hit("a/b/test_x.py", "test_*.py") and orq_mod._glob_hit("web/x.unit-test.js", "**/*.unit-test.js") and orq_mod._glob_hit("x.unit-test.js", "**/*.unit-test.js")
+    assert not orq_mod._glob_hit("web/x.test.js", "**/*.unit-test.js") and not orq_mod._glob_hit("a/notest_x.py", "test_*.py")
+    tmp = tempfile.mkdtemp()
+    for name, body, expected in (("a.md", "# 1: x\n\n## Acceptance criteria\n- tests red→green\n", True), ("b.md", "# 1: x\n\n## Acceptance criteria\n- Red-Green tests\n", True),
+                                 ("c.md", "# 1: x\n\n## What to build\nred→green\n## Acceptance criteria\n- done\n", False),
+                                 ("d.md", "# 1: x\n\n## Acceptance criteria\n- done\n\n## Notes\nred to green\n", False)):
+        with open(os.path.join(tmp, name), "w") as f:
+            f.write(body)
+        assert orq_mod.cites_red_green(os.path.join(tmp, name)) is expected, name
+    assert orq_mod.cites_red_green(os.path.join(tmp, "missing.md")) is False
+
+
+def test_ticket221_project_file_tests_key_takes_a_list_or_globs_and_command():
+    a = Env()
+    os.makedirs(os.path.join(a.home, "projects"))
+    for name, tests in (("lista", ["**/*.unit-test.js"]), ("obj", {"globs": ["t_*.py"], "command": "python3 -m unittest {file}"}), ("ruim", "x"), ("vazia", [])):
+        with open(os.path.join(a.home, "projects", f"{name}.json"), "w") as f:
+            json.dump({"repo": "path:/x", "tests": tests}, f)
+    with open(os.path.join(a.home, "projects", "sem.json"), "w") as f:
+        json.dump({"repo": "path:/x"}, f)
+    with InProcess(a):
+        ps = orq_mod.projects()
+    assert ps["lista"]["tests"] == {"globs": ["**/*.unit-test.js"], "command": None}, ps["lista"]
+    assert ps["obj"]["tests"] == {"globs": ["t_*.py"], "command": "python3 -m unittest {file}"}, ps["obj"]
+    assert ps["ruim"]["tests"] is None and ps["vazia"]["tests"] is None and ps["sem"]["tests"] is None
+
+
+def test_ticket221_prove_red_with_test_placeholder_runs_each_added_test_on_its_own():
+    runner = "import sys, mod\n\n\ndef test_a():\n    assert mod.f() == 2\n\n\ndef test_b():\n    assert mod.f() in (1, 2)\n\n\nglobals()[sys.argv[1]]()\n"
+    repo = _red_repo(tempfile.mkdtemp(), RED_BASE, {"mod.py": "def f():\n    return 2\n", "test_multi.py": runner})
+    r = orq_mod.prove_red(repo, "main", ["test_*.py"], "python3 {file} {test}")
+    assert {f["arquivo"]: f["resultado"] for f in r["files"]} == {"test_multi.py::test_a": "ok", "test_multi.py::test_b": "green_on_base"}, r
+    assert orq_mod.prove_red(repo, "main", ["test_*.py"], "python3 {file} test_a")["files"][0]["arquivo"] == "test_multi.py", "no {test}: one row per file"
+
+
+def _ticket221(a, num="05", task="task_t221"):
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], f"{num}-orq-teste.md"), "w") as f:
+        f.write(f"# {num}: orq: teste\n\nStatus: claimed\nBlocked by: (nenhum)\nRun: run_a\nTask: {task}\n\n## What to build\n\nx\n\n## Acceptance criteria\n- testes red→green\n")
+
+
+def test_ticket221_prove_red_ticket_records_the_event_with_the_head_and_suggests_send_back_without_sending():
+    tmp = tempfile.mkdtemp()
+    repo = _red_repo(tmp, RED_BASE, RED_BRANCH)
+    a = Env()
+    _ticket221(a)
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t221", "dispatch": "ctx_w", "titulo": "orq: teste"})
+    with InProcess(a):
+        r = orq_mod.prove_red_ticket("05", worktree=repo)
+        orq_mod.prove_red_ticket("task_t221", worktree=repo, command="python3 {file}")
+        try:
+            orq_mod.prove_red_ticket("99", worktree=repo)
+            raise AssertionError("ticket that does not exist")
+        except ValueError as e:
+            assert "99" in str(e)
+    proofs = [e for e in a.events() if e["tipo"] == "red_proof"]
+    assert len(proofs) == 2 and proofs[0]["head"] == r["head"] and proofs[0]["task"] == "task_t221" and proofs[0]["resultado"] == "green_on_base", proofs
+    assert {f["arquivo"]: f["resultado"] for f in proofs[0]["files"]}["test_new.py"] == "ok"
+    (notice, _) = [e for e in a.events() if e["tipo"] == "entrega" and e.get("avisos")]
+    assert "test_old.py" in notice["avisos"][0] and "orq send-back task_t221" in notice["avisos"][0] and notice["dispatch"] == "ctx_w", notice
+    assert not [e for e in a.events() if e["tipo"] == "devolver"], "suggests, does not send back by itself"
+    out = a.orq("provar-red", "05", "--worktree", repo, "--comando", "python3 {file}")
+    assert out.returncode == 0 and "test_new.py: red on base / green on head" in out.stdout and "test_old.py: green on base (proves nothing)" in out.stdout, (out.stdout, out.stderr)
+
+
+def test_ticket221_delivery_of_ticket_citing_red_green_starts_the_proof_once():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    _delivery141(a)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "141-do-orq.md"), "a") as f:
+        f.write("\n## Acceptance criteria\n- red→green with a temporary repository\n")
+    started, real, env = [], orq_mod.red_proof_bg, dict(os.environ)
+    orq_mod.red_proof_bg = started.append
+    os.environ["ORQ_REPOS"] = a.env["ORQ_REPOS"]
+    try:
+        with InProcess(a):
+            orq_mod.ingest()
+            orq_mod.ingest()
+    finally:
+        orq_mod.red_proof_bg = real
+        os.environ.clear()
+        os.environ.update(env)
+    assert started == ["141"], "one proof per delivery, with the ticket number"
+    assert "grepping the source text" in orq_mod.SPEC_BLOCKS and "fail without the change" in orq_mod.SPEC_BLOCKS
+
+
+
+# ---------- manager alive with failing rounds warns the coordinator (ticket 229) ----------
+
+def _stamp229(a, name, seconds_ago):
+    p = os.path.join(a.home, name)
+    open(p, "w").close()
+    os.utime(p, (time.time() - seconds_ago,) * 2)
+
+
+def _failed_rounds229(a, n, **env):
+    for _ in range(n):
+        r = a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger", **{"FAKE_FAIL": "check", **env})
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+
+
+def _events229(a, kind):
+    return [e for e in a.events() if e["tipo"] == kind]
+
+
+def test_ticket229_alive_manager_whose_rounds_all_fail_warns_the_coordinator():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager(a)
+    _failed_rounds229(a, 1)
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert cfg["falhas_seguidas"] == 1 and "RuntimeError" in cfg["ultimo_erro"] and len(cfg["ultimo_erro"]) <= 200, cfg
+    assert time.time() - os.path.getmtime(os.path.join(a.home, orq_mod.PANEL_ALIVE)) < 5 and not os.path.exists(os.path.join(a.home, orq_mod.PANEL_OK))
+    _stamp229(a, orq_mod.PANEL_OK, 300)
+    ctx = _ctx105(a)
+    assert "alive, but no round finished well for 5 min" in ctx and "RuntimeError" in ctx, ctx
+
+
+def test_ticket229_error_in_one_run_does_not_stop_the_other_run_or_the_rest_of_the_round():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    _write_state(os.path.join(a.home, "gerente.json"), {"coordenador": "term_coord", "gerente": "term_ger", "runs": ["run_a", "run_b"]})
+    a.inbox(_hb("lendo"))
+    r = a.orq("gerente", "absorver", FAKE_FAIL_RUN="run_b")
+    assert r.returncode == 1 and "run_b: absorb failed" in r.stdout and "run_a:" in r.stdout, (r.stdout, r.stderr)
+    assert set(a.states().values()) == {"acked"}, "run_a was absorbed after/before run_b failed"
+    assert _read_state(os.path.join(a.home, "gerente.json"))["falhas_seguidas"] == 1
+    assert not os.path.exists(os.path.join(a.home, orq_mod.PANEL_OK)), "a round with a failed Run is not a good round"
+    assert _read_state(os.path.join(a.home, "gerente.json"))["ultimo_erro"].startswith("run_b:")  # the round got to its end (round_record) after the failed Run
+
+
+def test_ticket229_serve_counts_a_child_that_exits_1_and_a_good_round_clears_the_warning():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager(a)
+    code = ("import subprocess, orqlib\n"
+            "class R: returncode = 1; stdout = ''; stderr = 'Traceback\\nImportError: boom'\n"
+            "subprocess.run = lambda *x, **k: R()\n"
+            "orqlib.manager_serve(loops=1)\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=a.env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert cfg["falhas_seguidas"] == 1 and cfg["ultimo_erro"] == "ImportError: boom", cfg
+    _stamp229(a, orq_mod.PANEL_OK, 300)
+    assert "no round finished well" in _ctx105(a)
+    assert a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger").returncode == 0
+    cfg = _read_state(os.path.join(a.home, "gerente.json"))
+    assert not cfg.get("falhas_seguidas") and "ultimo_erro" not in cfg, cfg
+    assert "no round finished well" not in _ctx105(a) and "agent manager" not in _ctx105(a)
+
+
+def test_ticket229_gerente_falha_once_per_episode_and_recovered_on_the_next_good_round():
+    a = Env(run="run_a")
+    _manager(a)
+    _failed_rounds229(a, 5)
+    assert len(_events229(a, "gerente_falha")) == 1 and not _events229(a, "gerente_recuperado")
+    assert a.orq("gerente", "absorver", ORCA_TERMINAL_HANDLE="term_ger").returncode == 0
+    assert len(_events229(a, "gerente_recuperado")) == 1
+    _failed_rounds229(a, 2)
+    assert len(_events229(a, "gerente_falha")) == 1, "two failures are not an episode"
+    _failed_rounds229(a, 1)
+    assert len(_events229(a, "gerente_falha")) == 2, "a new episode after the recovery"
+
+
+def test_ticket229_slow_round_without_error_stays_slow_panel_not_failing_rounds():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_ger"])
+    _manager105(a, loops=[50, 55, 60])
+    _panel_touched(a, 100)  # alive within the limit but past 60 s
+    _stamp229(a, orq_mod.PANEL_OK, 100)
+    ctx = _ctx105(a)
+    assert "slow panel" in ctx and "no round finished well" not in ctx, ctx
+    _panel_touched(a, 5)  # alive fresh, no ok stamp and no recorded failure (fresh install)
+    os.remove(os.path.join(a.home, orq_mod.PANEL_OK))
+    assert "agent manager" not in _ctx105(a)
+
+
+def test_ticket229_panel_shell_touches_manager_ok_only_when_absorb_exits_0():
+    for orq_body, expect_ok in (('[ "$2" = absorb ] && exit 1; [ "$2" = interval ] && echo 1', False), ('[ "$2" = interval ] && echo 1; exit 0', True)):
+        with tempfile.TemporaryDirectory() as t:
+            bin_ = os.path.join(t, "bin")
+            os.makedirs(bin_)
+            for item_name, body_text in (("orq", orq_body), ("clear", ":"), ("sleep", "kill $PPID")):
+                with open(os.path.join(bin_, item_name), "w") as f:
+                    f.write("#!/bin/sh\n" + body_text + "\n")
+                os.chmod(os.path.join(bin_, item_name), 0o755)
+            home = os.path.join(t, "orq")
+            os.makedirs(home)
+            subprocess.run(["sh", os.path.join(HERE, "painel-agent-manager.sh")], env={**os.environ, "PATH": bin_ + os.pathsep + os.environ["PATH"], "ORQ_HOME": home},
+                           capture_output=True, timeout=20)
+            assert os.path.exists(os.path.join(home, "manager-alive"))
+            assert os.path.exists(os.path.join(home, "manager-ok")) is expect_ok
+
+# ---------- ticket 230: the Stop, the prompt and the SessionStart of the coordinator bring the dead manager back up on their own ----------
+
+def _dead_manager(a):
+    """Manager bound to term_ger, whose terminal vanished from Orca, with the panel stamp old (the check is due)."""
+    _manager(a)
+    a.set("terminals.json", ["term_coord"])
+    _panel_touched(a, 200)
+
+
+def _creates(a):
+    return _log(a, "create.log")
+
+
+def test_ticket230_stop_hook_brings_the_dead_manager_back_up_on_its_own():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    r = a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert r.returncode == 0, r.stderr
+    (c,) = _creates(a)
+    assert c[c.index("--command") + 1] == f"sh {os.path.join(a.home, 'painel-agent-manager.sh')}", c
+    assert _read_state(os.path.join(a.home, "gerente.json")) == {"coordenador": "term_coord", "gerente": "term_ret1", "runs": ["run_a"]}
+    (e,) = [e for e in a.events() if e.get("tipo") == "gerente" and e.get("op") == "subiu_sozinho"]
+    assert e["terminal"] == "term_ret1" and e["anterior"] == "term_ger", e
+    assert not os.path.exists(os.path.join(a.fake, "send.log")), "nothing is typed over the coordinator"
+    assert "agent manager came back up on its own (terminal term_ret1)" in _context(a), "the next prompt's context carries the line"
+
+
+def test_ticket230_session_start_and_prompt_hooks_do_the_same():
+    for hook in ("session", "prompt"):
+        a = Env(run="run_a")
+        _dead_manager(a)
+        stdin = {"session_id": "abcdef123456", "source": "startup", "hook_event_name": "SessionStart", "prompt": "oi"}
+        assert a.orq("hook", hook, stdin=json.dumps(stdin)).returncode == 0
+        assert len(_creates(a)) == 1, hook
+
+
+def test_ticket230_nothing_to_do_with_fresh_stamp_live_terminal_or_unreadable_list():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    _panel_touched(a, 20)  # fresh stamp: not even the Orca list is asked
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert not _terminal_lists(a) and not _creates(a)
+    b = Env(run="run_a")
+    _dead_manager(b)
+    b.set("terminals.json", ["term_coord", "term_ger"])  # alive: only the panel stopped
+    b.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert _terminal_lists(b) and not _creates(b)
+    c = Env(run="run_a")
+    _dead_manager(c)
+    open(os.path.join(c.fake, "terminals_truncados"), "w").close()  # unreadable list proves nothing
+    c.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    assert _terminal_lists(c) and not _creates(c)
+    assert _read_state(os.path.join(c.home, "gerente.json"))["gerente"] == "term_ger"
+
+
+def test_ticket230_two_concurrent_checks_create_a_single_terminal():
+    a = Env(run="run_a", FAKE_SLEEP_CMD="create:1")  # the first one is still inside `terminal create` when the second one arrives
+    _dead_manager(a)
+    procs = [subprocess.Popen([sys.executable, ORQ, "manager", "check"], env=a.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    for p in procs:
+        p.communicate(timeout=30)
+    assert len(_creates(a)) == 1, _creates(a)
+    assert len([e for e in a.events() if e.get("op") == "subiu_sozinho"]) == 1
+
+
+def test_ticket230_a_second_check_after_the_respawn_finds_the_new_manager_alive_and_creates_nothing():
+    a = Env(run="run_a")
+    _dead_manager(a)
+    assert a.orq("manager", "check").returncode == 0 and len(_creates(a)) == 1
+    assert json.loads(a.orq("manager", "check").stdout)["morto"] is False and len(_creates(a)) == 1
+
+
+def test_ticket230_three_failed_attempts_leave_only_the_manual_notice_and_retries_wait_5_min():
+    a = Env(run="run_a", FAKE_FAIL="create")
+    _dead_manager(a)
+
+    def tries():
+        return _read_state(os.path.join(a.home, "manager-respawn.json"))["tentativas"]
+
+    def check_after(seconds):
+        _respawn_state(a, attempts=tries(), seconds_ago=seconds)
+        a.orq("manager", "check")
+        return tries()
+    a.orq("manager", "check")
+    assert tries() == 1
+    a.orq("manager", "check")
+    assert tries() == 1, "a new attempt before 5 min does not happen"
+    assert check_after(100) == 1
+    assert check_after(301) == 2
+    assert check_after(301) == 3
+    assert check_after(10_000) == 3 and not _creates(a), "after the 3rd failure only the manual notice is left"
+    ctx = _context(a)
+    assert "failed 3 times" in ctx and "orq manager spawn" in ctx and "on its own (" not in ctx, ctx
+
+
+def test_ticket230_the_manager_of_another_live_coordinator_is_never_taken():
+    a = Env(run="run_a")
+    a.set("terminals.json", ["term_coord", "term_old"])  # term_old is a live coordinator; its manager vanished
+    os.makedirs(a.home, exist_ok=True)
+    value = {"coordenador": "term_old", "gerente": "term_ger_old", "runs": ["run_a"]}
+    _write_state(os.path.join(a.home, "gerente.json"), value)
+    _panel_touched(a, 200)
+    a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456"}))
+    a.orq("manager", "check")
+    assert not _creates(a) and _read_state(os.path.join(a.home, "gerente.json")) == value
+
+
+def test_ticket230_the_panel_notice_says_it_is_spawning_on_its_own_while_attempts_remain():
+    a = Env(run="run_a", FAKE_FAIL="create")
+    _dead_manager(a)
+    a.orq("manager", "check")  # the attempt fails: the dead terminal stays in gerente.json and the check says morto
+    assert "bringing it back up on its own (attempt 1 of 3" in _context(a)
+
+
+def test_ticket230_stop_and_prompt_hooks_stay_under_100_ms_with_a_slow_orca():
+    a = Env(run="run_a", ORQ_NO_BG="", FAKE_SLEEP="0.5")
+    _dead_manager(a)
+    ev = {"session_id": "abcdef123456", "prompt": "oi"}
+    before = dict(os.environ), orq_mod.HOME
+    os.environ.update(a.env)
+    orq_mod.HOME = a.home
+    try:
+        t = time.perf_counter()
+        orq_mod.check_manager_bg()  # what the Stop and the prompt add: stamps and a Popen, never Orca
+        spent = time.perf_counter() - t
+    finally:
+        orq_mod.HOME = before[1]
+        os.environ.clear()
+        os.environ.update(before[0])
+    assert spent < 0.1, f"check_manager_bg took {spent:.3f} s"
+    for _ in range(100):  # the child, in the background, did the work
+        if _creates(a):
+            break
+        time.sleep(0.1)
+    assert len(_creates(a)) == 1
+
+
+# ---------- ticket 342: waves and milestones (the delivery order as layers of the backlog) ----------
+
+def _wave_new(a, name):
+    r = a.orq("wave", "new", name)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def test_ticket342_wave_of_three_parallel_tasks_waits_for_the_milestone_and_leaves_together():
+    a = _env_tk()
+    assert _wave_new(a, "Base") == {"wave": 1, "milestone": "01", "join": "02"}
+    it = _bl_items(a)
+    assert (it["t01"]["estado"], it["t02"]["estado"], it["t02"]["bloqueios"]) == ("done", "queued", ["t01"]), "wave 1 has no one to wait for; an empty join does not close"
+    assert _meta_tk(it["t01"]) == {"wave": "1", "role": "milestone"} and it["t01"]["titulo"] == "Wave 1: Base (milestone)"
+    first = json.loads(_new(a, "Foundation", "--wave", "1").stdout)["ticket"]
+    assert first == "03" and _bl_items(a)["t03"]["bloqueios"] == ["t01"] and _bl_items(a)["t02"]["bloqueios"] == ["t01", "t03"]
+    assert _wave_new(a, "Core") == {"wave": 2, "milestone": "04", "join": "05"}
+    parallel = [json.loads(_new(a, f"Parallel {k}", "--wave", "2").stdout)["ticket"] for k in (1, 2, 3)]
+    assert parallel == ["06", "07", "08"]
+    it = _bl_items(a)
+    assert it["t04"]["bloqueios"] == ["t02"], "the milestone of wave 2 waits for the join of wave 1"
+    assert all(it[f"t{n}"]["bloqueios"] == ["t04"] for n in parallel), "the three are blocked by the same milestone"
+    assert it["t05"]["bloqueios"] == ["t04", "t06", "t07", "t08"], "the join waits for the milestone and for the three"
+    ready = {i["id"] for i in backlog_mod.ready(list(it.values()))}
+    assert not ready & {"t04", "t06", "t07", "t08"}, ready
+    status = a.orq("status").stdout
+    assert "wave 1 Base: open, 0/1 integrated; open: 03" in status and "wave 2 Core: waiting, 0/3 integrated; waits for 02; open: 06, 07, 08" in status, status
+    out = json.loads(a.orq("ticket", "fechar", "03", "--answer", "integrated").stdout)
+    assert out["ondas"] == ["02"], "the last task of wave 1 closes its join, which closes wave 2's milestone"
+    it = _bl_items(a)
+    assert [it[k]["estado"] for k in ("t02", "t04")] == ["done", "done"]
+    ready = {i["id"] for i in backlog_mod.ready(list(it.values()))}
+    assert {"t06", "t07", "t08"} <= ready, "the three leave together when the milestone closes"
+    assert it["t05"]["estado"] == "queued"
+    for n in ("06", "07"):
+        a.orq("ticket", "fechar", n, "--answer", "integrated")
+        assert _bl_items(a)["t05"]["estado"] == "queued", "the join closes only with the three integrated"
+    a.orq("ticket", "fechar", "08", "--answer", "integrated")
+    assert _bl_items(a)["t05"]["estado"] == "done"
+    assert "wave 2 Core: closed, 3/3 integrated" in a.orq("status").stdout
+    assert _new(a, "Late", "--wave", "2").returncode == 1, "a closed wave takes no more tasks"
+
+
+def test_ticket342_after_names_the_wave_by_its_milestone_and_refuses_what_is_not_one():
+    a = _env_tk()
+    _wave_new(a, "Base")
+    _new(a, "Not a milestone")
+    assert _new(a, "Via after", "--after", "01").returncode == 0
+    assert _bl_items(a)["t04"]["bloqueios"] == ["t01"] and _bl_items(a)["t02"]["bloqueios"] == ["t01", "t04"]
+    r = _new(a, "Wrong", "--after", "03")
+    assert r.returncode == 1 and "not one" in r.stderr, r.stderr
+    r = _new(a, "No wave", "--wave", "9")
+    assert r.returncode == 1 and "wave 9 does not exist" in r.stderr, r.stderr
+    assert _new(a, "Outside the backlog", "--wave", "1", ORQ_BACKLOG_TICKETS="").returncode == 1
+
+
+# ---------- ticket 328: the runner (parallel, durations, suite queue, test map) ----------
+
+SUITE_QUEUE = CALLER_ENV.get("ORQ_SUITE_QUEUE") or os.path.expanduser("~/.cache/orq-suite/queue")  # the caller's, read before the strip
+
+
+def _private_paths():
+    """The machine paths each test gets of its own, so tests in parallel never share them (ticket 328): the orq link and Codex's config and hooks."""
+    os.environ["ORQ_LINK"] = orq_mod.ORQ_LINK = os.path.join(tempfile.mkdtemp(), "orq")
+    orq_mod.CODEX_CONFIG = os.path.join(tempfile.mkdtemp(), "codex-config.toml")
+    orq_mod.CODEX_HOOKS = os.path.join(tempfile.mkdtemp(), "hooks.json")
+
+
+def _cpu():
+    """CPU seconds of this process and of its waited children (the orq and fake Orca subprocesses of a test)."""
+    s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
+
+
+def _run_child(name, fn, out, cover):
+    """In the forked child: runs one test with its output in `out`.log and writes {ok, err, cpu, cover} to `out`.json. `cover`: also the repo functions it ran (ORQ_COVER for its subprocesses)."""
+    res = {"ok": True, "err": ""}
+    try:
+        fd = os.open(out + ".log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)  # inside the try: a child that raises here never returns into the scheduler
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        _private_paths()
+        if cover:
+            os.environ["ORQ_COVER"] = out + ".cover"
+            orq_mod.cover_start()
+        fn()
+    except BaseException as e:  # noqa: BLE001 - the report shows all failures at once
+        res = {"ok": False, "err": f"{type(e).__name__}: {str(e)[-400:]!r}"}
+    try:
+        hits = set(orq_mod.COVER_HITS) if res["ok"] else set()
+        if cover and os.path.exists(out + ".cover"):
+            hits |= set(open(out + ".cover").read().split())
+        res.update(cpu=_cpu(), cover=sorted(hits))
+        with open(out + ".json", "w") as f:
+            json.dump(res, f)
+    finally:
+        sys.stdout.flush()
+        os._exit(0)
+
+
+def _run_tests(tests, jobs, cover=False, echo=print):
+    """Runs `tests` [(name, fn)], each in a forked child of its own and `jobs` at a time, in name order; echoes one line per test as it ends.
+    Returns {name: {ok, err, s, cpu, cover}}. A child that dies without writing its result is a failure with the exit status."""
+    tmp, pending, running, results = tempfile.mkdtemp(prefix="orq-suite-"), list(tests), {}, {}
+    while pending or running:
+        while pending and len(running) < jobs:
+            name, fn = pending.pop(0)
+            out = os.path.join(tmp, name)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            pid = os.fork()
+            if pid == 0:
+                _run_child(name, fn, out, cover)
+            running[pid] = (name, out, time.time())
+        pid, status = os.wait()
+        name, out, t0 = running.pop(pid)
+        try:
+            res = json.load(open(out + ".json"))
+        except (OSError, ValueError):
+            res = {"ok": False, "err": f"the test process died (status {status})", "cpu": 0, "cover": []}
+        res["s"] = time.time() - t0
+        results[name] = res
+        echo(f"ok      {name}" if res["ok"] else f"FALHOU  {name}: {res['err']}")
+        if not res["ok"]:
+            echo(open(out + ".log").read().rstrip()[-2000:] if os.path.exists(out + ".log") else "")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
+@contextlib.contextmanager
+def _suite_turn(queue=SUITE_QUEUE, poll_s=2.0, echo=print):
+    """One full suite at a time on the machine (ticket 328), like the E2E queue: a `<time_ns>-<pid>` ticket in `queue` with the worktree, in order of arrival.
+    Waits while an older ticket has a live pid, echoing who is ahead whenever that changes; a dead owner's ticket is removed. The ticket goes away at the end."""
+    os.makedirs(queue, exist_ok=True)
+    mine = f"{time.time_ns():020d}-{os.getpid()}"
+    with open(os.path.join(queue, mine), "w") as f:
+        f.write(HERE)
+    try:
+        shown = None
+        while True:
+            ahead = []
+            for n in sorted(x for x in os.listdir(queue) if x < mine):
+                if not orq_mod._pid_alive(n.rsplit("-", 1)[-1]):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(queue, n))
+                    continue
+                with contextlib.suppress(OSError):
+                    ahead.append((n, open(os.path.join(queue, n)).read().strip()))
+            if not ahead:
+                break
+            if ahead[0][0] != shown:
+                shown, (n, wt) = ahead[0][0], ahead[0]
+                echo(f"suite queue: {len(ahead)} ahead; running: {wt} (pid {n.rsplit('-', 1)[-1]}, {int((time.time_ns() - int(n.split('-')[0])) / 6e10)} min)")
+            time.sleep(poll_s)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(queue, mine))
+
+
+def _live_events():
+    """The live events.jsonl a leaking test would write to (the clone's and the caller's ORQ_HOME), with their sizes now."""
+    paths = {os.path.join(p, "events.jsonl") for p in (orq_mod.orqpaths.CODE, CALLER_ENV.get("ORQ_HOME")) if p}
+    return {p: os.path.getsize(p) if os.path.exists(p) else 0 for p in paths}
+
+
+def _leaks(before):
+    """The lines the run appended to a live events.jsonl that carry the suite's temporary folder: a test that wrote outside its ORQ_HOME (ticket 328)."""
+    out, marks = [], {SUITE_TMP, os.path.realpath(SUITE_TMP)}
+    for p, size in before.items():
+        try:
+            with open(p, "rb") as f:
+                f.seek(size)
+                new = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        out += [f"{p}: {line[:300]}" for line in new.splitlines() if any(m in line for m in marks)]
+    return out
+
+
+def _write_map(path, results, full):
+    """The test map of `orq test --affected`: {tests: {name: ["file:function", ...]}}. A full green run replaces it; otherwise only the tests that passed
+    update their entry, so a test that failed or died early keeps the coverage it had instead of a short one."""
+    ok = {n: r["cover"] for n, r in results.items() if r["ok"]}
+    old = {} if full and len(ok) == len(results) else _dict_file(path).get("tests", {})
+    data = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": {**old, **ok}}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def _dict_file(path):
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _suite_args(argv):
+    """`test_orq.py [-j N] [--map PATH] [name...]`: a name equal to a test picks exactly it, any other is a substring. -j defaults to min(4, CPUs/2)."""
+    ap = argparse.ArgumentParser(prog="test_orq.py")
+    ap.add_argument("-j", "--jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--map", help="writes the test map (the functions each test ran) to PATH")
+    ap.add_argument("names", nargs="*")
+    return ap.parse_args(argv)
+
+
+def _pick(all_tests, names):
+    """The tests the names select: exact name, otherwise substring; no names is everything."""
+    known = {n for n, _ in all_tests}
+    return [(n, f) for n, f in all_tests if not names or any(x == n or (x not in known and x in n) for x in names)]
+
+
+def test_ticket328_runner_picks_exact_names_and_substrings():
+    tests = [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _pick(tests, []) == tests
+    assert _pick(tests, ["test_a"]) == [("test_a", 1)], "an exact name does not drag the longer ones"
+    assert _pick(tests, ["_a", "c"]) == [("test_a", 1), ("test_a_b", 2), ("test_c", 3)]
+    assert _suite_args(["-j", "3", "--map", "m.json", "x"]).__dict__ == {"jobs": 3, "map": "m.json", "names": ["x"]}
+
+
+def test_ticket328_runner_runs_each_test_in_its_own_process_and_reports_failures():
+    def ok():
+        os.environ["LEAK328"] = "1"
+        print("barulho")
+
+    def fails():
+        assert "LEAK328" not in os.environ, "the previous test's environment leaked"
+        raise ValueError("quebrou")
+
+    def dies():
+        os._exit(7)
+    seen = []
+    res = _run_tests([("t_ok", ok), ("t_fails", fails), ("t_dies", dies)], jobs=1, echo=seen.append)
+    assert res["t_ok"]["ok"] and "barulho" not in "".join(seen), "a passing test's output stays out"
+    assert res["t_fails"]["err"] == "ValueError: 'quebrou'", res["t_fails"]
+    assert not res["t_dies"]["ok"] and "died" in res["t_dies"]["err"], res["t_dies"]
+    assert seen[0] == "ok      t_ok" and seen[1].startswith("FALHOU  t_fails"), seen
+    res = _run_tests([(f"t{i}", ok) for i in range(6)], jobs=3, echo=seen.append)
+    assert sorted(res) == [f"t{i}" for i in range(6)] and all(r["ok"] for r in res.values())
+
+
+def test_ticket328_runner_records_the_functions_a_test_runs_in_process_and_in_subprocesses():
+    def runs():
+        orq_mod.origin_name("oi")
+        Env().orq("status")
+    res = _run_tests([("t", runs)], jobs=1, cover=True, echo=lambda _: None)["t"]
+    assert res["ok"], res
+    assert {"orqlib.py:origin_name", "test_orq.py:Env", "orqlib.py:main", "orqlib.py:state"} <= set(res["cover"]), res["cover"][:20]
+    t = tempfile.mkdtemp()
+    _write_map(os.path.join(t, "m.json"), {"t": res}, full=True)
+    _write_map(os.path.join(t, "m.json"), {"u": {"ok": True, "cover": ["x.py:f"]}}, full=False)
+    assert set(_dict_file(os.path.join(t, "m.json"))["tests"]) == {"t", "u"}, "a partial run updates its tests and keeps the rest"
+    _write_map(os.path.join(t, "m.json"), {"t": {"ok": False, "cover": []}, "u": {"ok": True, "cover": ["x.py:g"]}}, full=True)
+    assert _dict_file(os.path.join(t, "m.json"))["tests"] == {"t": res["cover"], "u": ["x.py:g"]}, "a red full run keeps the failed test's old coverage"
+
+
+def test_ticket328_suite_queue_waits_for_the_live_ticket_ahead_and_clears_a_dead_one():
+    q = tempfile.mkdtemp()
+    with open(os.path.join(q, f"{1:020d}-999999"), "w") as f:
+        f.write("/wt/morto")  # dead owner
+    seen = []
+    with _suite_turn(q, poll_s=0.05, echo=seen.append):
+        assert len(os.listdir(q)) == 1 and seen == [], "the dead ticket went away and nobody waited"
+    assert os.listdir(q) == [], "the ticket goes away at the end"
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with open(os.path.join(q, f"{2:020d}-{holder.pid}"), "w") as f:
+            f.write("/wt/vivo")
+        t0 = time.time()
+        threading.Timer(0.3, lambda: (holder.kill(), holder.wait())).start()  # reaped: a zombie still answers kill(pid, 0)
+        with _suite_turn(q, poll_s=0.05, echo=seen.append):
+            pass
+        assert time.time() - t0 >= 0.3 and seen and seen[0].startswith("suite queue: 1 ahead; running: /wt/vivo (pid "), seen
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+
+def _repo328(files):
+    """A git repo with `files` {path: text} committed on main: returns its path."""
+    root = tempfile.mkdtemp()
+    for path, text_value in files.items():
+        os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+        with open(os.path.join(root, path), "w") as f:
+            f.write(text_value)
+    for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", root, *c], check=True, capture_output=True)
+    return root
+
+
+def _edit328(root, path, old, new):
+    p = os.path.join(root, path)
+    text_value = open(p).read()
+    assert old in text_value, old
+    with open(p, "w") as f:
+        f.write(text_value.replace(old, new, 1))
+
+
+LIB328 = '"""doc"""\nimport os\n\nLIMIT = 3\n\n\ndef a():\n    return 1\n\n\ndef b():\n    return LIMIT\n\n\ndef c():\n    return 2\n'
+TESTS328 = ('import orqlib as orq_mod\n\nFAKE = "fake"\n\n\nclass Env:\n    x = FAKE\n\n\ndef test_a():\n    assert orq_mod.a()\n\n\ndef test_b():\n    Env()\n\n\n'
+            'def test_c():\n    assert orq_mod.LIMIT\n\n\ndef test_readme():\n    open("README.md")\n\n\nif __name__ == "__main__":\n    pass\n')
+MAP328 = {"tests": {"test_a": ["orqlib.py:a", "test_orq.py:test_a"], "test_b": ["orqlib.py:b", "test_orq.py:Env"], "test_c": ["orqlib.py:c"], "test_readme": []}}
+
+
+def test_ticket328_affected_picks_the_tests_that_ran_the_changed_function():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "docs/design.md": "x\n"})
+    _edit328(root, "orqlib.py", "return 1", "return 11")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_a"} and r["reasons"] == ["orqlib.py: a -> 1 tests"], r
+    _edit328(root, "orqlib.py", "LIMIT = 3", "LIMIT = 4")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_a", "test_b", "test_c"}, "a module name reaches the defs that use it and the tests that read it as orq_mod.X"
+
+
+def test_ticket328_affected_runs_changed_tests_and_the_ones_behind_a_changed_helper():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n"})
+    _edit328(root, "test_orq.py", "assert orq_mod.LIMIT", "assert orq_mod.LIMIT > 0")
+    _edit328(root, "test_orq.py", "\n\nif __name__", "\n\ndef test_novo():\n    pass\n\n\nif __name__")
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_c", "test_novo"}, "the changed test and the new one, which no map knows yet"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == {"test_b"}, "FAKE -> Env -> the tests that built an Env"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "README.md", "# x", "# y")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] == {"test_readme"} and r["reasons"] == ["README.md: 1 tests mention it"], r
+
+
+def test_ticket328_affected_falls_back_to_the_full_suite_when_it_cannot_tell():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "tool.py": "def f():\n    pass\n"})
+    assert orq_mod.affected_tests(root, "main", {})["tests"] is None, "no map"
+    _edit328(root, "orqlib.py", "import os", "import os\nimport re")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "module-level line" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "tool.py", "pass", "return 1")
+    r = orq_mod.affected_tests(root, "main", MAP328)
+    assert r["tests"] is None and "tool.py: not in the test map" in r["reasons"][-1], r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    _edit328(root, "test_orq.py", 'FAKE = "fake"', 'FAKE = "falso"')
+    r = orq_mod.affected_tests(root, "main", {"tests": {"test_a": ["orqlib.py:a"]}})
+    assert r["tests"] is None and "no test in the map ran Env" in r["reasons"][-1], "a def the map has no test for (untested, import-time, newer than the map) runs everything"
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    with open(os.path.join(root, "novo.md"), "w") as f:
+        f.write("x\n")
+    assert orq_mod.affected_tests(root, "main", MAP328)["reasons"] == ["novo.md: 0 tests mention it"], "an untracked file is part of the diff"
+    os.remove(os.path.join(root, "novo.md"))
+    _edit328(root, "orqlib.py", '"""doc"""', '"""the doc"""')
+    assert orq_mod.affected_tests(root, "main", MAP328)["tests"] == set(), "the module docstring reaches nothing"
+
+
+def test_ticket328_orq_test_affected_runs_only_the_affected_tests():
+    root = _repo328({"orqlib.py": LIB328, "test_orq.py": TESTS328, "README.md": "# x\n", "precompact.py": "def p():\n    pass\n"})
+    m = os.path.join(root, "..", os.path.basename(root) + "-map.json")
+    with open(m, "w") as f:
+        json.dump(MAP328, f)
+    _edit328(root, "orqlib.py", "return 2", "return 3")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", cwd=root)
+    assert (r.returncode, r.stdout) == (0, "test_orq.py test_c\n") and "1 affected tests" in r.stderr, r
+    _edit328(root, "precompact.py", "pass", "return 1")
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, "--dry-run", "-j", "2", cwd=root)
+    assert r.stdout == "test_orq.py -j 2 test_c\ntest_precompact.py\n", r
+    subprocess.run(["git", "-C", root, "checkout", "-q", "--", "."], check=True)
+    r = Env().orq("test", "--affected", "--base", "main", "--map", m, cwd=root)
+    assert (r.returncode, r.stdout) == (0, "orq test: the diff against main touches no test\n"), r
+    r = Env().orq("test", cwd=tempfile.mkdtemp())
+    assert r.returncode != 0 and "no test_orq.py" in r.stderr, r
+
+
+def test_ticket328_the_caller_environment_does_not_reach_the_tests():
+    caller_home = tempfile.mkdtemp()
+    env = {**os.environ, "ORQ_HOOK_TIMEOUT": "15", "ORQ_HOME": caller_home, "ORCA_TERMINAL_HANDLE": "y", "CLAUDECODE": "1"}
+    alarm = ["test_finding_8_stdin_that_never_closes_is_cut_by_the_3s_alarm", "test_finding_8_stuck_cursor_lock_is_cut_by_the_3s_alarm", "test_guard_fails_open_and_logs",
+             "test_heartbeat_orca_down_passes", "test_review2_b4_alarm_that_expires_after_writing_does_not_leave_the_gate_pending",
+             "test_ticket134_run_that_really_stopped_is_still_detected_after_expiry", "test_ticket147_release_ends_only_processes_with_cwd_inside_worktree"]
+    r = subprocess.run([sys.executable, os.path.join(HERE, "test_orq.py"), "-j", "4", *alarm], env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and f"{len(alarm)}/{len(alarm)} testes passaram" in r.stdout, r.stdout[-3000:]
+    ignored = next(x for x in r.stdout.splitlines() if x.startswith("ignored from the environment: "))
+    assert {"CLAUDECODE", "ORCA_TERMINAL_HANDLE", "ORQ_HOME", "ORQ_HOOK_TIMEOUT"} <= set(ignored.split(": ", 1)[1].split(", ")), ignored
+    assert os.listdir(caller_home) == [], "nothing was written to the caller's ORQ_HOME"
+
+
+def test_ticket328_the_runner_flags_a_test_line_in_a_live_events_file():
+    p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+    with open(p, "w") as f:
+        f.write('{"type": "old"}\n')
+    before = {p: os.path.getsize(p)}
+    with open(p, "a") as f:
+        f.write('{"type": "entry", "text": "real work"}\n' + json.dumps({"type": "processes", "worktree": os.path.join(SUITE_TMP, "tmpx", "wt147")}) + "\n")
+    (leak,) = _leaks(before)
+    assert leak.startswith(p + ": ") and "wt147" in leak, leak
+
+
+def _queue324(a, n=25):
+    items = [{"id": f"fd{i:06x}", "tipo": "despacho", "run": "run_a", "titulo": f"t{i}", "modelo": "claude-sonnet-5-5", "effort": "medium", "prioridade": 2,
+              "ts": f"2026-10-02T10:{i:02d}:00Z", "motivo": "full", "falhas": 0, **({"mate": "orq", "ticket": "77"} if i == 20 else {})} for i in range(1, n + 1)]
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "dispatch-queue.json"), "w") as f:
+        json.dump({"itens": items}, f)
+
+
+def test_ticket324_dispatch_queue_priority_moves_a_p2_item_ahead_without_losing_its_ts():
+    a = Env()
+    _queue324(a)
+    before = json.loads(a.orq("dispatch-queue", "list", "--json").stdout)
+    assert before[19]["id"] == "fd000014", before[19]
+    r = a.orq("dispatch-queue", "priority", "fd000014", "1")
+    assert r.returncode == 0, r.stderr
+    after = json.loads(a.orq("dispatch-queue", "list", "--json").stdout)
+    assert after[0]["id"] == "fd000014" and after[0]["prioridade"] == 1 and after[0]["ts"] == before[19]["ts"], after[0]
+    assert [i["id"] for i in after[1:]] == [i["id"] for i in before if i["id"] != "fd000014"]
+    ev = [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+    assert len(ev) == 1 and ev[0]["id"] == "fd000014" and ev[0]["valor"] == 1 and ev[0]["de"] == 2 and ev[0]["autor"] == "coordinator", ev
+
+
+def test_ticket324_dispatch_queue_priority_refuses_an_unknown_id_listing_the_existing_ones():
+    a = Env()
+    _queue324(a, 3)
+    r = a.orq("dispatch-queue", "priority", "fdffffff", "1")
+    assert r.returncode == 1 and "fdffffff" in r.stderr and "fd000001, fd000002, fd000003" in r.stderr, r.stderr
+    assert not [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+
+
+def test_ticket324_only_the_coordinator_and_the_owner_mate_change_a_queue_item_and_orq_priority_takes_the_queue_id():
+    a = Env()
+    _queue324(a)
+    r = a.orq("dispatch-queue", "priority", "fd000014", "1", ORQ_MATE="other")
+    assert r.returncode == 1 and "belongs to" in r.stderr, r.stderr
+    r = a.orq("priority", "fd000014", "1", ORQ_MATE="orq")
+    assert r.returncode == 0, r.stderr
+    ev = [e for e in a.events() if e.get("tipo") == "dispatch_queue_priority"]
+    assert len(ev) == 1 and ev[0]["autor"] == "orq", ev
+    assert not [e for e in a.events() if e.get("tipo") == "prioridade"]
+
+
+def test_ticket324_dispatch_queue_list_shows_task_ticket_priority_and_owner():
+    a = Env()
+    _queue324(a, 20)
+    r = a.orq("dispatch-queue", "list")
+    line = next(x for x in r.stdout.splitlines() if "fd000014" in x)
+    assert "P2" in line and "ticket 77" in line and "mate orq" in line, line
+
+
+def _cite209(a, report_text, transcript_lines):
+    t = a.tmp.name
+    tr = os.path.join(t, "sessao.jsonl")
+    open(tr, "w").write("\n".join(transcript_lines) + "\n")
+    rep = os.path.join(t, "rel.md")
+    open(rep, "w").write(report_text.replace("TR", tr))
+    return rep, tr
+
+
+def test_ticket209_citations_present_confere_and_paraphrase_does_not():
+    a = Env()
+    rep, _ = _cite209(a, 'O monitor não era chamado (`transcript:TR:2`): "o monitor nunca roda no hook".\n'
+                         'Outro achado (TR:1): "o usuário pediu para trocar a fila".\n',
+                      ["o usuário pediu para trocar a fila", "o monitor nunca roda no hook de parada"])
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and "citações: 2 (2 confere, 0 não confere)" in r.stdout, r.stdout
+    rep2, _ = _cite209(a, 'Achado (TR:1): "o usuário quis outra fila de trabalho".\n', ["o usuário pediu para trocar a fila"])
+    r = a.orq("retro", "citacoes", rep2)
+    assert r.returncode == 1 and "not found" in r.stdout, "paráfrase não confere"
+
+
+def test_ticket330_retro_gaps_does_not_fall_into_citations_and_citations_takes_the_report_as_ref():
+    a = Env()
+    r = a.orq("retro", "gaps")
+    assert r.returncode == 0 and "usage: orq retro citacoes" not in r.stderr, r.stderr
+    rep, _ = _cite209(a, 'Achado (TR:1): "o usuário pediu para trocar a fila".\n', ["o usuário pediu para trocar a fila"])
+    for op in ("citacoes", "citations"):
+        r = a.orq("retro", op, rep)
+        assert r.returncode == 0 and "citações: 1 (1 confere" in r.stdout, r.stdout
+    r = a.orq("retro", "citacoes")
+    assert r.returncode == 1 and "usage: orq retro citacoes <report.md>" in r.stderr, r.stderr
+
+
+def test_ticket209_citations_missing_file_is_named_and_no_pointer_says_zero():
+    a = Env()
+    rep = os.path.join(a.tmp.name, "rel.md")
+    open(rep, "w").write('Achado (`transcript:/nao/existe/s.jsonl:3`): "uma frase que ninguém vai achar".\n')
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 1 and "file missing" in r.stdout and "/nao/existe/s.jsonl:3" in r.stdout, r.stdout
+    open(rep, "w").write("# Relatório sem ponteiro\n\nnada citado.\n")
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and r.stdout.strip() == "citações: 0", r.stdout
+
+
+def test_ticket209_citations_line_break_inside_the_quote_still_confere():
+    a = Env()
+    rep, _ = _cite209(a, "Achado (TR:1):\n> o usuário pediu\n> para trocar   a fila\n\nOutro (TR:2): \"duas\\nlinhas aqui no trecho\".\n",
+                      ["o usuário pediu para trocar a fila", '{"text": "duas\\nlinhas aqui no trecho"}'])
+    r = a.orq("retro", "citacoes", rep)
+    assert r.returncode == 0 and "citações: 2 (2 confere" in r.stdout, r.stdout
+
+
+def test_ticket209_ingest_of_a_report_with_a_false_quote_records_the_event_and_clean_report_records_nothing():
+    for quote, expect in (("frase que o transcrito não tem", 1), ("o usuário pediu para trocar a fila", 0)):
+        a = Env()
+        runs = _fix("automations_runs.json")
+        ok = [r for r in runs["result"]["runs"] if r["status"] == "completed" and r["createdAt"] > 1790600000000][:1]
+        os.makedirs(os.path.join(a.tmp.name, ".scratch", "x"))
+        rep, _ = _cite209(a, f'# R\n\nAchado (TR:1): "{quote}".\n', ["o usuário pediu para trocar a fila"])
+        moved = os.path.join(a.tmp.name, ".scratch", "x", "rel.md")
+        os.rename(rep, moved)
+        rep = moved
+        ok[0]["outputSnapshot"]["content"] = f"O relatório está em `{rep}`."
+        runs["result"]["runs"] = ok
+        _ingest_env(a, runs=runs)
+        assert a.orq("ingest").returncode == 0
+        bad = [e for e in a.events() if e.get("tipo") == "citacao_nao_confere"]
+        assert len(bad) == expect and (not expect or (bad[0]["n"] == 1 and bad[0]["ref"] == ok[0]["id"])), bad
+
+
+# ---------- ticket 326: orq clean removes the residue with no owner ----------
+
+class _World326:
+    """A temporary ORQ_HOME, plan and ~/.claude around the ticket 176 repo (worktrees 1 pronta, 2 fora, 3 suja, integracao), with `now_at` two days ahead of the real clock (no worktree is recent)."""
+
+    def __init__(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home, self.plan, self.claude = (os.path.join(self.tmp, n) for n in ("home", "plan", "claude"))
+        for d in (self.home, os.path.join(self.plan, "backups"), self.claude):
+            os.makedirs(d)
+        self.repo, self.root = _scenario176()
+        os.remove(os.path.join(self.root, "3", "novo.txt"))  # the scenario's dirty worktree is clean here
+        self.now_at = time.time() + 172800
+        self.backups = os.path.join(self.plan, "backups")
+        self.saved = (orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT, os.environ.get("ORQ_CLAUDE_DIR"))
+        orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT = self.home, self.plan, self.root
+        os.environ["ORQ_CLAUDE_DIR"] = self.claude
+
+    def restore(self):
+        orq_mod.HOME, orq_mod.PLAN, orq_mod.WT_ROOT = self.saved[:3]
+        os.environ.pop("ORQ_CLAUDE_DIR") if self.saved[3] is None else os.environ.__setitem__("ORQ_CLAUDE_DIR", self.saved[3])
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def put(self, path, text="x", age_h=0, folder=False):
+        """A file (or folder) `age_h` hours old at `now_at`."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if folder:
+            os.makedirs(path, exist_ok=True)
+            open(os.path.join(path, "f"), "w").write(text)
+        else:
+            open(path, "w").write(text)
+        t = self.now_at - age_h * 3600
+        os.utime(path, (t, t))
+        return path
+
+    def plan_(self, **kw):
+        return orq_mod.clean_plan(self.now_at, repo=self.repo, root=self.root, backups=self.backups, **kw)
+
+    def apply(self, plan, **kw):
+        return orq_mod.clean_apply(plan, self.now_at, repo=self.repo, root=self.root, backups=self.backups, **kw)
+
+    def events(self):
+        return orq_mod.read_events()
+
+    def snapshot(self):
+        files = {}
+        for base in (self.home, self.plan, self.claude, self.root):
+            for dirpath, _, names in os.walk(base):
+                if os.sep + ".git" in dirpath + os.sep or dirpath.endswith(".git"):
+                    continue
+                for n in names:
+                    p = os.path.join(dirpath, n)
+                    files[p] = (os.path.getmtime(p), os.path.getsize(p))
+        git = subprocess.run(["git", "-C", self.repo, "for-each-ref"], capture_output=True, text=True).stdout + subprocess.run(["git", "-C", self.repo, "worktree", "list"], capture_output=True, text=True).stdout
+        return files, git
+
+
+def _fill326(w):
+    """One of everything: expired and fresh notices, state leftovers, backups beyond and within retention, a test line in the real log, protected files, a loose integrated branch."""
+    h = os.path.join(w.home, "avisos")
+    w.put(os.path.join(h, "old.txt"), age_h=30)
+    w.put(os.path.join(h, "old.json"), json.dumps({"valid_while": None}), age_h=30)
+    w.put(os.path.join(h, "fresh.txt"), age_h=1)
+    w.put(os.path.join(h, "gone.txt"), age_h=1)
+    w.put(os.path.join(h, "gone.json"), json.dumps({"valid_while": "e2e_stuck"}), age_h=1)  # E2E queue free: the fact no longer holds
+    w.put(os.path.join(w.home, "gerente.json.antes-troca"), age_h=30)
+    w.put(os.path.join(w.home, "gerente.json.antes-recente"), age_h=2)
+    w.put(os.path.join(w.home, "e2e-notice.json"), json.dumps({"ticket": "t"}), age_h=1)
+    w.put(os.path.join(w.home, "cursor.lock"), age_h=500)  # flock files are not residue
+    for i in range(5):
+        w.put(os.path.join(w.home, f"backup-pt-2026-09-0{i + 1}"), folder=True, age_h=24 * (20 + i))
+        w.put(os.path.join(w.backups, f"orq-wt-{i}.bundle"), age_h=24 * (20 + i))
+        w.put(os.path.join(w.claude, f"settings.json.bak-{i}"), age_h=10 + i)
+        w.put(os.path.join(w.claude, "backups", f"b{i}"), age_h=10 + i)
+    w.put(os.path.join(w.backups, "orq-wt-new.bundle"), age_h=24)  # under 7 days
+    w.put(os.path.join(w.home, "events.jsonl"), "\n".join(json.dumps(e) for e in (
+        {"ts": "2026-10-02T10:00:00Z", "tipo": "despacho", "task": "task_real", "run": "run_real", "terminal": "term_real"},
+        {"ts": "2026-10-02T10:01:00Z", "tipo": "despacho", "task": "x", "run": "run_a", "terminal": "term_x"},
+        {"ts": "2026-10-02T10:02:00Z", "tipo": "entrada", "texto": "ok", "origem": "usuario"})) + "\n", age_h=0)
+    w.put(os.path.join(w.home, "cursor.json"), "{}", age_h=900)
+    w.put(os.path.join(w.home, "backlog.md"), "- a", age_h=900)
+    w.put(os.path.join(w.home, "projects", "p.json"), "{}", age_h=900)
+    w.put(os.path.join(w.home, "groups", "g.json"), "{}", age_h=900)
+    w.put(os.path.join(w.plan, "issues", "1-x.md"), "# t", age_h=900)
+    _g176(w.repo, "branch", "feat/solta", "main~1")  # integrated (an ancestor of main), no worktree
+    _g176(w.repo, "branch", "feat/nunca", "feat/fora")  # has a commit outside main
+    return w
+
+
+def _clean326(fn):
+    w = _World326()
+    try:
+        _fill326(w)
+        return fn(w)
+    finally:
+        w.restore()
+
+
+def test_ticket326_dry_run_lists_every_category_and_writes_nothing():
+    def run(w):
+        before = w.snapshot()
+        plan = w.plan_()
+        assert w.snapshot() == before and not [e for e in w.events() if e.get("tipo") in ("clean", "clean_run")], "dry run touched something"
+        by = {c: sorted(os.path.basename(i["alvo"]) for i in items) for c, items in plan.items()}
+        assert by["notices"] == ["gone.txt", "old.txt"], by
+        assert by["state"] == ["e2e-notice.json", "gerente.json.antes-troca"], by
+        assert by["backups"] == ["backup-pt-2026-09-04", "backup-pt-2026-09-05", "orq-wt-2.bundle", "orq-wt-3.bundle", "orq-wt-4.bundle"], by  # the 3 newest of each and the one under 7 days stay
+        assert by["claude"] == ["b3", "b4", "settings.json.bak-3", "settings.json.bak-4"], by
+        assert by["worktrees"] == ["1", "3"] and by["branches"] == ["solta"], by
+        assert len(plan["test-lines"]) == 1 and plan["test-lines"][0]["bytes"] > 0
+        for items in plan.values():
+            assert all(i["motivo"] and i["bytes"] is not None and "idade_s" in i for i in items), items
+        text = orq_mod.clean_text(plan)
+        assert text.startswith("dry run: nothing was removed") and "notices (2" in text and "needs your approval:" in text, text
+    _clean326(run)
+
+
+def test_ticket326_apply_removes_only_the_allowed_and_the_second_pass_has_nothing_to_clean():
+    def run(w):
+        result = w.apply(w.plan_())
+        gone = sorted(os.path.basename(i["alvo"]) for i in result["removed"])
+        assert gone == ["1", "3", "b3", "b4", "backup-pt-2026-09-04", "backup-pt-2026-09-05", "e2e-notice.json", "gerente.json.antes-troca", "gone.txt", "old.txt",
+                        "orq-wt-2.bundle", "orq-wt-3.bundle", "orq-wt-4.bundle", "settings.json.bak-3", "settings.json.bak-4", "solta"], gone
+        for stays in ("avisos/fresh.txt", "gerente.json.antes-recente", "cursor.lock", "cursor.json", "backlog.md", "projects/p.json", "groups/g.json", "backup-pt-2026-09-01"):
+            assert os.path.exists(os.path.join(w.home, stays)), stays
+        assert not os.path.exists(os.path.join(w.home, "avisos", "old.json")) and not os.path.exists(os.path.join(w.home, "avisos", "gone.json")), "the sidecar goes with its notice"
+        assert os.path.exists(os.path.join(w.plan, "issues", "1-x.md")) and os.path.exists(os.path.join(w.backups, "orq-wt-new.bundle"))
+        assert os.path.isdir(os.path.join(w.root, "2")) and os.path.isdir(os.path.join(w.root, "integracao")) and not os.path.exists(os.path.join(w.root, "1"))
+        branches = subprocess.run(["git", "-C", w.repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+        assert "feat/solta" not in branches and {"feat/fora", "feat/nunca", "main"} <= set(branches), branches
+        clean_events = [e for e in w.events() if e.get("tipo") == "clean"]
+        assert len(clean_events) == len(result["removed"]) and all(e["categoria"] and e["alvo"] and e["motivo"] and e["bytes"] is not None for e in clean_events), clean_events
+        (branch_event,) = [e for e in clean_events if e["categoria"] == "branches"]
+        assert branch_event["sha"], "a branch already in main is recorded by its tip, to be recreated"
+        (run_event,) = [e for e in w.events() if e.get("tipo") == "clean_run"]
+        assert dict(run_event["quantos"])["notices"] == 2 and run_event["bytes"] > 0, run_event
+        again = w.plan_()
+        assert not [i for c, items in again.items() if c != "test-lines" for i in items], again
+        assert orq_mod.clean_text(again).startswith("nothing to clean"), orq_mod.clean_text(again)
+        assert w.apply(again)["removed"] == [], "second pass changes nothing"
+    _clean326(run)
+
+
+def test_ticket326_worktree_with_live_dispatch_and_branch_not_integrated_never_leave():
+    def run(w):
+        orq_mod.append_event({"tipo": "despacho", "ticket": "1", "task": "task_1", "dispatch": "ctx_1", "projeto": "orq"})  # live dispatch on the integrated branch (worktree 1)
+        orq_mod.append_event({"tipo": "despacho", "ticket": "2", "task": "task_2", "dispatch": "ctx_2", "projeto": "orq"})  # live dispatch on the branch with a commit outside main (worktree 2)
+        plan = w.plan_()
+        assert [os.path.basename(i["alvo"]) for i in plan["worktrees"]] == ["3"], "1 has a live dispatch, 2 is not integrated"
+        w.apply(plan)
+        assert os.path.isdir(os.path.join(w.root, "1")) and os.path.isdir(os.path.join(w.root, "2")), "live dispatch and unintegrated branch stay"
+        branches = subprocess.run(["git", "-C", w.repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+        assert "feat/pronta" in branches and "feat/fora" in branches and "feat/nunca" in branches, branches
+        # released: the integrated one goes, the unintegrated one still does not
+        orq_mod.append_event({"tipo": "liberar", "dispatch": "ctx_1", "estado": "released"})
+        orq_mod.append_event({"tipo": "liberar", "dispatch": "ctx_2", "estado": "released"})
+        w.apply(w.plan_())
+        assert not os.path.exists(os.path.join(w.root, "1")) and os.path.isdir(os.path.join(w.root, "2"))
+        assert "feat/fora" in subprocess.run(["git", "-C", w.repo, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+    _clean326(run)
+
+
+def test_ticket326_delivery_on_the_integrator_queue_keeps_its_worktree_and_branch():
+    def run(w):
+        orq_mod.integrate_queue_add("feat/pronta", "1")
+        orq_mod.integrate_queue_add("feat/solta", "9")
+        plan = w.plan_()
+        assert [os.path.basename(i["alvo"]) for i in plan["worktrees"]] == ["3"] and plan["branches"] == [], plan
+    _clean326(run)
+
+
+def test_ticket326_branch_at_the_tip_of_main_or_checked_out_stays():
+    def run(w):
+        _g176(w.repo, "branch", "feat/recem-criada", "main")  # a worker's branch before its first commit: an ancestor of main, but not integrated work
+        names = [i["alvo"] for i in w.plan_(only=["branches"])["branches"]]
+        assert names == ["feat/solta"], names  # feat/pronta and feat/suja are checked out in worktrees; integracao's integra/x too
+    _clean326(run)
+
+
+def test_ticket326_integra_folder_goes_only_without_process_dirty_tree_or_new_commit():
+    def run(w):
+        _g176(w.repo, "worktree", "add", "-q", "-b", "integra/velha", os.path.join(w.root, "integra-velha"))
+        _g176(os.path.join(w.root, "integra-velha"), "commit", "-q", "--allow-empty", "-m", "integra", "--date=2000-01-01T00:00:00", "--author=t <t@t>")
+        _g176(w.repo, "worktree", "add", "-q", "-b", "integra/nova", os.path.join(w.root, "integra-nova"))
+        _g176(w.repo, "worktree", "add", "-q", "-b", "integra/suja", os.path.join(w.root, "integra-suja"))
+        open(os.path.join(w.root, "integra-suja", "x.txt"), "w").write("x")
+        env = {**os.environ, "GIT_COMMITTER_DATE": "2000-01-01T00:00:00"}
+        subprocess.run(["git", "-C", os.path.join(w.root, "integra-velha"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "--allow-empty", "--no-edit", "--reset-author"], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", os.path.join(w.root, "integra-nova"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "fresh"], check=True, capture_output=True)
+        real = time.time
+        w.now_at = real() + 60  # the "nova" commit is a minute old
+        plan = w.plan_(only=["integra"])
+        assert [os.path.basename(i["alvo"]) for i in plan["integra"]] == ["integra-velha"], plan
+        orq_mod._open_cwds, saved = (lambda: [os.path.realpath(os.path.join(w.root, "integra-velha"))]), orq_mod._open_cwds
+        try:
+            assert w.plan_(only=["integra"])["integra"] == [], "a process inside keeps it"
+        finally:
+            orq_mod._open_cwds = saved
+        result = w.apply(plan)
+        assert [os.path.basename(i["alvo"]) for i in result["removed"]] == ["integra-velha"] and not os.path.exists(os.path.join(w.root, "integra-velha"))
+        assert os.path.isdir(os.path.join(w.root, "integra-nova")) and os.path.isdir(os.path.join(w.root, "integra-suja"))
+        (ev,) = [e for e in w.events() if e.get("tipo") == "clean" and e["categoria"] == "integra"]
+        assert ev["bundle"] and os.path.exists(ev["bundle"]), "its commits main does not have go to a verified bundle first"
+    _clean326(run)
+
+
+def test_ticket326_notice_stores_its_condition_and_goes_when_it_stops_holding():
+    def run(w):
+        text = "orq: " + "E2E queue held " * 20
+        short = orq_mod._short(text, "e2e_stuck")
+        (path,) = [p for p in os.listdir(os.path.join(w.home, "avisos")) if p.endswith(".txt")]
+        side = json.load(open(os.path.join(w.home, "avisos", path[:-4] + ".json")))
+        assert side["valid_while"] == "e2e_stuck" and path in short, (side, short)
+        w.now_at = time.time() + 60  # one minute old: only the condition can expire it
+        fresh = [os.path.basename(i["alvo"]) for i in orq_mod.clean_plan(w.now_at, only=["notices"], backups=w.backups)["notices"]]
+        assert path in fresh, "E2E lock free: the notice is no longer true"
+        saved = orq_mod.e2e_queue
+        orq_mod.e2e_queue = lambda *a, **k: {"presa": "owner died", "ticket": "t"}
+        try:
+            assert path not in [os.path.basename(i["alvo"]) for i in orq_mod.clean_plan(w.now_at, only=["notices"], backups=w.backups)["notices"]], "still stuck: the notice stays"
+            w.put(os.path.join(w.home, "e2e-notice.json"), json.dumps({"ticket": "t"}))
+            assert "e2e-notice.json" not in [os.path.basename(i["alvo"]) for i in orq_mod.clean_plan(w.now_at, only=["state"], backups=w.backups)["state"]]
+        finally:
+            orq_mod.e2e_queue = saved
+        assert orq_mod._short("short text", "e2e_stuck") == "short text"
+    w = _World326()
+    try:
+        run(w)
+    finally:
+        w.restore()
+
+
+def test_ticket326_test_lines_are_listed_and_removed_only_with_approval_and_a_backup():
+    def run(w):
+        before = open(os.path.join(w.home, "events.jsonl")).read()
+        plan = w.plan_()
+        w.apply(plan)  # the automatic and the plain --apply never take them
+        assert open(os.path.join(w.home, "events.jsonl")).read().startswith(before.splitlines()[0]) and '"term_x"' in open(os.path.join(w.home, "events.jsonl")).read()
+        assert w.plan_(only=["test-lines"])["test-lines"], "still listed after a plain apply"
+        w.apply(w.plan_(only=["test-lines"]), approve_test_lines=True)
+        now_log = open(os.path.join(w.home, "events.jsonl")).read()
+        assert '"term_x"' not in now_log and '"task_real"' in now_log and '"texto": "ok"' in now_log, now_log
+        (bak,) = [p for p in os.listdir(w.backups) if p.startswith("events-")]
+        assert open(os.path.join(w.backups, bak)).read().startswith(before.splitlines()[0]) and '"term_x"' in open(os.path.join(w.backups, bak)).read(), "backup holds the original log"
+        assert w.plan_(only=["test-lines"])["test-lines"] == []
+    _clean326(run)
+
+
+def test_ticket326_never_touches_versioned_files_plan_or_live_state():
+    def run(w):
+        assert orq_mod._clean_protected(os.path.join(w.home, "events.jsonl")) and orq_mod._clean_protected(os.path.join(w.home, "cursor.json")) and orq_mod._clean_protected(os.path.join(w.home, "projects", "p.json"))
+        assert orq_mod._clean_protected(os.path.join(w.home, "backlog.md")) and orq_mod._clean_protected(os.path.join(w.home, "groups")) and orq_mod._clean_protected(os.path.join(w.plan, "issues", "1-x.md"))
+        assert orq_mod._clean_protected(os.path.join(w.plan, "backups")) and not orq_mod._clean_protected(os.path.join(w.backups, "x.bundle")), "plan/ is untouchable, its bundles are not"
+        tracked = os.path.join(w.repo, "tracked.txt")
+        open(tracked, "w").write("x")
+        _g176(w.repo, "add", "tracked.txt")
+        assert orq_mod._clean_protected(tracked) == "versioned file"
+        item = {"categoria": "state", "alvo": tracked, "bytes": 1, "idade_s": 1, "motivo": "forced"}
+        result = w.apply({"state": [item]})
+        assert result["removed"] == [] and result["kept"][0][1] == "versioned file" and os.path.exists(tracked), "apply also refuses what the listing let through"
+    _clean326(run)
+
+
+def test_ticket326_retention_follows_clean_json_over_machine_json():
+    def run(w):
+        assert orq_mod.clean_cfg()["backups_keep"] == 3
+        w.put(os.path.join(w.home, "machine.json"), json.dumps({"backups_keep": 4, "settings_keep": "x"}))
+        assert orq_mod.clean_cfg()["backups_keep"] == 4 and orq_mod.clean_cfg()["settings_keep"] == 3, "a key of the wrong type counts as absent"
+        w.put(os.path.join(w.home, "clean.json"), json.dumps({"backups_keep": 5, "settings_keep": 1}))
+        assert orq_mod.clean_cfg()["backups_keep"] == 5 and orq_mod.clean_cfg()["settings_keep"] == 1
+        assert [os.path.basename(i["alvo"]) for i in w.plan_(only=["backups"])["backups"]] == ["orq-wt-4.bundle"] and len(w.plan_(only=["claude"])["claude"]) == 8
+    _clean326(run)
+
+
+def test_ticket326_manager_round_runs_safe_hourly_and_size_daily_outside_away_and_pressure():
+    w = _World326()
+    try:
+        _fill326(w)
+        saved = orq_mod.machine_level
+        orq_mod.machine_level = lambda *a, **k: ("alta", "load")
+        try:
+            lines = orq_mod.clean_round(w.now_at)
+            assert all("size" not in l for l in lines) and os.path.exists(os.path.join(w.claude, "settings.json.bak-4")), "pressure holds the size tier back"
+            assert os.path.exists(os.path.join(w.home, "backup-pt-2026-09-05")) and not os.path.exists(os.path.join(w.home, "avisos", "old.txt")), "the safe tier ran anyway"
+            orq_mod.machine_level = lambda *a, **k: ("ok", None)
+            orq_mod._cursor_mut(lambda c: c.__setitem__("ausente", {"desde": "2026-10-02T10:00:00Z"}))
+            w.put(os.path.join(w.home, "avisos", "x2.txt"), age_h=30)
+            assert all("size" not in l for l in orq_mod.clean_round(w.now_at + 3700)) and os.path.exists(os.path.join(w.claude, "settings.json.bak-4")), "away mode holds it too"
+            orq_mod._cursor_mut(lambda c: c.pop("ausente"))
+            lines = orq_mod.clean_round(w.now_at + 7400)
+            assert any("size" in l for l in lines) and not os.path.exists(os.path.join(w.claude, "settings.json.bak-4")) and not os.path.exists(os.path.join(w.home, "backup-pt-2026-09-05")), lines
+            assert not [l for l in orq_mod.clean_round(w.now_at + 7500)], "stamps keep the next loop quiet"
+        finally:
+            orq_mod.machine_level = saved
+    finally:
+        w.restore()
+
+
+def test_ticket326_digest_has_one_line_for_the_days_cleaning():
+    ev = [{"ts": "2026-10-02T10:00:00Z", "tipo": "clean_run", "quantos": [["notices", 40], ["worktrees", 3]], "bytes": 100 * 1048576},
+          {"ts": "2026-10-02T11:00:00Z", "tipo": "clean_run", "quantos": [["notices", 1], ["worktrees", 9]], "bytes": 280 * 1048576},
+          {"ts": "2026-10-01T10:00:00Z", "tipo": "clean_run", "quantos": [["notices", 99]], "bytes": 1}]
+    line = orq_mod.clean_summary_line(ev, "2026-10-02T00:00:00Z")
+    assert line["titulo"] == "Cleaned 41 notices, 12 worktrees, 380 MB" and line["tipo"] == "info", line
+    assert orq_mod.clean_summary_line(ev, "2026-10-03T00:00:00Z") is None
+
+
+def test_ticket326_cli_lists_by_default_and_refuses_an_unknown_category():
+    a = Env()
+    claude = os.path.join(a.tmp.name, "claude")
+    r = a.orq("clean", ORQ_CLAUDE_DIR=claude)
+    assert r.returncode == 0 and r.stdout.startswith("nothing to clean"), (r.stdout, r.stderr)
+    assert a.orq("limpar-residuos", ORQ_CLAUDE_DIR=claude).stdout.startswith("nothing to clean")
+    r = a.orq("clean", "--only", "nope", ORQ_CLAUDE_DIR=claude)
+    assert r.returncode != 0 and "unknown category" in (r.stderr + r.stdout), (r.stdout, r.stderr)
+    assert a.orq("clean", "--closed", "--dry-run").returncode == 0, "the old mode keeps working"
+
+
+# ---- ticket 337: entries whose effect is already known close on their own ----
+
+def _closing337(a, entry):
+    return next((e for e in a.events() if e["tipo"] == "intake" and e["entrada"] == entry), None)
+
+
+def test_ticket337_worker_report_of_a_delivery_that_entered_the_queue_closes_itself():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    report = os.path.join(tmp, "final-report.md")
+    open(report, "w").write("# entregue\n")
+    _delivery141(a, reportPath=report)
+    assert a.orq("ingest").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert entry_event["origem"] == "relatorio_worker"
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "descartado" and "integrator queue" in closing["nota"] and "141" in closing["nota"], closing
+    assert orq_mod.open_entries(a.events()) == [], "o relatório da entrega que entrou na fila não pede nada"
+
+
+def test_ticket337_worker_report_without_queue_entry_and_escalations_stay_open():
+    tmp = tempfile.mkdtemp()
+    a = Env(run="run_a", ORQ_REPOS=_repo_with_branch(tmp, "feat/orq-x"))
+    report = os.path.join(tmp, "final-report.md")
+    open(report, "w").write("# entregue\n")
+    _delivery141(a, body="sem branch no texto", reportPath=report)  # no branch: nothing entered the queue
+    _group(a)
+    _mate_alive(a)
+    for kind in ("decisao", "bloqueio"):
+        assert a.orq("mate", "subir", "--tipo", kind, "--texto", "preciso de você", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate").returncode == 0
+    cur = os.path.join(a.home, "cursor.json")
+    d = json.load(open(cur))
+    json.dump({**d, "mate_avisada_ate": 99}, open(cur, "w"))
+    a.prompt("e agora, o que faço?")
+    assert a.orq("ingest").returncode == 0
+    kinds = [(e.get("origem", "usuario"), e.get("tipo_mate")) for e in orq_mod.open_entries(a.events())]
+    assert sorted(kinds, key=str) == sorted([("relatorio_worker", None), ("mate", "decisao"), ("mate", "bloqueio"), ("usuario", None)], key=str), kinds
+
+
+def test_ticket337_pr_entry_closes_when_the_obligations_went_to_the_mate():
+    a = _prs_env()
+    _group(a)
+    _mate_alive(a)
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "development")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    e = entry_event["id"]
+    assert set(_find_obligation(a, e)) == {"deploy", "proximo"}
+    assert a.orq("ingest").returncode == 0 and _closing337(a, e) is None, "sem pedido ao mate a entrada continua com o coordenador"
+    assert a.orq("mate", "pedir", "orq", "--texto", "PR #1216 entered development: check the deploy and open the PR for staging").returncode == 0
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, e)
+    assert closing and closing["efeito"] == "conversa" and "mate orq" in closing["nota"], closing
+    assert _find_obligation(a, e) == {}
+    handed = [x for x in a.events() if x["tipo"] == "obrigacao" and x["op"] == "repassada"]
+    assert {(x["chave"], x["grupo"], x["corr"]) for x in handed} == {("deploy", "orq", "p1"), ("proximo", "orq", "p1")}, handed
+
+
+def test_ticket337_pr_entry_keeps_obligations_the_mate_does_not_take():
+    a = _prs_env()
+    _group(a)
+    _mate_alive(a)
+    e = _merge_main(a, issue="2045")  # main: deploy, comentario, limpeza
+    assert a.orq("mate", "pedir", "orq", "--texto", "PR #1282 entered main: check the deploy").returncode == 0
+    assert a.orq("ingest").returncode == 0
+    assert _closing337(a, e) is None and set(_find_obligation(a, e)) == {"comentario", "limpeza"}, "o mate leva só o deploy; o resto o coordenador cumpre"
+
+
+def test_ticket337_pr_entry_without_obligations_closes_itself():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    _pr(a, PR1, "MERGED", "release/outra")
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada" and e.get("origem") == "pr"]
+    assert _find_obligation(a, entry_event["id"]) == {}
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "conversa" and closing["nota"], closing
+
+
+def test_ticket337_mate_answer_the_coordinator_read_closes_itself():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.orq("mate", "pedir", "orq", "--texto", "despache o ticket 77")
+    ans = json.loads(a.orq("mate", "subir", "--tipo", "resposta", "--corr", "p1", "--texto", "despachado", ORQ_MATE="orq", ORCA_TERMINAL_HANDLE="term_mate").stdout)
+    assert a.orq("ingest").returncode == 0 and _closing337(a, ans["id"]) is None, "o coordenador ainda não foi avisado"
+    cur = os.path.join(a.home, "cursor.json")
+    json.dump({**json.load(open(cur)), "mate_avisada_ate": int(ans["id"][1:])}, open(cur, "w"))
+    assert a.orq("ingest").returncode == 0
+    closing = _closing337(a, ans["id"])
+    assert closing and closing["efeito"] == "conversa" and "mate orq" in closing["nota"], closing
+
+
+def test_ticket337_machine_under_pressure_notice_closes_itself_in_the_hook():
+    a = Env()
+    a.prompt("orq: machine under pressure (free memory 1200 MB). The manager stopped starting workers (2 in the dispatch queue).")
+    (entry_event,) = [e for e in a.events() if e["tipo"] == "entrada"]
+    closing = _closing337(a, entry_event["id"])
+    assert closing and closing["efeito"] == "conversa" and "pressure" in closing["nota"], closing
+    a.prompt("segue o jogo")
+    assert [e["texto"] for e in orq_mod.open_entries(a.events())] == ["segue o jogo"]
 
 
 # ---- ticket 329: conformance checked before the worker_done; a send-back after it opens a new dispatch ----
@@ -18669,15 +21549,34 @@ def test_ticket329_accept_delivery_lets_a_mate_checked_delivery_through_and_reco
 
 
 if __name__ == "__main__":
-    filter_rule = sys.argv[1] if len(sys.argv) > 1 else ""
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and filter_rule in n]
+    opts = _suite_args(sys.argv[1:])
+    os.nice(10)  # the suite yields to interactive work (ticket 328)
+    tests = _pick([(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)], opts.names)
     failures = [f"{n} (definido depois do __main__)" for n in _tests_after_main(open(__file__).read())]
-    for item_name, fn in tests:
-        try:
-            fn()
-            print(f"ok      {item_name}")
-        except Exception as e:  # noqa: BLE001 - the report shows all failures at once
-            failures.append(item_name)
-            print(f"FALHOU  {item_name}: {type(e).__name__}: {str(e)[-400:]!r}")
-    print(f"{len(tests) - len(failures)}/{len(tests)} testes passaram")
+    for n in failures:
+        print(f"FALHOU  {n}")
+    if CALLER_ENV:
+        print(f"ignored from the environment: {', '.join(CALLER_ENV)}")
+    live = _live_events()
+    real_logs = log_snapshot(_real_logs())  # ticket 216: the legacy log too
+    with _suite_turn() if not opts.names else contextlib.nullcontext():
+        w0, c0 = time.time(), _cpu()
+        results = _run_tests(tests, opts.jobs, cover=bool(opts.map))
+        wall, cpu = time.time() - w0, _cpu() - c0
+    if opts.names and not tests:
+        print(f"FALHOU  no test matches {' '.join(opts.names)}")
+        failures.append("no test")
+    if opts.map:
+        _write_map(opts.map, results, full=not opts.names)
+    failures += [n for n, r in results.items() if not r["ok"]]
+    for leak in _leaks(live):
+        print(f"FALHOU  a test wrote to a live events.jsonl: {leak}")
+        failures.append(leak)
+    for leak in log_leaks(real_logs):  # ticket 216: the suite leaves the real events.jsonl as it found it
+        failures.append(leak)
+        print(f"FALHOU  isolation: {leak}")
+    shutil.rmtree(SUITE_TMP, ignore_errors=True)
+    slow = sorted(results.items(), key=lambda x: -x[1]["s"])[:15]
+    print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
+    print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)

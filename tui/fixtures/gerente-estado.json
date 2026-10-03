@@ -1,4 +1,4 @@
 {"ts": "2026-10-01T12:00:00Z", "pid": 4242, "terminal": "term_ger", "linhas": ["run_a: 2 heartbeat(s) absorvido(s)"],
- "agentes": [{"dispatch": "ctx_1", "titulo": "orq: serve do gerente", "modelo": "claude-opus-5-5", "estado": "rodando", "fase": "implementing", "desde": "2026-10-01T11:50:00Z"},
+ "agentes": [{"dispatch": "ctx_1", "titulo": "orq: serve do gerente", "modelo": "claude-opus-5-5", "estado": "rodando", "fase": "implementing", "desde": "2026-10-01T11:50:00Z", "task": "task_1", "idade_s": 240},
              {"dispatch": "ctx_2", "titulo": "worker já entregue", "modelo": "claude-sonnet-5-5", "estado": "entregue", "fase": null, "desde": "2026-10-01T10:00:00Z"}],
  "maquina": {"cfg": {"max_workers": 6, "carga_max": 20, "mem_livre_min_mb": 3072, "livre_pct_min": 15}, "leitura": {"carga": 25.5, "mem_livre_mb": 8000, "livre_pct": 40}}}
