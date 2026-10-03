@@ -12822,7 +12822,7 @@ def drain_dispatch(cfg=None, now_at=None, only_exempt=False):
             dispatch_queue_rm(it["id"], "saiu", motivo="the dispatch already finished or already came back")
             line_list.append(f"queue: {it['titulo']} left (the dispatch already finished or already came back)")
             continue
-        if it["tipo"] == "despacho" and it.get("ticket") and not it.get("mate") and (owner := _mate_owning(it.get("run"))):  # ticket 351: the mate's Run is not the coordinator's to start
+        if it["tipo"] == "despacho" and it.get("ticket") and (owner := _mate_owning(it.get("run"))):  # tickets 351, 367: the mate's Run is not the coordinator's to start, whoever queued the item
             with contextlib.suppress(ValueError):
                 line_list.append(_forward_to_mate(it, owner))
                 continue

@@ -10536,6 +10536,16 @@ def test_ticket351_queue_item_of_a_mate_run_goes_to_the_mate_instead_of_giving_u
     assert any("request p1" in " ".join(e) for e in _sent_notices(a, "term_mate")), "the mate's terminal received the request"  # the typed text is cut at NOTICE_MAX; the event keeps it whole
 
 
+def test_ticket367_queue_item_the_mate_queued_goes_to_the_mate_not_to_the_coordinator_dispatch():
+    a = _panel79()
+    _mate_queue351(a, "run_mate", mate="orq", coord="term_mate")
+    for _ in range(orq_mod.QUEUE_FAILURES):
+        a.orq("gerente", "absorver", FAKE_FAIL_START_MODEL=SONNET)
+    ev = a.events()
+    assert not _queue79(a) and not [e for e in ev if e["tipo"] == "despacho_fila" and e["op"] == "desistiu"], ev
+    assert [e["fila"] for e in ev if e["tipo"] == "mate_pedido"] == ["fd351"]
+
+
 def test_ticket351_queue_item_of_the_coordinator_run_keeps_giving_up_after_three_errors():
     a = _panel79()
     _mate_queue351(a, "run_a")
