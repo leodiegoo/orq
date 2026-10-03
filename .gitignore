@@ -12,6 +12,8 @@ relatorios/
 clean-run.json
 backlog-doctor.json
 hook-timings.json
+acordar.json
+publish-notice.json
 backup-pt-*/
 ask/
 # the portuguese names, until scripts/migrar-ingles.py renames them
