@@ -6551,7 +6551,10 @@ def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURE
         state_.update(mandate)
         _cursor_mut(lambda c: (c.__setitem__("ausente", state_), preflight is not None and c.__setitem__("preflight", {"ts": state_["ligada_em"], **preflight})))
         _away_marker(_hora_local(state_["ligada_em"]))
-        append_event({"tipo": "ausente_ligar", **({"palavras": words} if words else {})})
+        usage = {h: plan_usage(agent=h) for h in HARNESSES}
+        state_["uso_plano"] = usage
+        _cursor_mut(lambda c: c.__setitem__("ausente", state_))
+        append_event({"tipo": "ausente_ligar", "uso_plano": usage, **({"palavras": words} if words else {})})
     elif words and words != was.get("palavras"):
         state_ = {**was, **mandate}
         _cursor_mut(lambda c: c.__setitem__("ausente", state_))
@@ -6617,7 +6620,7 @@ def coordinator_stops(evs, end_ts):
     return [x for x in out if (_dt(x[1]) - _dt(x[0])).total_seconds() > LACUNA_S]
 
 
-def away_report(since, live=None, now_at=None, preflight=None):
+def away_report(since, live=None, now_at=None, preflight=None, uso_inicio=None):
     """The absence report in pt-BR lines, only from what orq stores (events.jsonl and the pending item list), no LLM, only with what was born after
     `since`. Sections in order: decisions, problems, coordinator stopped, summaries, deliveries, PRs, tickets, then the morning card's (dispatch stops, dirty
     worktrees, not pushed, manager, log gap, commands to paste); an empty section does not appear. `live` is `_live_states` for the dispatches still running."""
@@ -6633,6 +6636,30 @@ def away_report(since, live=None, now_at=None, preflight=None):
     decisions = [pending_line(i) for i in open_entries if i.get("tipo") == "decisao"]
     ok = lambda e: e.get("outcome") == "succeeded"  # noqa: E731
     mandates = [f"{_hora_local(e['ts'])}: {e['palavras']}" for e in evs if e.get("tipo") in ("ausente_ligar", "ausente_mandato") and e.get("palavras")]
+    starts = uso_inicio if isinstance(uso_inicio, dict) else next((e.get("uso_plano") for e in evs if e.get("tipo") == "ausente_ligar"), None)
+    ends = {h: plan_usage(agent=h) for h in HARNESSES}
+    cost = []
+    if not starts or not any(_dict(starts).values()):
+        cost.append("uso desconhecido")
+    else:
+        for harness in HARNESSES:
+            before, after = _dict(starts).get(harness), ends.get(harness)
+            for key, label in (("semana", "week"), ("cinco_h", "5 h")):
+                a, b = _dict(before).get(key), _dict(after).get(key)
+                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    cost.append(f"{harness} {label}: {b-a:+g} pp ({a:g}% → {b:g}%)")
+                elif a is not None or b is not None:
+                    cost.append(f"{harness} {label}: uso desconhecido")
+        if not cost:
+            cost.append("uso desconhecido")
+    dispatches = [e for e in evs if e.get("tipo") == "despacho"]
+    cost.append(f"{len(dispatches)} dispatch(es) in this window")
+    rolled = any(isinstance(_dict(_dict(starts).get(h)).get(k + "_reset"), (int, float)) and
+                 isinstance(_dict(ends.get(h)).get(k + "_reset"), (int, float)) and
+                 _dict(_dict(starts).get(h)).get(k + "_reset") != _dict(ends.get(h)).get(k + "_reset")
+                 for h in HARNESSES for k in ("semana", "cinco_h")) if starts else False
+    if rolled:
+        cost.append("window rollover during absence")
     sections = [
         ("Your instructions", mandates),
         ("Crooked when the night began", [*[f"refused, forced: {x}" for x in _dict(preflight).get("duros", [])], *_dict(preflight).get("avisos", [])]),
@@ -6649,6 +6676,7 @@ def away_report(since, live=None, now_at=None, preflight=None):
         ("PRs", [f"{'opened' if e['op'] == 'ligar' else 'merged into ' + str(e.get('base'))}: {e.get('url')}" for e in evs if e.get("tipo") == "pr" and e.get("op") in ("ligar", "entrou")]),
         ("Tickets", [f"{'opened' if e['op'] == 'novo' else 'closed'} {e.get('ticket')}" + (f": {_quote(e.get('titulo'), 80)}" if e.get("titulo") else "")
                      for e in evs if e.get("tipo") == "ticket" and e.get("op") in ("novo", "fechar")]),
+        ("Custo", cost),
         ("Dispatch stops", card["lines"]),
         ("Dirty worktrees", card["dirty"][1]),
         ("Not pushed", card["without_push"][1]),
@@ -6700,11 +6728,19 @@ def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURE
         return [f"away mode on since {since}; the digest records each reply", *away_readback(_cursor_ro()), *notes, *night_lines(_cursor_ro(), read_events())[1:]]
     n = len(digest_generate()[0]["linha"]) if cur else 0
     pre = _dict(_cursor_ro().get("preflight"))
+    if not cur:
+        away_off()
+        return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}"]
+    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]), preflight=pre, uso_inicio=cur.get("uso_plano"))
+    file_path = write_away_report(rel)
+    entry = "away-report-" + hashlib.sha1(cur["ligada_em"].encode()).hexdigest()[:10]
+    if not any(o.get("entrada") == entry and o.get("chave") == "relatorio_ausencia" for o in open_obligations(read_events())):
+        append_event({"tipo": "entrada", "id": entry, "texto": "Deliver the absence report", "origem": "sistema", "sessao": "away"})
+        append_event({"tipo": "obrigacao", "op": "nova", "entrada": entry, "chave": "relatorio_ausencia", "texto": file_path})
+        append_event({"tipo": "intake", "entrada": entry, "efeito": "task", "nota": "report delivery obligation"})
     away_off()
     if not cur:
         return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}"]
-    rel = away_report(cur["ligada_em"], _live_states(read_events(), cur["ligada_em"]), preflight=pre)
-    file_path = write_away_report(rel)
     digest_generate()  # atual.json already carries the report
     return [f"away mode off; {n} timeline entries, see the dashboard {PANEL_URL}", "", *rel, "", f"Report saved to {file_path}; hand it to the user in the first reply."]
 
@@ -6778,6 +6814,11 @@ def digest_no_stop(ev):
     """On the coordinator's Stop, with away mode on: records the reply as a `resposta_coordenador` event and updates the digest. Fail-open: the
     failure goes to the log and the Stop proceeds."""
     if not _dict(_cursor_ro().get("ausente")):
+        answer = _last_answer(ev)
+        if answer:
+            for obligation in open_obligations(read_events()):
+                if obligation.get("chave") == "relatorio_ausencia" and (obligation.get("texto", "") in answer or os.path.basename(obligation.get("texto", "\0")) in answer):
+                    _close_obligation(obligation, "feito", prova="report path in coordinator reply", auto=True)
         return
     try:
         text_value = _last_answer(ev)
@@ -8031,14 +8072,18 @@ def _hook_stop(ev, run):
     events, now_at = read_events(), now_dt()
     without = open_entries(events)
     old_entries = obligations_to_chase(events, now_at)
+    report_obligations = [o for o in open_obligations(events) if o.get("chave") == "relatorio_ausencia"] if not mate else []
     asked = [p for p in mate_pending(events, _mates(), now_at) if p["grupo"] == mate and p["estado"] != "escalado"] if mate else []  # the mate answers before it stops (ticket 323)
     blocker = None if mate else away_blocker(events, now_at)
     session = (ev.get("session_id") or "")[:8]
-    if not without and not old_entries and not asked and not blocker:
+    if not without and not old_entries and not asked and not blocker and not report_obligations:
         with contextlib.suppress(Exception):
             _gate_resets_total(session)
         return None
     msg, gate_ids = MARK, []
+    if report_obligations:
+        msg += " Deliver the absence report (" + ", ".join(o.get("texto", "") for o in report_obligations) + ") in your reply."
+        gate_ids += [f"{o['entrada']}:{o['chave']}" for o in report_obligations]
     if without:
         ids = [e["id"] for e in without]
         append_event({"tipo": "gate_aviso", "abertas": ids, "sessao": session})
@@ -8071,7 +8116,7 @@ def _hook_stop(ev, run):
     elif not gate_ids:
         with contextlib.suppress(Exception):
             _gate_resets_total(session)
-    return {"systemMessage": msg} if without or old_entries or asked else {}
+    return {"systemMessage": msg} if without or old_entries or asked or report_obligations else {}
 
 
 def _ask_data(ev):
@@ -11941,8 +11986,9 @@ def session_context():
     SESSION_LINES lines. Tickets that do not fit become `+N open_items`."""
     card = card_first_line(read_events(), datetime.now(timezone.utc))
     mandate = away_readback(_cursor_ro())
-    line_list = state().splitlines()[:SESSION_LINES - 2 - bool(card) - len(mandate)]
-    line_list += mandate
+    obligations = [f"Open obligation: {o['chave']} — {o.get('texto', '')}" for o in open_obligations(read_events()) if o.get("chave") == "relatorio_ausencia"]
+    line_list = state().splitlines()[:SESSION_LINES - 2 - bool(card) - len(mandate) - len(obligations)]
+    line_list += mandate + obligations
     if card:
         line_list.append(card)
     open_items = [t for t in tickets() if t["status"] != STATUS_CLOSED]

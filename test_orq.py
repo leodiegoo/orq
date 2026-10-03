@@ -9362,9 +9362,36 @@ def test_away_off_delivers_the_absence_report_only_with_the_away_window():
     assert order == sorted(order), out
     assert "http://127.0.0.1:4387/session/x" in out and PR1 in out and "Fechei o passo 1" in out and "ticket 8 quebrou" in out
     assert "de antes do away" not in out
+    assert "Custo" in out and "dispatch(es) in this window" in out
     file_path = [f for f in os.listdir(folder) if f.endswith("-ausencia.md")]
     assert len(file_path) == 1 and PR1 in open(os.path.join(folder, file_path[0])).read()
     assert any("Away report" in l for l in _current(a)["ausencia"])
+    assert any(o["chave"] == "relatorio_ausencia" for o in orq_mod.open_obligations(a.events()))
+
+
+def test_ticket432_absence_report_obligation_blocks_then_closes_from_reply_path():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    off = a.orq("away", "off")
+    assert off.returncode == 0 and "Custo" in off.stdout and "uso desconhecido" in off.stdout
+    opened = [o for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia"]
+    assert len(opened) == 1 and os.path.exists(opened[0]["texto"])
+    assert "Open obligation: relatorio_ausencia" in _ctx_session(a)
+    blocked = _stop(a, last_assistant_message="Done.")
+    assert "Deliver the absence report" in blocked.stdout, blocked.stdout
+    closed = _stop(a, last_assistant_message=f"Report: {opened[0]['texto']}")
+    assert not [o for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia"]
+
+
+def test_ticket432_failed_report_write_keeps_away_window_for_retry():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    invalid_folder = os.path.join(a.tmp.name, "not-a-folder")
+    open(invalid_folder, "w").write("file")
+    failed = a.orq("away", "off", ORQ_RESUMOS=invalid_folder)
+    assert failed.returncode != 0 and _away_is_on(a)
+    retried = a.orq("away", "off")
+    assert retried.returncode == 0 and "Away report" in retried.stdout and not _away_is_on(a)
 
 
 WORDS = "até as 8h, só investiga, não mergeia"
@@ -14659,7 +14686,9 @@ def test_ticket392_user_prompt_and_empty_stop_zero_the_total():
     _stop126(a)
     assert total() == 1
     a.orq("away", "off")
-    assert _stop126(a) == {} and total() == 0
+    report = next(o["texto"] for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia")
+    assert _stop126(a, last_assistant_message=f"Report: {report}") == {} and total() == 0
+    assert not [o for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia"]
 
 
 def test_ticket156_obligation_done_or_deferred_allows_stopping():
