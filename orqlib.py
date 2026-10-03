@@ -2878,7 +2878,7 @@ def check_delivery(text_value, repos, pr_commits=None):
     for sha in shas:
         where = next((r for r in repos if _git(r, "cat-file", "-e", sha + "^{commit}") is not None), None)
         if not where:
-            notices.append(f"delivery without commit: {sha} does not exist in the worker repository")
+            notices.append(f"delivery without commit: {sha} does not exist in {', '.join(repos) or 'the worker repository'}")
         elif where not in dirty_list and _git(where, "status", "--porcelain").strip():
             dirty_list.append(where)
             notices.append(f"delivery without commit: dirty tree in {where}")
@@ -2900,7 +2900,7 @@ def _pr_commits(url):
 
 
 def _worker_repos(m, p):
-    """The dispatch's worktree (worker-list) and then the ORQ_REPOS repositories (default: the orq clone)."""
+    """The dispatch's worktree (worker-list), the absolute paths the task spec lists (a ticket that touches a second repo names its worktree) and then the ORQ_REPOS repositories (default: the orq clone)."""
     repos = []
     try:
         for w in _all_workers(m["run_id"]):
@@ -2909,7 +2909,12 @@ def _worker_repos(m, p):
                 repos += [wt] if wt.startswith("/") else []
     except Exception as e:  # noqa: BLE001
         log(f"delivery: worker-list failed ({type(e).__name__}: {e}); ORQ_REPOS only")
-    return repos + [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]
+    try:
+        t = next((t for t in orca("task-list", "--run", m["run_id"], timeout=20)["tasks"] if t["id"] == p.get("taskId")), None)
+        repos += re.findall(r"`(/[^`\s]+)`", (t or {}).get("spec") or "")
+    except Exception as e:  # noqa: BLE001
+        log(f"delivery: task-list failed ({type(e).__name__}: {e}); without the spec's repositories")
+    return list(dict.fromkeys(repos + [r for r in os.environ.get("ORQ_REPOS", orqpaths.CODE).split(":") if r]))
 
 
 def _already_has_event(type_name, msg):

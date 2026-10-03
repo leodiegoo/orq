@@ -6398,7 +6398,7 @@ def test_audience_check_finds_forbidden_term_and_skips_without_list():
     assert subprocess.run([sys.executable, check], capture_output=True, text=True).returncode == 0
 
 
-def _repo_git(tmp, dirty=False):
+def _repo_git(tmp, dirty=False, tag="c"):
     """Git repository with one commit; returns (path, short sha)."""
     repo = os.path.join(tmp, "r" + str(len(os.listdir(tmp))))
     os.makedirs(repo)
@@ -6406,11 +6406,11 @@ def _repo_git(tmp, dirty=False):
     g("init", "-q")
     open(os.path.join(repo, "f"), "w").write("x")
     g("add", "f")
-    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", tag)
     for i in range(50):  # a short sha of only digits (1 in 27) is not a sha to SHA_RE: the PR test went red at random (ticket 328)
         if orq_mod.SHA_RE.fullmatch(g("rev-parse", "--short=7", "HEAD")):
             break
-        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--amend", "-qm", f"c{i}")
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--amend", "-qm", f"{tag}{i}")
     if dirty:
         open(os.path.join(repo, "novo"), "w").write("y")
     return repo, g("rev-parse", "--short=7", "HEAD")
@@ -6464,6 +6464,38 @@ def test_it_should_show_the_delivery_warning_in_the_summary_and_in_orq_agents():
         agent_rows = orq_mod.build_agents([{"dispatchId": "ctx_e", "taskId": "task_e", "dispatchStatus": "completed", "agentTerminalHandle": "term_e"}],
                                     [], a.events(), datetime.now(timezone.utc), live=["term_e"])
         assert agent_rows[0]["entrega"] and "NOTICE: delivery without commit" in orq_mod.agents_text(agent_rows)
+
+
+def _two_repo_delivery(a, repo_a, repo_b, body):
+    """Ingests a worker_done of a ticket that touches two repos: the dispatch's worktree is repo_a, the spec lists repo_b's worktree. Returns the delivery events."""
+    a.set("automations_runs.json", {"result": {"runs": []}})
+    a.set("workers.json", [{"handle": "term_e", "run": "run_a", "dispatch": "ctx_e", "task": "task_e", "worktree": repo_a}])
+    a.set("tasks_run_a.json", [{"id": "task_e", "status": "completed", "dispatch_id": "ctx_e", "created_at": "2026-09-27T00:00:00Z",
+                                "spec": f"## orq worktree\n\nCreate the worktrees `{repo_a}` and `{repo_b}`."}])
+    a.set("inbox.json", {"result": {"messages": [{"id": "msg_e2", "run_id": "run_a", "type": "worker_done", "subject": "pronto", "sequence": 5, "body": body,
+                                     "created_at": "2099-01-01T00:00:00Z", "payload": json.dumps({"taskId": "task_e", "dispatchId": "ctx_e", "outcome": "succeeded"})}]}})
+    os.makedirs(a.home, exist_ok=True)
+    json.dump({"ingest": {"desde": SINCE_EARLY, "inbox_seq": 0, "runs": []}}, open(os.path.join(a.home, "cursor.json"), "w"))
+    a.orq("ingest")
+    return [e for e in a.events() if e.get("tipo") == "entrega"]
+
+
+def test_it_should_accept_a_commit_in_each_repo_of_a_two_repo_ticket():
+    with tempfile.TemporaryDirectory() as t:
+        repo_a, sha_a = _repo_git(t)
+        repo_b, sha_b = _repo_git(t, tag="b")
+        ev = _two_repo_delivery(Env(ORQ_REPOS=os.path.join(t, "none")), repo_a, repo_b, f"orq {sha_a} e dashboard {sha_b}")
+        assert ev == [], ev
+
+
+def test_it_should_name_the_repos_when_a_commit_of_a_two_repo_ticket_is_in_none():
+    with tempfile.TemporaryDirectory() as t:
+        repo_a, sha_a = _repo_git(t)
+        repo_b, _ = _repo_git(t, tag="b")
+        ev = _two_repo_delivery(Env(ORQ_REPOS=os.path.join(t, "none")), repo_a, repo_b, f"orq {sha_a} e dashboard abc1234")
+        assert len(ev) == 1 and len(ev[0]["avisos"]) == 1, ev
+        aviso = ev[0]["avisos"][0]
+        assert "abc1234" in aviso and repo_a in aviso and repo_b in aviso, aviso
 
 
 # ---------- ticket 32: interrupt, stop and relaunch ----------
