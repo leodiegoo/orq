@@ -564,7 +564,7 @@ def integrate_proof(branches, no_proof=None):
     return proof_guard(checks, no_proof)
 
 
-def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "readme")):
+def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "readme"), public_project=None):
     """Reasons why `revs` (args of `git rev-list`, e.g. `base..head`) cannot go to the public main: author or committer outside the configured noreply
     (`ORQ_AUTOR` or `git config user.email`), Co-Authored-By trailer or generator footer, forbidden term in the diff or message, `orqlib.py`/`orq.py` without `README.md` in the range.
     Returns [] if clean (ticket 139). The pre-push and the integrator, before the FF, run this same check. `checks` narrows it: `orq pr open` on a product repo
@@ -583,7 +583,7 @@ def audit_publication(revs, repo=None, checks=("author", "trailer", "terms", "re
     else:
         print(f"audit-publication: no {listing}, forbidden-terms check skipped", file=sys.stderr)
     reasons, files_set, first_code = [], set(), None
-    public_project = _public_project(repo) if repo and "public" in checks else None
+    public_project = (public_project or _public_project(repo)) if repo and "public" in checks else None
     for sha in git("rev-list", "--reverse", *revs).split():
         an, ae, cn, ce, msg = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha).split("\0", 4)
         findings = [f"author {an} <{ae}> and committer {cn} <{ce}> must be <{expected}> (git commit --amend --reset-author, or git rebase --exec 'git commit --amend --no-edit --reset-author')"
@@ -3378,6 +3378,10 @@ def _push_product_pr(m, p):
                 reasons.append(f"commit {sha[:8]} author and committer must be {expected}")
             if re.search(r"^co-authored-by:|generated with|🤖", record[2] if len(record) == 3 else "", re.I | re.M):
                 reasons.append(f"commit {sha[:8]} has a Co-Authored-By trailer or generator footer")
+        try:
+            reasons.extend(audit_publication([f"{tip}..{head}"], worktree, checks=("public",), public_project=project))
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+            reasons.append(f"could not check public content ({type(error).__name__}: {error})")
     if reasons:
         _product_push_notice(m, p, branch, "; ".join(reasons))
         return False

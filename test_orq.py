@@ -23572,6 +23572,65 @@ def test_ticket439_product_pr_branch_pushes_only_a_valid_fast_forward():
         assert not pushed, events
 
 
+def test_ticket446_product_pr_push_uses_the_publication_content_guard():
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = os.path.join(tmp, "remote.git")
+        repo, worktree = os.path.join(tmp, "repo"), os.path.join(tmp, "worker")
+        subprocess.run(["git", "init", "-q", "--bare", "--initial-branch=feat/pr", bare], check=True)
+        subprocess.run(["git", "clone", "-q", bare, repo], check=True)
+        for path in (repo,):
+            subprocess.run(["git", "-C", path, "config", "user.name", "Worker"], check=True)
+            subprocess.run(["git", "-C", path, "config", "user.email", "worker@users.noreply.github.com"], check=True)
+        pathlib.Path(repo, "file.txt").write_text("base\n")
+        subprocess.run(["git", "-C", repo, "add", "file.txt"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", repo, "push", "-q", "origin", "HEAD:feat/pr"], check=True)
+        subprocess.run(["git", "clone", "-q", bare, worktree], check=True)
+        subprocess.run(["git", "-C", worktree, "config", "user.name", "Worker"], check=True)
+        subprocess.run(["git", "-C", worktree, "config", "user.email", "worker@users.noreply.github.com"], check=True)
+        ticket_file = os.path.join(tmp, "ticket.md")
+        pathlib.Path(ticket_file).write_text("# ticket\n\nBranch do PR: feat/pr\n")
+        events = [{"tipo": "despacho", "dispatch": "ctx_x", "projeto": "app"}]
+        before = {name: getattr(orq_mod, name) for name in ("read_events", "tickets", "projects", "machine_cfg", "_public_project", "_delivery_project", "_dispatch_worktree", "append_event")}
+        try:
+            orq_mod.read_events = lambda: events
+            orq_mod.tickets = lambda: [{"task": "task_x", "num": "09", "arquivo": ticket_file}]
+            orq_mod.projects = lambda: {"app": {"repo": f"path:{repo}", "remote": "origin", "author": "worker@users.noreply.github.com", "publico_proibido": {"patterns": ["internal tool"], "allow": []}}}
+            orq_mod.machine_cfg = lambda: {"publico_proibido": {"patterns": ["ticket 446"], "allow_by_project": {}}}
+            orq_mod._public_project = lambda _: "app"
+            orq_mod._delivery_project = lambda *_: "app"
+            orq_mod._dispatch_worktree = lambda *_: worktree
+            orq_mod.append_event = lambda event, **_: events.append(event)
+            pathlib.Path(worktree, "file.txt").write_text("base\nlocal change\n")
+            subprocess.run(["git", "-C", worktree, "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", worktree, "commit", "-q", "-m", "fix: ticket 446 private work"], check=True)
+            pushed = orq_mod._push_product_pr({"id": "msg_forbidden", "run_id": "run_a"}, {"outcome": "succeeded", "dispatchId": "ctx_x", "taskId": "task_x"})
+            remote_head = subprocess.run(["git", "--git-dir", bare, "rev-parse", "refs/heads/feat/pr"], check=True, capture_output=True, text=True).stdout.strip()
+            notices = [notice for event in events for notice in event.get("avisos", [])]
+            assert not pushed and remote_head == subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(), (pushed, remote_head, notices)
+            assert any("ticket 446 private work" in notice and "issue/PR do GitHub" in notice for notice in notices), notices
+            # A project-specific term is also blocked and reported with its matching line.
+            pathlib.Path(worktree, "docs").mkdir()
+            pathlib.Path(worktree, "docs", "design.md").write_text("internal tool\n")
+            subprocess.run(["git", "-C", worktree, "add", "docs/design.md"], check=True)
+            subprocess.run(["git", "-C", worktree, "commit", "-q", "-m", "docs: document behavior"], check=True)
+            pushed = orq_mod._push_product_pr({"id": "msg_project_term", "run_id": "run_a"}, {"outcome": "succeeded", "dispatchId": "ctx_x", "taskId": "task_x"})
+            assert not pushed and any("internal tool" in notice for event in events for notice in event.get("avisos", [])), events
+            # A clean commit is pushed in an independent worker clone so the rejected commits are not in its range.
+            clean = os.path.join(tmp, "clean-worker")
+            subprocess.run(["git", "clone", "-q", bare, clean], check=True)
+            subprocess.run(["git", "-C", clean, "config", "user.name", "Worker"], check=True)
+            subprocess.run(["git", "-C", clean, "config", "user.email", "worker@users.noreply.github.com"], check=True)
+            pathlib.Path(clean, "file.txt").write_text("base\nclean change\n")
+            subprocess.run(["git", "-C", clean, "commit", "-qam", "fix: clean change"], check=True)
+            orq_mod._dispatch_worktree = lambda *_: clean
+            pushed = orq_mod._push_product_pr({"id": "msg_clean", "run_id": "run_a"}, {"outcome": "succeeded", "dispatchId": "ctx_x", "taskId": "task_x"})
+            assert pushed and any(event.get("tipo") == "pr_branch_push" and event.get("head") == subprocess.run(["git", "-C", clean, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip() for event in events), events
+        finally:
+            for name, value in before.items():
+                setattr(orq_mod, name, value)
+
+
 # ---- ticket 356: the manager finds the delivery that nobody carries ----
 
 def _orphan_env(**env):
