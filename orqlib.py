@@ -5789,6 +5789,16 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
                        "pontos": _points(list(flow_info.values()) or [task_flow(None, events)])}}
 
 
+def badge_colors(folder):
+    """[{nome, cor}] from ORQ_HOME/<folder>/*.json that carry a `color`; one without it (or not a string) is left out, there is nothing to paint (ticket 387)."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(_path(folder), "*.json"))):
+        cfg = _read_json(f)
+        if isinstance(cfg, dict) and isinstance(cfg.get("color"), str) and cfg["color"]:
+            out.append({"nome": os.path.basename(f)[:-5], "cor": cfg["color"]})
+    return out
+
+
 def digest_json(d):
     """What goes into atual.json: the contract's keys, each step only with its own, and an empty `line` with away mode off."""
     return {"versao": d["versao"], "geradoEm": d["geradoEm"], "ausente": d["ausente"],
@@ -5796,7 +5806,8 @@ def digest_json(d):
             "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"], "idade": d["idade"], "integrator": d["integrator"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
-            **({"retro": d["retro"]} if d.get("retro") else {}), **({"bloqueios_area": d["bloqueios_area"]} if d.get("bloqueios_area") else {})}  # additive: with no recorded round the v1 contract stays as it was
+            **({"retro": d["retro"]} if d.get("retro") else {}), **({"bloqueios_area": d["bloqueios_area"]} if d.get("bloqueios_area") else {}),
+            **{k: v for k, v in (("projetos", badge_colors("projects")), ("grupos", badge_colors(GROUPS_DIR))) if v}}  # additive: with no recorded round the v1 contract stays as it was
 
 
 def html_digest(d):
@@ -9227,6 +9238,17 @@ def _inject_dispatch(run_, task, handle, restore, repeat):
     return new
 
 
+def _superseding_dispatch(events, d):
+    """(dispatch, task) of the latest `despacho` that shares `d`'s worktree and came after it, or None: the worker of a closed or replaced ticket must not be reopened (ticket 388)."""
+    # ponytail: the worktree is the only link between two dispatches of one branch that the log keeps; a `devolver` dispatch is not a `despacho`, so a return never supersedes
+    ds = [e for e in events if e.get("tipo") == "despacho" and e.get("worktree")]
+    i = next((i for i, e in enumerate(ds) if e["dispatch"] == d), None)
+    if i is None:
+        return None
+    later = [e for e in ds[i + 1:] if e["worktree"] == ds[i]["worktree"]]
+    return (later[-1]["dispatch"], later[-1]["task"]) if later else None
+
+
 def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
     worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
@@ -9247,6 +9269,8 @@ def send_back(target, reason, run=None, achado=False):
             t = {"id": opened["task"], "dispatch_id": opened["novo_dispatch"]}
         if not t:
             raise ValueError(f"{target} is neither a task nor a dispatch of Run {run_}")
+        if newer := _superseding_dispatch(read_events(), t["dispatch_id"]):  # ticket 388: two workers on one branch, only the latest is reopened
+            raise ValueError(f"dispatch {t['dispatch_id']} was superseded by {newer[0]} (task {newer[1]}) on the same worktree: `orq send-back {newer[1]} \"<reason>\"` reaches the worker that holds the branch")
         d, body_text = t["dispatch_id"], f"The delivery was sent back by the coordinator; redo it and send a new worker_done with this dispatch's command. Reason: {reason}"
         if d in _hibernated():
             r = wake(d, MSG_REDISPATCH)
