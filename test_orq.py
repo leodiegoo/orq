@@ -19900,6 +19900,7 @@ EVENTOS_LIDOS = {
     "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
     "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
     "clean_run": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
+    "segurar": "hook_stop wake_stopped", "segurar_solta": "hook_stop wake_stopped",
 }
 NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
 
@@ -19907,6 +19908,8 @@ NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pen
 def _type_strings(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [node.value]
+    if isinstance(node, ast.IfExp):  # `{"tipo": "a" if c else "b"}` writes both
+        return _type_strings(node.body) + _type_strings(node.orelse)
     return [s for x in node.elts for s in _type_strings(x)] if isinstance(node, (ast.Tuple, ast.List, ast.Set)) else []
 
 
