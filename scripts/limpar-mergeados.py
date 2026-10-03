@@ -4,6 +4,7 @@
 Usage: limpar-mergeados.py [--repo <path>] [--branch <name>] [--task <id>] [--dry-run] [--json] [--self-test]
 Without --repo, uses the cwd's git root. Summary of the last run in ~/.claude/logs/limpar-mergeados.last.json.
 With --branch, only that branch (worktree, local and remote) is considered; with --task, the result becomes a `pr`/`cleaned` event in orq's log.
+A worktree with no merged PR also goes when orq proves its branch is in main (`orqlib.integration_proof`: a cycle of the integrator recorded the tip, or every commit is patch-equivalent in main), after a bundle of its commits; the 24 h window counts from the end of that cycle.
 Never uses --force; an error on one item goes into the summary and not onto the others.
 An untracked file that is an orq artifact (ORQ_ARTIFACTS) doesn't block removing the worktree: it is copied to RELATORIOS first.
 """
@@ -14,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -139,13 +141,13 @@ def decide_orphan(f):
         return "skip", "an open PR uses the branch as head"
     if f["dirty"]:
         return "skip", "worktree has changes or untracked files"
-    if f["ahead"]:
+    if f["ahead"] and not f.get("integrated"):
         return "skip", "commit outside main"
     if f["busy"] is not False:
         return "skip", "a live orq worker uses the worktree"
     if f["recente"]:
-        return "skip", f"activity in the last {ORPHAN_IDLE_H} h"
-    return "remove", "no commit outside main, clean tree and no worker"
+        return "skip", f"{'its integration cycle ended' if f.get('integrated') else 'activity'} in the last {ORPHAN_IDLE_H} h"
+    return "remove", f"integrated by orq ({f['integrated']}), clean tree and no worker" if f.get("integrated") else "no commit outside main, clean tree and no worker"
 
 
 def is_ahead(base, head, cwd, pr_head_oid=None):
@@ -238,6 +240,9 @@ def self_test():
     for k, v in dict(branch="main", kept=True, open_head=True, dirty=True, ahead=True, busy=True, recente=True).items():
         assert decide_orphan({**orphan, k: v})[0] == "skip", k
     assert decide_orphan({**orphan, "branch": "prototype/2039-x"})[0] == "skip"  # prototype never, even outside .keep
+    assert decide_orphan({**orphan, "ahead": True, "integrated": "registro"})[0] == "remove"  # a tip outside main that an integrator cycle recorded
+    assert decide_orphan({**orphan, "ahead": True, "integrated": "registro", "dirty": True})[0] == "skip" and decide_orphan({**orphan, "ahead": True, "integrated": "cherry", "recente": True})[0] == "skip"
+    assert decide_orphan({**orphan, "ahead": True})[0] == "skip"
     assert decide_orphan({**orphan, "busy": None})[0] == "skip"  # no answer from orq about workers, when in doubt it doesn't delete
     assert is_kept("prototype/2039-x", ["prototype/*"]) and not is_kept("feat/x", ["prototype/*"])
     assert is_kept("main_bkp_1", ["main_bkp_*"]) and is_kept("feat/plataform-metrics", ["feat/plataform-metrics"])
@@ -253,6 +258,17 @@ def self_test():
     for k, v in dict(mine=False, on_remote=False, open_base=True, tip_matches=False).items():
         assert decide({**r, k: v})[0] == "skip", k
     print("self-test ok")
+
+
+def orq_proof(repo, branch):
+    """orq's proof that `branch` is in main (`integration_proof`: contained, recorded by an integrator cycle, or every commit patch-equivalent): {via, since} or None.
+    orq doesn't answer: None, and the branch stays as it was (ticket 327)."""
+    try:
+        from orqlib import integration_proof
+        return integration_proof(repo, branch, "main")
+    except Exception as e:  # noqa: BLE001 - without orq the hook decides only by the PR and by `git cherry`
+        print(f"limpar-mergeados: orq proof: {e}", file=sys.stderr)
+        return None
 
 
 def busy_worktrees():
@@ -365,11 +381,14 @@ def main():
             fa = facts("worktree", b, w["path"])
             v, r = decide(fa)
             if not fa["merged"] and not fa["is_main_current"]:  # no merged PR: maybe orphaned (cherry-pick, research, stopped)
-                fa["ahead"] = is_ahead("origin/main", "HEAD", w["path"])
+                proof = orq_proof(main_path, b)
+                fa["integrated"] = proof and proof["via"]
+                fa["ahead"] = False if proof else is_ahead("origin/main", "HEAD", w["path"])
                 blockers, fa["artefatos"] = dirt(w["path"])
                 fa["dirty"] = bool(blockers)
                 fa["busy"] = None if busy is None else w["path"] in busy
-                fa["recente"] = (datetime.now(timezone.utc).timestamp() * 1000 - (w.get("lastActivityAt") or 0)) < ORPHAN_IDLE_H * 3600 * 1000
+                since = proof["since"] * 1000 if proof and proof["since"] else (w.get("lastActivityAt") or 0)  # the cycle's end, not the folder's activity (the hook itself and `orq agents` touch it)
+                fa["recente"] = datetime.now(timezone.utc).timestamp() * 1000 - since < ORPHAN_IDLE_H * 3600 * 1000
                 v, r = decide_orphan(fa)
                 if v == "remove":
                     r += "; branch local apagada junto"
@@ -382,6 +401,13 @@ def main():
                         stored = store(w["path"], fa["artefatos"])
                     except OSError as e:  # without the copy, removing would lose the report
                         v, r = "skip", f"could not save {', '.join(fa['artefatos'])}: {e}"
+            if v == "remove" and not a.dry_run and fa.get("integrated") not in (None, False, "contida"):  # the tip is not in main: bundle first, then the branch is deleted with -D
+                try:
+                    from orqlib import PLAN, clean_bundle
+                    if not clean_bundle(main_path, [b], os.path.join(PLAN, "backups"), time.time(), "main")[1]:
+                        v, r = "skip", "backup bundle failed: nothing removed"
+                except Exception as e:  # noqa: BLE001
+                    v, r = "skip", f"no backup bundle ({e}): nothing removed"
             if v == "remove" and not a.dry_run:
                 try:
                     from orqlib import terminate_worktree_processes
