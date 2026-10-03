@@ -12304,6 +12304,7 @@ def doctor_backlog(manager=False):
     by_run, notices, problems = {}, [], []
     events = read_events()
     integrating, held = integration_queue(), _held(events)
+    deliveries = _delivery_ledger(events)
     dispatch_tickets, services = _dispatch_ticket(events), _services(events)
     service_tickets = {ticket for dispatch, ticket in dispatch_tickets.items() if dispatch in services and dispatch not in _released(events)}
     for run in sorted({t["run"] for _, t in tks if t["run"] and t["task"]}):
@@ -12328,17 +12329,30 @@ def doctor_backlog(manager=False):
             add_finding(t, f"task {t['task']} is not in Run {t['run']}", "if the work is done, orq ticket close; otherwise recreate the ticket (orq ticket new)")
             continue
         st, is_open = tk.get("status"), tk.get("status") not in ("completed", "failed")
+        delivery = deliveries.get(n) if not t.get("projeto") else None
+        integrated = bool(delivery and _on_main(delivery, events))
         if (t["status"] == STATUS_IN_PROGRESS and st == "completed"
-                and (n in integrating or n in held or (not manager and _integrated_into_main(t)) or n in service_tickets)):
+                and (n in integrating or n in held or (not manager and integrated) or n in service_tickets)):
             continue
         if t["status"] == STATUS_CLOSED and is_open:
             add_finding(t, f"Done, but task {t['task']} is {st}", f"orca orchestration task-update --id {t['task']} --status completed --run {t['run']}")
         elif t["status"] == STATUS_IN_PROGRESS and not is_open:
-            add_finding(t, f"In flight, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and _integrated_into_main(t))
+            if st == "completed" and delivery and not integrated:
+                branch = delivery.get("branch")
+                if branch:
+                    problem = f"In flight, but task {t['task']} is already completed; delivered branch {branch} is missing from the integration queue"
+                    if _branch_repo(branch):
+                        add_finding(t, problem, f"orq integrate queue add {shlex.quote(branch)} {n}")
+                    else:
+                        add_finding(t, problem + " and no local branch ref was found", f"coordinator review required: verify or recover branch {shlex.quote(branch)} before adding ticket {n} to the integration queue")
+                else:
+                    add_finding(t, f"In flight, but task {t['task']} is already completed and its delivery record has no branch", f"coordinator review required: identify or recover the delivered branch for ticket {n} before closing it")
+            else:
+                add_finding(t, f"In flight, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and integrated)
         elif t["status"] == STATUS_IN_PROGRESS and st != "dispatched":
             add_finding(t, f"In flight, but task {t['task']} is {st}, with no dispatched worker", f"orq dispatch --run {t['run']} --ticket {n} --model <m> --effort <e>")
         elif t["status"] == STATUS_NEW and not is_open:
-            add_finding(t, f"Queued, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and _integrated_into_main(t))
+            add_finding(t, f"Queued, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and integrated)
         elif t["status"] == STATUS_NEW and st == "dispatched":
             add_finding(t, f"Queued, but task {t['task']} is dispatched", f"{file_path} start t{n}")
     try:
