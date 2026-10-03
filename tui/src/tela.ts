@@ -2,7 +2,7 @@
 // As linhas dos blocos trazem trechos com cor semântica (verde, amarelo...): aqui cada um vira o hex da paleta do tema.
 import { BoxRenderable, StyledText, TextRenderable, bold, fg, type CliRenderer } from "@opentui/core"
 import { texto, type Bloco } from "./dados"
-import { PALETAS, type Tema } from "./tema"
+import { PALETAS, textoLegivel, type Cor, type Tema } from "./tema"
 
 export function criarTela(renderer: CliRenderer, rodape: string, tema: Tema = "dark") {
   const cor = PALETAS[tema]
@@ -16,7 +16,7 @@ export function criarTela(renderer: CliRenderer, rodape: string, tema: Tema = "d
       b.linhas.flatMap((l, n) => [
         ...(n ? [fg(cor.texto)("\n")] : []),
         ...(typeof l === "string" ? [l] : l).map((t) => {
-          const c = fg(typeof t === "string" ? cor.texto : cor[t.c ?? "texto"])(typeof t === "string" ? t : t.t)
+          const c = fg(typeof t === "string" ? cor.texto : t.c?.startsWith("#") ? textoLegivel(t.c, tema) : cor[(t.c as Cor | undefined) ?? "texto"])(typeof t === "string" ? t : t.t)
           return typeof t !== "string" && t.b ? bold(c) : c
         }),
       ]),
