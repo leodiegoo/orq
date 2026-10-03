@@ -186,6 +186,7 @@ The easy way is `orq project add <path|url>`, which writes it. By hand:
 {
   "repo": "path:~/code/my-app",
   "harness": "codex",
+  "commit_autorizado": true,
   "group": "work",
   "environments": [
     {"branch": "development"},
@@ -219,6 +220,7 @@ Optional publication guard: `publico_proibido` adds project-specific `patterns` 
 10. `sem_ci` is optional (`true`): the project has no CI. `orq fila` reads a PR with no registered check as `? no check registered for N min` and does not count it as ready (the workflow may not have fired, the checks may not be registered yet, or a conflicting PR gets no workflow); with `sem_ci: true` an empty list is ready. Checks that do show up keep counting.
 11. `integrator` is optional: `"manual"` says the repo has no integrator (the panel). A delivery of that project is not queued: the ingest records an `entrega_manual` event and the manager raises the coordinator's obligation `juntar` ("merge `<branch>` into the main of `<repo>`"), shown in the prompt context and the Stop until `orq fulfill <entry> juntar --proof "<hash>"`. If the same ticket also delivered an orq branch, the obligation waits until the integrator cycle records that branch in main.
 12. `priority_base`, `reserve_slots` and `max_slots` are optional integers that shape the shared dispatch queue (see `machine.json` above): the project's base priority (1 to 3), the slots kept for it and its ceiling of live workers. A value of the wrong type counts as absent.
+13. `commit_autorizado` is optional and defaults to `false`. Only `true` adds a line to this project's worker brief authorizing commits on the worker branch; pushing stays prohibited unless that brief explicitly allows it.
 
 Check it with `orq projects` (an invalid file shows `invalid: <why>` and is never picked on its own) and `orq flow --repo <path>`.
 
