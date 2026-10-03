@@ -10408,6 +10408,56 @@ def steer(task, text_value, run=None, entry=None):
         return _steer(task, text_value, target, entry, request)
 
 
+def _service_dispatch_for_terminal(handle, events):
+    """The active service dispatch attached to `handle`, using the latest recorded terminal for each dispatch."""
+    services = set(_services(events))
+    superseded = {e.get("dispatch") for e in events if e.get("tipo") in ("acordar", "devolver") and e.get("novo_dispatch")}
+    active = services - _released(events) - superseded
+    current = {}
+    for index, event in enumerate(events):
+        kind, dispatch = event.get("tipo"), event.get("dispatch")
+        if kind in ("despacho", "retomada"):
+            target = dispatch
+        elif kind in ("acordar", "devolver"):
+            target = event.get("novo_dispatch") or dispatch
+        else:
+            continue
+        if target in active and event.get("terminal"):
+            current[target] = (index, {"dispatch": target, "task": event.get("task"), "run": event.get("run"), "terminal": event["terminal"]})
+    matches = [(index, item) for index, item in current.values() if item["terminal"] == handle]
+    return max(matches, key=lambda match: match[0], default=(None, None))[1]
+
+
+def escalate(text_value):
+    """Records a service-worker escalation in the coordinator inbox and wakes the configured coordinator."""
+    body_text = (text_value or "").strip()
+    if not body_text:
+        raise ValueError("orq escalate <text>")
+    handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if not handle:
+        raise ValueError("orq escalate requires an active Orca Dispatch")
+    events = read_events()
+    dispatch = _service_dispatch_for_terminal(handle, events)
+    if not dispatch:
+        raise ValueError("orq escalate requires an active service Dispatch")
+    if not dispatch.get("run") or not dispatch.get("task"):
+        raise ValueError("orq escalate cannot resolve the active service Dispatch Run and task")
+    coordinator = (_manager_cfg() or {}).get("coordenador")
+    if not isinstance(coordinator, str) or not coordinator.strip():
+        raise ValueError("orq escalate cannot find the configured coordinator terminal")
+    entry = append_event({"tipo": "entrada", "origem": "servico", "texto": body_text, "run": dispatch["run"], "task": dispatch["task"],
+                          "dispatch": dispatch["dispatch"], "terminal": handle}, new_id=True)
+    entry_id = entry["id"]
+    notice = f"orq escalation {entry_id} from service Dispatch {dispatch['dispatch']}: {body_text}"
+    try:
+        status = notify_coordinator(coordinator, notice)
+    except Exception as e:  # noqa: BLE001 — the inbox entry remains durable if waking Orca fails
+        raise RuntimeError(f"Escalation was recorded in coordinator inbox as {entry_id}, but the coordinator notice failed: {e}") from e
+    if status not in ("enviado", "adiado"):
+        raise RuntimeError(f"Escalation was recorded in coordinator inbox as {entry_id}, but coordinator notification failed ({status})")
+    return entry_id, status
+
+
 def _steer_line(task, body_text):
     """(what goes in the message, the file or None): an adjustment over STEER_FILE_MIN goes whole to STEERS/<task>-<n>.md and the message carries one line with the path
     and the request for `orq reply` (at most NOTICE_MAX with the usual paths, so `type_text` sends it whole; Orca's typed notice cuts the body at 300 characters, and a worker that does not ack rereads the oldest message: the text must fit)."""
@@ -18165,6 +18215,8 @@ def parser():
     st.add_argument("text_value")
     st.add_argument("--run")
     _arg(st, "entrada")
+    es = sub.add_parser("escalate", aliases=["escalar"], help="orq escalate \"<text>\": records an escalation from the active service Dispatch, notifies the coordinator, and prints its inbox entry ID")
+    es.add_argument("text_value")
     pr = sub.add_parser("pr", help="the PRs of each feature linked to the task: link, list, unlink, poll (poll runs outside the hooks)").add_subparsers(dest="op", required=True)
     pl2 = pr.add_parser("link", aliases=["ligar"], help="orq pr link <task> <url> [--issue N]: registers the feature's PR (one per project environment, or merge/<feature>-<environment>)")
     pl2.add_argument("task")
@@ -18656,6 +18708,9 @@ def main(argv=None):
             print(json.dumps(ev, ensure_ascii=False))
             if not a.entry:
                 _implicit("steer", a.task, ev.get("run"))
+        elif a.cmd in ("escalate", "escalar"):
+            entry_id, status = escalate(a.text_value)
+            print(f"Escalation recorded in coordinator inbox as {entry_id}; coordinator notice {status}.")
         elif a.cmd == "steers":
             print("\n".join(redeliver_steers()) or "no adjustment to redeliver")
         elif a.cmd == "reply":
