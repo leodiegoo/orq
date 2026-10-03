@@ -14575,7 +14575,9 @@ def test_ticket392_user_prompt_and_empty_stop_zero_the_total():
     _stop126(a)
     assert total() == 1
     a.orq("away", "off")
-    assert _stop126(a) == {} and total() == 0
+    report = next(o["texto"] for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia")
+    assert _stop126(a, last_assistant_message=f"Report: {report}") == {} and total() == 0
+    assert not [o for o in orq_mod.open_obligations(a.events()) if o["chave"] == "relatorio_ausencia"]
 
 
 def test_ticket156_obligation_done_or_deferred_allows_stopping():
