@@ -10220,7 +10220,11 @@ def ticket_close(numero, answer, dropped=None, integrated=False):
     if not answer_text:
         raise ValueError("--answer is empty: say what resolved the ticket (text or file)")
     events = read_events()
-    if not (dropped or integrated) and (rec := _delivery_ledger(events).get(n)) and not _on_main(rec, events):
+    product = bool(t.get("projeto")) and not orq_ticket(t.get("titulo"), t["projeto"])  # ticket 386: product code goes by PR in the project's repo, never through orq's integrator cycle
+    cites_pr = bool(re.search(r"/pull/\d+|(?<![\w&])#\d+", answer_text))
+    if product and not (dropped or integrated) and (rec := _delivery_ledger(events).get(n)) and not cites_pr:
+        raise ValueError(f"ticket {n} is a product ticket ({t['projeto']}) that delivered code: cite its PR in the Answer (a URL or #<number>), or `--dropped \"<reason>\"` if the code is dropped on purpose")
+    if not (dropped or integrated or product) and (rec := _delivery_ledger(events).get(n)) and not _on_main(rec, events):
         raise ValueError(f"ticket {n} delivered {rec.get('branch') or 'code with no branch recorded'} and it is not in main (no integrator cycle recorded it): "
                          f"`orq integrate queue add {rec.get('branch') or '<branch>'} {n}` and let the cycle run (a merge by hand: `orq integrate conclude --hash <hash> <branch>`), "
                          f"or `orq ticket close {n} --dropped \"<reason>\"` if the code is dropped on purpose")

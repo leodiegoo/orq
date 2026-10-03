@@ -23137,6 +23137,24 @@ def test_ticket371_backlog_doctor_closes_the_integrated_orq_ticket_and_only_warn
     assert len(_sent_notices(a)) == 1, "the same list is not warned again"
 
 
+def test_ticket386_close_accepts_a_product_ticket_with_the_pr_in_the_answer_and_still_refuses_an_orq_branch_outside_main():
+    a = _orphan_env()
+    for n in ("283", "284"):
+        _tk_file(a, n, f"shop-web: t{n}", f"task_{n}")
+        path = os.path.join(a.env["ORQ_ISSUES"], f"{n}-t.md")
+        text = open(path).read().replace("Task:", "Project: shop-web\nTask:")
+        open(path, "w").write(text)
+    _evs(a, {"tipo": "entrega", "dispatch": "ctx_283", "task": "task_283", "ticket": "283", "branch": "feat/283-x", "ts": "2026-10-02T09:00:00Z"},
+         {"tipo": "entrega", "dispatch": "ctx_284", "task": "task_284", "ticket": "284", "ts": "2026-10-02T09:00:00Z"})
+    r = a.orq("ticket", "fechar", "284", "--answer", "feito, sem PR")
+    assert r.returncode == 1 and "PR" in r.stderr, r.stderr
+    r = a.orq("ticket", "fechar", "283", "--answer", "PRs #1360 e #1361 abertos no shop-web")
+    assert r.returncode == 0, r.stderr
+    assert "Status: resolved" in _read_text(a, "283")
+    r = a.orq("ticket", "fechar", "322", "--answer", "PR #1360")
+    assert r.returncode == 1 and "fix/322-deny" in r.stderr, "an orq ticket keeps the integration proof, a PR in the Answer does not replace it"
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
