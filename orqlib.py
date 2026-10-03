@@ -8249,6 +8249,8 @@ def _mate_command(group_name, cfg, session, cwd=None, was_sleeping=False):
     typed = HARNESS[agent].get("digita_prompt")
     msg = None if typed else text_value
     cmd = HARNESS[agent]["resume"](session, model, cfg.get("effort"), msg) if session else HARNESS[agent]["abrir"](model, cfg.get("effort"), msg)
+    if agent == "codex":
+        cmd.insert(0, "command")  # bypass a shell alias such as `codex = codex --yolo ...`
     # `ORQ_MATE=x claude` and not `env ORQ_MATE=x claude`: in an Orca terminal (fish) a claude launched via `env` runs non-interactive (sdk-cli, or the --print error
     # without prompt), with or without a prompt on the line. The direct assignment works in fish, zsh and bash and leaves claude interactive (ticket 106)
     mine = backlog_group(group_name, cfg)  # the group that already received tickets (`orq backlog mover`) reads and writes its own backlog, not the machine's

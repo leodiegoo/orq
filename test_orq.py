@@ -12298,6 +12298,26 @@ def test_mate_open_starts_with_orq_mate_in_the_environment_and_resumes_the_sessi
     assert len(texts) == 2 and "terminal went down" in texts[1], texts
 
 
+def test_ticket413_codex_mate_open_and_resume_bypass_shell_alias():
+    a = Env()
+    _group(a, harness="codex", modelo="gpt-6-sol")
+    a.set("terminals.json", ["term_coord"])
+    a.set("screens.json", {"term_ret1": ["›"], "term_ret2": ["esc to interrupt"]})
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    commands = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
+    command = commands[0][commands[0].index("--command") + 1]
+    assert " ORQ_MATE=orq command codex -m gpt-6-sol --dangerously-bypass-approvals-and-sandbox" in command, command
+
+    cur = _cursor(a)
+    cur["mates"]["orq"]["sessao"] = "sess-mate"
+    json.dump(cur, open(os.path.join(a.home, "cursor.json"), "w"))
+    a.set("terminals.json", ["term_coord"])
+    assert a.orq("mate", "abrir", "orq").returncode == 0
+    commands = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
+    command = commands[1][commands[1].index("--command") + 1]
+    assert " ORQ_MATE=orq command codex resume sess-mate -m gpt-6-sol --dangerously-bypass-approvals-and-sandbox" in command, command
+
+
 def _env_claude(created_items):
     """The `orca terminal create` commands that launch claude or codex behind `env VAR=…`."""
     return [c[c.index("--command") + 1] for c in created_items if re.search(r"\benv\s+\S+=\S*\s.*\b(?:claude|codex)\b", c[c.index("--command") + 1])]
@@ -23824,4 +23844,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
