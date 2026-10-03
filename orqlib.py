@@ -13847,8 +13847,13 @@ def resolve_python():
 
 
 def hook_interpreter(command):
-    """The interpreter (first word) of an orq hook command, or None when the command is not an orq hook or has none."""
-    first = (command or "").split(None, 1)[0] if HOOK_ORQ.search(command or "") else ""
+    """The interpreter of an orq hook command, allowing Codex's leading timeout environment assignment."""
+    if not HOOK_ORQ.search(command or ""):
+        return None
+    words = (command or "").split()
+    if words and re.fullmatch(r"ORQ_HOOK_TIMEOUT=\d+", words[0]):
+        words = words[1:]
+    first = words[0] if words else ""
     return first if first and not first.endswith(".py") else None
 
 

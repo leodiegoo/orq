@@ -19670,6 +19670,42 @@ def _settings228(a, python):
     json.dump(cfg, open(a.env["ORQ_CLAUDE_SETTINGS"], "w"))
 
 
+def test_ticket423_doctor_hooks_recognizes_codex_timeout_prefix_and_still_reports_loose_python():
+    hooks_path = os.path.join(tempfile.mkdtemp(), "hooks.json")
+    example = os.path.join(HERE, "codex.hooks.example.json")
+    cfg = json.load(open(example))
+    changed = 0
+    for groups in cfg["hooks"].values():
+        for group in groups:
+            for hook in group["hooks"]:
+                if "orq.py hook" in hook.get("command", "") or "precompact.py" in hook.get("command", ""):
+                    hook["command"] = "ORQ_HOOK_TIMEOUT=15 " + hook["command"]
+                    changed += 1
+    assert changed
+    json.dump(cfg, open(hooks_path, "w"))
+
+    old_hooks = orqlib.HOOKS_FILES["codex"]
+    orqlib.HOOKS_FILES["codex"] = hooks_path
+    try:
+        hook_commands = orqlib._hook_commands(hooks_path)
+        assert hook_commands, f"no Codex hooks found in {hooks_path}"
+        assert all(orqlib.hook_interpreter(command) == "/opt/homebrew/bin/python3" for _, _, command in hook_commands)
+        assert all(orqlib.hook_interpreter(command) != "ORQ_HOOK_TIMEOUT=15" for _, _, command in hook_commands)
+
+        for groups in cfg["hooks"].values():
+            for group in groups:
+                for hook in group["hooks"]:
+                    if "orq.py hook" in hook.get("command", "") or "precompact.py" in hook.get("command", ""):
+                        hook["command"] = re.sub(r"^ORQ_HOOK_TIMEOUT=\d+\s+", "", hook["command"])
+        json.dump(cfg, open(hooks_path, "w"))
+        hook_commands = orqlib._hook_commands(hooks_path)
+        assert hook_commands
+        assert all(orqlib.hook_interpreter(command) == "/opt/homebrew/bin/python3" for _, _, command in hook_commands)
+        assert not orqlib.hooks_python_problems("codex")
+    finally:
+        orqlib.HOOKS_FILES["codex"] = old_hooks
+
+
 def test_ticket228_doctor_hooks_should_name_the_hook_whose_interpreter_does_not_import_orqlib():
     old_python = _old_python228()
     a = _env97("claude")
