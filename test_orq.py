@@ -17234,21 +17234,23 @@ def test_ticket436_dirty_ticket_worktree_stays_out_of_integrator_queue_and_retur
     a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery141(a, body=f"branch feat/orq-x commit {sha}")
     assert a.orq("ingest").returncode == 0
-    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "dirty delivery is not queued"
+    assert not _state_exists(os.path.join(a.home, "integrar-fila.json")), "a worktree conformation failure stays out"
     ev = next(e for e in reversed(a.events()) if e.get("tipo") == "entrega" and e.get("msg") == "msg_141")
     assert "dirty tree" in ev["avisos"][0] and wt in ev["avisos"][0], ev
     assert any(e.get("tipo") == "devolver" and e.get("dispatch") == "ctx_term_w1" for e in a.events()), (a.events(), a.log())
 
 
-def test_ticket436_missing_commit_does_not_enter_integrator_queue():
+def test_ticket436_missing_commit_keeps_branch_in_queue_without_proof():
     tmp = tempfile.mkdtemp()
     repo = _repo_with_branch(tmp, "feat/orq-x")
     a = Env(run="run_a", ORQ_REPOS=repo)
     _delivery141(a, body="branch feat/orq-x commit deadbeef123")
     assert a.orq("ingest").returncode == 0
-    assert not _state_exists(os.path.join(a.home, "integrar-fila.json"))
+    queue = _read_state(os.path.join(a.home, "integrar-fila.json"))["itens"]
+    assert [(i["ticket"], i["branch"]) for i in queue] == [("141", "feat/orq-x")], queue
     ev = next(e for e in reversed(a.events()) if e.get("tipo") == "entrega" and e.get("msg") == "msg_141")
     assert "does not exist" in ev["avisos"][0], ev
+    assert not [e for e in a.events() if e.get("tipo") == "prova" and e.get("passo") == "delivery"]
 
 
 def test_ticket141_worker_done_of_product_ticket_or_without_branch_or_failed_does_not_enter():

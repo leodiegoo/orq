@@ -3477,7 +3477,7 @@ def _manual_delivery(m, p):
     return True
 
 
-def _orq_delivery(m, p):
+def _orq_delivery(m, p, prove_delivery=True):
     """worker_done `succeeded` of an orq ticket (the task is the `Task:` of an ISSUES ticket; the product's do not enter) with a branch in the payload or the text ->
     `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `<ORQ_WT>/<ticket>` worktree, the dispatch worktree's current branch and only
     last from the text; an environment branch and a branch outside ORQ_REPOS never enter, if it exists in the orq repository. With no branch: log and `delivery` event with a warning, the coordinator adds it by hand.
@@ -3504,7 +3504,7 @@ def _orq_delivery(m, p):
                       "avisos": [f"delivery of ticket {t['num']} did not enter the integrator queue: {problem}; `orq integrate queue add <branch> {t['num']}` once the branch is right"]})
         return None
     ev = integrate_queue_add(branch, t["num"], head)
-    if head:
+    if head and prove_delivery:
         prove(p["taskId"], "delivery", head, "ok", ticket=t["num"], branch=branch, msg=m["id"])
     notice = f"orq: ticket {t['num']} entered the queue. Branch {branch}" + (f", worktree {wt}" if wt else "") + (f", commit {commit[:8]}" if commit else "") + "."
     h = _integrator_terminal(read_events())
@@ -3714,14 +3714,17 @@ def _ingest_msg(m, since, already, titles, send=True):
     proof_ok = _delivery_proof(m, p, send)
     queued = None
     try:
-        if proof_ok and _delivery_worktrees(m, p, send) and _delivery_conformance(m, p, send):  # missing or dirty delivery proof, outside worktree (352), or incomplete conformance (201) goes back before queueing
-            queued = None if _manual_delivery(m, p) else _orq_delivery(m, p)
-            _delivery_head_of_worktree(m, p)
-            if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
+        if _delivery_worktrees(m, p, send) and _delivery_conformance(m, p, send):  # outside worktree (352) or incomplete conformance (201) goes back before queueing
+            is_orq_ticket = bool(p.get("taskId") and any(t.get("task") == p["taskId"] for t in tickets()) and not _delivery_project(next((t for t in tickets() if t.get("task") == p["taskId"]), None), p.get("dispatchId")))
+            if proof_ok or is_orq_ticket:
+                queued = None if _manual_delivery(m, p) else _orq_delivery(m, p, prove_delivery=proof_ok)
+            if proof_ok:
+                _delivery_head_of_worktree(m, p)
+            if proof_ok and queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
                 red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
-    _release_delivered(m, p, queued)
+    _release_delivered(m, p, queued if proof_ok else None)
     if p.get("reportPath"):
         items = _report_items(p["reportPath"])
         alert = None
