@@ -1125,7 +1125,7 @@ def integrate_conclude(hash_, branches, dispatch=None):
         tickets_.append(n)
         integrate_queue_rm(n)
         try:
-            notices += [x for x in [ticket_close(n, f"integrated into main at {hash_}")["aviso"]] if x]
+            notices += [x for x in [ticket_close(n, f"integrated into main at {hash_}", integrated=True)["aviso"]] if x]
         except ValueError as e:
             notices.append(f"ticket {n}: {e}")
         released = _released(read_events())
@@ -2178,7 +2178,7 @@ KEYS_EN = {
     "turno": "turn", "turno_fim": "turn_end", "turno_inicio": "turn_begin", "turnos": "turns", "ultima": "last", "ultima_volta": "last_round",
     "ultimo_heartbeat": "last_heartbeat", "ultimo_poll": "last_poll", "uso": "usage", "usuario": "user", "valor": "value", "velha": "stale",
     "versao": "version", "visto": "seen", "vistos": "seen_list", "vivo": "alive", "vivos": "alive_list", "voltas_s": "rounds_s",
-    "worktree_intacta": "worktree_intact",
+    "worktree_intacta": "worktree_intact", "largado": "dropped",
 }
 TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake, worker_done, ticket, steer, mate, doctor, backlog) stay
     "conformidade": "conformance", "fase_declarada": "phase_declared",
@@ -2194,7 +2194,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "noite_parou": "night_stopped", "nao_iniciou": "not_started", "maquina_aviso": "machine_notice", "hibernar": "hibernate", "acordar": "wake",
     "heartbeat_visto": "heartbeat_seen", "heartbeat_absorvido": "heartbeat_absorbed", "gate_aviso": "gate_notice", "gate_falha": "gate_failed",
     "gate_falhou": "gate_blocked", "gate_resolvido": "gate_resolved", "fim_dispatch": "dispatch_end", "entrega": "delivery",
-    "entrega_orq": "orq_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
+    "entrega_orq": "orq_delivery", "entrega_manual": "manual_delivery", "controle": "control", "ciclo": "cycle", "binding_perdido": "binding_lost", "ausente_ligar": "away_on",
     "ausente_desligar": "away_off", "coordenador_parou": "coordinator_stopped", "coordenador_retomou": "coordinator_resumed", "away_bloqueio": "away_block", "fila": "queue", "gerente": "manager", "servico_marcado": "service_marked",
     "processos": "processes", "resumo_add": "summary_add", "devolver": "send_back", "limite_tela": "screen_limit",
     "pendente_avisado": "pending_notified", "revisao_nm": "nm_review", "prova": "proof",
@@ -3016,6 +3016,27 @@ def _delivery_head_of_worktree(m, p):
         prove(p["taskId"], "delivery", head, "ok", branch=branch, msg=m["id"])
 
 
+def _manual_delivery(m, p):
+    """worker_done `succeeded` of a dispatch of a project whose file says `"integrator": "manual"` (ticket 356): the orq integrator does not queue another repo's branch, so the delivery is
+    recorded (`entrega_manual`, with the branch and the repo) and `orphan_sweep` turns it into the coordinator's obligation. True when the dispatch was of such a project."""
+    if p.get("outcome") != "succeeded" or not p.get("dispatchId"):
+        return False
+    disp = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == p["dispatchId"]), None)
+    proj = projects().get((disp or {}).get("projeto") or "") or {}
+    if proj.get("integrator") != "manual":
+        return False
+    if _already_has_event("entrega_manual", m["id"]):
+        return True
+    wt = _dispatch_worktree(m.get("run_id"), p["dispatchId"])
+    branch = _payload_branch(p.get("branch")) or (wt and (_git(wt, "branch", "--show-current") or "").strip()) or _text_branch(f"{m.get('subject') or ''}\n{m.get('body') or ''}")
+    if branch and not _environment_branch(branch):
+        append_event({"tipo": "entrega_manual", "ticket": disp.get("ticket"), "task": disp.get("task"), "dispatch": p["dispatchId"], "branch": branch, "projeto": disp["projeto"],
+                      "repo": repo_folder(proj["repo"]) or proj["repo"], "msg": m["id"]})
+    else:
+        log(f"manual delivery: worker_done {m['id']} of {disp['projeto']} has no branch to merge")
+    return True
+
+
 def _orq_delivery(m, p):
     """worker_done `succeeded` of an orq ticket (the task is the `Task:` of an ISSUES ticket; the product's do not enter) with a branch in the payload or the text ->
     `integrate queue add` and a short notice typed into the integrator (branch, worktree and commit). The branch comes from the payload, the `<ORQ_WT>/<ticket>` worktree, the dispatch worktree's current branch and only
@@ -3032,14 +3053,14 @@ def _orq_delivery(m, p):
               or _text_branch(text_value))
     if not branch:
         log(f"orq delivery: ticket {t['num']} has no branch in worker_done {m['id']}; it stays out of the integrator queue")
-        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "ticket": t["num"],
                       "avisos": [f"delivery of ticket {t['num']} has no branch: it did not enter the integrator queue; `orq integrate queue add <branch> {t['num']}`"]})
         return None
     commit = p.get("commit") or next(iter(SHA_RE.findall(text_value)), None)
     head, problem = _delivery_head(branch, commit)
     if problem:
         log(f"orq delivery: ticket {t['num']}: {problem}; it stays out of the integrator queue")
-        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"],
+        append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "ticket": t["num"], "branch": branch,
                       "avisos": [f"delivery of ticket {t['num']} did not enter the integrator queue: {problem}; `orq integrate queue add <branch> {t['num']}` once the branch is right"]})
         return None
     ev = integrate_queue_add(branch, t["num"], head)
@@ -3228,7 +3249,7 @@ def _ingest_msg(m, since, already, titles, send=True):
     _delivery_proof(m, p)
     try:
         if _delivery_conformance(m, p, send):  # an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
-            queued = _orq_delivery(m, p)
+            queued = None if _manual_delivery(m, p) else _orq_delivery(m, p)
             _delivery_head_of_worktree(m, p)
             if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
                 red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
@@ -8565,6 +8586,122 @@ def hold(target, reason=None, release=False):
     return append_event({**ev, "motivo": reason.strip()})
 
 
+# ---------- delivery with no owner: the manager's sweep (ticket 356) ----------
+# The sweep by hand of 02/10 found deliveries that stopped halfway with nobody knowing: branches the integrator gave back to a worker already released (322, 346), branches never
+# queued (183, 185), a repo with no integrator (the panel). Every delivery with a branch ends in one of: main (the integrator cycle's record, never ancestry), the integrator queue,
+# a PR, a live worker (sent back or redispatched), or dropped on purpose (`orq hold`, `orq ticket close --dropped`). Outside all of them for ORPHAN_MIN, it is an alert.
+
+ORPHAN_MIN = float(os.environ.get("ORQ_ORFA_MIN") or 15)
+_ALIVE = (*ANDA, "hibernado")
+
+
+def _delivery_ledger(events):
+    """{ticket: {ticket, branch, dispatch, task, ts}}: the last delivery of each ticket that carries code. Its sources are the ingest's `entrega_orq`, a branch put on the queue by hand
+    and the `entrega` that said the branch did not enter the queue (it carries the ticket and, when known, the branch)."""
+    out = {}
+    for e in events:
+        n = e.get("ticket")
+        if n and (e.get("tipo") in ("entrega_orq", "entrega") or e.get("tipo") == "integrar_fila" and e.get("op") == "add"):
+            old = out.get(str(n)) or {}
+            out[str(n)] = {"ticket": str(n), "ts": e.get("ts"), **{k: e.get(k) or old.get(k) for k in ("branch", "dispatch", "task")}}
+    return out
+
+
+def _on_main(rec, events):
+    """The delivery's branch is in main by the integrator cycle's record (`ciclo` with the branch, after the delivery). Ancestry proves nothing: a branch can be an ancestor of a main it never went through."""
+    return bool(rec.get("branch")) and any(e.get("tipo") == "ciclo" and rec["branch"] in (e.get("branches") or []) and (e.get("ts") or "") >= (rec.get("ts") or "") for e in events)
+
+
+def _dropped(n, events):
+    return any(e.get("tipo") == "ticket" and e.get("op") == "fechar" and e.get("ticket") == n and e.get("largado") for e in events)
+
+
+def orphan_deliveries(events, now_at, queue, prs, agents, closed=()):
+    """Pure: the deliveries outside every end state, with the time they have been there (`desde`, from the delivery, from the last return or from the queue item that left without a
+    cycle), the reason and the commands that resolve: [{ticket, branch, dispatch, desde, minutos, motivo, comando, fechado}]. `agents` are the reassessed rows (a worker
+    of the ticket that is alive, sent back or redispatched, holds the delivery); `closed` are the numbers of the tickets already `resolved`."""
+    held, of_ticket = _held(events), _dispatch_ticket(events)
+    live = {of_ticket.get(a.get("dispatch")) or of_ticket.get(a.get("task")) for a in agents if a.get("estado") in _ALIVE}
+    out = []
+    for n, rec in _delivery_ledger(events).items():
+        if _on_main(rec, events) or n in queue or n in held or _dropped(n, events) or n in live or (rec.get("task") and any(i.get("task") == rec["task"] for i in prs)):
+            continue
+        after = [e for e in events if (e.get("ts") or "") >= (rec.get("ts") or "") and (e.get("ticket") == n and e.get("tipo") == "integrar_fila" and e.get("op") == "rm"
+                                                                                      or e.get("tipo") == "devolver" and e.get("dispatch") == rec.get("dispatch"))]
+        since = max([rec.get("ts") or "", *(e.get("ts") or "" for e in after)])
+        minutes = int((now_at - _dt(since)).total_seconds() // 60) if since else 0
+        branch = rec.get("branch")
+        why = ("sent back to a worker that is gone" if any(e["tipo"] == "devolver" for e in after) else "left the integrator queue without a cycle" if after
+               else "never entered the integrator queue")
+        out.append({"ticket": n, "branch": branch, "dispatch": rec.get("dispatch"), "desde": since, "minutos": minutes, "motivo": why, "fechado": n in closed,
+                    "comando": f"orq integrate queue add {branch or '<branch>'} {n}; or `orq dispatch --ticket {n}` for a new worker; or `orq hold {n} --reason \"...\"` to hold it on purpose"})
+    return out
+
+
+def ticket_reopen(numero, reason):
+    """Puts a `resolved` ticket back in progress (`claimed`): its code never reached main. File: the header's Status; backlog: `tasks-axi reopen`. ValueError if it does not exist or is not resolved."""
+    n = str(numero).strip().zfill(2)
+    t = next((t for t in tickets() if t["num"] == n), None)
+    if not t or t["status"] != STATUS_CLOSED:
+        raise ValueError(f"ticket {n} does not exist or is not {STATUS_CLOSED}")
+    if _tickets_in_backlog():
+        backlog.cli(BACKLOG, "reopen", _item_of_ticket(n)["id"])
+    else:
+        with open(t["arquivo"], encoding="utf-8") as f:
+            _write(t["arquivo"], _trocar_campo(f.read(), "Status", STATUS_IN_PROGRESS))
+    return append_event({"tipo": "ticket", "op": "reabrir", "ticket": n, "motivo": reason})
+
+
+def _manual_obligations(events, ledger):
+    """The `entrega_manual` (a delivery in a repo with no integrator) with no obligation yet whose condition holds: the orq branch of the same ticket, if there is one, is already in main.
+    Returns [(entry event of the delivery, obligation text)]."""
+    raised = {(e.get("task"), e.get("branch")) for e in events if e.get("tipo") == "obrigacao" and e.get("op") == "nova" and e.get("chave") == "juntar"}
+    out = []
+    for e in events:
+        rec = ledger.get(str(e.get("ticket")))
+        if e.get("tipo") == "entrega_manual" and (e.get("task"), e.get("branch")) not in raised and not (rec and not _on_main(rec, events)):
+            out.append(e)
+            raised.add((e.get("task"), e.get("branch")))
+    return out
+
+
+def orphan_sweep(now_at=None, dry_run=False):
+    """The manager's round over the deliveries (ticket 356): reopens the `resolved` tickets whose code never reached main, raises the coordinator's obligation "merge <branch> into the main
+    of <repo>" for a delivery of a repo with no integrator, and tells the coordinator, once per delivery, about each orphan with the command that resolves it. `dry_run` only reads.
+    Returns {orphans, reopened, obligations, lines}."""
+    now_at, events = now_at or now_dt(), read_events()
+    tks = {t["num"]: t for t in tickets()}
+    closed = {n for n, t in tks.items() if t["status"] == STATUS_CLOSED}
+    agents = reassess(_dict(_read_json(_path("open.json"))).get("agentes") or [], events, now_at, _turns_ro())
+    all_found = orphan_deliveries(events, now_at, integration_queue(), _prs_ro()["itens"], agents, closed)
+    ledger = _delivery_ledger(events)
+    manual = _manual_obligations(events, ledger)
+    result = {"orphans": [o for o in all_found if o["minutos"] * 60 >= ORPHAN_MIN * 60], "reopened": [o["ticket"] for o in all_found if o["fechado"]], "obligations": [e.get("branch") for e in manual], "lines": []}
+    if dry_run:
+        return result
+    for n in result["reopened"]:
+        ticket_reopen(n, "its branch is not in main: the delivery has no end state")
+        result["lines"].append(f"ticket {n} reopened: resolved without its code in main")
+    for e in manual:
+        entry = append_event({"tipo": "entrada", "origem": "entrega", "texto": f"delivery of ticket {e.get('ticket')} in {e.get('projeto')}: branch {e.get('branch')} waits to be merged by hand (the repo has no integrator)",
+                              "fonte": f"delivery {e.get('ticket') or e.get('task')}", "task": e.get("task")}, new_id=True)
+        append_event({"tipo": "obrigacao", "op": "nova", "entrada": entry["id"], "chave": "juntar", "texto": f"merge {e.get('branch')} into the main of {e.get('repo')}", "task": e.get("task"),
+                      "branch": e.get("branch"), **({"ticket": e["ticket"]} if e.get("ticket") else {})})
+        append_event({"tipo": "intake", "entrada": entry["id"], "efeito": "conversa", "nota": "obligation raised by orq"})  # the entry is handled: what stays open is the obligation
+        result["lines"].append(f"{e.get('branch')}: obligation raised, merge it into the main of {e.get('repo')}")
+    told = {(e.get("ticket"), e.get("branch"), e.get("desde")) for e in events if e.get("tipo") == "orphan" and e.get("op") == "alerta"}
+    handle = (_manager_cfg() or {}).get("coordenador")
+    for o in result["orphans"]:
+        if (o["ticket"], o["branch"], o["desde"]) in told:
+            continue
+        text_value = f"orq: ticket {o['ticket']}: branch {o['branch'] or '(none)'} {o['motivo']} and has been out of main, the queue, a PR and every live worker for {o['minutos']} min. {o['comando']}"
+        if handle and notify_coordinator(handle, text_value, context=False) not in DELIVERED:
+            continue  # nothing was typed: the next round tries
+        append_event({"tipo": "orphan", "op": "alerta", "ticket": o["ticket"], "branch": o["branch"], "desde": o["desde"], "motivo": o["motivo"], "comando": o["comando"]})
+        result["lines"].append(f"orphan delivery: {_quote(text_value, 140)}")
+    return result
+
+
 # ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
 # The 02/10 incident (#2039): a "phase 1 integrated" went out without four tickets of the plan, and nothing proved item by item what each ticket asked for.
 
@@ -9124,9 +9261,12 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     return {"ticket": number, "arquivo": path, "task": task, "run": target, **({"aviso": "; ".join(notices)} if notices else {})}
 
 
-def ticket_close(numero, answer):
+def ticket_close(numero, answer, dropped=None, integrated=False):
     """Writes `## Answer` (the text, or the file's contents if `answer` is a path), sets `Status: resolved` and completes the task in Orca if it
     is still open. The file is the truth: an Orca failure becomes a notice and the ticket stays resolved. Returns {ticket, status, task, task_fechada, aviso}.
+
+    A ticket that delivered a branch is refused while the branch is not in main by the integrator cycle's record (ticket 356): `dropped` (the reason) closes it anyway, on purpose,
+    and `integrated` is the cycle's own close (`integrate_conclude`, which writes that record right after).
 
     With tickets in the backlog (M5) the truth is the item: the `done` comes first (if the CLI refuses, nothing changed), the `## Answer` goes into the file afterwards and the file's
     header is not touched. Dependents leave the block on their own, because the blocker became Done."""
@@ -9138,9 +9278,14 @@ def ticket_close(numero, answer):
     if t["status"] == STATUS_CLOSED:
         raise ValueError(f"ticket {n} is already {STATUS_CLOSED}")
     path = os.path.expanduser(answer or "")
-    answer_text = (open(path, encoding="utf-8").read() if answer and os.path.isfile(path) else answer or "").strip()
+    answer_text = (open(path, encoding="utf-8").read() if answer and os.path.isfile(path) else answer or dropped or "").strip()
     if not answer_text:
         raise ValueError("--answer is empty: say what resolved the ticket (text or file)")
+    events = read_events()
+    if not (dropped or integrated) and (rec := _delivery_ledger(events).get(n)) and not _on_main(rec, events):
+        raise ValueError(f"ticket {n} delivered {rec.get('branch') or 'code with no branch recorded'} and it is not in main (no integrator cycle recorded it): "
+                         f"`orq integrate queue add {rec.get('branch') or '<branch>'} {n}` and let the cycle run (a merge by hand: `orq integrate conclude --hash <hash> <branch>`), "
+                         f"or `orq ticket close {n} --dropped \"<reason>\"` if the code is dropped on purpose")
     closed_item, notice = False, ""
     if _tickets_in_backlog():
         backlog.cli(BACKLOG, "done", _item_of_ticket(n)["id"], "--no-prune")
@@ -9173,7 +9318,7 @@ def ticket_close(numero, answer):
             notice = "; ".join(x for x in (notice, f"the scratch {t['scratch']} kept its Status ({e.strerror}): set **Status:** {STATUS_CLOSED} by hand") if x)
     released, notices = _release_dependents(n, before)
     notice = "; ".join(x for x in (notice, *notices) if x)
-    append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": closed_item, **({"aviso": notice} if notice else {}),
+    append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": closed_item, **({"aviso": notice} if notice else {}), **({"largado": dropped} if dropped else {}),
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in released]})
     for o in [o for o in open_obligations(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
         _close_obligation(o, "feito", prova=f"ticket {n} {STATUS_CLOSED}")  # orq fulfils it on its own and only records it
@@ -11029,7 +11174,7 @@ def projects():
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
                          "tests": _file_tests(d.get("tests")),
-                         "sem_ci": d.get("sem_ci") is True}
+                         "sem_ci": d.get("sem_ci") is True, "integrator": "manual" if d.get("integrator") == "manual" else None}
     return findings
 
 
@@ -13811,6 +13956,10 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - the warning about hooks doesn't take down the panel; the next loop tries
         log(f"hooks quebrados: {type(e).__name__}: {e}")
     try:
+        line_list += [] if os.environ.get("ORQ_NO_ORPHANS") else orphan_sweep()["lines"]
+    except Exception as e:  # noqa: BLE001 - the sweep of orphan deliveries doesn't take down the panel; the next loop tries
+        log(f"entregas orfas: {type(e).__name__}: {e}")
+    try:
         line_list += mate_lap()
     except Exception as e:  # noqa: BLE001 - the mates channel doesn't take down the panel; the next loop tries
         log(f"mates: {type(e).__name__}: {e}")
@@ -14834,6 +14983,9 @@ def parser():
     hd.add_argument("target")
     _arg(hd, "motivo", help="why the delivery is not integrated (required unless --release)")
     hd.add_argument("--release", action="store_true", help="puts the held delivery back in the queue of charges")
+    orf = sub.add_parser("orphans", help="the deliveries outside main, the integrator queue, a PR, a live worker and every hold for over 15 min, with the command that resolves each (the manager runs it every round)")
+    orf.add_argument("--dry-run", action="store_true", help="only lists: no ticket reopened, no obligation raised, no notice")
+    orf.add_argument("--json", action="store_true")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("text_value")
@@ -15046,7 +15198,8 @@ def parser():
     tn.add_argument("--after", help="the number of a wave's milestone: same as --wave of that wave")
     tf = tk.add_parser("close", aliases=["fechar"], help="writes the Answer, sets resolved and completes the task")
     tf.add_argument("numero")
-    tf.add_argument("--answer", required=True, help="text or the path of a file")
+    tf.add_argument("--answer", help="text or the path of a file (required, unless --dropped says why)")
+    tf.add_argument("--dropped", help="the reason the ticket's delivered code is dropped on purpose: closes a ticket whose branch is not in main")
     wv = sub.add_parser("wave", aliases=["onda"], help="the delivery order in waves: each wave is a milestone that blocks its parallel tasks and a join that every task blocks").add_subparsers(dest="op", required=True)
     wv.add_parser("new", aliases=["novo"], help="creates the next wave's milestone and join").add_argument("name")
     wv.add_parser("list", aliases=["lista"], help="the waves, what each waits for and the tasks still open").add_argument("--json", action="store_true")
@@ -15288,6 +15441,9 @@ def main(argv=None):
                              or ["no test file created or changed by the branch"]) + f"\nhead {r['head'][:8]}: {r['resultado']}")
         elif a.cmd == "hold":
             print(json.dumps(hold(a.target, a.reason, a.release), ensure_ascii=False))
+        elif a.cmd == "orphans":
+            r = orphan_sweep(dry_run=a.dry_run)
+            print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join([*r["lines"], *(f"ticket {o['ticket']}: {o['branch'] or '(no branch)'} {o['motivo']}, {o['minutos']} min: {o['comando']}" for o in r["orphans"] if a.dry_run)]) or "no orphan delivery")
         elif a.cmd == "steer":
             ev = steer(a.task, a.text_value, a.run, a.entry)
             print(json.dumps(ev, ensure_ascii=False))
@@ -15508,7 +15664,7 @@ def main(argv=None):
             elif a.op == "edit":
                 print(json.dumps(ticket_edit(a.numero, modelo=a.model, effort=a.effort, despacho=a.dispatch_mode, espera=a.waiting), ensure_ascii=False))
             elif a.op == "close":
-                r = ticket_close(a.numero, a.answer)
+                r = ticket_close(a.numero, a.answer, a.dropped)
                 print(json.dumps(r, ensure_ascii=False))
                 if r["aviso"]:
                     print(f"warning: {r['aviso']}", file=sys.stderr)

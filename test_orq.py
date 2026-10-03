@@ -16826,7 +16826,7 @@ def test_ticket154_conclude_with_branch_outside_queue_only_writes_cycle():
 def test_ticket154_conclude_already_closed_ticket_or_running_worker_notifies_and_proceeds():
     a = Env(run="run_a")
     _integrated154(a)
-    assert a.orq("ticket", "fechar", "07", "--answer", "feito antes").returncode == 0
+    assert a.orq("ticket", "fechar", "07", "--dropped", "feito antes").returncode == 0  # ticket 356: its branch is queued, not in main
     r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
     assert r.returncode == 0 and "warning" in r.stderr, r.stderr
     assert "empty" in a.orq("integrar", "fila", "lista").stdout, "a fila esvazia mesmo com o ticket já fechado"
@@ -21344,6 +21344,120 @@ def test_ticket337_machine_under_pressure_notice_closes_itself_in_the_hook():
     a.prompt("segue o jogo")
     assert [e["texto"] for e in orq_mod.open_entries(a.events())] == ["segue o jogo"]
 
+
+
+# ---- ticket 356: the manager finds the delivery that nobody carries ----
+
+def _orphan_env(**env):
+    """Ticket files 322/183/50/60/70/80 (claimed) and the log of a day: 322 sent back to a worker already released, 183 delivered and never queued, 50 queued, 60 in main
+    (integrator cycle record), 70 delivered a minute ago, 80 sent back to a worker that is alive."""
+    a = Env(run="run_a", **env)
+    old, fresh = "2026-10-02T09:00:00Z", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    for n in ("322", "183", "50", "60", "70", "80"):
+        _tk_file(a, n, f"orq: t{n}", f"task_{n}")
+    _evs(a, *[{"tipo": "despacho", "run": "run_a", "task": f"task_{n}", "dispatch": f"ctx_{n}", "ticket": n, "ts": old} for n in ("322", "183", "50", "60", "70", "80")],
+         {"tipo": "entrega_orq", "ticket": "322", "branch": "fix/322-deny", "dispatch": "ctx_322", "ts": old},
+         {"tipo": "devolver", "task": "task_322", "dispatch": "ctx_322", "run": "run_a", "ts": "2026-10-02T09:10:00Z"},
+         {"tipo": "liberar", "dispatch": "ctx_322", "estado": "released", "ts": "2026-10-02T09:20:00Z"},
+         {"tipo": "entrega", "dispatch": "ctx_183", "task": "task_183", "ticket": "183", "branch": "feat/183-x", "ts": old,
+          "avisos": ["delivery of ticket 183 did not enter the integrator queue: commit not in the branch"]},
+         {"tipo": "entrega_orq", "ticket": "50", "branch": "feat/50-q", "dispatch": "ctx_50", "ts": old},
+         {"tipo": "entrega_orq", "ticket": "60", "branch": "feat/60-m", "dispatch": "ctx_60", "ts": old},
+         {"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/60-m"], "tickets": ["60"], "ts": "2026-10-02T09:30:00Z"},
+         {"tipo": "entrega", "dispatch": "ctx_70", "task": "task_70", "ticket": "70", "branch": "feat/70-n", "ts": fresh, "avisos": ["did not enter the queue"]},
+         {"tipo": "entrega_orq", "ticket": "80", "branch": "feat/80-r", "dispatch": "ctx_80", "ts": old},
+         {"tipo": "devolver", "task": "task_80", "dispatch": "ctx_80", "run": "run_a", "ts": "2026-10-02T09:10:00Z"})
+    assert a.orq("integrate", "queue", "add", "feat/50-q", "50").returncode == 0
+    _write_state(os.path.join(a.home, "aberto.json"), {"agentes": [{"dispatch": "ctx_80", "task": "task_80", "estado": "devolvida"}]})
+    return a
+
+
+def test_ticket356_sweep_flags_the_sent_back_to_dead_and_the_never_queued_and_stays_quiet_for_queued_main_fresh_and_alive():
+    a = _orphan_env()
+    r = a.orq("orphans", "--dry-run", "--json")
+    assert r.returncode == 0, r.stderr
+    found = {x["ticket"]: x for x in json.loads(r.stdout)["orphans"]}
+    assert sorted(found) == ["183", "322"], found
+    assert found["322"]["branch"] == "fix/322-deny" and "orq integrate queue add fix/322-deny 322" in found["322"]["comando"], found["322"]
+    assert "orq hold 322" in found["322"]["comando"] and "orq dispatch --ticket 322" in found["322"]["comando"], found["322"]
+    assert "orq integrate queue add feat/183-x 183" in found["183"]["comando"], found["183"]
+
+
+def test_ticket356_sweep_alerts_the_coordinator_once_with_the_command_that_resolves():
+    a = _orphan_env()
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    r = a.orq("orphans")
+    assert r.returncode == 0 and "322" in r.stdout and "183" in r.stdout, r.stdout + r.stderr
+    alerts = [e for e in a.events() if e["tipo"] == "orphan" and e.get("op") == "alerta"]
+    assert sorted(e["ticket"] for e in alerts) == ["183", "322"] and all("orq integrate queue add" in e["comando"] for e in alerts), alerts
+    assert a.orq("orphans").returncode == 0
+    assert len([e for e in a.events() if e["tipo"] == "orphan" and e.get("op") == "alerta"]) == 2, "once per delivery, not every round"
+
+
+def test_ticket356_close_refuses_a_code_ticket_whose_branch_is_not_in_main():
+    a = _orphan_env()
+    r = a.orq("ticket", "fechar", "322", "--answer", "feito")
+    assert r.returncode == 1 and "fix/322-deny" in r.stderr and "main" in r.stderr and "--dropped" in r.stderr, r.stderr
+    assert "Status: claimed" in _read_text(a, "322")
+    assert a.orq("ticket", "fechar", "183", "--answer", "feito").returncode == 1, "also the delivery that never entered the queue"
+    assert a.orq("ticket", "fechar", "60", "--answer", "entrou no ciclo").returncode == 0, "in main by the cycle record"
+    r = a.orq("ticket", "fechar", "322", "--dropped", "superseded by 346")
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "fechar" and e["ticket"] == "322"]
+    assert ev["largado"] == "superseded by 346", ev
+    assert "superseded by 346" in _read_text(a, "322")
+
+
+def _resolve356(a, n):
+    path = os.path.join(a.env["ORQ_ISSUES"], f"{n}-t.md")
+    txt = open(path).read()
+    open(path, "w").write(txt.replace("Status: claimed", "Status: resolved"))
+
+
+def test_ticket356_sweep_reopens_the_resolved_ticket_without_code_and_leaves_dropped_and_integrated_alone():
+    a = _orphan_env()
+    for n in ("322", "60"):
+        _resolve356(a, n)
+    _evs(a, {"tipo": "entrega_orq", "ticket": "90", "branch": "feat/90-d", "dispatch": "ctx_90", "ts": "2026-10-02T09:00:00Z"},
+         {"tipo": "ticket", "op": "fechar", "ticket": "90", "largado": "not needed", "ts": "2026-10-02T09:05:00Z"})
+    _tk_file(a, "90", "orq: t90", "task_90")
+    _resolve356(a, "90")
+    r = a.orq("orphans")
+    assert r.returncode == 0, r.stderr
+    assert "Status: claimed" in _read_text(a, "322") and "Status: resolved" in _read_text(a, "60") and "Status: resolved" in _read_text(a, "90")
+    (ev,) = [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "reabrir"]
+    assert ev["ticket"] == "322", ev
+
+
+def _manual_env(tmp):
+    a = Env(run="run_a")
+    os.makedirs(os.path.join(a.home, "projects"), exist_ok=True)
+    json.dump({"repo": f"path:{tmp}", "integrator": "manual"}, open(os.path.join(a.home, "projects", "painel.json"), "w"))
+    _delivery141(a, body="entregue", branch="feat/343-badge")
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_t141", "dispatch": "ctx_term_w1", "ticket": "141", "projeto": "painel", "ts": "2026-10-02T09:00:00Z"})
+    return a
+
+
+def test_ticket356_delivery_of_a_repo_without_integrator_becomes_an_obligation_of_the_coordinator_that_waits_for_the_orq_branch():
+    tmp = tempfile.mkdtemp()
+    a = _manual_env(tmp)
+    assert a.orq("ingest").returncode == 0
+    (ev,) = [e for e in a.events() if e["tipo"] == "entrega_manual"]
+    assert (ev["ticket"], ev["branch"], ev["repo"]) == ("141", "feat/343-badge", os.path.realpath(tmp)), ev
+    assert not [e for e in a.events() if e["tipo"] == "integrar_fila"], "the orq integrator does not queue another repo's branch"
+    _evs(a, {"tipo": "entrega_orq", "ticket": "141", "branch": "feat/141-orq", "dispatch": "ctx_o", "ts": "2026-10-02T09:00:00Z"})
+    assert a.orq("orphans", "--dry-run").returncode == 0
+    a.orq("orphans")
+    assert not [e for e in a.events() if e["tipo"] == "obrigacao"], "waits for the orq branch of the same ticket to enter main"
+    _evs(a, {"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/141-orq"], "tickets": ["141"], "ts": "2026-10-02T10:00:00Z"})
+    a.orq("orphans")
+    a.orq("orphans")
+    (ob,) = [e for e in a.events() if e["tipo"] == "obrigacao" and e.get("op") == "nova"]
+    assert ob["chave"] == "juntar" and "feat/343-badge" in ob["texto"] and os.path.realpath(tmp) in ob["texto"], ob
+    assert f"To do by you: {ob['entrada']} → juntar" in _ctx(a.prompt("e agora?")), "stays in the coordinator's context until fulfilled"
+    assert a.orq("fulfill", ob["entrada"], "juntar", "--proof", "abc1234").returncode == 0
+    assert "To do by you" not in (a.prompt("e agora?").stdout or "")
 
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
