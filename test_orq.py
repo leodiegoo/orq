@@ -20337,16 +20337,20 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
-    "alerta": "hook_stop wake_stopped", "steer": "hook_stop wake_stopped", "steer_fim": "hook_stop wake_stopped", "steer_reentrega": "hook_stop wake_stopped", "alerta_visto": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
-    "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
-    "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
-    "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
-    "liberar": "hook_stop wake_stopped", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "wake_stopped",
-    "pendente_avisado": "hook_stop wake_stopped", "pr": "wake_stopped", "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped", "resposta": "wake_stopped",
-    "resposta_coordenador": "hook_stop", "resposta_lavish": "wake_stopped", "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped",
-    "run_projeto": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "ticket": "wake_stopped", "worker_done": "hook_stop wake_stopped",
-    "clean_run": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop", "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop",
-    "segurar": "hook_stop wake_stopped", "segurar_solta": "hook_stop wake_stopped",
+    "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped",
+    "clean_run": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped", "coordenador_parou": "hook_stop wake_stopped",
+    "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
+    "entrada": "hook_stop wake_stopped", "entrega": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "hook_stop wake_stopped",
+    "gate_resolvido": "hook_stop wake_stopped", "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped",
+    "intake": "hook_stop wake_stopped", "liberar": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop",
+    "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped",
+    "obrigacao": "hook_stop wake_stopped", "pend": "hook_stop wake_stopped", "pendente_avisado": "hook_stop wake_stopped",
+    "pr": "hook_stop wake_stopped", "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped",
+    "resposta": "hook_stop wake_stopped", "resposta_coordenador": "hook_stop", "resposta_lavish": "hook_stop wake_stopped",
+    "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped", "run_projeto": "hook_stop wake_stopped",
+    "segurar": "hook_stop wake_stopped", "segurar_solta": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped",
+    "steer": "hook_stop wake_stopped", "steer_fim": "hook_stop wake_stopped", "steer_reentrega": "hook_stop wake_stopped",
+    "ticket": "hook_stop wake_stopped", "worker_done": "hook_stop wake_stopped",
 }
 NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
 
