@@ -6124,17 +6124,24 @@ NIGHT_FAILURES = 3  # consecutive failures that close the dispatch (night and aw
 AWAY_UNTIL = "08:00"  # away on without --until: the budget ends at the next 08:00 local
 
 
-def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None):
+def away_on(until_at=AWAY_UNTIL, max_dispatches=None, max_failures=NIGHT_FAILURES, preflight=None, words=None):
     """Turns on away mode: the coordinator's Stop updates the digest on every reply (`hook_stop`). It also arms the night budget (`noite` in cursor.json,
     marked `via: away`): the end time, the dispatch cap and the failure breaker. The budget releases no external action: `hook_external` applies AWAY_EXTERNAL whatever it holds. Already on, it keeps the original
-    `ligada_em` and only re-arms the budget. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
+    `ligada_em` and only re-arms the budget. `words` is the user's mandate, stored as given (`palavras`, `palavras_em`) and never interpreted: the first goes in the `ausente_ligar` event, a different one later replaces it and logs
+    `ausente_mandato` with the old words; with none, a refresh leaves the mandate alone. With `preflight` (the `away_preflight` result) it keeps it in cursor.json for the absence report. Returns the stored state."""
     _night_state(until_at, max_dispatches, max_failures)  # refuses a bad flag before anything is written
     was = _dict(_cursor_ro().get("ausente"))
     state_ = was or {"ligada_em": now()}
+    mandate = {"palavras": words, "palavras_em": now()} if words else {}
     if not was:
+        state_.update(mandate)
         _cursor_mut(lambda c: (c.__setitem__("ausente", state_), preflight is not None and c.__setitem__("preflight", {"ts": state_["ligada_em"], **preflight})))
         _away_marker(_hora_local(state_["ligada_em"]))
-        append_event({"tipo": "ausente_ligar"})
+        append_event({"tipo": "ausente_ligar", **({"palavras": words} if words else {})})
+    elif words and words != was.get("palavras"):
+        state_ = {**was, **mandate}
+        _cursor_mut(lambda c: c.__setitem__("ausente", state_))
+        append_event({"tipo": "ausente_mandato", "palavras": words, "antes": was.get("palavras"), "antes_em": was.get("palavras_em")})
     night_on(until_at, max_dispatches, max_failures, via="away")
     return state_
 
@@ -6162,6 +6169,18 @@ def away_lines(cur):
         return ["away mode off"]
     return [f"away mode on since {_hora_local(a.get('ligada_em'))} (the HUD shows away since ... via statusline.sh): the Stop of each reply updates {_path(os.path.join(DIGEST, 'atual.json'))}",
             *([] if _manager_cfg() else ["warning: with no agent manager bound nobody runs the PR poll; run `orq pr poll` (the Stop does not call gh)"])]
+
+
+def away_readback(cur):
+    """What `away on`, `away status`, the session start and the compact snapshot show while away is on: the user's words as given, since when, the planned
+    return (the end of the night budget) and what away does. Empty when away is off. Nothing here reads the words; the coordinator judges them."""
+    a = _dict(_dict(cur).get("ausente"))
+    if not a:
+        return []
+    until_at = _dict(_dict(cur).get("noite")).get("ate")
+    return [f"Away mandate (the user's words): {a['palavras']}" if a.get("palavras") else "Away mandate: none given",
+            f"Away since {_hora_local(a.get('ligada_em'))}" + (f", expected return {_hora_local(until_at)}" if until_at else ""),
+            "Away: a decision becomes a pending item, the Stop asks for work that needs no user, notices are typed into the coordinator."]
 
 
 PANEL_URL = "http://localhost:8765/"
@@ -6199,7 +6218,9 @@ def away_report(since, live=None, now_at=None, preflight=None):
     pending_line = lambda i: f"{i['id']}: {_quote(i.get('titulo'), 90)} — {i.get('link') or 'no link'}"  # noqa: E731
     decisions = [pending_line(i) for i in open_entries if i.get("tipo") == "decisao"]
     ok = lambda e: e.get("outcome") == "succeeded"  # noqa: E731
+    mandates = [f"{_hora_local(e['ts'])}: {e['palavras']}" for e in evs if e.get("tipo") in ("ausente_ligar", "ausente_mandato") and e.get("palavras")]
     sections = [
+        ("Your instructions", mandates),
         ("Crooked when the night began", [*[f"refused, forced: {x}" for x in _dict(preflight).get("duros", [])], *_dict(preflight).get("avisos", [])]),
         ("Decisions left for you", decisions),
         ("Other open pending items", [f"{i.get('tipo')} {pending_line(i)}" for i in open_entries if i.get("tipo") != "decisao"]),
@@ -6240,16 +6261,16 @@ def write_away_report(line_list):
     return path
 
 
-def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES, force=False):
+def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURES, force=False, words=None):
     """`orq away` / `/away`: turns away mode on, off or shows it; without op it toggles. Returns the lines to print.
-    On, the flags set the night budget (`--until` default 08:00, `--max-dispatches` default none, `--max-failures` default 3); on again with no flag keeps the budget as it is.
+    On, the flags set the night budget (`--until` default 08:00, `--max-dispatches` default none, `--max-failures` default 3); on again with no flag keeps the budget and the mandate as they are; `--text` stores the user's words (a new text replaces the mandate).
     Turning on runs `away_preflight` first (`ORQ_AWAY_PREFLIGHT=off` skips it): a hard failure refuses and names the fix, `force` turns on anyway and logs `away_preflight_forcado`;
     warnings go in the text and in cursor.json for the report.
     On turning off it shows the link to the 8765 panel, the count and the absence report (written to a file; the path goes last); it does not open a tab."""
     cur = _dict(_cursor_ro().get("ausente"))
     op = {"ligar": "on", "desligar": "off"}.get(op, op) or ("off" if cur else "on")
     if op == "status":
-        return away_lines(_cursor_ro())[:1]
+        return [*away_lines(_cursor_ro())[:1], *away_readback(_cursor_ro())]
     if op == "on":
         pre, notes = None, []
         if not cur and os.environ.get("ORQ_AWAY_PREFLIGHT") != "off":
@@ -6257,12 +6278,12 @@ def away(op=None, until_at=None, max_dispatches=None, max_failures=NIGHT_FAILURE
             notes = away_preflight_lines(pre)
             if pre["duros"] and not force:
                 return [*notes, "away mode stays off; fix the above or pass --force"]
-        if not cur or not night_active(_cursor_ro()) or until_at or max_dispatches is not None or max_failures != NIGHT_FAILURES:
-            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures, pre)
+        if not cur or not night_active(_cursor_ro()) or until_at or max_dispatches is not None or max_failures != NIGHT_FAILURES or words:
+            away_on(until_at or AWAY_UNTIL, max_dispatches, max_failures, pre, words)
         if pre and pre["duros"]:
             append_event({"tipo": "away_preflight_forcado", "duros": pre["duros"]})
         since = _hora_local(_dict(_cursor_ro().get("ausente")).get("ligada_em"))
-        return [f"away mode on since {since}; the digest records each reply", *notes, *night_lines(_cursor_ro(), read_events())[1:]]
+        return [f"away mode on since {since}; the digest records each reply", *away_readback(_cursor_ro()), *notes, *night_lines(_cursor_ro(), read_events())[1:]]
     n = len(digest_generate()[0]["linha"]) if cur else 0
     pre = _dict(_cursor_ro().get("preflight"))
     away_off()
@@ -10997,7 +11018,9 @@ def session_context():
     """What a new coordinator session reads at start: `orq status` (up to 5 lines), the open tickets and the map path, in up to
     SESSION_LINES lines. Tickets that do not fit become `+N open_items`."""
     card = card_first_line(read_events(), datetime.now(timezone.utc))
-    line_list = state().splitlines()[:SESSION_LINES - 2 - bool(card)]
+    mandate = away_readback(_cursor_ro())
+    line_list = state().splitlines()[:SESSION_LINES - 2 - bool(card) - len(mandate)]
+    line_list += mandate
     if card:
         line_list.append(card)
     open_items = [t for t in tickets() if t["status"] != STATUS_CLOSED]
@@ -16714,6 +16737,7 @@ def parser():
     aw = sub.add_parser("away", aliases=["ausente"], help="away mode: orq away [on|off|status]; with no op it toggles; when turned off it shows the panel link (the `ausente` alias keeps the old behavior: with no op it shows the state)")
     aw.add_argument("op", nargs="?", choices=["on", "off", "status", "ligar", "desligar"])
     _arg(aw, "ate", help="on: end of the budget, next HH:MM local (default 08:00)")
+    _arg(aw, "texto", help="on: the user's words for this absence, kept as given and reread after a compact or in a new session (a new text replaces the old one)")
     _arg(aw, "max-despachos", type=int, help="on: dispatch cap (default none)")
     _arg(aw, "max-falhas", type=int, default=NIGHT_FAILURES, help="on: consecutive worker failures that stop dispatching (default 3)")
     _arg(aw, "forcar", action="store_true", help="with on, turns it on even when the preflight refuses (logs away_preflight_forcado)")
@@ -17231,7 +17255,7 @@ def main(argv=None):
                 away_off()
             print("\n".join(away_lines(_cursor_ro())))
         elif a.cmd == "away":
-            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures, a.force)))
+            print("\n".join(away(a.op, a.until_at, a.max_dispatches, a.max_failures, a.force, a.text_value)))
         elif a.cmd == "remind":
             words = a.op_or_text
             if words[0] in ("list", "lista"):

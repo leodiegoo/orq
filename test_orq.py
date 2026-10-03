@@ -8941,6 +8941,46 @@ def test_away_off_delivers_the_absence_report_only_with_the_away_window():
     assert any("Away report" in l for l in _current(a)["ausencia"])
 
 
+WORDS = "até as 8h, só investiga, não mergeia"
+
+
+def test_ticket390_away_on_text_stores_the_words_and_on_and_status_repeat_them_as_given():
+    a = Env(run="run_a")
+    r = a.orq("away", "on", "--text", WORDS)
+    assert r.returncode == 0 and WORDS in r.stdout and "expected return" in r.stdout, r
+    assert _cursor(a)["ausente"]["palavras"] == WORDS
+    assert [e["palavras"] for e in a.events() if e["tipo"] == "ausente_ligar"] == [WORDS]
+    assert WORDS in a.orq("away", "status").stdout
+    assert WORDS in a.orq("away", "on", "--texto", WORDS).stdout  # the pt flag is the same
+
+
+def test_ticket390_second_on_without_text_keeps_the_mandate_and_a_new_text_replaces_it_and_the_report_lists_both():
+    a = Env(run="run_a")
+    a.orq("away", "on", "--text", WORDS)
+    assert WORDS in a.orq("away", "on").stdout and _cursor(a)["ausente"]["palavras"] == WORDS
+    assert not [e for e in a.events() if e["tipo"] == "ausente_mandato"]
+    a.orq("away", "on", "--text", "pode mergear na development")
+    assert _cursor(a)["ausente"]["palavras"] == "pode mergear na development"
+    assert [(e["antes"], e["palavras"]) for e in a.events() if e["tipo"] == "ausente_mandato"] == [(WORDS, "pode mergear na development")]
+    out = a.orq("away", "off").stdout
+    assert out.index("Your instructions") < out.index("Report saved") and re.search(rf"\d\d:\d\d: {re.escape(WORDS)}", out) and re.search(r"\d\d:\d\d: pode mergear na development", out), out
+
+
+def test_ticket390_report_without_words_has_no_instructions_section():
+    a = Env(run="run_a")
+    a.orq("away", "on")
+    assert "Your instructions" not in a.orq("away", "off").stdout
+
+
+def test_ticket390_session_context_carries_the_mandate_only_while_away_is_on():
+    a = Env(run="run_a")
+    a.orq("away", "on", "--text", WORDS)
+    ctx = _ctx_session(a)
+    assert WORDS in ctx and len(ctx.splitlines()) <= 12, ctx
+    a.orq("away", "off")
+    assert WORDS not in _ctx_session(a)
+
+
 def _stop(a, **ev):
     return a.orq("hook", "stop", stdin=json.dumps({"session_id": "abcdef123456", **ev}))
 
@@ -20659,6 +20699,7 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
     "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop",
+    "ausente_ligar": "wake_stopped", "ausente_mandato": "wake_stopped",
     "bloqueio_area": "hook_stop wake_stopped", "ciclo": "hook_stop wake_stopped", "clean_run": "hook_stop wake_stopped",
     "controle": "hook_stop wake_stopped", "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped",
     "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped", "entrada": "hook_stop wake_stopped",
