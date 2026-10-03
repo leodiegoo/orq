@@ -17576,6 +17576,96 @@ def test_ticket180_without_cycle_and_without_commits_without_push_does_not_wake(
         restore()
 
 
+# ---------- ticket 231: a stuck, not-started or stopped worker wakes the coordinator, with an escalation count ----------
+
+def _next231(agent_rows, events=(), now_at=None):
+    return orq_mod.next_without_user([], agent_rows, {}, [], list(events), {}, 0, now_at=now_at or datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc))
+
+
+def _row231(estado, idade_s=20 * 60, dispatch="d1", **k):
+    return {"dispatch": dispatch, "task": "t_" + dispatch, "run": "r1", "estado": estado, "idade_s": idade_s, **k}
+
+
+def test_ticket231_stuck_not_started_and_stopped_worker_is_the_next_step_without_the_user():
+    for estado, label in (("travado", "stuck"), ("nao_comecou", "not started"), ("parado", "stopped at the prompt")):
+        reason = _next231([_row231(estado)])
+        assert reason == f'worker t_d1 {label}: orq steer t_d1 "<adjustment>" --run r1', reason
+    assert "(wait expired)" in _next231([_row231("travado", motivo="wait expired")])
+
+
+def test_ticket231_order_is_stuck_then_not_started_then_stopped_and_oldest_first():
+    rows = [_row231("parado", 99999, "d_p"), _row231("nao_comecou", 50, "d_n"), _row231("travado", 10, "d_t1"), _row231("travado", 900, "d_t2")]
+    assert _next231(rows).startswith("worker t_d_t2 stuck"), "travado first, the oldest"
+    assert _next231(rows[:2]).startswith("worker t_d_n not started")
+
+
+def test_ticket231_asking_hibernated_integration_service_limit_and_declared_wait_do_not_enter():
+    for estado in ("perguntando", "hibernado", "aguardando_integracao", "servico", "limite", "rodando"):
+        assert _next231([_row231(estado)]) is None, estado
+    now_at = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)
+    (r,) = orq_mod.reassess([{"dispatch": "d1", "task": "t1", "estado": "rodando", "fase": "esperando: CI até 07:00", "ultimo_heartbeat": "2026-10-02T05:30:00Z", "desde": "2026-10-02T05:00:00Z"}], [], now_at, integration={})
+    assert r["estado"] == "rodando" and _next231([r]) is None, "declared wait inside its deadline"
+
+
+def test_ticket231_dispatch_with_open_steer_inside_the_read_window_does_not_enter():
+    now_at = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)
+    steer = lambda secs: [{"tipo": "steer", "msg_id": "m1", "dispatch": "d1", "task": "t_d1", "ts": (now_at - timedelta(seconds=secs)).strftime("%Y-%m-%dT%H:%M:%SZ")}]
+    assert _next231([_row231("travado")], steer(orq_mod.STEER_READ_S - 30), now_at) is None, "the coordinator has just handled it"
+    assert _next231([_row231("travado")], steer(orq_mod.STEER_READ_S + 30), now_at), "overdue: enters"
+
+
+def test_ticket231_unpushed_commits_come_before_a_stalled_worker():
+    now_at = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)
+    reason = orq_mod.next_without_user([], [_row231("travado")], {}, [], [], {}, 2, now_at=now_at)
+    assert "2 commit(s) unpushed" in reason, reason
+
+
+def _open231(home, heartbeat_at):
+    _write_state(os.path.join(home, "open.json"), {"agentes": [{"dispatch": "d1", "task": "t1", "run": "r1", "estado": "rodando", "fase": "x", "desde": "2026-10-02T05:00:00Z",
+                                                                  "ultimo_heartbeat": heartbeat_at.strftime("%Y-%m-%dT%H:%M:%SZ")}]})
+
+
+def test_ticket231_wake_repeats_with_escalation_and_the_reason_key_does_not_change():
+    home, sent, restore = _wake174(cycle=False, without_push=0)
+    try:
+        _open231(home, _in_minutes174(-20))
+        orq_mod.wake_stopped(_in_minutes174(0))
+        assert orq_mod.wake_stopped(_in_minutes174(5)) and len(sent) == 1 and "escalation" not in sent[0][1] and "worker t1 stuck" in sent[0][1], sent
+        assert orq_mod.wake_stopped(_in_minutes174(34)) == [] and len(sent) == 1
+        assert orq_mod.wake_stopped(_in_minutes174(35)) and "(escalation 2)" in sent[1][1] and "terminal screen" not in sent[1][1], sent
+        assert orq_mod.wake_stopped(_in_minutes174(65)) and "(escalation 3)" in sent[2][1] and "terminal screen" in sent[2][1], sent
+        assert [e["escalada"] for e in orq_mod.read_events() if e.get("tipo") == "acorda"] == [1, 2, 3]
+        assert len({x[1].split(": worker")[1].split(" (escalation")[0] for x in sent}) == 1, "same reason text every time"
+    finally:
+        restore()
+
+
+def test_ticket231_worker_that_runs_again_resets_the_count_and_leaves_the_reason():
+    home, sent, restore = _wake174(cycle=False, without_push=0)
+    try:
+        _open231(home, _in_minutes174(-20))
+        orq_mod.wake_stopped(_in_minutes174(0))
+        orq_mod.wake_stopped(_in_minutes174(5))
+        _open231(home, _in_minutes174(36))
+        assert orq_mod.wake_stopped(_in_minutes174(40)) == [] and orq_mod._dict(orq_mod._read_json(orq_mod._path(orq_mod.WAKE_FILE))) == {}, "counter cleared"
+        _open231(home, _in_minutes174(-20))
+        orq_mod.wake_stopped(_in_minutes174(100))
+        assert orq_mod.wake_stopped(_in_minutes174(105)) and "escalation" not in sent[-1][1], "starts over at 1"
+    finally:
+        restore()
+
+
+def test_ticket231_away_stop_blocks_at_most_away_blockers_times_for_the_same_stuck_worker():
+    home, _, restore = _wake174(cycle=False, without_push=0)
+    try:
+        now_at = datetime.now(timezone.utc)
+        _open231(home, now_at - timedelta(minutes=20))
+        results = [orq_mod.away_blocker(orq_mod.read_events(), now_at) for _ in range(orq_mod.AWAY_BLOCKERS + 1)]
+        assert all("worker t1 stuck" in r for r in results[:-1]) and results[-1] is None, results
+    finally:
+        restore()
+
+
 def _g176(repo, *a):
     subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
 
@@ -19891,7 +19981,7 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
-    "alerta": "wake_stopped", "alerta_visto": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
+    "alerta": "hook_stop wake_stopped", "steer": "hook_stop wake_stopped", "steer_fim": "hook_stop wake_stopped", "steer_reentrega": "hook_stop wake_stopped", "alerta_visto": "wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped",
     "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
     "entrada": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "wake_stopped", "gate_resolvido": "wake_stopped",
     "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped", "intake": "hook_stop wake_stopped",
