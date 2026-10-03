@@ -11378,6 +11378,27 @@ def test_ticket216_a_red_night_replay_keeps_main_and_leaves_a_pending_line_the_m
     assert r.returncode == 0 and re.search(r"night replay ok in \d+\.\d s", r.stdout), r.stdout + r.stderr
 
 
+def test_ticket370_fast_forward_writes_an_ff_line_that_closes_a_pending_one():
+    alive, env, g = _alive_repo55({"um": {"um.txt": "1\n"}})
+    integrate, cycles = os.path.join(alive, "scripts", "integrar.py"), os.path.join(env["ORQ_WT_DIR"], "integracao", "ciclos.log")
+    os.makedirs(os.path.dirname(cycles))
+    pending = "[PENDENTE: main did not advance, night replay failed] 2026-10-02 18:39 integra/x in /w"
+    open(cycles, "w").write(pending + "\n")
+    before = g("rev-parse", "--short", "HEAD").stdout.strip()
+    r = subprocess.run([sys.executable, integrate, "um"], cwd=alive, env={**env, "ORQ_REPLAY": "true"}, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    after = g("rev-parse", "--short", "HEAD").stdout.strip()
+    assert open(cycles).read().splitlines()[-1].endswith(f" FF main {before}..{after}"), open(cycles).read()
+    cycles_before = orq_mod.CYCLES_LOG
+    orq_mod.CYCLES_LOG = cycles
+    try:
+        assert orq_mod._integrator_pending([]) is None, "pending followed by a green cycle gives no notice"
+        open(cycles, "w").write(pending + "\n")
+        assert orq_mod._integrator_pending([])["linha"] == pending, "pending with no cycle after it still notifies"
+    finally:
+        orq_mod.CYCLES_LOG = cycles_before
+
+
 def test_ticket55_advance_refuses_forgotten_conflict_marker():
     alive, env, g = _alive_repo55({"um": {"nota.txt": "a\num\nc\n"}, "dois": {"nota.txt": "a\ndois\nc\n"}})
     integrate = os.path.join(alive, "scripts", "integrar.py")
