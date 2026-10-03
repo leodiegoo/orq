@@ -20547,10 +20547,11 @@ def test_ticket222_review_records_the_proof_at_the_worktree_head():
 # code and fails when it drifts, and when a type read there has no real command that writes it: ticket 180 was a consumer reading `ciclo`, which the
 # integrator never writes, with tests that wrote it by hand.
 EVENTOS_LIDOS = {
-    "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop", "ciclo": "hook_stop wake_stopped",
-    "clean_run": "hook_stop wake_stopped", "controle": "hook_stop wake_stopped", "coordenador_parou": "hook_stop wake_stopped",
-    "despacho": "hook_stop wake_stopped", "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped",
-    "entrada": "hook_stop wake_stopped", "entrega": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "hook_stop wake_stopped",
+    "alerta": "hook_stop wake_stopped", "alerta_visto": "hook_stop wake_stopped", "away_bloqueio": "hook_stop",
+    "bloqueio_area": "hook_stop wake_stopped", "ciclo": "hook_stop wake_stopped", "clean_run": "hook_stop wake_stopped",
+    "controle": "hook_stop wake_stopped", "coordenador_parou": "hook_stop wake_stopped", "despacho": "hook_stop wake_stopped",
+    "despacho_fila": "hook_stop wake_stopped", "devolver": "hook_stop wake_stopped", "entrada": "hook_stop wake_stopped",
+    "entrega": "hook_stop wake_stopped", "fim_dispatch": "wake_stopped", "gate_falha": "hook_stop wake_stopped",
     "gate_resolvido": "hook_stop wake_stopped", "heartbeat_absorvido": "hook_stop wake_stopped", "heartbeat_visto": "hook_stop wake_stopped",
     "intake": "hook_stop wake_stopped", "liberar": "hook_stop wake_stopped", "mate_entregue": "hook_stop", "mate_escalado": "hook_stop",
     "mate_pedido": "hook_stop", "mate_reenvio": "hook_stop", "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped",
