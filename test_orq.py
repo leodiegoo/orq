@@ -10904,6 +10904,93 @@ def test_ticket60_hibernate_and_wake_by_hand_with_the_refusals_and_the_force():
     assert r.returncode == 1 and "is not hibernated" in r.stderr, r.stderr
 
 
+# ---------- ticket 363: service worker never hibernates, wake of a revoked dispatch opens a new one, idle integrator with a queue is steered ----------
+
+def test_ticket363_service_worker_never_hibernates_by_the_manager_or_by_hand():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger", **HIBERNATE60)
+    lap = _in_manager60(a, stopped_min=20)
+    _evs(a, {"tipo": "servico_marcado", "dispatch": "ctx_term_w1"})
+    assert lap().returncode == 0 and not _log(a, "close.log") and not _hibernated60(a), "idle for 20 min, but a service"
+    r = a.orq("hibernar", "task_term_w1", "--run", "run_a", "--forcar")
+    assert r.returncode == 1 and "service worker" in r.stderr and not _log(a, "close.log"), r.stderr
+
+
+def test_ticket363_wake_of_a_revoked_dispatch_opens_a_new_dispatch_and_hands_over_the_handle():
+    a = Env(run="run_a", **HIBERNATE60)
+    _hibernate60(a)
+    assert a.orq("hibernar", "task_term_w1", "--run", "run_a").returncode == 0
+    _evs(a, {"tipo": "servico_marcado", "dispatch": "ctx_term_w1"})
+    a.set("workers.json", [_w48("term_w1", agente="claude", modelo="claude-opus-5-5", status="completed")])  # Orca settled the dispatch meanwhile: capability revoked
+    a.set("tasks_run_a.json", [{"id": "task_term_w1", "task_title": "Integrador", "status": "completed", "dispatch_id": "ctx_term_w1", "created_at": _iso(-3600)}])
+    a.set("caps.json", {"ctx_term_w1": "revoked"})
+    r = a.orq("acordar", "task_term_w1", "--texto", "a fila tem 3 branches")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    (c,) = _log(a, "create.log")
+    command = c[c.index("--command") + 1]
+    assert "claude --resume sess-w1" in command and "a fila tem 3 branches" in command and "NEW dispatch" in command and "--type escalation" not in command, command
+    (call,) = _log(a, "dispatched.log")
+    assert call[:5] == ["dispatch", "--task", "task_term_w1", "--to", "term_ret1"] and "--inject" in call, call
+    task = next(t for t in json.load(open(os.path.join(a.fake, "tasks_run_a.json"))) if t["id"] == "task_term_w1")
+    assert (task["status"], task["dispatch_id"]) == ("dispatched", "ctx_novo_disp1"), task
+    (ev,) = [e for e in a.events() if e["tipo"] == "acordar"]
+    assert ev["novo_dispatch"] == "ctx_novo_disp1" and not _hibernated60(a), ev
+    assert "ctx_novo_disp1" in orqlib._services(a.events()), "the new dispatch is the same service"
+    assert any(c[c.index("--to") + 1] == "dispatch:ctx_novo_disp1" and "a fila tem 3 branches" in c[c.index("--body") + 1] for c in _sent(a)), _sent(a)
+
+
+def test_ticket363_wake_of_a_live_dispatch_keeps_the_plain_resume():
+    a = Env(run="run_a", **HIBERNATE60)
+    _hibernate60(a)
+    assert a.orq("hibernar", "task_term_w1", "--run", "run_a").returncode == 0
+    assert a.orq("acordar", "task_term_w1").returncode == 0
+    (c,) = _log(a, "create.log")
+    assert "--type escalation" in c[c.index("--command") + 1] and not _log(a, "dispatched.log"), "dispatch still valid: no new one"
+
+
+def _integrator363(queue=2, turn_ended_min=5, turn_started_min=10):
+    home = tempfile.mkdtemp()
+    before = (orq_mod.HOME, orq_mod.type_text, orq_mod._integrator_terminal)
+    sent = []
+    orq_mod.HOME, orq_mod.type_text, orq_mod._integrator_terminal = home, lambda h, t: sent.append((h, t)) or "enviado", lambda events: "term_i"
+    now_at = datetime.now(timezone.utc)
+    orq_mod.append_event({"tipo": "despacho", "dispatch": "dI", "task": "tI", "run": "run_a", "titulo": "integrador", "servico": True})
+    _write_state(os.path.join(home, "turnos.json"), {"dI": {"task": "tI", "sessao": "s", "inicio": _z60(turn_started_min), "fim": _z60(turn_ended_min) if turn_ended_min is not None else None}})
+    _write_state(os.path.join(home, "integrar-fila.json"), {"itens": [{"ticket": str(n), "branch": f"feat/{n}", "ts": _z60(30)} for n in range(queue)]})
+
+    def restore():
+        orq_mod.HOME, orq_mod.type_text, orq_mod._integrator_terminal = before
+    return sent, restore, now_at
+
+
+def test_ticket363_idle_integrator_with_a_queue_is_steered_once_and_without_a_queue_it_is_not():
+    sent, restore, now_at = _integrator363()
+    try:
+        assert len(orq_mod.integrator_steer(now_at)) == 1 and len(sent) == 1, sent
+        assert sent[0][0] == "term_i" and "2 branch(es)" in sent[0][1] and "run the next cycle" in sent[0][1], sent
+        assert orq_mod.integrator_steer(now_at + timedelta(minutes=1)) == [] and len(sent) == 1, "not typed again inside the repeat window"
+        assert [e["fila"] for e in orq_mod.read_events() if e["tipo"] == "integrador_steer"] == [2]
+    finally:
+        restore()
+    sent, restore, now_at = _integrator363(queue=0)
+    try:
+        assert orq_mod.integrator_steer(now_at) == [] and sent == [], "empty queue: nothing to run"
+    finally:
+        restore()
+
+
+def test_ticket363_integrator_in_a_turn_or_idle_for_a_short_time_is_not_steered():
+    sent, restore, now_at = _integrator363(turn_ended_min=None)
+    try:
+        assert orq_mod.integrator_steer(now_at) == [] and sent == [], "turn still running"
+    finally:
+        restore()
+    sent, restore, now_at = _integrator363(turn_ended_min=1)
+    try:
+        assert orq_mod.integrator_steer(now_at) == [] and sent == [], "ended 1 min ago: inside the idle window"
+    finally:
+        restore()
+
+
 def test_ticket60_resume_defers_next_hibernation_and_the_pure_criterion():
     cfg = {"min": 15, "externa_min": 2}
     now_at = datetime.now(timezone.utc)
