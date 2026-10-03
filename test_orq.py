@@ -23137,6 +23137,33 @@ def test_ticket329_the_new_dispatch_is_recorded_even_when_the_reason_does_not_re
     assert [e["novo_dispatch"] for e in a.events() if e["tipo"] == "devolver"] == ["ctx_novo_disp1"], "the link the checks follow is already there"
 
 
+def test_ticket451_send_back_accepts_branch_and_refuses_reason_naming_another_branch():
+    a = Env()
+    a.set("tasks_run_a.json", [{"id": "task_52990a92d8f9", "status": "completed", "dispatch_id": None},
+                               {"id": "task_certa", "status": "completed", "dispatch_id": None}])
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_52990a92d8f9", "dispatch": "ctx_errada", "status": "completed"},
+                            {"handle": "term_w2", "run": "run_a", "task": "task_certa", "dispatch": "ctx_certa_latest", "status": "completed"}])
+    a.set("terminals.json", ["term_w1", "term_w2", "term_coord"])
+    _evs(a,
+         {"tipo": "despacho", "run": "run_a", "task": "task_52990a92d8f9", "dispatch": "ctx_errada", "worktree": "/wt/errada", "branch": "leodiegoo/orq-away-custo-corrige-392", "terminal": "term_w1"},
+         {"tipo": "despacho", "run": "run_a", "task": "task_certa", "dispatch": "ctx_certa", "worktree": "/wt/certa", "branch": "leodiegoo/orq-prova-falha-nao-enfileira", "terminal": "term_w2"},
+         {"tipo": "despacho", "run": "run_a", "task": "task_certa", "dispatch": "ctx_certa_latest", "worktree": "/wt/certa", "branch": "leodiegoo/orq-prova-falha-nao-enfileira", "terminal": "term_w2"})
+    assert orqlib._send_back_branch(a.events(), "leodiegoo/orq-prova-falha-nao-enfileira") == {"id": "task_certa", "dispatch_id": "ctx_certa_latest", "branch": "leodiegoo/orq-prova-falha-nao-enfileira"}, a.events()
+    r = a.orq("send-back", "task_52990a92d8f9", "ajuste em leodiegoo/orq-prova-falha-nao-enfileira")
+    assert r.returncode == 1 and "task_certa" in r.stderr, (r.returncode, r.stdout, r.stderr, a.events())
+    assert not [e for e in a.events() if e["tipo"] == "devolver"], "mismatched branch must be refused before dispatching"
+    r = a.orq("send-back", "leodiegoo/orq-prova-falha-nao-enfileira", "ajuste em leodiegoo/orq-prova-falha-nao-enfileira")
+    assert r.returncode == 0, r.stderr
+    (dv,) = [e for e in a.events() if e["tipo"] == "devolver"]
+    assert (dv["task"], dv["dispatch"]) == ("task_certa", "ctx_certa_latest"), dv
+
+
+def test_ticket451_send_back_branch_selects_the_latest_dispatch_for_that_branch():
+    events = [{"tipo": "despacho", "task": "task_old", "dispatch": "ctx_old", "branch": "feat/shared"},
+              {"tipo": "despacho", "task": "task_new", "dispatch": "ctx_new", "branch": "feat/shared"}]
+    assert orqlib._send_back_branch(events, "feat/shared") == {"id": "task_new", "dispatch_id": "ctx_new", "branch": "feat/shared"}
+
+
 def test_ticket329_scratch_ticket_of_a_delivery_that_passed_on_the_new_dispatch_counts_as_done():
     a = Env(run="run_a")
     plan = _plan201(a.tmp.name, {"04": (1, "ready-for-agent")})

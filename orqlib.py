@@ -9982,19 +9982,51 @@ def _superseding_dispatch(events, d):
     return (later[-1]["dispatch"], later[-1]["task"]) if later else None
 
 
+def _dispatch_branch(event):
+    """Branch recorded for a dispatch, falling back to its worktree's current branch."""
+    if event.get("branch"):
+        return event["branch"]
+    worktree = event.get("worktree")
+    return (_git(worktree, "branch", "--show-current") or "").strip() if worktree else ""
+
+
+def _send_back_branch(events, branch):
+    """Latest task/dispatch whose dispatch worktree is on `branch`."""
+    for event in reversed(events):
+        if event.get("tipo") == "despacho" and event.get("task") and _dispatch_branch(event) == branch:
+            return {"id": event["task"], "dispatch_id": event.get("dispatch"), "branch": branch}
+    return None
+
+
 def send_back(target, reason, run=None, achado=False):
     """Gives the delivery of a completed task back to the worker with the correction `reason`. Orca revokes the capability of a dispatch at its first worker_done, so the
     worker could not deliver again on it (ticket 329): the return opens a NEW dispatch (`orca orchestration dispatch --task --to <terminal> --inject`, the task back to `ready`) in a
     terminal running the worker's session (the live one, the hibernated one woken, or `claude --resume` in the same worktree when it is gone) and sends the reason to the new dispatch.
     Records `devolver` with `novo_dispatch` (the delivery leaves the away Stop and the "entregues sem liberar" (delivered, not released) until the new dispatch's worker_done).
-    ValueError if `target` (task or dispatch) does not exist in the Run or the worker has no way to receive it."""
+    `target` may be a task, dispatch, or branch; a reason that names another known branch is refused with that branch's task. ValueError if the target does not exist in the Run or the worker has no way to receive it."""
     run_ = default_run(run)
     if not run_:
         raise ValueError("no Run bound: pass --run and run run-use --id <r>")
     if achado:  # `--achado`: the reason cites a review finding, so it carries the invariant rule
         reason = f"{reason} {INVARIANT_RULE}"
     with _no_run(run_):
-        t = next((t for t in orca("task-list", "--run", run_, timeout=20)["tasks"] if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
+        events = read_events()
+        target_branch = _send_back_branch(events, target)
+        tasks = orca("task-list", "--run", run_, timeout=20)["tasks"]
+        if target_branch:
+            owner = target_branch["id"]
+            t = next((item for item in tasks if item.get("id") == owner and item.get("dispatch_id")), None)
+            if not t:
+                worker = next((w for w in _all_workers(run_) if w.get("taskId") == owner and w.get("dispatchId")), None)
+                t = {"id": owner, "dispatch_id": worker["dispatchId"]} if worker else target_branch
+        else:
+            t = next((t for t in tasks if target in (t["id"], t.get("dispatch_id")) and t.get("dispatch_id")), None)
+        branches = {}
+        for event in events:
+            if event.get("tipo") == "despacho" and event.get("task"):
+                branch = _dispatch_branch(event)
+                if branch:
+                    branches[branch] = event["task"]
         if not t:  # task-list zeroes the dispatch_id of the completed task (ticket created with the backlog on); worker-list, which `agents` reads, still links task and dispatch
             t = next(({"id": w["taskId"], "dispatch_id": w["dispatchId"]} for w in _all_workers(run_) if target in (w.get("taskId"), w.get("dispatchId")) and w.get("dispatchId")), None)
         opened = next((e for e in reversed(read_events()) if e.get("tipo") == "devolver" and e.get("novo_dispatch") and target in (e.get("task"), e.get("novo_dispatch"))), None)
@@ -10002,6 +10034,10 @@ def send_back(target, reason, run=None, achado=False):
             t = {"id": opened["task"], "dispatch_id": opened["novo_dispatch"]}
         if not t:
             raise ValueError(f"{target} is neither a task nor a dispatch of Run {run_}")
+        t_branch = target_branch["branch"] if target_branch else next((b for b, task in branches.items() if task == t["id"]), "")
+        cited = next((b for b in branches if b != t_branch and re.search(rf"(?<![\w./-]){re.escape(b)}(?![\w./-])", reason)), None)
+        if cited:
+            raise ValueError(f"reason cites branch {cited}, whose task is {branches[cited]}; target {t['id']} is on {t_branch or 'an unknown branch'}; use `orq send-back {branches[cited]} \"<reason>\"`")
         if newer := _superseding_dispatch(read_events(), t["dispatch_id"]):  # ticket 388: two workers on one branch, only the latest is reopened
             raise ValueError(f"dispatch {t['dispatch_id']} was superseded by {newer[0]} (task {newer[1]}) on the same worktree: `orq send-back {newer[1]} \"<reason>\"` reaches the worker that holds the branch")
         d, body_text = t["dispatch_id"], f"The delivery was sent back by the coordinator; redo it and send a new worker_done with this dispatch's command. Reason: {reason}"
@@ -17371,7 +17407,7 @@ def parser():
     bl.add_argument("ticket_numbers", nargs="*", help="the tickets that leave (move)")
     _arg(bl, "grupo", help="the group that receives the tickets (move)")
     bl.add_argument("--json", action="store_true")
-    dv = sub.add_parser("send-back", aliases=["devolver"], help="orq send-back <task|dispatch> \"<reason>\": sends the correction to the worker of an already finished delivery and takes the delivery off the Stop until the new worker_done")
+    dv = sub.add_parser("send-back", aliases=["devolver"], help="orq send-back <task|dispatch|branch> \"<reason>\": sends the correction to the worker of an already finished delivery and takes the delivery off the Stop until the new worker_done")
     dv.add_argument("target")
     dv.add_argument("reason")
     dv.add_argument("--run")
