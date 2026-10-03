@@ -2327,7 +2327,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "conformidade": "conformance", "fase_declarada": "phase_declared",
     "entrada": "entry", "obrigacao": "obligation", "steer_fim": "steer_end", "steer_reentrega": "steer_redelivered",
     "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
-    "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
+    "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_travado": "mate_stalled", "mate_reenvio": "mate_resent",
     "segurar": "hold", "segurar_solta": "hold_release",
     "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue", "integrador_steer": "integrator_steer",
     "despacho": "dispatch", "despacho_fila": "dispatch_queued", "alerta": "alert", "alerta_visto": "alert_seen", "uso_aviso": "usage_notice",
@@ -6686,11 +6686,30 @@ def _stalled_worker(agent_rows, events, now_at):
     integration, service, plan limit and declared wait. A dispatch with a steer still inside STEER_READ_S is out too: the coordinator has just handled it. The text carries no
     minutes: the reason is the key of the wake-up count and of the away blocker, and it must not change while the worker stays in the same state."""
     handled = {s["steer"].get("dispatch") for s in open_steers(events, now_at).values() if (now_at - s["ultima"]).total_seconds() < STEER_READ_S}
-    rows = [a for a in agent_rows if a.get("estado") in STALLED and a.get("dispatch") not in handled]
+    rows = [a for a in agent_rows if a.get("estado") in STALLED and a.get("dispatch") not in handled and not _mate_owning(a.get("run"))]  # a mate's Run is not the coordinator's to steer (ticket 369)
     if not rows:
         return None
     a = min(rows, key=lambda a: (list(STALLED).index(a["estado"]), -(a.get("idade_s") or 0)))
     return f"worker {a.get('task')} {STALLED[a['estado']]}{' (' + a['motivo'] + ')' if a.get('motivo') else ''}: orq steer {a.get('task')} \"<adjustment>\" --run {a.get('run')}"
+
+
+def stalled_to_mates(agent_rows, events):
+    """A stalled worker of a mate's Run becomes an `orq mate request` with the suggested steer (the coordinator cannot steer that Run without taking it), once per dispatch and state.
+    Raises nothing: a mate that cannot take the request is tried again on the next loop."""
+    sent = {(e.get("dispatch"), e.get("estado")) for e in events if e.get("tipo") == "mate_travado"}
+    line_list = []
+    for a in agent_rows:
+        owner = _mate_owning(a.get("run"))
+        if a.get("estado") not in STALLED or not owner or (a.get("dispatch"), a["estado"]) in sent:
+            continue
+        reason = f" ({a['motivo']})" if a.get("motivo") else ""
+        try:
+            r = mate_request(owner, f"worker {a.get('task')} in your Run is {STALLED[a['estado']]}{reason}: steer it with `orq steer {a.get('task')} \"<adjustment>\" --run {a.get('run')}`.")
+        except ValueError:
+            continue
+        append_event({"tipo": "mate_travado", "dispatch": a.get("dispatch"), "estado": a["estado"], "grupo": owner, "corr": r["corr"]})
+        line_list.append(f"stalled worker {a.get('task')} went to mate {owner} ({r['corr']})")
+    return line_list
 
 
 def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_push, pending_item=None, mate_to_open=None, now_at=None):
@@ -14577,6 +14596,11 @@ def manager_absorb():
                 parados[r] = reason
         manager_release(parados)
         line_list += [f"{r}: released from the manager ({m})" for r, m in parados.items()]
+    try:
+        stall_events = read_events()
+        line_list += stalled_to_mates(reassess(_dict(_read_json(_path("open.json"))).get("agentes") or [], stall_events, datetime.now(timezone.utc), _turns_ro()), stall_events)
+    except Exception as e:  # noqa: BLE001 - the panel doesn't go down because of the mate forward; the next loop tries
+        log(f"travado_para_mate: {type(e).__name__}: {e}")
     try:
         line_list += redeliver_steers()
     except Exception as e:  # noqa: BLE001 - the panel doesn't go down because of steer tracking; the next loop tries
