@@ -58,7 +58,7 @@ while time.time() - start < MAX_S:
             res = orca("check", "--run", bound).get("result") or {}
             if orq and res.get("messages"):
                 try:
-                    res = orq.confirm_batches(bound, res)[1]
+                    res = orq.confirm_batches(bound, res, "waiter")[1]
                 except Exception:  # noqa: BLE001 - a batch consumed and without ack is repeated on the next check: nothing is lost
                     res = {}
         msgs = res.get("messages") or []

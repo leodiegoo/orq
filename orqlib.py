@@ -1350,6 +1350,69 @@ def integrate_publish_round():
     return [f"orq main published at {r['hash']} (tickets {', '.join(r['tickets']) or 'none'})"] if r["estado"] == "publicou" else []
 
 
+INTEGRATOR_BOOT_S = float(os.environ.get("ORQ_INTEGRADOR_SOBE_MIN") or 5) * 60  # a queue entry this old with no live integrator makes the manager start one (ticket 389)
+INTEGRA_ORPHAN_S = float(os.environ.get("ORQ_INTEGRA_ORFA_MIN") or 15) * 60  # an integra-* folder with no process and no commit for this long is reported as orphan
+INTEGRATOR_MODEL, INTEGRATOR_EFFORT = "claude-sonnet-5-5", "medium"
+
+
+def _orphan_integra(now_at):
+    """[(folder name, minutes since its last commit)] of the `<WT_ROOT>/integra-*` worktrees with no process inside and no commit for INTEGRA_ORPHAN_S (a merge left open counts)."""
+    out, cwds = [], None
+    for name in sorted(os.listdir(WT_ROOT)) if os.path.isdir(WT_ROOT) else []:
+        d = os.path.join(WT_ROOT, name)
+        last = (_git(d, "log", "-1", "--format=%ct") or "").strip() if name.startswith("integra-") and os.path.exists(os.path.join(d, ".git")) else ""
+        if not last.isdigit() or now_at.timestamp() - int(last) < INTEGRA_ORPHAN_S:
+            continue
+        cwds = _open_cwds() if cwds is None else cwds
+        if not any(c == os.path.realpath(d) or c.startswith(os.path.realpath(d) + os.sep) for c in cwds):
+            out.append((name, int((now_at.timestamp() - int(last)) // 60)))
+    return out
+
+
+def _integrator_notice(coord, events, text_value, **key):
+    """Types `text_value` into the coordinator once per `key` (an `integrador_aviso` event with those fields). True when it went out now."""
+    if not coord or any(e.get("tipo") == "integrador_aviso" and all(e.get(k) == v for k, v in key.items()) for e in events):
+        return False
+    if notify_coordinator(coord, text_value) not in DELIVERED:
+        return False
+    append_event({"tipo": "integrador_aviso", **key})
+    return True
+
+
+def integrator_lap():
+    """One manager lap over the integrator (ticket 389). A queue entry waiting over INTEGRATOR_BOOT_S with no live integrator service starts one (`dispatch_worker --service`, priority 1,
+    in the orq project's Run; the dispatch queue holds it when the machine has no slot, and an integrator already queued counts as started). With the integrator alive and the queue
+    standing (`integrator_state` stalled) it only warns the coordinator, once per stall. An `integra-*` folder with no process and no new commit is reported once. Returns panel lines."""
+    events, now_at, g = read_events(), now_dt(), _manager_cfg() or {}
+    coord, lines = g.get("coordenador"), []
+    for name, minutes in _orphan_integra(now_at):
+        if _integrator_notice(coord, events, f"orq: integration folder {name} has no process and no commit for {minutes} min: orphan, clean it up or resume the cycle.", motivo="orfa", pasta=name):
+            lines.append(f"integration folder {name} orphan, coordinator notified")
+    items = list(integration_queue().values())
+    live = _alive_terminals() if items else None
+    if live is None:
+        return lines
+    terminal = _integrator_terminal(events)
+    if terminal and terminal in live:
+        stalled = integrator_state(events, items, now_at)["stalled"]
+        if stalled and _integrator_notice(coord, events, f"orq: the integrator is alive but the queue ({len(items)} waiting) has not moved since {_hora_local(stalled['desde'])}: it may be stuck.", motivo="travado", desde=stalled["desde"]):
+            lines.append("integrator alive and stuck, coordinator notified")
+        return lines
+    oldest = min((_dt(i["ts"]) for i in items if _ts(i.get("ts"))), default=None)
+    if not oldest or (now_at - oldest).total_seconds() < INTEGRATOR_BOOT_S or any(i.get("servico") and "integrador" in (i.get("titulo") or "").lower() for i in dispatch_queue_items()):
+        return lines
+    runs = g.get("runs") or []
+    project = project_by_folder(projects(), os.path.realpath(orqpaths.CODE))
+    run = next((r for r in runs if project and run_project(r) == project), runs[0] if runs else None)
+    if not run:
+        return lines
+    try:
+        r = dispatch_worker(run, "Integrador", os.path.join(PLAN, "specs", "orq-integrador-servico.md"), INTEGRATOR_MODEL, INTEGRATOR_EFFORT, project=project, service=True, priority_level=1)
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+        return lines + [f"integrator not started: {e}"]
+    return lines + [f"integrator started for {len(items)} waiting branch(es)" + (" (queued: no slot)" if r.get("estado") == "enfileirado" else "")]
+
+
 def integrate_conclude(hash_, branches, dispatch=None):
     """`integrate.py` advanced main by fast-forward to `hash_`: records the integrator's `cycle` (`dispatch`, or the not-yet-released service titled "integrador"; without it the event
     stays without a dispatch, which the Stop still reads) with the branches, the tickets that were on the queue and each branch's tip, then calls `integrate_publish` (ticket 185):
@@ -6932,9 +6995,9 @@ def mark_arrival(org):
     _cursor_mut(lambda c: c.__setitem__("chegada", {"origem": org, "t": time.time()}))
 
 
-def confirm_batches(run_id, res):
+def confirm_batches(run_id, res, by):
     """`res` is the response of a consuming `check`. Acknowledges (--ack) the consecutive batches that are only heartbeat, up to HB_BATCHES, and records
-    a heartbeat_absorvido event. Returns (event or None, response of the first batch that is not only heartbeat or of the last).
+    a heartbeat_absorvido event carrying `by` (who absorbed: manager, prompt-hook or waiter). Returns (event or None, response of the first batch that is not only heartbeat or of the last).
 
     The --ack confirms the batch and already brings the next one. A batch that is not only heartbeat is not acknowledged: it stays in the open delivery, which Orca
     repeats on the coordinator's check. Acknowledging the same batch again is harmless in Orca (it repeats the current delivery, checked in a
@@ -6952,7 +7015,7 @@ def confirm_batches(run_id, res):
     if not deliveries:
         return None, res
     with _lock("cursor.lock"), _no_alarm():  # already confirmed: the event and the batch mark go in together, out of the alarm's reach
-        ev = _write_event({"tipo": "heartbeat_absorvido", "run": run_id, "entregas": deliveries, "heartbeats": signals})
+        ev = _write_event({"tipo": "heartbeat_absorvido", "run": run_id, "by": by, "entregas": deliveries, "heartbeats": signals})
         cur = _read_cursor()
         _sub(cur, "hb_absorvido")[run_id] = time.time()
         _write_json(_path("cursor.json"), cur)
@@ -6970,7 +7033,7 @@ def absorb_heartbeats(run_id, pending_messages=None):
     if not only_heartbeats(pending_messages):
         return None
     with manager_lock():  # the check and the ack in the same manager-to-Run call
-        return confirm_batches(run_id, orca("check", "--run", run_id))[0]
+        return confirm_batches(run_id, orca("check", "--run", run_id), "prompt-hook")[0]
 
 
 def late_notice(run_id):
@@ -15371,7 +15434,7 @@ def _absorb_run(run, bound_run):
     with manager_lock():
         if bound_run:
             orca("run-use", "--id", run)
-        ev, res = confirm_batches(run, orca("check", "--run", run))
+        ev, res = confirm_batches(run, orca("check", "--run", run), "manager")
     msgs = res.get("messages") or []
     line = f"{run}: {len(ev['heartbeats']) if ev else 0} heartbeat(s) absorbed"
     return line, (None if not msgs or only_heartbeats(msgs) else msgs)
@@ -15529,7 +15592,7 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - an unreadable screen doesn't take down the panel; the next loop tries
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round(), *integrate_publish_round()]
+        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round(), *integrate_publish_round(), *integrator_lap()]
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:

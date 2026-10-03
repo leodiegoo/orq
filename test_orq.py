@@ -23395,6 +23395,88 @@ def test_ticket388_send_back_refuses_the_dispatch_a_later_one_replaced_on_the_sa
     assert a.orq("devolver", "task_nova", "redo").returncode == 0, "the latest one is"
 
 
+# ---------- ticket 389: the manager starts the integrator when the queue has a branch waiting ----------
+
+def _queue389(a, minutes_ago, ticket="9", branch="feat/x"):
+    os.makedirs(a.home, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes_ago * 60))
+    _write_state(os.path.join(a.home, "integrate-queue.json"), {"itens": [{"branch": branch, "ticket": ticket, "ts": ts}]})
+
+
+def _env389():
+    a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
+    _manager(a)
+    plan = os.path.join(a.tmp.name, "plan")
+    os.makedirs(os.path.join(plan, "specs"))
+    open(os.path.join(plan, "specs", "orq-integrador-servico.md"), "w").write("## What to build\nintegre\n")
+    a.env["ORQ_PLAN"] = plan
+    a.set("terminals.json", ["term_ger", "term_coord", "term_int", "term_novo1"])
+    return a
+
+
+def _integrator_starts(a):
+    return [e for e in a.events() if e["tipo"] == "despacho" and e.get("servico") and "integrador" in (e.get("titulo") or "").lower()]
+
+
+def test_ticket389_manager_starts_the_integrator_when_an_old_queue_entry_has_none_alive():
+    a = _env389()
+    _queue389(a, 8)
+    assert a.orq("gerente", "absorver").returncode == 0
+    (ev,) = _integrator_starts(a)
+    assert ev["run"] == "run_a", ev
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert len(_integrator_starts(a)) == 1, "one integrator at a time: the one just started counts"
+
+
+def test_ticket389_manager_waits_for_a_recent_entry_and_does_not_start_a_second_integrator():
+    a = _env389()
+    _queue389(a, 1)
+    assert a.orq("gerente", "absorver").returncode == 0 and not _integrator_starts(a), "under N minutes"
+    _queue389(a, 8)
+    assert a.orq("gerente", "absorver").returncode == 0 and len(_integrator_starts(a)) == 1, "over N minutes it starts"
+    b = _env389()
+    _service105(b)
+    _queue389(b, 8)
+    assert b.orq("gerente", "absorver").returncode == 0 and not _log(b, "started.log"), "integrator alive: no second one"
+
+
+def test_ticket389_manager_warns_the_coordinator_once_when_the_live_integrator_stalls():
+    a = _env389()
+    _service105(a)
+    _queue389(a, 30)
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert a.orq("gerente", "absorver").returncode == 0
+    assert not _log(a, "started.log")
+    (env,) = [x for x in _log(a, "send.log") if "integrator" in x[x.index("--text") + 1].lower()]
+    assert env[env.index("--terminal") + 1] == "term_coord", env
+
+
+def test_ticket389_manager_warns_about_an_orphan_integration_folder():
+    a = _env389()
+    root = os.path.join(a.env["ORQ_WT_ROOT"], "integra-velha")
+    os.makedirs(root)
+    g = lambda *x: subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": "2000-01-01T00:00:00"})
+    g("init", "-q")
+    g("commit", "-q", "--allow-empty", "-m", "merge", "--date=2000-01-01T00:00:00")
+    for _ in range(2):
+        assert a.orq("gerente", "absorver").returncode == 0
+    (env,) = _log(a, "send.log")
+    assert "integra-velha" in env[env.index("--text") + 1], env
+
+
+def test_ticket389_heartbeat_absorption_event_says_who_absorbed():
+    a = _env389()
+    a.inbox(_hb("lendo"))
+    assert a.orq("gerente", "absorver").returncode == 0
+    b = Env()
+    b.inbox(_hb("lendo"))
+    assert _blocked(b.prompt(NOTICE_A))
+    c = Env()
+    c.inbox(_hb("lendo"))
+    _waiter(c)
+    assert [[e["by"] for e in x.events() if e["tipo"] == "heartbeat_absorvido"] for x in (a, b, c)] == [["manager"], ["prompt-hook"], ["waiter"]]
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
