@@ -8723,6 +8723,44 @@ def test_queue_main_pr_with_failure_only_in_the_staging_workflow_is_ready_with_t
     assert ci[1216]["falhas"] == [] and ci[1216]["outro_ambiente"] == ["Web Deploy Staging"], ci
 
 
+def _ckr(item_name, workflow, conclusion, started, status="COMPLETED"):
+    return {**_ckw(item_name, workflow, conclusion), "status": status, "startedAt": started}
+
+
+def _ci_falhas(rollup):
+    a = _ci_queue(pr1={"statusCheckRollup": rollup})
+    a.orq("fila", "lista")
+    ci = {i["numero"]: i["ci"] for i in _read_state(os.path.join(a.home, "prs.json"))["itens"]}
+    return ci[1216]["falhas"]
+
+
+def test_ticket395_failure_superseded_by_a_newer_green_round_is_not_red():
+    w = "Web PR Checks"
+    rollup = [_ckr(n, w, c, t) for n in ("mocha", "check") for c, t in (("FAILURE", "2026-10-02T16:05:08Z"), ("SUCCESS", "2026-10-02T16:05:11Z"), ("SUCCESS", "2026-10-02T17:12:03Z"))]
+    assert _ci_falhas(rollup) == []
+
+
+def test_ticket395_failure_newer_running_undated_or_tied_with_the_green_stays_red():
+    w = "Web PR Checks"
+    green = _ckr("check", w, "SUCCESS", "2026-10-02T16:05:11Z")
+    assert _ci_falhas([green, _ckr("check", w, "FAILURE", "2026-10-02T17:00:00Z")]) == ["check"]
+    assert _ci_falhas([green, _ckr("check", w, "FAILURE", "2026-10-02T16:05:11Z")]) == ["check"]
+    undated = {k: v for k, v in _ckr("check", w, "FAILURE", "x").items() if k != "startedAt"}
+    assert _ci_falhas([green, undated]) == ["check"]
+    running = _ckr("check", w, None, "2026-10-02T16:01:00Z", "IN_PROGRESS")
+    assert _ci_falhas([green, _ckr("check", w, "FAILURE", "2026-10-02T16:00:00Z"), running]) == ["check"]
+
+
+def test_ticket395_same_check_name_in_another_workflow_does_not_supersede():
+    rollup = [_ckr("check", "Web PR Checks", "FAILURE", "2026-10-02T16:00:00Z"), _ckr("check", "MCP CI", "SUCCESS", "2026-10-02T17:00:00Z")]
+    assert _ci_falhas(rollup) == ["check"]
+
+
+def test_ticket395_status_context_failure_is_never_superseded():
+    status = {"__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE", "startedAt": "2026-10-02T16:00:00Z"}
+    assert _ci_falhas([status, _ckr("ci/legacy", "Web PR Checks", "SUCCESS", "2026-10-02T17:00:00Z")]) == ["ci/legacy"]
+
+
 def test_queue_main_pr_with_failure_in_its_own_base_workflow_turns_red():
     a = _ci_queue(pr1={"baseRefName": "main", "statusCheckRollup": [_ckw("check", "Web Deploy Staging", "FAILURE"), _ckw("check", "Web Deploy Production", "FAILURE")]})
     l1 = a.orq("fila", "lista").stdout.splitlines()[0]

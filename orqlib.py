@@ -4222,6 +4222,32 @@ def _workflow_of_other_environment(workflow, base, flow_info):
     return bool(base and targets and base not in targets)
 
 
+def _started_at(c):
+    """`startedAt` of a check run as a datetime, or None when missing or unreadable."""
+    try:
+        return datetime.fromisoformat(str(c["startedAt"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        return None
+
+
+def _superseded_checks(rollup):
+    """{(workflowName, name)} of the check runs whose current round is green: the newest SUCCESS run started after every non-green run of the same workflow and name, and each of
+    those non-green runs is COMPLETED with a valid `startedAt`. A round still running, undated or tied with the green stays red, and so does an old status (`StatusContext`).
+    The key carries the workflow: `check` exists in several workflows and one does not clear another."""
+    groups = {}
+    for c in rollup:
+        if isinstance(c, dict) and c.get("__typename") != "StatusContext" and "context" not in c:
+            groups.setdefault((c.get("workflowName"), c.get("name")), []).append(c)
+    out = set()
+    for key, runs in groups.items():
+        green = [t for c in runs if c.get("status") == "COMPLETED" and c.get("conclusion") == "SUCCESS" and (t := _started_at(c))]
+        red = [c for c in runs if c.get("status") != "COMPLETED" or c.get("conclusion") in CHECK_FAILED]
+        starts = [_started_at(c) for c in red if c.get("status") == "COMPLETED"]
+        if green and red and len(starts) == len(red) and None not in starts and max(starts) < max(green):
+            out.add(key)
+    return out
+
+
 def _gh_ci(seen_item, now_at, flow_info):
     """{mergeable, falhas, rodando, outro_ambiente, lido_em, falhas_na_base?} of what gh saw of a PR, or None if the response carries neither CI nor mergeable (gh with no response, `pr view`).
     A workflow check from another environment (e.g. the test environment's on a PR to production) counts neither in falhas nor in rodando: the workflow becomes `outro_ambiente`, only if it failed.
@@ -4229,6 +4255,7 @@ def _gh_ci(seen_item, now_at, flow_info):
     if "mergeable" not in seen_item and "statusCheckRollup" not in seen_item:
         return None
     failures, running, other_item = [], [], []
+    superseded = _superseded_checks(seen_item.get("statusCheckRollup") or [])
     for c in seen_item.get("statusCheckRollup") or []:
         if not isinstance(c, dict):
             continue
@@ -4243,7 +4270,7 @@ def _gh_ci(seen_item, now_at, flow_info):
             running += [item_name] if check_state in ("PENDING", "EXPECTED") else []
         elif c.get("status") != "COMPLETED":
             running.append(item_name)
-        elif c.get("conclusion") in CHECK_FAILED:
+        elif c.get("conclusion") in CHECK_FAILED and (c.get("workflowName"), c.get("name")) not in superseded:
             failures.append(item_name)
     base_item = _dict(seen_item.get("_base"))
     on_base = [f for f in failures if f in (base_item.get("falhas") or [])]
