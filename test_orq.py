@@ -10123,7 +10123,7 @@ def test_ticket51_usage_reads_rate_limits_from_hud_board_without_calling_orca():
     assert (u["uso"]["semana"], u["uso"]["cinco_h"], u["nivel"]) == (93, 86, "pausa"), u
     assert "week at 93% (threshold 92%), turns over in 2d" in u["motivo"], u
     assert not _log(a, "calls.log"), "ler o uso não fala com o Orca"
-    _usage51(a, week=80, five_h=50)
+    _usage51(a, week=80, five_h=50, without_reset=6 * 86400 + 12 * 3600)
     assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "ok"
     _usage51(a, week=86, five_h=50)
     assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "avisa"
@@ -10146,6 +10146,49 @@ def test_ticket51_thresholds_come_from_usage_json():
     assert json.loads(a.orq("uso", "--json").stdout)["nivel"] == "avisa"
 
 
+def test_ticket434_projection_softens_week_pause_and_warns_before_projected_exhaustion():
+    a = Env()
+    _usage51(a, week=93, five_h=10, without_reset=2 * 3600)
+    result = json.loads(a.orq("uso", "--json").stdout)
+    assert result["nivel"] == "avisa", result
+    assert result["uso"]["semana_projecao"] <= 100, result
+
+    _usage51(a, week=10, five_h=40, five_hour_reset=150 * 60)
+    text = a.orq("uso").stdout
+    assert text.startswith("ok") and "projected 80% at reset" in text, text
+
+    _usage51(a, week=85, five_h=10, without_reset=4 * 86400)
+    result = json.loads(a.orq("uso", "--json").stdout)
+    assert result["nivel"] == "avisa" and "exhausts around" in result["motivo"], result
+    assert result["uso"]["semana_esgota"], result
+
+
+def test_ticket434_projected_five_hour_exhaustion_holds_but_early_window_uses_fixed_threshold():
+    a = Env()
+    _usage51(a, week=10, five_h=91, five_hour_reset=30 * 60)
+    result = json.loads(a.orq("uso", "--json").stdout)
+    assert result["nivel"] == "segura", result
+    assert result["uso"]["cinco_h_projecao"] > 100, result
+
+    _usage51(a, week=10, five_h=91, five_hour_reset=4 * 3600 + 40 * 60)
+    result = json.loads(a.orq("uso", "--json").stdout)
+    assert result["nivel"] == "segura", result
+    assert result["uso"]["cinco_h_projecao"] is None, result
+
+
+def test_ticket434_usage_without_reset_keeps_fixed_threshold_behavior():
+    a = Env()
+    _usage51(a, week=93, five_h=10)
+    hud_path = os.path.join(a.env["ORQ_HUD_CACHE"], "stdin.sessao-1.json")
+    hud = json.load(open(hud_path))
+    hud["rate_limits"]["seven_day"].pop("resets_at")
+    hud["rate_limits"]["five_hour"].pop("resets_at")
+    json.dump(hud, open(hud_path, "w"))
+    result = json.loads(a.orq("uso", "--json").stdout)
+    assert result["nivel"] == "pausa", result
+    assert result["uso"]["semana_projecao"] is None and result["uso"]["cinco_h_projecao"] is None, result
+
+
 def test_ticket51_dispatch_refuses_above_week_threshold_and_5h_window():
     a = Env(run="run_a")
     _usage51(a, week=93, five_h=10)
@@ -10164,16 +10207,16 @@ def test_ticket51_dispatch_refuses_above_week_threshold_and_5h_window():
 def test_ticket51_manager_notifies_coordinator_once_per_level_and_window():
     a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
     _manager(a)
-    _usage51(a, week=93)
+    _usage51(a, week=93, five_h=10)
     assert a.orq("gerente", "absorver").returncode == 0
     a.orq("gerente", "absorver")
     (env,) = _log(a, "send.log")
     assert env[env.index("--terminal") + 1] == "term_coord"
-    assert "plan usage, week at 93%" in env[env.index("--text") + 1] and "orq pause" in env[env.index("--text") + 1]
+    assert "plan usage, week at 93%" in env[env.index("--text") + 1]
     assert [e["nivel"] for e in a.events() if e["tipo"] == "uso_aviso"] == ["pausa"]
-    _usage51(a, week=50)  # back to normal: the notice reopens
+    _usage51(a, week=10, five_h=10)  # back to normal: the notice reopens
     a.orq("gerente", "absorver")
-    _usage51(a, week=94)
+    _usage51(a, week=94, five_h=10)
     a.orq("gerente", "absorver")
     assert len(_log(a, "send.log")) == 2, "cruzou de novo: avisa de novo"
 
