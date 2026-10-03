@@ -663,6 +663,8 @@ An obligation of the coordinator or a worker that depends on someone remembering
 
 ## Development
 
+`recycle_worktree(path, base, branch, lease_id)` prepares an already released linked worktree for reuse without removing its directory. It checks the lease and processes, refuses unapproved dirty files or commits outside the base, then resets tracked files, runs `git clean -fd` (without `-x`), removes only fixed discard paths, creates the next branch, and rotates the ignored `.orq-lease-id`. Callers must present the current lease; a late release with an old id has no effect. This function is not connected to `limpar-mergeados` yet.
+
 ```sh
 orq test --affected              # only the tests your diff touches (what a worker runs)
 python3 test_orq.py              # the full suite: fake Orca, temporary ORQ_HOME, -j min(4, CPUs/2)
