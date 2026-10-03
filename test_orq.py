@@ -22635,7 +22635,7 @@ def test_ticket371_answer_screen_works_when_orca_refuses_a_text_plus_enter_send(
 
 
 def _doctor_env371(tmp):
-    repo = _repo_with_branch(tmp, "feat/orq-x")  # feat/orq-x is at main's commit: it is in main
+    repo = _repo_with_branch(tmp, "feat/orq-x", "feat/orq-y")  # both are at main's commit: in main by ancestry
     a = Env(ORCA_TERMINAL_HANDLE="term_ger", ORQ_REPOS=repo)
     a.env["ORQ_BACKLOG"] = os.path.join(a.tmp.name, "data", "backlog.md")
     a.env["ORQ_BACKLOG_TICKETS"] = "1"
@@ -22651,7 +22651,11 @@ def test_ticket371_backlog_doctor_closes_the_integrated_orq_ticket_and_only_warn
     assert r1.returncode == 0 and r2.returncode == 0, (r1.stderr, r2.stderr)
     a.orq("integrate", "queue", "add", "feat/orq-x", "01")
     a.orq("integrate", "queue", "rm", "01")
-    for n in ("t01", "t02"):
+    _evs(a, {"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/orq-x"], "tickets": [], "ts": "2999-01-01T00:00:00Z"})  # the integrator's record: only 01's branch went through a cycle
+    assert _new(a, "orq: so ancestral").returncode == 0
+    a.orq("integrate", "queue", "add", "feat/orq-y", "03")  # in main by ancestry, no cycle recorded it: ticket 356 refuses to close it
+    a.orq("integrate", "queue", "rm", "03")
+    for n in ("t01", "t02", "t03"):
         backlog_mod.cli(a.env["ORQ_BACKLOG"], "start", n)  # In flight
     ts = _tasks_fake(a)
     for t in ts:
@@ -22660,10 +22664,11 @@ def test_ticket371_backlog_doctor_closes_the_integrated_orq_ticket_and_only_warn
     r = a.orq("gerente", "absorver")
     assert r.returncode == 0 and "01: backlog fixed" in r.stdout, r
     items = _bl_items(a)
-    assert items["t01"]["estado"] == "done" and items["t02"]["estado"] == "in_flight", "only the ticket with a proof closes"
+    assert items["t01"]["estado"] == "done" and items["t02"]["estado"] == "in_flight" and items["t03"]["estado"] == "in_flight", "only the ticket the cycle recorded closes"
     (env,) = _sent_notices(a)
     text_value = _whole_notice(env[env.index("--text") + 1])
-    assert "02:" in text_value and "orq ticket close 02" in text_value and "01:" not in text_value, text_value
+    assert "02:" in text_value and "03:" in text_value and "orq ticket close 02" in text_value and "01:" not in text_value, text_value
+    assert not [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "reabrir"], "nothing for the sweep to reopen"
     a.orq("gerente", "absorver")
     assert len(_sent_notices(a)) == 1, "the hour has not passed: no new round"
     p = os.path.join(a.home, "backlog-doctor.json")

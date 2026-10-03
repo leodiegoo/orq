@@ -10290,11 +10290,11 @@ def doctor_hooks(pin=False):
 
 
 def _integrated_into_main(t):
-    """The proof that orq's own ticket `t` is in main, or None: a branch it put on the integrator queue is an ancestor of `main`. A project ticket never has it (its code is in another repo)."""
-    if t.get("projeto"):
-        return None
-    branches = {e["branch"] for e in read_events() if e.get("tipo") == "integrar_fila" and e.get("op") == "add" and e.get("ticket") == t["num"] and e.get("branch")}
-    return next((f"{b} is in {BRANCH_NO_REMOTE}" for b in sorted(branches) if (repo := _branch_repo(b)) and _git(repo, "merge-base", "--is-ancestor", b, BRANCH_NO_REMOTE) is not None), None)
+    """The proof that orq's own ticket `t` is in main, or None: the integrator cycle's record has the branch it delivered (the same proof `ticket_close` and the orphan sweep of ticket 356
+    demand; ancestry alone proves nothing). A project ticket never has it (its code is in another repo)."""
+    events = read_events()
+    rec = None if t.get("projeto") else _delivery_ledger(events).get(t["num"])
+    return f"integrator cycle recorded {rec['branch']}" if rec and _on_main(rec, events) else None
 
 
 BACKLOG_DOCTOR_FILE = "backlog-doctor.json"  # {ts, sig}: the last hourly round and the notice it sent
