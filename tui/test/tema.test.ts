@@ -4,7 +4,7 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { join } from "node:path"
 import { VISTA0, lerEstado, montarBlocos } from "../src/dados"
 import { criarTela } from "../src/tela"
-import { PALETAS, contraste, temaDoColorFgBg, temaForcado, type Tema } from "../src/tema"
+import { PALETAS, contraste, temaDoColorFgBg, temaForcado, textoLegivel, type Tema } from "../src/tema"
 
 const fixtures = join(import.meta.dir, "..", "fixtures")
 const agora = Date.parse("2026-10-01T12:00:30Z")
@@ -46,4 +46,14 @@ test("it should be the forced theme from the flag, then the variable, and light 
   expect(temaDoColorFgBg("0;15")).toBe("light")
   expect(temaDoColorFgBg("15;0")).toBe("dark")
   expect(temaDoColorFgBg("garbage")).toBeNull()
+})
+
+test("it should read a project color at 4.5:1 on the theme background, moving it only when needed", () => {
+  for (const tema of ["light", "dark"] as Tema[]) {
+    for (const cor of ["#58a6ff", "#bc8cff", "#3fb950", "#e3b341", "#ffffff", "#000000", "#0000ff"]) {
+      expect(contraste(textoLegivel(cor, tema), PALETAS[tema].fundo), `${cor} ${tema}`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+  expect(textoLegivel("#bc8cff", "dark")).toBe("#bc8cff")
+  expect(textoLegivel("#e3b341", "light")).not.toBe("#e3b341")
 })

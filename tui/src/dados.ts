@@ -5,12 +5,12 @@ import { existsSync, openSync, readFileSync, readSync, readdirSync, statSync, cl
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 import { idadeTrecho, limitesDo, minutosDesde, type Idade } from "./idade"
-import type { Cor } from "./tema"
+import type { Cor, CorProjeto } from "./tema"
 
 type Json = Record<string, any>
 
-/** Um trecho de linha com cor semântica (a paleta do tema dá o hex); `string` solta é texto sem cor. */
-export type Trecho = { t: string; c?: Cor; b?: boolean }
+/** Um trecho de linha com cor semântica (a paleta do tema dá o hex) ou o `#rrggbb` de um projeto (a tela o clareia ou escurece para ler no tema); `string` solta é texto sem cor. */
+export type Trecho = { t: string; c?: Cor | CorProjeto; b?: boolean }
 export type Linha = string | Trecho[]
 export type Bloco = { id: string; titulo: string; linhas: Linha[] }
 
@@ -219,6 +219,17 @@ const corta = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1
 
 const seg = (t: string, c?: Cor, b?: boolean): Trecho => ({ t, c, b })
 
+const HEX = /^#[0-9a-fA-F]{6}$/
+
+// o selo do projeto de um item do digest, na cor do projeto (a do projeto, senão a do grupo); sem projeto, sem selo; sem cor válida, texto do tema
+function selo(e: Estado, item: Json | undefined): Trecho | null {
+  const nome = typeof item?.projeto === "string" && item.projeto ? item.projeto : null
+  if (!nome) return null
+  const achar = (lista: unknown) => (Array.isArray(lista) ? lista : []).find((c: Json) => c?.nome === nome)?.cor
+  const cor = achar(e.digest?.projetos) ?? achar(e.digest?.grupos)
+  return seg(nome, typeof cor === "string" && HEX.test(cor) ? (cor.toLowerCase() as CorProjeto) : undefined)
+}
+
 // a escala (machine.json) e os fatores por tipo (digest.idade) são os do orq; sem eles, os padrões
 const idadeDe = (e: Estado, desde: string | null | undefined, tipo: string, prioridade?: number): Idade | undefined => {
   const min = minutosDesde(desde, e.agora)
@@ -247,12 +258,16 @@ const COR_ESTADO: Record<string, Cor> = { rodando: "azul", perguntando: "roxo", 
 function blocoWorkers(e: Estado): Bloco {
   const { lista, fonte } = workers(e)
   const vivos = lista.filter((a) => ANDA.has(a.estado))
-  const linhas: Linha[] = vivos.map((a) => [
-    seg(`${corta(a.titulo ?? a.dispatch ?? "?", 52).padEnd(52)} `),
+  const linhas: Linha[] = vivos.map((a) => {
+    const s = selo(e, (e.digest?.rodando ?? []).find((r: Json) => r.titulo === a.titulo))
+    return [
+    ...(s ? [s, seg(" ")] : []),
+    seg(`${corta(a.titulo ?? a.dispatch ?? "?", 52 - (s ? s.t.length + 1 : 0)).padEnd(52 - (s ? s.t.length + 1 : 0))} `),
     seg(`${String(a.modelo ?? "?").padEnd(18)} `, "secundario"),
     seg(`${corta(String(a.fase ?? a.estado) + (a.fase && a.estado !== "rodando" ? ` (${a.estado})` : ""), 36).padEnd(36)} `, COR_ESTADO[a.estado]),
     ((i) => (i ? idadeTrecho(i, idade(a.desde, e.agora)) : seg(idade(a.desde, e.agora), "secundario")))(idadeDe(e, a.desde, a.estado === "aguardando_integracao" ? "entrega" : "worker", a.prioridade)),
-  ])
+    ]
+  })
   return { id: "workers", titulo: `Workers vivos (${vivos.length})${fonte}`, linhas: linhas.length ? linhas : ["nenhum"] }
 }
 
@@ -396,7 +411,8 @@ function blocoFilas(e: Estado): Bloco {
   linhas.push(passos.length ? "merge:" : [seg("merge: "), seg("nada pendente", "verde")])
   for (const p of passos.slice(0, 5)) {
     const prs = (p.prs ?? []).filter((x: Json) => x.estado === "OPEN").map((x: Json) => `#${x.numero}→${x.base}`)
-    linhas.push([seg(`  ${p.passo}. `, "secundario"), seg(corta(p.nome ?? "", 70)), ...(prs.length ? [seg("  " + prs.join(" "), "azul")] : [])])
+    const s = selo(e, p.prs?.[0])
+    linhas.push([seg(`  ${p.passo}. `, "secundario"), ...(s ? [s, seg(" ")] : []), seg(corta(p.nome ?? "", 70)), ...(prs.length ? [seg("  " + prs.join(" "), "azul")] : [])])
   }
   return { id: "filas", titulo: "Filas", linhas }
 }
@@ -404,6 +420,7 @@ function blocoFilas(e: Estado): Bloco {
 function blocoPendencias(e: Estado): Bloco {
   const pend = (e.digest?.pendencias ?? []).filter((p: Json) => !p.depois)
   const linhas: Linha[] = pend.slice(0, 8).map((p: Json) => [
+    ...((s) => (s ? [s, seg(" ")] : []))(selo(e, p)),
     seg(`[${p.tipo}] `, p.tipo === "decisao" ? "roxo" : "amarelo"),
     seg(corta(p.titulo ?? p.id, 90)),
     ...(p.desde ? [seg(`  (desde ${p.desde})`, "secundario")] : []),

@@ -1,4 +1,7 @@
 {"versao": 1, "fila": [{"passo": 1, "nome": "Plano 1: um escritor só do timing", "feito": true, "prs": []},
- {"passo": 2, "nome": "Failover do HeatWave", "feito": false, "prs": [{"numero": 1295, "base": "development", "estado": "OPEN"}]}],
- "pendencias": [{"id": "chave-oci", "tipo": "avisar", "titulo": "Pedir ao devops uma chave da OCI", "desde": "2026-09-29", "depois": false},
-                {"id": "depois-x", "tipo": "decisao", "titulo": "coisa para depois", "depois": true}]}
+ {"passo": 2, "nome": "Failover do HeatWave", "feito": false, "prs": [{"numero": 1295, "base": "development", "estado": "OPEN", "projeto": "app-web", "grupo": "app-web"}]}],
+ "pendencias": [{"id": "chave-oci", "tipo": "avisar", "titulo": "Pedir ao devops uma chave da OCI", "desde": "2026-09-29", "depois": false, "projeto": "app-web", "grupo": "app-web"},
+                {"id": "depois-x", "tipo": "decisao", "titulo": "coisa para depois", "depois": true}],
+ "rodando": [{"titulo": "orq: serve do gerente", "estado": "implementing", "projeto": "orq", "grupo": "orq"}],
+ "projetos": [{"nome": "orq", "cor": "#bc8cff"}, {"nome": "app-web", "cor": "#e3b341"}],
+ "grupos": [{"nome": "orq", "cor": "#bc8cff"}, {"nome": "app-web", "cor": "#e3b341"}]}

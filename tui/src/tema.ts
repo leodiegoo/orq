@@ -7,6 +7,9 @@ export type Paleta = { fundo: string; texto: string; secundario: string; borda: 
 /** Cor semântica de um trecho: verde = pronto, em dia ou feito; amarelo = esperando ou parado; laranja = esperando há tempo demais (escala de idade); vermelho = bloqueado, travado ou falhou; azul = em andamento; roxo = decisão com o usuário; secundario = cinza. */
 export type Cor = Exclude<keyof Paleta, "fundo" | "borda">
 
+/** O `#rrggbb` de um projeto: não é da paleta, a tela o ajusta ao tema com `textoLegivel`. */
+export type CorProjeto = `#${string}`
+
 // GitHub Dark e GitHub Light, chave a chave. `fundo` só serve de referência para o teste de contraste; a TUI não o pinta.
 export const PALETAS: Record<Tema, Paleta> = {
   dark: { fundo: "#0d1117", texto: "#c9d1d9", secundario: "#8b949e", borda: "#8b949e", verde: "#3fb950", amarelo: "#d29922", laranja: "#db6d28", vermelho: "#f85149", azul: "#58a6ff", roxo: "#bc8cff" },
@@ -52,4 +55,16 @@ export async function detectarTema(
   opts: { argv: string[]; env: NodeJS.ProcessEnv; osc?: () => Promise<Tema | null> },
 ): Promise<Tema> {
   return temaForcado(opts.argv, opts.env) ?? (await opts.osc?.().catch(() => null)) ?? temaDoColorFgBg(opts.env.COLORFGBG) ?? temaDoSistema() ?? "dark"
+}
+
+/** A cor `#rrggbb` do projeto, escurecida (tema claro) ou clareada (escuro) o bastante para ler a 4,5:1 sobre o fundo do tema; inalterada se já passa. */
+export function textoLegivel(cor: string, tema: Tema): string {
+  const fundo = PALETAS[tema].fundo
+  const alvo = tema === "light" ? [0, 0, 0] : [255, 255, 255]
+  const base = [1, 3, 5].map((i) => parseInt(cor.slice(i, i + 2), 16))
+  for (let t = 0; t <= 1.0001; t += 0.02) {
+    const c = "#" + base.map((v, i) => Math.round(v + (alvo[i]! - v) * Math.min(t, 1)).toString(16).padStart(2, "0")).join("")
+    if (contraste(c, fundo) >= 4.5) return c
+  }
+  return `#${alvo.map((v) => v.toString(16).padStart(2, "0")).join("")}`
 }

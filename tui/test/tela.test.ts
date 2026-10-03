@@ -4,8 +4,9 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { cpSync, existsSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { VISTA0, lerEstado, montarBlocos, texto } from "../src/dados"
+import { VISTA0, lerEstado, montarBlocos, texto, type Trecho } from "../src/dados"
 import { criarTela } from "../src/tela"
+import { textoLegivel } from "../src/tema"
 
 const fixtures = join(import.meta.dir, "..", "fixtures")
 const agora = Date.parse("2026-10-01T12:00:30Z")
@@ -69,4 +70,33 @@ test("it should show the waves block only when the serve brought waves", () => {
   const linha = "wave 2 Core: waiting, 0/3 integrated; waits for 02; open: 06, 07, 08"
   const bloco = montarBlocos({ ...e, gerente: { ...e.gerente, ondas: [linha] } }).find((b) => b.id === "ondas")
   expect(bloco).toEqual({ id: "ondas", titulo: "Ondas (1)", linhas: [linha] })
+})
+
+test("it should badge the workers, the merge steps and the pendências with the project, in the project color", async () => {
+  const e = { ...lerEstado(fixtures, agora), vivoMs: agora - 5000 }
+  const blocos = montarBlocos(e)
+  const linhas = (id: string) => blocos.find((b) => b.id === id)!.linhas as Trecho[][]
+  expect(linhas("workers")[0].slice(0, 2)).toEqual([{ t: "orq", c: "#bc8cff", b: undefined }, { t: " ", c: undefined, b: undefined }])
+  expect(texto(linhas("workers")[0])).toStartWith("orq orq: serve do gerente")
+  expect(linhas("filas").find((l) => texto(l).includes("Failover"))).toContainEqual({ t: "app-web", c: "#e3b341", b: undefined })
+  expect(linhas("pendencias")[0][0]).toEqual({ t: "app-web", c: "#e3b341", b: undefined })
+  const setup = await createTestRenderer({ width: 140, height: 60 })
+  try {
+    criarTela(setup.renderer, "orq gerente tui", "dark")(blocos, "lido")
+    await setup.renderOnce()
+    const spans = setup.captureSpans().lines.flatMap((l) => l.spans)
+    const pintado = (t: string) => spans.find((s) => s.text.trim() === t)!
+    const hex = (c: { r: number; g: number; b: number }) => "#" + [c.r, c.g, c.b].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")
+    expect(hex(pintado("orq").fg)).toBe("#bc8cff")
+    expect(hex(pintado("app-web").fg)).toBe(textoLegivel("#e3b341", "dark"))
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("it should leave the badge in the theme text when the project has no valid color", () => {
+  const e = lerEstado(fixtures, agora)
+  const sem = { ...e, digest: { ...e.digest, projetos: [{ nome: "orq", cor: "azul" }], grupos: [] } }
+  const workers = montarBlocos(sem).find((b) => b.id === "workers")!
+  expect((workers.linhas[0] as Trecho[])[0]).toEqual({ t: "orq", c: undefined, b: undefined })
 })
