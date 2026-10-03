@@ -5755,6 +5755,46 @@ def test_ticket24_worker_hook_stays_under_100_ms():
     assert min(durations) < 0.1, durations
 
 
+def test_ticket418_worker_prompt_uses_fast_path_and_records_stage_times_without_ingest():
+    a = Env(run=None)
+    a.prompt(PREAMBLE_24, ORCA_TERMINAL_HANDLE="term_worker")
+    before = _orca_calls(a)
+    r = a.prompt("worker follow-up", ORCA_TERMINAL_HANDLE="term_worker")
+    assert r.returncode == 0, r.stderr
+    assert _orca_calls(a) == before, "a known worker prompt must not call the heavy coordinator/ingest path"
+    timings = json.load(open(os.path.join(a.home, "hook-timings.json")))
+    assert timings["prompt"]["worker_fast_path_ms"] >= 0
+    assert "record_turn_ms" in timings["prompt"] and timings["prompt"]["total_ms"] >= timings["prompt"]["worker_fast_path_ms"]
+    assert timings["prompt"]["total_ms"] < 1000, timings["prompt"]
+    samples = iter((10.0, 10.125))
+    measured = {}
+    assert orq_mod.timed_hook_stage(measured, "injected", lambda: "ok", lambda: next(samples)) == "ok"
+    assert measured["injected_ms"] == 125
+
+
+def test_ticket418_doctor_hooks_shows_stage_timings():
+    a = Env(run=None)
+    a.prompt(PREAMBLE_24, ORCA_TERMINAL_HANDLE="term_worker")
+    a.prompt("worker follow-up", ORCA_TERMINAL_HANDLE="term_worker")
+    r = a.orq("doctor", "hooks")
+    assert r.returncode == 0, r.stderr
+    assert "hook timing:" in r.stdout and "worker_fast_path" in r.stdout and "total" in r.stdout, r.stdout
+
+
+def test_ticket418_install_adds_codex_timeout_without_changing_claude_command():
+    t = os.path.realpath(tempfile.mkdtemp())
+    clone = _clone124(t)
+    r = subprocess.run([sys.executable, os.path.join(clone, "orq.py"), "install"], env=_env124(t), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    codex = json.load(open(os.path.join(t, ".codex", "hooks.json")))
+    commands = [h["command"] for groups in codex["hooks"].values() for g in groups for h in g["hooks"] if "orq.py hook" in h["command"]]
+    assert commands and all("ORQ_HOOK_TIMEOUT=15" in c for c in commands), commands
+    claude = json.load(open(os.path.join(t, ".claude", "settings.json")))
+    claude_commands = [h["command"] for groups in claude["hooks"].values() for g in groups for h in g["hooks"] if "orq.py hook" in h["command"]]
+    assert claude_commands and all("ORQ_HOOK_TIMEOUT=" not in c for c in claude_commands), claude_commands
+    assert "Codex" in r.stdout and "/hooks" in r.stdout, r.stdout
+
+
 def _agents_24(a, turns):
     a.set("workers.json", [{"handle": "term_n", "run": "run_a", "status": "dispatched", "desde": _iso(-180), "agente": "claude"},
                            {"handle": "term_p", "run": "run_a", "status": "dispatched", "desde": _iso(-3000), "agente": "claude"},
@@ -19752,7 +19792,7 @@ def test_ticket124_install_repoints_hooks_in_place_appends_the_missing_ones_and_
     assert sum("hook acordar" in c for c in commands) == 1, "the rewake hook of the example is appended (ticket 394)"
     assert any(c == f"{sys.executable} {clone}/orq.py hook prompt" for c in commands), commands
     c = json.load(open(hooks))["hooks"]
-    assert [g["hooks"][0]["command"] for g in c["Stop"]] == ["mine", f"/usr/bin/python3 {clone}/orq.py hook stop codex"], "Codex keeps each group in its position"
+    assert [g["hooks"][0]["command"] for g in c["Stop"]] == ["mine", f"ORQ_HOOK_TIMEOUT=15 /usr/bin/python3 {clone}/orq.py hook stop codex"], "Codex keeps each group in its position and sets the hook ceiling"
     assert any(f"{clone}/orq.py hook prompt codex" in g["hooks"][0]["command"] for g in c["UserPromptSubmit"])
     for link, target in orq_mod.INSTALL_LINKS:
         link = link.replace("~", t, 1)
