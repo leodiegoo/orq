@@ -17359,16 +17359,52 @@ def _integrated154(a, ticket="07", branch="feat/b1"):
     assert a.orq("integrar", "fila", "add", branch, ticket).returncode == 0
 
 
-def test_ticket154_conclude_removes_from_queue_closes_ticket_releases_worker_and_writes_cycle():
+def _git185(a, repo, *args, **env):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, check=True,
+                          env={**a.env, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", **env}).stdout.strip()
+
+
+def _origin185(a, branch="feat/b1", **author):
+    """a.home becomes orq's checkout (ORQ_HOME): main published to a bare origin, plus a new commit on main that has not gone out, also on `branch` (the queued one).
+    `author` swaps GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL of the new commit. Returns (origin, short hash of the new commit)."""
+    origin = os.path.join(a.tmp.name, "origem.git")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True)
+    os.makedirs(a.home, exist_ok=True)
+    _git185(a, a.home, "init", "-q", "-b", "main")
+    open(os.path.join(a.home, "base.txt"), "w").write("a\n")
+    _git185(a, a.home, "add", "base.txt")
+    _git185(a, a.home, "commit", "-qm", "chore: base")
+    _git185(a, a.home, "remote", "add", "origin", origin)
+    _git185(a, a.home, "push", "-q", "origin", "main")
+    open(os.path.join(a.home, "novo.txt"), "w").write("b\n")
+    _git185(a, a.home, "add", "novo.txt")
+    _git185(a, a.home, "commit", "-qm", "feat: new", **author)
+    _git185(a, a.home, "branch", branch)
+    a.env.update({"ORQ_AUTOR": "t@t", "ORQ_TERMOS": os.path.join(a.tmp.name, "sem-termos.txt"), "ORQ_REPOS": a.home})
+    return origin, _git185(a, a.home, "rev-parse", "--short", "main")
+
+
+def _notices185(a):
+    """The notices typed in the coordinator, whole: what went past the `type` cap is in the file the text cites."""
+    texts = [e[e.index("--text") + 1] for e in _sent_notices(a)]
+    return [open(t.rsplit("full text at ", 1)[1].split()[0]).read().strip() if "full text at " in t else t for t in texts]
+
+
+def _closed185(a, ticket="07"):
+    return "Status: resolved" in _read_text(a, ticket).split("\n## ")[0]
+
+
+def _conclude185(a, hash_):
+    return a.orq("integrar", "concluir", "--hash", hash_, "feat/b1")
+
+
+def test_ticket154_conclude_records_the_cycle_and_without_origin_closes_nothing():
     a = Env(run="run_a")
     _integrated154(a)
-    r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
-    assert r.returncode == 0, r.stderr
-    assert "empty" in a.orq("integrar", "fila", "lista").stdout
-    txt = _read_text(a, "07")
-    assert "Status: resolved" in txt.split("\n## ")[0] and txt.rstrip().endswith("integrated into main at abc1234"), txt
-    (lib,) = [e for e in a.events() if e["tipo"] == "liberar"]
-    assert lib["dispatch"] == "ctx_term_w1", lib
+    r = _conclude185(a, "abc1234")
+    assert r.returncode == 0 and "warning" in r.stderr, r.stderr
+    assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"]
+    assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "publicou")]
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
     assert (ev["dispatch"], ev["hash"], ev["branches"], ev["tickets"]) == ("ctx_term_int", "abc1234", ["feat/b1"], ["07"]), ev
 
@@ -17383,14 +17419,78 @@ def test_ticket154_conclude_with_branch_outside_queue_only_writes_cycle():
     assert (ev["branches"], ev["tickets"]) == (["feat/outra"], []), ev
 
 
-def test_ticket154_conclude_already_closed_ticket_or_running_worker_notifies_and_proceeds():
+# ---- ticket 185: the integrator publishes orq's main after the audit and closes the tickets ----
+
+def test_ticket185_clean_audit_pushes_main_closes_ticket_releases_worker_and_records_publicou():
     a = Env(run="run_a")
     _integrated154(a)
-    assert a.orq("ticket", "fechar", "07", "--dropped", "feito antes").returncode == 0  # ticket 356: its branch is queued, not in main
-    r = a.orq("integrar", "concluir", "--hash", "abc1234", "feat/b1")
-    assert r.returncode == 0 and "warning" in r.stderr, r.stderr
-    assert "empty" in a.orq("integrar", "fila", "lista").stdout, "a fila esvazia mesmo com o ticket já fechado"
+    origin, hash_ = _origin185(a)
+    r = _conclude185(a, hash_)
+    assert r.returncode == 0, r.stderr
+    assert _git185(a, origin, "rev-parse", "--short", "main") == hash_, "the origin got main"
+    assert "empty" in a.orq("integrar", "fila", "lista").stdout and _closed185(a)
+    assert _read_text(a, "07").rstrip().endswith(f"integrated into main at {hash_}")
     assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
+    (pub,) = [e for e in a.events() if e["tipo"] == "publicou"]
+    assert pub["hash"] == hash_ and pub["intervalo"].endswith(f"..{hash_}"), pub
+    assert [e["tipo"] for e in a.events() if e["tipo"] in ("ciclo", "publicou")] == ["ciclo", "publicou"]
+
+
+def test_ticket185_failed_audit_pushes_nothing_closes_nothing_and_tells_the_coordinator_once():
+    a = Env(run="run_a")
+    _integrated154(a)
+    _manager(a)
+    origin, hash_ = _origin185(a, GIT_AUTHOR_EMAIL="errado@x", GIT_COMMITTER_EMAIL="errado@x")
+    before = _git185(a, origin, "rev-parse", "main")
+    r = _conclude185(a, hash_)
+    assert r.returncode == 0 and "the audit refused" in r.stderr, r.stderr
+    assert _git185(a, origin, "rev-parse", "main") == before, "nothing was pushed"
+    assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] in ("liberar", "publicou")]
+    (notice,) = _notices185(a)
+    assert "NOT published" in notice and "errado@x" in notice, notice
+    assert a.orq("integrar", "publicar").returncode == 1 and len(_notices185(a)) == 1, "the next lap retries without repeating the notice"
+
+
+def test_ticket185_failed_push_tells_and_the_next_lap_publishes_and_closes():
+    a = Env(run="run_a")
+    _integrated154(a)
+    _manager(a)
+    origin, hash_ = _origin185(a)
+    _git185(a, a.home, "remote", "set-url", "origin", os.path.join(a.tmp.name, "sem-rede.git"))
+    _git185(a, a.home, "update-ref", "refs/remotes/origin/main", f"{hash_}~1")
+    r = _conclude185(a, hash_)
+    assert r.returncode == 0 and "push of orq main" in r.stderr, r.stderr
+    assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] == "publicou"]
+    (notice,) = _notices185(a)
+    assert "push of orq main" in notice and "next lap" in notice, notice
+    assert a.orq("integrar", "publicar").returncode == 1 and len(_notices185(a)) == 1
+    _git185(a, a.home, "remote", "set-url", "origin", origin)
+    r = a.orq("integrar", "publicar")
+    assert r.returncode == 0, r.stderr
+    assert _git185(a, origin, "rev-parse", "--short", "main") == hash_ and _closed185(a)
+    assert [e["hash"] for e in a.events() if e["tipo"] == "publicou"] == [hash_]
+    assert any(hash_ in t and "published" in t for t in _notices185(a)), "the summary goes to the coordinator"
+
+
+def test_ticket185_summary_to_the_coordinator_carries_cycle_tickets_and_hash():
+    a = Env(run="run_a")
+    _integrated154(a)
+    _manager(a)
+    _, hash_ = _origin185(a)
+    assert _conclude185(a, hash_).returncode == 0
+    (summary,) = _notices185(a)
+    assert f"orq main published at {hash_} (cycle 1; tickets 07)." in summary, summary
+
+
+def test_ticket185_main_already_on_origin_only_closes_what_is_left():
+    a = Env(run="run_a")
+    _integrated154(a)
+    _, hash_ = _origin185(a)
+    _evs(a, {"tipo": "ciclo", "hash": hash_, "branches": ["feat/b1"], "tickets": ["07"], "integrated": [{"branch": "feat/b1", "tip": _sha327(a.home, "feat/b1"), "integrated_into": hash_}]})
+    _git185(a, a.home, "push", "-q", "origin", "main")  # the push went out, the closing did not
+    r = a.orq("integrar", "publicar")
+    assert r.returncode == 0 and json.loads(r.stdout)["estado"] == "em_dia", r.stderr
+    assert _closed185(a) and not [e for e in a.events() if e["tipo"] == "publicou"]
 
 
 def test_ticket154_cycle_done_of_known_dispatch_marks_service_and_writes_cycle():
@@ -17422,14 +17522,13 @@ def _integrate154(a, tests):
     return subprocess.run([sys.executable, os.path.join(alive, "scripts", "integrar.py"), "feat/b1"], cwd=alive, env=env, capture_output=True, text=True), g
 
 
-def test_ticket154_integrate_py_after_fast_forward_closes_what_it_integrated():
+def test_ticket154_integrate_py_after_fast_forward_records_the_cycle_and_leaves_closing_to_the_push():
     a = Env(run="run_a")
     r, g = _integrate154(a, "true")
     assert r.returncode == 0, r.stdout + r.stderr
     hash_ = g("rev-parse", "--short", "HEAD").stdout.strip()
-    assert "empty" in a.orq("integrar", "fila", "lista").stdout
-    assert f"integrated into main at {hash_}" in _read_text(a, "07") and "Status: resolved" in _read_text(a, "07")
-    assert [e["dispatch"] for e in a.events() if e["tipo"] == "liberar"] == ["ctx_term_w1"]
+    assert [i["ticket"] for i in json.loads(a.orq("integrar", "fila", "lista", "--json").stdout)] == ["07"], "only the push (ticket 185) closes"
+    assert "Status: claimed" in _read_text(a, "07") and not [e for e in a.events() if e["tipo"] == "liberar"]
     (ev,) = [e for e in a.events() if e["tipo"] == "ciclo"]
     assert (ev["hash"], ev["branches"], ev["tickets"]) == (hash_, ["feat/b1"], ["07"]), ev
 
@@ -18404,6 +18503,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("integrar fila rm 1", "integrate queue rm 1"),
     ("integrar fila lista", "integrate queue list"),
     ("integrar concluir --hash h b1 b2", "integrate conclude --hash h b1 b2"),
+    ("integrar publicar", "integrate publish"),
     ("auditar-publicacao a..b", "audit-publication a..b"),
     ("ticket novo --titulo T --spec-arquivo s.md --modelo m --despacho manual --espera e", "ticket new --title T --spec-file s.md --model m --dispatch manual --waiting e"),
     ("onda novo X", "wave new X"),

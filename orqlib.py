@@ -1250,43 +1250,121 @@ def worktrees_clean(dry_run=False, now_at=None, repo=None, root=None, backups=No
                       *[f"  review {x['pasta']}: {x['motivo']}" for x in r["revisar"]]])
 
 
+PUBLISH_NOTICE = "publish-notice.json"  # {chave}: the last reason (main hash + audit or push) already told to the coordinator
+PUBLISH_PUSH_S = 120  # the git push of orq's main: past this it counts as a network failure and the next lap repeats it
+
+
+def _publish_notify(key, text_value):
+    """Notice to the coordinator through the manager's channel, once per `key`: the next lap retries the push without repeating the notice. Without a manager bound nothing goes out."""
+    g, file_path = _manager_cfg(), _path(PUBLISH_NOTICE)
+    if not g or not g.get("coordenador") or _dict(_read_json(file_path)).get("chave") == key:
+        return
+    if notify_coordinator(g["coordenador"], f"orq: {text_value}") in ("enviado", "adiado"):
+        _write_json(file_path, {"chave": key})
+
+
+def _close_integrated(item, hash_):
+    """Closes what a published queue item asked for: out of the queue, `ticket_close` with the hash in the Answer and `release` of the ticket's worker. A failure of one step
+    becomes a notice and doesn't stop the others. Returns the notices."""
+    n, notices = item["ticket"], []
+    integrate_queue_rm(n)
+    try:
+        notices += [x for x in [ticket_close(n, f"integrated into main at {hash_}", integrated=True)["aviso"]] if x]
+    except ValueError as e:
+        notices.append(f"ticket {n}: {e}")
+    event_list = read_events()
+    d = next((e["dispatch"] for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("ticket") == n and e.get("dispatch") and e["dispatch"] not in _released(event_list)), None)
+    if not d:
+        return notices + [f"ticket {n}: no worker to release (no dispatch --ticket, or already released)"]
+    try:
+        notices += [x for x in [release(d).get("aviso")] if x]
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        notices.append(f"release {d}: {e}")
+    for x in _redispatches(event_list, d):  # ticket 329: the dispatches a send-back opened; an unsupervised one may not be in worker-list
+        with contextlib.suppress(ValueError, RuntimeError, subprocess.TimeoutExpired, OSError):
+            release(x)
+    return notices
+
+
+def integrate_publish(repo=None, ref="origin/main"):
+    """Publishes orq's main (ticket 185): the integrator fast-forwards main with the suite green and the push was manual. With main ahead of `ref` it runs `audit_publication`
+    on `ref..main`: with reasons it pushes nothing and tells the coordinator; clean, it runs `git push` and records the `publicou` event (hash and range). A push that fails (network,
+    hook, timeout) is a notice and the next call retries (the manager lap calls it). One notice per hash and reason. Once main is on `ref` it closes what the integrator queue holds
+    whose branch a cycle recorded at its current tip (`_close_integrated`; the integrator rewrites commits, so ancestry proves nothing), runs `worktrees_clean` and sends a short
+    summary (cycle, tickets, hash). Never raises. Returns {estado: publicou|em_dia|auditoria|push|sem_origem, hash, intervalo, tickets, avisos}."""
+    repo = repo or HOME
+    head = (_git(repo, "rev-parse", "--short", "main") or "").strip()
+    out = {"estado": "sem_origem", "hash": head, "intervalo": None, "tickets": [], "avisos": []}
+    if not head or _git(repo, "rev-parse", "--verify", "-q", ref) is None:
+        out["avisos"].append(f"{repo} has no main or no {ref}: nothing published")
+        return out
+    base, span = _git(repo, "rev-parse", "--short", ref).strip(), f"{ref}..main"
+    if int((_git(repo, "rev-list", "--count", span) or "0").strip()):
+        out["intervalo"] = f"{base}..{head}"
+        try:
+            reasons = audit_publication([span], repo=repo)
+        except subprocess.CalledProcessError as e:
+            reasons = [f"the audit did not run: {(e.stderr or str(e)).strip()}"]
+        if reasons:
+            out["estado"] = "auditoria"
+            out["avisos"] += [f"orq main at {head} not published, the audit refused: {r}" for r in reasons]
+            _publish_notify(f"{head}:audit", f"orq main at {head} NOT published: the audit refused ({_quote('; '.join(reasons), 300)}). Fix it and run `orq integrate publish`.")
+            return out
+        try:
+            r = subprocess.run([GIT, "-C", repo, "push", ref.split("/")[0], "main"], capture_output=True, text=True, timeout=PUBLISH_PUSH_S)
+            error = r.stderr.strip() or "push failed" if r.returncode else None
+        except (subprocess.TimeoutExpired, OSError) as e:
+            error = f"{type(e).__name__}: {e}"
+        if error:
+            out["estado"] = "push"
+            out["avisos"].append(f"push of orq main at {head} failed: {_quote(error, 300)}")
+            _publish_notify(f"{head}:push", f"push of orq main at {head} failed ({_quote(error, 200)}). The next lap tries again.")
+            return out
+        out["estado"] = "publicou"
+        append_event({"tipo": "publicou", "hash": head, "intervalo": out["intervalo"]})
+        with contextlib.suppress(OSError):
+            os.remove(_path(PUBLISH_NOTICE))
+    else:
+        out["estado"] = "em_dia"
+    registry = integration_registry()
+    for item in integration_queue().values():
+        tip = _branch_tip(item["branch"])
+        if tip and any(r["tip"] == tip for r in registry.get(item["branch"], [])):
+            out["tickets"].append(item["ticket"])
+            out["avisos"] += _close_integrated(item, head)
+    if out["estado"] == "publicou":
+        try:
+            worktrees_clean()
+        except Exception as e:  # noqa: BLE001 - the cleanup doesn't undo the publication: it becomes a notice
+            out["avisos"].append(f"worktrees clean: {type(e).__name__}: {e}")
+        cycle = sum(1 for e in read_events() if e.get("tipo") == "ciclo")
+        g = _manager_cfg()
+        if g and g.get("coordenador"):
+            notify_coordinator(g["coordenador"], f"orq: orq main published at {head} (cycle {cycle}; tickets {', '.join(out['tickets']) or 'none'}).")
+    return out
+
+
+def integrate_publish_round():
+    """One manager lap: repeats `integrate_publish` (a push that failed before, a ticket left to close). The panel line only when something went out."""
+    r = integrate_publish()
+    return [f"orq main published at {r['hash']} (tickets {', '.join(r['tickets']) or 'none'})"] if r["estado"] == "publicou" else []
+
+
 def integrate_conclude(hash_, branches, dispatch=None):
-    """`integrate.py` advanced main by fast-forward to `hash_`: closes what the cycle integrated (ticket 154). For each branch on the integrator queue:
-    removes the ticket from the queue, `ticket_close` with the hash in the Answer and `release` the ticket's worker. A branch off the queue only enters the cycle. Records the integrator's `cycle`
-    (`dispatch`, or the not-yet-released service titled "integrador"; without it the event stays without a dispatch, which the Stop still reads). Nothing here is a push: it stays manual.
-    A failure of one step becomes a notice and doesn't stop the others. Returns {hash, branches, tickets, avisos}."""
+    """`integrate.py` advanced main by fast-forward to `hash_`: records the integrator's `cycle` (`dispatch`, or the not-yet-released service titled "integrador"; without it the event
+    stays without a dispatch, which the Stop still reads) with the branches, the tickets that were on the queue and each branch's tip, then calls `integrate_publish` (ticket 185):
+    audit, push of main and, only after it, closing the tickets (queue, ticket, worker). A branch off the queue only enters the cycle.
+    Returns {hash, branches, tickets, avisos, publicacao}."""
     queue, event_list = integration_queue(), read_events()
-    tickets_, notices = [], []
-    for b in branches:
-        item = next((i for i in queue.values() if i["branch"] == b), None)
-        if not item:
-            continue
-        n = item["ticket"]
-        tickets_.append(n)
-        integrate_queue_rm(n)
-        try:
-            notices += [x for x in [ticket_close(n, f"integrated into main at {hash_}", integrated=True)["aviso"]] if x]
-        except ValueError as e:
-            notices.append(f"ticket {n}: {e}")
-        released = _released(read_events())
-        d = next((e["dispatch"] for e in reversed(event_list) if e.get("tipo") == "despacho" and e.get("ticket") == n and e.get("dispatch") and e["dispatch"] not in released), None)
-        if not d:
-            notices.append(f"ticket {n}: no worker to release (no dispatch --ticket, or already released)")
-            continue
-        try:
-            notices += [x for x in [release(d).get("aviso")] if x]
-        except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as e:
-            notices.append(f"release {d}: {e}")
-        for x in _redispatches(event_list, d):  # ticket 329: the dispatches a send-back opened; an unsupervised one may not be in worker-list
-            with contextlib.suppress(ValueError, RuntimeError, subprocess.TimeoutExpired, OSError):
-                release(x)
+    tickets_ = [i["ticket"] for b in branches for i in queue.values() if i["branch"] == b]
     d = dispatch or (_integrator_dispatch(event_list) or {}).get("dispatch")
     extra = {"branches": list(branches), "tickets": tickets_, "integrated": [{"branch": b, "tip": tip, "integrated_into": hash_} for b in branches if (tip := _branch_tip(b))]}
     if d:
         cycle_done(d, hash_, extra=extra)
     else:
         append_event({"tipo": "ciclo", "hash": hash_, **extra})
-    return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": notices}
+    pub = integrate_publish()
+    return {"hash": hash_, "branches": list(branches), "tickets": tickets_, "avisos": pub["avisos"], "publicacao": pub["estado"]}
 
 
 def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=None, screens=None, screen_questions=None, hibernated=None, integration=None, limits=None, paused=None):
@@ -15260,7 +15338,7 @@ def manager_absorb():
     except Exception as e:  # noqa: BLE001 - an unreadable screen doesn't take down the panel; the next loop tries
         log(f"telas: {type(e).__name__}: {e}")
     try:
-        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round()]
+        line_list += [*pr_poll(), *pr_notify(), *deploy_verify(), *pr_production_open(), *notify_e2e_queue(), *usage_notify(), *usage_notify(agent="codex"), *deliver_notices(), *remind_round(), *integrate_publish_round()]
     except Exception as e:  # noqa: BLE001 - same: gh being down doesn't take down the panel
         log(f"prs: {type(e).__name__}: {e}")
     try:
@@ -16203,7 +16281,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
     "project": {"confiar": "trust"},
     "service": {"marcar": "mark"},
     "cycle": {"feito": "done"},
-    "integrate": {"fila": "queue", "concluir": "conclude"},
+    "integrate": {"fila": "queue", "concluir": "conclude", "publicar": "publish"},
     "integrate queue": {"lista": "list"},
     "ticket": {"novo": "new", "fechar": "close", "editar": "edit", "lista": "list"},
     "wave": {"novo": "new", "lista": "list"},
@@ -16503,10 +16581,11 @@ def parser():
     iga.add_argument("ticket")
     igf.add_parser("rm", help="removes the ticket from the queue").add_argument("ticket")
     igf.add_parser("list", aliases=["lista"], help="the branches in the queue").add_argument("--json", action="store_true")
-    igc = ig.add_parser("conclude", aliases=["concluir"], help="orq integrate conclude --hash <new main> <branch>...: what integrar.py calls after the fast-forward; closes queue, ticket and worker and records the cycle")
+    igc = ig.add_parser("conclude", aliases=["concluir"], help="orq integrate conclude --hash <new main> <branch>...: what integrar.py calls after the fast-forward; records the cycle and publishes main (queue, ticket and worker close after the push)")
     igc.add_argument("--hash", required=True)
     igc.add_argument("--dispatch", help="the integrator's dispatch (default: the not yet released service titled integrador)")
     igc.add_argument("branches", nargs="+")
+    ig.add_parser("publish", aliases=["publicar"], help="orq integrate publish: audits and pushes orq's main and closes the integrated tickets (conclude and the panel already call it; use it to repeat by hand)")
     igk = ig.add_parser("check", help="orq integrate check <branch>... [--no-proof REASON]: what integrar.py runs before merging; refuses a queued branch whose tip is not the commit its delivery proved")
     igk.add_argument("branches", nargs="+")
     _arg(igk, "sem-prova", metavar="REASON", help="goes ahead without the proof; the reason goes to the `prova` event")
@@ -16956,6 +17035,12 @@ def main(argv=None):
             print(json.dumps(r, ensure_ascii=False))
             for x in r["avisos"]:
                 print(f"warning: {x}", file=sys.stderr)
+        elif a.cmd == "integrate" and a.op == "publish":
+            r = integrate_publish()
+            print(json.dumps(r, ensure_ascii=False))
+            for x in r["avisos"]:
+                print(f"warning: {x}", file=sys.stderr)
+            return 1 if r["estado"] in ("auditoria", "push") else 0
         elif a.cmd == "integrate" and a.op == "check":
             for x in integrate_proof(a.branches, a.no_proof):
                 print(f"warning: {x}", file=sys.stderr)
