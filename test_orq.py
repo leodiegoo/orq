@@ -23561,6 +23561,75 @@ def test_ticket386_close_accepts_a_product_ticket_with_the_pr_in_the_answer_and_
     assert r.returncode == 1 and "fix/322-deny" in r.stderr, "an orq ticket keeps the integration proof, a PR in the Answer does not replace it"
 
 
+def test_ticket412_product_close_requests_a_manual_production_continuation_from_its_mate_only_when_pr_is_not_in_production():
+    for already_in_production in (False, True):
+        a = Env(run="run_a")
+        _tk_file(a, "01", "shop-web: add checkout", "task_product")
+        path = os.path.join(a.env["ORQ_ISSUES"], "01-t.md")
+        txt = open(path).read().replace("Status: claimed", "Status: claimed\nProject: shop-web")
+        open(path, "w").write(txt)
+        _project(a, "shop-web", {"repo": "path:/r/shop-web", "grupo": "commerce", "environments": [{"branch": "staging"}, {"branch": "main", "production": True}]})
+        os.makedirs(os.path.join(a.home, "groups"), exist_ok=True)
+        json.dump({"projetos": ["shop-web"]}, open(os.path.join(a.home, "groups", "commerce.json"), "w"))
+        _write_state(os.path.join(a.home, "cursor.json"), {"mates": {"commerce": {"terminal": "term_mate", "runs": ["run_mate"]}}})
+        if already_in_production:
+            _evs(a, {"tipo": "pr", "op": "entrou", "task": "task_product", "numero": 17, "base": "main", "url": "https://github.com/acme/shop-web/pull/17"})
+        old_type_text = orq_mod.type_text
+        orq_mod.type_text = lambda *_args, **_kwargs: "enviado"
+        try:
+            with InProcess(a):
+                orq_mod.ticket_close("01", "Merged in staging: https://github.com/acme/shop-web/pull/17")
+        finally:
+            orq_mod.type_text = old_type_text
+        requests = [e for e in a.events() if e["tipo"] == "mate_pedido"]
+        if already_in_production:
+            assert not requests, requests
+        else:
+            assert len(requests) == 1, a.events()
+            message = requests[0]["texto"]
+            assert "levar #17 até produção" in message and "ticket #01" in message and "Dispatch: manual" in message, message
+
+
+def test_ticket412_product_close_without_a_live_mate_leaves_the_continuation_as_a_coordinator_entry():
+    a = Env(run="run_a")
+    _tk_file(a, "01", "shop-web: add checkout", "task_product")
+    path = os.path.join(a.env["ORQ_ISSUES"], "01-t.md")
+    txt = open(path).read().replace("Status: claimed", "Status: claimed\nProject: shop-web")
+    open(path, "w").write(txt)
+    _project(a, "shop-web", {"repo": "path:/r/shop-web", "grupo": "commerce"})
+    os.makedirs(os.path.join(a.home, "groups"), exist_ok=True)
+    json.dump({"projetos": ["shop-web"]}, open(os.path.join(a.home, "groups", "commerce.json"), "w"))
+    with InProcess(a):
+        orq_mod.ticket_close("01", "Merged in staging: #17")
+    entries = [e for e in a.events() if e["tipo"] == "entrada"]
+    assert len(entries) == 1 and not entries[0].get("grupo"), entries
+    assert "levar #17 até produção" in entries[0]["texto"] and "ticket #01" in entries[0]["texto"] and "Dispatch: manual" in entries[0]["texto"]
+
+
+def test_ticket412_production_pr_entry_and_checked_deploy_close_the_mates_continuation_ticket():
+    a = Env(run="run_a")
+    _tk_file(a, "01", "shop-web: add checkout", "task_product")
+    _tk_file(a, "02", "levar #18 até produção", "task_continuation")
+    parent_path, child_path = os.path.join(a.env["ORQ_ISSUES"], "01-t.md"), os.path.join(a.env["ORQ_ISSUES"], "02-t.md")
+    parent_text = open(parent_path).read().replace("Status: claimed", "Status: resolved\nProject: shop-web")
+    child_text = open(child_path).read().replace("Status: claimed", "Status: claimed\nProject: shop-web") + "\nTicket anterior #01\n"
+    open(parent_path, "w").write(parent_text)
+    open(child_path, "w").write(child_text)
+    _evs(a, {"tipo": "pr", "op": "entrou", "task": "task_product", "numero": 18, "base": "main", "url": "https://github.com/acme/shop-web/pull/18"},
+         {"tipo": "obrigacao", "op": "nova", "entrada": "e1", "chave": "deploy", "task": "task_product", "base": "main", "sha": "abc", "production_pr": 18, "continuation_ticket": "02"},
+         {"tipo": "despacho", "task": "task_product", "run": "run_a", "projeto": "shop-web"})
+    old_deploy_of = orq_mod._deploy_of
+    orq_mod._deploy_of = lambda _o: ("printf 'v12\\n'", a.tmp.name)
+    try:
+        with InProcess(a):
+            lines = orq_mod.deploy_verify(now_at=time.time() + orq_mod.PR_POLL_S + 1)
+    finally:
+        orq_mod._deploy_of = old_deploy_of
+    assert any("main deploy checked (v12)" in line for line in lines), lines
+    assert "Status: resolved" in open(child_path).read()
+    assert "production PR #18 entered and deploy checked: v12" in open(child_path).read()
+
+
 # ---------- ticket 341: tickets that touch the same area block each other in order ----------
 
 def _area_spec(a, name, what):
@@ -24088,5 +24157,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
-

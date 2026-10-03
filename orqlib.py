@@ -5256,9 +5256,13 @@ def _apply_prs(d, seen, now_at):
         i.update(entrada=entry_event["id"], texto=text_value, avisado=False)
         if new == "mergeado":
             tk = next((t for t in tickets() if t["task"] == i["task"] and t["status"] != STATUS_CLOSED), None)
+            parent = tk or next((t for t in tickets() if t.get("task") == i["task"] and t.get("projeto")), None)
+            continuation = _continuation_ticket(parent) if i["base"] == (FINAL_BASE or task_flow(i["task"], event_list)["producao"]) else None
             for key_name, txt in merge_obligations(i, next_item, tk, task_flow(i['task'], event_list)):
                 append_event({"tipo": "obrigacao", "op": "nova", "entrada": entry_event["id"], "chave": key_name, "texto": txt, "task": i["task"],
-                              **({"ticket": tk["num"]} if key_name == "ticket" else {}), **({"base": i["base"], "sha": i.get("sha") or ""} if key_name == "deploy" else {})})
+                              **({"ticket": tk["num"]} if key_name == "ticket" else {}),
+                              **({"base": i["base"], "sha": i.get("sha") or "", "production_pr": i.get("numero"), "continuation_ticket": continuation["num"]} if key_name == "deploy" and continuation else
+                                 {"base": i["base"], "sha": i.get("sha") or "", "production_pr": i.get("numero")} if key_name == "deploy" else {})})
         line_list.append(f"{i['task']}: {text_value}")
     return line_list
 
@@ -5483,6 +5487,13 @@ def deploy_verify(now_at=None):
             rc, output = -1, [type(e).__name__]
         if rc == 0 and output:
             _close_obligation(o, "feito", prova=output[0], auto=True)
+            continuation = o.get("continuation_ticket")
+            if not continuation:
+                parent = next((t for t in tickets() if t.get("task") == o.get("task") and t.get("projeto")), None)
+                continuation = (_continuation_ticket(parent) or {}).get("num")
+            if continuation:
+                with contextlib.suppress(OSError, ValueError):
+                    ticket_close(continuation, f"production PR #{o.get('production_pr') or '?'} entered and deploy checked: {output[0]}")
             line_list.append(f"{o['task']}: {o.get('base')} deploy checked ({output[0]})")
         elif rc not in (0, 2) and not any(e.get("tipo") == "obrigacao" and e.get("op") == "falhou" and (e.get("entrada"), e.get("chave")) == (o["entrada"], o["chave"]) for e in read_events()):
             g = _manager_cfg()
@@ -10782,10 +10793,70 @@ def ticket_close(numero, answer, dropped=None, integrated=False):
     notice = "; ".join(x for x in (notice, *notices) if x)
     append_event({"tipo": "ticket", "op": "fechar", "ticket": n, "task": t["task"], "task_fechada": closed_item, **({"aviso": notice} if notice else {}), **({"largado": dropped} if dropped else {}),
                   "liberados": [{"ticket": x["ticket"], "prioridade": x["prioridade"]} for x in released]})
+    if product and not dropped and not integrated:
+        _request_production_continuation(t, answer_text, events)
     for o in [o for o in open_obligations(read_events()) if o["chave"] == "ticket" and o.get("ticket") == n]:
         _close_obligation(o, "feito", prova=f"ticket {n} {STATUS_CLOSED}")  # orq fulfils it on its own and only records it
     swept = wave_sweep()  # the close may have emptied the blockers of a join or of the next wave's milestone
     return {"ticket": n, "status": STATUS_CLOSED, "arquivo": t["arquivo"], "task": t["task"], "task_fechada": closed_item, "aviso": notice, "liberados": released, **({"ondas": swept} if swept else {})}
+
+
+def _request_production_continuation(ticket, answer_text, events):
+    """Asks the product's group mate to create a manual continuation ticket when the cited PR has not entered production; without an active mate it becomes a coordinator entry."""
+    ref = next(iter(re.findall(r"https?://[^\s)]+/pull/(\d+)|(?<![\w&])#(\d+)\b", answer_text)), None)
+    if not ref:
+        return
+    number = next((part for part in ref if part), None)
+    if not number:
+        return
+    flow = project_flow(ticket.get("projeto"))
+    url = next((u for u in re.findall(r"https?://[^\s)]+/pull/\d+", answer_text) if u.endswith("/" + number)), f"#{number}")
+    entered = any(e.get("tipo") == "pr" and e.get("op") == "entrou" and str(e.get("numero")) == number
+                  and e.get("base") == flow["producao"] for e in events)
+    entered = entered or any(str(i.get("numero")) == number and i.get("estado") == "mergeado" and i.get("base") == flow["producao"]
+                             for i in _prs_ro().get("itens", []))
+    if entered:
+        return
+    project = projects().get(ticket.get("projeto")) or {}
+    group_name = project.get("grupo") or _run_group(ticket.get("run")).get("grupo")
+    title_ref = f"#{number}"
+    text_value = (f"levar {title_ref} até produção ({url}) — ticket #{ticket['num']} (anterior; ticket anterior #{ticket['num']}). "
+                  f"Crie no seu Run um spec com `## What to build`, citando o ticket anterior #{ticket['num']}, e `## Acceptance criteria` para fechar quando a PR de produção entrar e o deploy for conferido; "
+                  f"rode `orq ticket new --titulo \"levar {title_ref} até produção\" --spec-file <spec.md> --dispatch manual --project {ticket.get('projeto')}` (Dispatch: manual).")
+    mate = _dict(_mates().get(group_name)) if group_name else {}
+    if group_name in groups() and (mate.get("terminal") or mate.get("dormiu")):
+        entry = append_event({"tipo": "entrada", "origem": "ticket", "texto": text_value, "fonte": f"ticket {ticket['num']}",
+                              "ticket": ticket["num"], "task": ticket.get("task"), "grupo": group_name}, new_id=True)
+        try:
+            request = mate_request(group_name, text_value)
+            intake(entry["id"], "mate", request["corr"])
+            append_event({"tipo": "continuacao_producao", "ticket": ticket["num"], "task": ticket.get("task"), "projeto": ticket.get("projeto"),
+                          "pr": url, "entrada": entry["id"], "grupo": group_name})
+            return
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+            log(f"ticket {ticket['num']}: continuation request to mate {group_name} failed ({type(e).__name__}: {e})")
+            # The ticket close is already durable. Leave the recorded request visible to the coordinator if delivery failed.
+            return
+    append_event({"tipo": "entrada", "origem": "ticket", "texto": text_value, "fonte": f"ticket {ticket['num']}",
+                  "ticket": ticket["num"], "task": ticket.get("task")}, new_id=True)
+
+
+def _continuation_ticket(parent):
+    """The open product ticket that cites `parent` as its previous ticket, created by the group's mate."""
+    if not parent:
+        return None
+    for candidate in tickets():
+        if candidate["status"] == STATUS_CLOSED or candidate.get("projeto") != parent.get("projeto"):
+            continue
+        if not re.match(r"levar\s+#?\d+\s+até\s+produção", candidate["titulo"], re.I):
+            continue
+        try:
+            body = open(candidate["arquivo"], encoding="utf-8").read()
+        except OSError:
+            continue
+        if re.search(rf"ticket anterior\s+#?0*{int(parent['num'])}\b", body, re.I):
+            return candidate
+    return None
 
 
 def ticket_edit(numero, **fields):
