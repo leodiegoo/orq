@@ -19490,7 +19490,7 @@ def test_ticket102_m7_move_refuses_dangling_dependency_ticket_outside_queue_and_
     a.orq("ticket", "fechar", "01", "--answer", "ok")
     r = a.orq("backlog", "mover", "01", "--grupo", "orq")
     assert r.returncode == 1 and "only what is still queued moves" in r.stderr, r.stderr
-    assert a.orq("despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "02").returncode == 0
+    assert a.orq("despachar", "--run", "run_a", "--modelo", "claude-sonnet-5-5", "--effort", "medium", "--ticket", "02", "--direct").returncode == 0
     r = a.orq("backlog", "mover", "02", "--grupo", "orq")
     assert r.returncode == 1 and "only what is still queued moves" in r.stderr
     assert a.orq("backlog", "mover", "02", "--grupo", "nao-existe").returncode == 1 and a.orq("backlog", "mover", "--grupo", "orq").returncode == 2
@@ -21151,6 +21151,42 @@ def _ready_tickets(a, *titles):
 
 def _dispatch_orq(a, *extra):
     return a.orq("despachar", "--run", "run_a", "--titulo", "orq: ticket do grupo", "--spec-arquivo", _spec(a), "--modelo", "claude-sonnet-5-5", "--effort", "medium", *extra)
+
+
+def test_ticket464_explicit_run_requires_direct_for_group_owned_ticket_and_keeps_mate_request_available():
+    a = Env(run="run_a")
+    _group(a)
+    _mate_alive(a)
+    title = "orq: integrador de serviço no projeto orq"
+    created = json.loads(_new(a, title, "--run", "run_a").stdout)
+    before_tasks = json.load(open(os.path.join(a.fake, "tasks_run_a.json")))
+    before_events = a.events()
+
+    refused = a.orq("dispatch", "--run", "run_a", "--ticket", created["ticket"], "--model", "claude-sonnet-5-5", "--effort", "medium")
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "use --direct to dispatch this ticket in that Run, or orq mate request to ask the group's mate" in refused.stderr, refused.stderr
+    assert not os.path.exists(os.path.join(a.fake, "started.log")), "the refusal happens before worker-start"
+    assert json.load(open(os.path.join(a.fake, "tasks_run_a.json"))) == before_tasks, "the ticket task stays ready"
+    assert a.events() == before_events, "the refusal does not create a mate request or dispatch event"
+
+    a.set("terminals.json", ["term_coord"])  # ownership still applies when there is no live mate to receive a request
+    no_mate = a.orq("dispatch", "--run", "run_a", "--ticket", created["ticket"], "--model", "claude-sonnet-5-5", "--effort", "medium")
+    assert no_mate.returncode == 1 and "use --direct" in no_mate.stderr, no_mate.stdout + no_mate.stderr
+    assert json.load(open(os.path.join(a.fake, "tasks_run_a.json"))) == before_tasks and a.events() == before_events
+    _mate_alive(a)
+
+    direct = a.orq("dispatch", "--run", "run_a", "--ticket", created["ticket"], "--model", "claude-sonnet-5-5", "--effort", "medium", "--direct")
+    assert direct.returncode == 0, direct.stderr
+    assert json.loads(direct.stdout)["taskId"] == created["task"], direct.stdout
+    (started,) = _log(a, "started.log")
+    assert started[started.index("--run") + 1] == "run_a" and started[started.index("--task") + 1] == created["task"], started
+    dispatch = next(e for e in a.events() if e["tipo"] == "despacho")
+    assert dispatch["run"] == "run_a" and "--direct" in dispatch["direct"], dispatch
+    assert not any(e["tipo"] == "mate_dispatch" for e in a.events())
+
+    request = a.orq("mate", "pedir", "orq", "--texto", "despache o ticket 317")
+    assert request.returncode == 0 and json.loads(request.stdout)["entrega"] == "enviado", request.stdout + request.stderr
+    assert any(e["tipo"] == "mate_pedido" for e in a.events()), a.events()
 
 
 def test_ticket181_dispatch_of_a_group_ticket_should_go_to_the_mate_request_instead_of_starting_a_worker():
