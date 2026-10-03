@@ -8970,6 +8970,11 @@ def _dropped(n, events):
     return any(e.get("tipo") == "ticket" and e.get("op") == "fechar" and e.get("ticket") == n and e.get("largado") for e in events)
 
 
+def _restored(rec, events):
+    """The coordinator restored the ticket to `resolved` with proof (`orq orphans --restore`) after this delivery."""
+    return any(e.get("tipo") == "ticket" and e.get("op") == "restaurar" and e.get("ticket") == rec.get("ticket") and (e.get("ts") or "") >= (rec.get("ts") or "") for e in events)
+
+
 def orphan_deliveries(events, now_at, queue, prs, agents, closed=()):
     """Pure: the deliveries outside every end state, with the time they have been there (`desde`, from the delivery, from the last return or from the queue item that left without a
     cycle), the reason and the commands that resolve: [{ticket, branch, dispatch, desde, minutos, motivo, comando, fechado}]. `agents` are the reassessed rows (a worker
@@ -8978,7 +8983,7 @@ def orphan_deliveries(events, now_at, queue, prs, agents, closed=()):
     live = {of_ticket.get(a.get("dispatch")) or of_ticket.get(a.get("task")) for a in agents if a.get("estado") in _ALIVE}
     out = []
     for n, rec in _delivery_ledger(events).items():
-        if _on_main(rec, events) or n in queue or n in held or _dropped(n, events) or n in live or (rec.get("task") and any(i.get("task") == rec["task"] for i in prs)):
+        if _on_main(rec, events) or n in queue or n in held or _dropped(n, events) or _restored(rec, events) or n in live or (rec.get("task") and any(i.get("task") == rec["task"] for i in prs)):
             continue
         after = [e for e in events if (e.get("ts") or "") >= (rec.get("ts") or "") and (e.get("ticket") == n and e.get("tipo") == "integrar_fila" and e.get("op") == "rm"
                                                                                       or e.get("tipo") == "devolver" and e.get("dispatch") == rec.get("dispatch"))]
@@ -9006,6 +9011,68 @@ def ticket_reopen(numero, reason):
     return append_event({"tipo": "ticket", "op": "reabrir", "ticket": n, "motivo": reason})
 
 
+def ticket_restore(numero, reason):
+    """Puts a ticket the sweep reopened back to `resolved`, with the `## Answer` it already had (reopening only touched the Status). ValueError if it does not exist or is already resolved."""
+    n = str(numero).strip().zfill(2)
+    t = next((t for t in tickets() if t["num"] == n), None)
+    if not t or t["status"] == STATUS_CLOSED:
+        raise ValueError(f"ticket {n} does not exist or is already {STATUS_CLOSED}")
+    if _tickets_in_backlog():
+        backlog.cli(BACKLOG, "done", _item_of_ticket(n)["id"], "--no-prune")
+    else:
+        with open(t["arquivo"], encoding="utf-8") as f:
+            _write(t["arquivo"], _trocar_campo(f.read(), "Status", STATUS_CLOSED))
+    return append_event({"tipo": "ticket", "op": "restaurar", "ticket": n, "motivo": reason})
+
+
+def _delivery_standing(branch, registry):
+    """Where a delivered branch stands against main: `(gone, why)` the branch is in no repo (deleted by the cleanup, or never made); `(proved, via)` `integration_proof` holds (contained,
+    cycle record, or every commit has a patch-equivalent in main); `(unproved, why)` the branch exists and nothing proves it is in main. Local git only."""
+    repo = _branch_repo(branch) if branch else None
+    if not repo:
+        return "gone", "its branch no longer exists" if branch else "no branch recorded"
+    if proof := integration_proof(repo, branch, BRANCH_NO_REMOTE, registry):
+        return "proved", INTEGRATION_VIA[proof["via"]].format(ref=BRANCH_NO_REMOTE, into=proof["into"])
+    return "unproved", f"{branch} has a commit that is not in {BRANCH_NO_REMOTE}"
+
+
+def restore_reopened(numbers, dry_run=False):
+    """The tickets the 356 sweep reopened by mistake, back to `resolved` (ticket 383): one that is open again (`claimed`, or `ready-for-agent` in the backlog) with a `reabrir` event, no dispatch since, and a delivery whose branch is gone, or in main by
+    `integration_proof`, or whose commits all have their subject in main (a rewritten merge). The rest stays, for the coordinator. `dry_run` only lists. Returns {restored: [{ticket, via}], stayed: [{ticket, motivo}]}."""
+    events, tks = read_events(), {t["num"]: t for t in tickets()}
+    ledger, registry = _delivery_ledger(events), integration_registry(events)
+    reopened = {}  # {ticket: when the sweep last reopened it}
+    for e in events:
+        if e.get("tipo") == "ticket" and e.get("op") == "reabrir":
+            reopened[e.get("ticket")] = e.get("ts") or ""
+    redone = {e.get("ticket") for e in events if e.get("tipo") == "despacho" and (e.get("ts") or "") >= reopened.get(e.get("ticket"), "~")}  # a worker took the reopened ticket: it is real work now
+    out = {"restored": [], "stayed": []}
+    for n in (str(x).strip().zfill(2) for x in numbers):
+        t = tks.get(n)
+        if why := ("does not exist" if not t else f"already {STATUS_CLOSED}" if t["status"] == STATUS_CLOSED else "not reopened by the sweep" if n not in reopened
+                   else "dispatched again since the reopening" if n in redone else None):
+            out["stayed"].append({"ticket": n, "motivo": why})
+            continue
+        if n not in ledger:
+            out["stayed"].append({"ticket": n, "motivo": "no delivery recorded: nothing to compare"})
+            continue
+        branch = ledger[n].get("branch")
+        state, via = _delivery_standing(branch, registry)
+        if state == "unproved":
+            repo = _branch_repo(branch)
+            subs = (_git(repo, "log", "--format=%s", f"{BRANCH_NO_REMOTE}..{branch}") or "?").splitlines()
+            main_subjects = set((_git(repo, "log", "--format=%s", BRANCH_NO_REMOTE) or "").splitlines())
+            if "?" not in subs and all(x in main_subjects for x in subs):
+                state, via = "proved", f"every commit subject of {branch} is in {BRANCH_NO_REMOTE}"
+        if state == "unproved":
+            out["stayed"].append({"ticket": n, "motivo": via})
+        else:
+            out["restored"].append({"ticket": n, "via": via})
+            if not dry_run:
+                ticket_restore(n, via)
+    return out
+
+
 def _manual_obligations(events, ledger):
     """The `entrega_manual` (a delivery in a repo with no integrator) with no obligation yet whose condition holds: the orq branch of the same ticket, if there is one, is already in main.
     Returns [(entry event of the delivery, obligation text)]."""
@@ -9020,7 +9087,7 @@ def _manual_obligations(events, ledger):
 
 
 def orphan_sweep(now_at=None, dry_run=False):
-    """The manager's round over the deliveries (ticket 356): reopens the `resolved` tickets whose code never reached main, raises the coordinator's obligation "merge <branch> into the main
+    """The manager's round over the deliveries (ticket 356): reopens the `resolved` tickets whose branch exists and is not in main (a gone branch only alerts), raises the coordinator's obligation "merge <branch> into the main
     of <repo>" for a delivery of a repo with no integrator, and tells the coordinator, once per delivery, about each orphan with the command that resolves it. `dry_run` only reads.
     Returns {orphans, reopened, obligations, lines}."""
     now_at, events = now_at or now_dt(), read_events()
@@ -9028,9 +9095,13 @@ def orphan_sweep(now_at=None, dry_run=False):
     closed = {n for n, t in tks.items() if t["status"] == STATUS_CLOSED}
     agents = reassess(_dict(_read_json(_path("open.json"))).get("agentes") or [], events, now_at, _turns_ro())
     all_found = orphan_deliveries(events, now_at, integration_queue(), _prs_ro()["itens"], agents, closed)
+    # a resolved ticket reopens only with its branch there and the proof failing (ticket 383): a branch the cleanup deleted proves nothing, and one `integration_proof` holds is in main
+    registry = integration_registry(events)
+    standing = {o["ticket"]: _delivery_standing(o["branch"], registry)[0] for o in all_found if o["fechado"]}
+    all_found = [o for o in all_found if standing.get(o["ticket"]) != "proved"]
     ledger = _delivery_ledger(events)
     manual = _manual_obligations(events, ledger)
-    result = {"orphans": [o for o in all_found if o["minutos"] * 60 >= ORPHAN_MIN * 60], "reopened": [o["ticket"] for o in all_found if o["fechado"]], "obligations": [e.get("branch") for e in manual], "lines": []}
+    result = {"orphans": [o for o in all_found if o["minutos"] * 60 >= ORPHAN_MIN * 60], "reopened": [n for n, st in standing.items() if st == "unproved"], "obligations": [e.get("branch") for e in manual], "lines": []}
     if dry_run:
         return result
     for n in result["reopened"]:
@@ -15676,6 +15747,7 @@ def parser():
     orf = sub.add_parser("orphans", help="the deliveries outside main, the integrator queue, a PR, a live worker and every hold for over 15 min, with the command that resolves each (the manager runs it every round)")
     orf.add_argument("--dry-run", action="store_true", help="only lists: no ticket reopened, no obligation raised, no notice")
     orf.add_argument("--json", action="store_true")
+    orf.add_argument("--restore", metavar="FILE", help="restores to `resolved` the tickets of FILE (one number per line) that the sweep reopened and whose branch is gone or in main; with --dry-run only lists (ticket 383)")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("text_value")
@@ -16144,6 +16216,11 @@ def main(argv=None):
                              or ["no test file created or changed by the branch"]) + f"\nhead {r['head'][:8]}: {r['resultado']}")
         elif a.cmd == "hold":
             print(json.dumps(hold(a.target, a.reason, a.release), ensure_ascii=False))
+        elif a.cmd == "orphans" and a.restore:
+            with open(os.path.expanduser(a.restore), encoding="utf-8") as f:
+                r = restore_reopened([x for x in (ln.split("#")[0].strip() for ln in f) if x], dry_run=a.dry_run)
+            print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join([*(f"ticket {x['ticket']}: {'would restore' if a.dry_run else 'restored'} ({x['via']})" for x in r["restored"]),
+                  *(f"ticket {x['ticket']}: stays ({x['motivo']})" for x in r["stayed"]), f"{len(r['restored'])} {'to restore' if a.dry_run else 'restored'}, {len(r['stayed'])} stay"]))
         elif a.cmd == "orphans":
             r = orphan_sweep(dry_run=a.dry_run)
             print(json.dumps(r, ensure_ascii=False) if a.json else "\n".join([*r["lines"], *(f"ticket {o['ticket']}: {o['branch'] or '(no branch)'} {o['motivo']}, {o['minutos']} min: {o['comando']}" for o in r["orphans"] if a.dry_run)]) or "no orphan delivery")
