@@ -9289,6 +9289,20 @@ def _released_worktree(t, project):
     return "new-top-level", _slug(t["titulo"])[:40].strip("-")
 
 
+def _ask_model(t, priority):
+    """A released ticket with no valid Model:/Effort: never enters the queue and nobody reads a text notice (tickets 352 and 353 sat there): it becomes a request to its group's mate
+    (the Run's owner, else the group of the title) or, with no mate to take it, an entry for the coordinator, with the command that fixes it. Returns the notice line."""
+    text = f"ticket {t['num']} (P{priority}) was released without a valid Model:/Effort: in the header, so it is outside the dispatch queue: orq ticket edit {t['num']} --model <model> --effort <effort>"
+    group_name = _mate_owning(t.get("run")) or group_of(groups(), title=t["titulo"])[0]
+    if group_name:
+        try:
+            return f"{text} (asked of mate {group_name}: {mate_request(group_name, text)['corr']})"
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError):
+            pass  # no mate that can take it: the coordinator gets the entry
+    e = append_event({"tipo": "entrada", "origem": "ticket", "texto": text, "fonte": f"ticket {t['num']}", "task": t.get("task")}, new_id=True)
+    return f"{text} (entry {e['id']})"
+
+
 def _release_dependents(n, before=None):
     """Ticket `n` has just been resolved: removes the number from the `Blocked by:` of whoever depended on it (and the other blockers already resolved).
     With tickets in the backlog there is no line to rewrite: `before` (the tickets from before the `done`) says who depended on `n`, and the rest of the computation is the same.
@@ -9333,7 +9347,7 @@ def _release_dependents(n, before=None):
             except (OSError, ValueError) as e:
                 notices.append(f"ticket {t['num']} released, but did not enter the dispatch queue ({e}): dispatch it with orq dispatch --ticket {t['num']}")
         elif priority < 3:
-            notices.append(f"ticket {t['num']} (P{priority}) released without a valid Model:/Effort: in the header: dispatch it with orq dispatch --ticket {t['num']}")
+            notices.append(_ask_model(t, priority))
         released.append(item)
     for t in free_items:  # the task blocked by an Orca blocker (worker-stop, deps) becomes ready again
         if not (t["task"] and t["run"]):
@@ -15502,6 +15516,8 @@ def main(argv=None):
                       else "\n".join(wave_lines()) or "no wave")
         elif a.cmd == "ticket":
             if a.op == "new":
+                if not (a.model and a.effort):
+                    raise ValueError("ticket new needs --model and --effort (a ticket without them is released outside the dispatch queue): pass both, e.g. --model sonnet --effort medium")
                 r = ticket_new(a.title, a.spec_file, a.blocked_by, a.run, a.model, a.effort, a.dispatch_mode, a.waiting, a.project, a.wave, a.after)
                 print(json.dumps(r, ensure_ascii=False))
                 _implicit("tarefa", r["task"], r["run"])
