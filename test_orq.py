@@ -13857,9 +13857,11 @@ def test_it_should_map_the_profile_between_harnesses_and_refuse_what_has_no_equi
     profile = orq_mod._handoff_profile
     assert profile("claude-opus-5-5", "high", "codex") == ("gpt-6-sol", "high")
     assert profile("claude-opus-5-5", "xhigh", "codex") == ("gpt-6-astra", "low")
+    assert profile("claude-sonnet-5-5", "xhigh", "codex") == ("gpt-6-sol", "low")
     assert profile("gpt-6-sol", "high", "claude") == ("claude-opus-5-5", "high")
     assert profile("gpt-6-luna", "low", "claude") == ("claude-sonnet-5-5", "low")
-    for model, effort, to_ in (("claude-haiku-4-5-20251001", "high", "codex"), ("claude-sonnet-5-5", "ultra", "codex"), ("gpt-6-astra", "high", "claude"), (None, None, "codex")):
+    for model, effort, to_ in (("claude-haiku-4-5-20251001", "high", "codex"), ("claude-sonnet-5-5", "ultra", "codex"),
+                               ("gpt-6-luna", "max", "claude"), ("gpt-6-astra", "high", "claude"), (None, None, "codex")):
         try:
             profile(model, effort, to_)
         except ValueError as e:
@@ -18685,6 +18687,44 @@ def test_ticket102_m5_model_effort_dispatch_and_waiting_go_to_meta_and_edit_swap
     assert r.returncode == 0, r.stderr
     assert _meta_tk(_bl_items(a)["t01"]) == {"spec": "issues/01-com-modelo.md", "orca": "task_tk1 run_a", "modelo": "claude-opus-5-5", "effort": "medium", "espera": "integrador vazio"}
     assert a.orq("ticket", "editar", "01").returncode == 1 and a.orq("ticket", "editar", "09", "--effort", "low").returncode == 1
+
+
+def test_ticket457_ticket_new_refuses_unsupported_model_effort_without_creating_state():
+    a = _env_tk()
+    before_backlog, before_events = _bl_items(a), a.events()
+    r = _new(a, "Luna no limite", "--modelo", "gpt-6-luna", "--effort", "max")
+    assert r.returncode == 1 and "gpt-6-luna" in r.stderr and "xhigh" in r.stderr, r.stderr
+    assert _bl_items(a) == before_backlog and a.events() == before_events
+    assert not os.path.exists(a.env["ORQ_ISSUES"]) and not _log(a, "created.log") and not _log(a, "started.log")
+    accepted = _new(a, "Luna permitido", "--modelo", "gpt-6-luna", "--effort", "xhigh")
+    assert accepted.returncode == 0, accepted.stderr
+
+
+def test_ticket457_ticket_edit_refuses_unsupported_model_effort_without_changing_ticket():
+    a = _env_tk()
+    _new(a, "Luna editável", "--modelo", "gpt-6-luna", "--effort", "xhigh")
+    before_item, before_file, before_tasks, before_events = _bl_items(a)["t01"], _read_text(a, "01"), _tasks_fake(a), a.events()
+    r = a.orq("ticket", "editar", "01", "--effort", "max")
+    assert r.returncode == 1 and "gpt-6-luna" in r.stderr and "xhigh" in r.stderr, r.stderr
+    assert _bl_items(a)["t01"] == before_item and _read_text(a, "01") == before_file
+    assert _tasks_fake(a) == before_tasks and a.events() == before_events and not _log(a, "started.log")
+    accepted = a.orq("ticket", "editar", "01", "--effort", "high")
+    assert accepted.returncode == 0, accepted.stderr
+
+
+def test_ticket457_dispatch_refuses_unsupported_model_effort_without_starting_worker():
+    a = _env_tk()
+    _new(a, "Luna para despachar", "--modelo", "gpt-6-luna", "--effort", "xhigh")
+    before_item, before_file, before_tasks, before_events = _bl_items(a)["t01"], _read_text(a, "01"), _tasks_fake(a), a.events()
+    args = ("despachar", "--run", "run_a", "--ticket", "01", "--agente", "codex", "--modelo", "gpt-6-luna", "--effort", "max")
+    r = a.orq(*args)
+    assert r.returncode == 1 and "gpt-6-luna" in r.stderr and "xhigh" in r.stderr, r.stderr
+    assert _bl_items(a)["t01"] == before_item and _read_text(a, "01") == before_file
+    assert _tasks_fake(a) == before_tasks and a.events() == before_events and not _log(a, "started.log")
+    args = (*args[:-1], "xhigh")
+    accepted = a.orq(*args)
+    assert accepted.returncode == 0, accepted.stderr
+    assert len(_log(a, "started.log")) == 1 and _bl_items(a)["t01"]["estado"] == "in_flight"
 
 
 def test_ticket102_m5_edit_without_backlog_swaps_the_header_line_of_the_file():

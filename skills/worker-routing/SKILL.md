@@ -41,13 +41,13 @@ Trivial planning ("`phone` field with migration, endpoint and form") is Sonnet m
 | Haiku | no equivalent: simple search and mechanical change stay on Claude Haiku |
 | Sonnet low | `gpt-6-luna` low |
 | Sonnet medium | `gpt-6-luna` medium or high |
-| Sonnet high | `gpt-6-luna` xhigh or max, or `gpt-6-sol` low, which is cheap for what it delivers |
+| Sonnet high | `gpt-6-luna` xhigh, or `gpt-6-sol` low, which is cheap for what it delivers |
 | Opus high | `gpt-6-sol` medium or high |
 | Opus xhigh | `gpt-6-astra` low |
 | Opus max | `gpt-6-astra` medium; if it fails, move up to Claude Opus max |
 
-- Luna's `max` sits above high and below Sol.
-- To escalate on Codex, go up one step at a time: Luna low → medium → high → xhigh → max → Sol low → medium → high → xhigh → max → Astra low → Astra medium → Claude Opus max.
+- The `gpt-6-luna` ceiling is `xhigh`; escalate to `gpt-6-sol` low next.
+- To escalate on Codex, go up one step at a time: Luna low → medium → high → xhigh → Sol low → medium → high → xhigh → max → Astra low → Astra medium → Claude Opus max.
 - Astra only at low and medium, in place of Opus xhigh and max (user decision, 01/10). Do not use `gpt-5.6-terra`.
 - Do not use `ultra` on a worker: it delegates to subagents on its own.
 
