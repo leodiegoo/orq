@@ -247,6 +247,26 @@ HARNESS["codex"] = {
     "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),  # ~/.codex/models_cache.json: ultra only on the models that have it (Orca refuses it on Luna)
 }
 HARNESSES = tuple(HARNESS)
+
+# Model-specific limits sit on top of the harness-wide effort vocabulary. Unknown models keep the harness check,
+# which lets Orca work with models added by a harness before this table is updated.
+MODEL_EFFORT_SUPPORT = {
+    "gpt-6-luna": ("low", "medium", "high", "xhigh"),
+    "gpt-6-sol": HARNESS["codex"]["efforts"],
+    "gpt-6.1-sol": HARNESS["codex"]["efforts"],
+    "gpt-6-astra": HARNESS["codex"]["efforts"],
+}
+
+
+def validate_model_effort(model, effort):
+    """Raises when a known model does not support `effort`; unknown model ids are checked by their harness."""
+    model_name = (model or "").strip().casefold()
+    effort_name = (effort or "").strip().casefold()
+    support = next(((family, levels) for family, levels in MODEL_EFFORT_SUPPORT.items()
+                    if model_name == family or model_name.startswith(family + "-")), None)
+    if support and effort_name not in support[1]:
+        family, levels = support
+        raise ValueError(f"model {model} supports up to {levels[-1]} ({', '.join(levels)}); {effort} is unsupported")
 CODEX_CONFIG = os.environ.get("ORQ_CODEX_CONFIG") or os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "config.toml")
 CODEX_HOOKS = os.environ.get("ORQ_CODEX_HOOKS") or os.path.join(os.path.dirname(CODEX_CONFIG), "hooks.json")
 CLAUDE_SETTINGS = os.environ.get("ORQ_CLAUDE_SETTINGS") or os.path.expanduser("~/.claude/settings.json")
@@ -11098,6 +11118,8 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
     title = " ".join((title or "").split())
     if not title:
         raise ValueError("ticket without a title")
+    if model and effort:
+        validate_model_effort(model, effort)
     no_backlog = _tickets_in_backlog()
     if no_backlog and (p := backlog.problem_title(title)):
         raise ValueError(p)
@@ -11364,6 +11386,7 @@ def ticket_edit(numero, **fields):
     fresh = {k: " ".join(v.split()) for k, v in fields.items() if v is not None}
     if not fresh:
         raise ValueError("say what to change: --model, --effort, --dispatch or --waiting")
+    validate_model_effort(fresh.get("modelo", t.get("modelo")), fresh.get("effort", t.get("effort")))
     if _tickets_in_backlog():
         item = _item_of_ticket(n)
         meta, rest = backlog.body_meta(item["corpo"], backlog.META_TICKET)
@@ -12589,11 +12612,11 @@ def relaunch(dispatch, note, model=None, effort=None, run=None):
 _SONNET, _OPUS = "claude-sonnet-5-5", "claude-opus-5-5"
 HANDOFF_PROFILE = {
     "codex": {("sonnet", "low"): ("gpt-6-luna", "low"), ("sonnet", "medium"): ("gpt-6-luna", "medium"), ("sonnet", "high"): ("gpt-6-luna", "xhigh"),
-              ("sonnet", "xhigh"): ("gpt-6-luna", "max"), ("sonnet", "max"): ("gpt-6-sol", "low"),
+              ("sonnet", "xhigh"): ("gpt-6-sol", "low"), ("sonnet", "max"): ("gpt-6-sol", "medium"),
               ("opus", "low"): ("gpt-6-sol", "low"), ("opus", "medium"): ("gpt-6-sol", "medium"), ("opus", "high"): ("gpt-6-sol", "high"),
               ("opus", "xhigh"): ("gpt-6-astra", "low"), ("opus", "max"): ("gpt-6-astra", "medium")},
     "claude": {("luna", "low"): (_SONNET, "low"), ("luna", "medium"): (_SONNET, "medium"), ("luna", "high"): (_SONNET, "medium"),
-               ("luna", "xhigh"): (_SONNET, "high"), ("luna", "max"): (_SONNET, "high"), ("sol", "low"): (_SONNET, "high"),
+               ("luna", "xhigh"): (_SONNET, "high"), ("sol", "low"): (_SONNET, "high"),
                ("sol", "medium"): (_OPUS, "high"), ("sol", "high"): (_OPUS, "high"), ("sol", "xhigh"): (_OPUS, "xhigh"), ("sol", "max"): (_OPUS, "xhigh"),
                ("astra", "low"): (_OPUS, "xhigh"), ("astra", "medium"): (_OPUS, "max")},
 }
@@ -13939,6 +13962,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         raise ValueError(f"--agent {agent}: orq only dispatches {', '.join(HARNESSES)}")
     if effort not in HARNESS[agent]["efforts"]:
         raise ValueError(f"--effort {effort} does not exist in {agent} ({', '.join(HARNESS[agent]['efforts'])})")
+    validate_model_effort(model, effort)
     night_check()
     if (name or base_branch) and worktree != "new-top-level":
         raise ValueError("--name and --base-branch only work with --worktree new-top-level (Orca refuses to create a worktree in current)")
