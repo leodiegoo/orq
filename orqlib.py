@@ -219,6 +219,7 @@ HARNESS = {
         "resume": lambda session, model, effort, msg: ["claude", "--resume", session, *(["--model", model] if model else []),
                                                        "--dangerously-skip-permissions", msg],
         "tela": {"opcao": SCREEN_OPTION, "cursor": "❯", "perguntas": SCREEN_QUESTIONS, "espera": SCREEN_WAIT, "limite": SCREEN_LIMIT_CLAUDE, "falha": SCREEN_FAILURE,
+                 "enter_separado": True,  # a text-plus-Enter send into an agent mid-turn is refused as agent_prompt_blocked (a permission prompt is mid-turn): number and Enter go apart (ticket 371)
                  "pronto": re.compile(r"bypass permissions|\? for shortcuts|esc to interrupt")},  # claude's box is on screen: it is possible to type
         "abrir": lambda model, effort, msg: ["claude", *(["--model", model] if model else []), "--dangerously-skip-permissions", msg],  # o mate (ticket 80)
         # the mate opens without a prompt and the text is typed (ticket 80). What made claude non-interactive was the `env ORQ_MATE=…` in front, not the prompt on the line (ticket 106)
@@ -5245,6 +5246,116 @@ def _open_question(events):
     return open_entries
 
 
+DESTRUCTIVE = (  # a permission prompt for one of these gets "no" from the manager (ticket 371): rm -rf (any flag order), git reset --hard, git push --force
+    re.compile(r"\brm\s+(?:-\w+\s+)*(?:-\w*[rR]\w*\s+(?:-\w+\s+)*-\w*f|-\w*f\w*\s+(?:-\w+\s+)*-\w*[rR]|-\w*(?:[rR]\w*f|f\w*[rR]))"),
+    re.compile(r"\bgit\s+reset\s+(?:\S+\s+)*?--hard\b"),
+    re.compile(r"\bgit\s+push\s+(?:\S+\s+)*?(?:--force\b|-f\b)"),
+)
+
+
+def destructive_command(line_list):
+    """The destructive command (DESTRUCTIVE) the permission prompt at the end of the screen asks about, or None. Reads from the last `Bash(` or `Bash command` line on:
+    a command that already ran, up in the history, never counts."""
+    screen = [re.sub(r"[│╭╮╰╯─]", " ", str(l)).strip() for l in line_list or []]
+    start = next((i for i in range(len(screen) - 1, -1, -1) if re.match(r"^\W*(?:Bash\(|Bash command\b)", screen[i])), None)
+    for line in screen[start:] if start is not None else []:
+        if any(r.search(line) for r in DESTRUCTIVE):
+            return re.sub(r"^\W*Bash\(", "", line).removesuffix(")")
+    return None
+
+
+def _deny_destructive(w, command, coordinator):
+    """Answers "no" to the destructive permission prompt of worker `w` and tells the coordinator which command it tried (ticket 371). False when the answer did not go
+    (the usual question notice goes out instead)."""
+    try:
+        answer_screen(w.get("taskId"), "No", run=w.get("runId"))
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+    append_event({"tipo": "screen_denied", "dispatch": w["dispatchId"], "task": w.get("taskId"), "run": w.get("runId"), "comando": command})
+    text = f"orq: worker {w.get('taskId')} asked to run `{command}` (destructive); orq answered no on its screen. Ask it what it was after: orq agents."
+    if notify_coordinator(coordinator, text) not in ("enviado", "adiado"):  # the menu is gone: no next round to retry from, so the notice waits in the queue
+        _cursor_mut(lambda c: c.setdefault("avisos", []).append({"texto": text, "ts": now(), "contexto": True}))
+    return True
+
+
+STUCK_WAIT = re.compile(r"Bash\((until\s[^;\n]*\bgrep\b[^;\n]*);\s*do\b")
+STUCK_WAIT_S = 600  # the same `until grep` on the screen for this long, with its file empty or not growing: the wait is stuck
+STUCK_WAIT_EVERY_S = 3600  # once per worker per hour
+STUCK_WAIT_STEER = "orq: stop the wait; run only the ticket's tests in the foreground."
+STUCK_WAIT_FILE = "stuck-wait.json"  # {waits: {dispatch: {cmd, first_seen, dir, fp}}, acted: {dispatch: ts}, steer_due: {dispatch: terminal}}
+
+
+def stuck_wait_command(line_list):
+    """The condition of the `until grep …; do sleep …` that the last Bash call at the end of the screen is still running (`Running…`), or None. Running in the background does not count."""
+    screen = [str(l) for l in line_list or []]
+    last = next((i for i in range(len(screen) - 1, -1, -1) if "Bash(" in screen[i]), None)
+    m = last is not None and STUCK_WAIT.search(screen[last])
+    return " ".join(m.group(1).split()) if m and any(re.search(r"Running(?:…|\.\.\.)", x) for x in screen[last + 1:]) else None
+
+
+def _wait_file(command, cwd):
+    """The file the `until grep <pattern> <file>` waits on (absolute), or None when it cannot be told (a variable, a pipe, no folder for a relative path)."""
+    with contextlib.suppress(ValueError):
+        tokens = [t for t in shlex.split(command) if not re.match(r"^\d*[<>&]", t)]
+        f = os.path.expanduser(tokens[-1])
+        if len(tokens) >= 4 and not f.startswith("-") and not re.search(r"[$`|]", f) and (os.path.isabs(f) or cwd):
+            return os.path.join(cwd or "", f)
+    return None
+
+
+def _file_print(path):
+    """[size, mtime_ns] of the file, or None."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [st.st_size, st.st_mtime_ns]
+
+
+def interrupt_stuck_waits(ws, screens_read, now_at=None):
+    """Manager step (ticket 371): a worker whose screen shows the same `until grep` for STUCK_WAIT_S while the expected file is empty or did not change gets the interrupt and the
+    standard steer (STUCK_WAIT_STEER), once per worker per STUCK_WAIT_EVERY_S. The steer is typed with `type_text` (the manager is not the coordinator Orca fences steers to); if the worker is
+    not at the prompt yet, it stays in `steer_due` for the next rounds. A wait whose file cannot be told is left alone. Returns the panel lines."""
+    now_at = time.time() if now_at is None else now_at
+    state = _dict(_read_json(_path(STUCK_WAIT_FILE)))
+    waits, acted, due, line_list = _dict(state.get("waits")), {d: t for d, t in _dict(state.get("acted")).items() if now_at - t < STUCK_WAIT_EVERY_S}, _dict(state.get("steer_due")), []
+    seen = {}
+    for w in ws:
+        d, cmd = w["dispatchId"], (screens_read.get(w["dispatchId"]) or {}).get("espera_cmd")
+        if not cmd:
+            continue
+        prev = waits.get(d) if _dict(waits.get(d)).get("cmd") == cmd else None
+        if not prev:
+            cwd = None
+            with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+                cwd = _worker_path(orca("worker-show", "--dispatch", d, timeout=10))
+            prev = {"cmd": cmd, "first_seen": now_at, "dir": cwd}
+        seen[d] = prev
+        path = _wait_file(cmd, prev.get("dir"))
+        fp = _file_print(path) if path else None
+        if fp and fp[0] and fp != prev.get("fp"):  # the file has content and changed since the last look: the log is filling
+            prev.update(fp=fp, first_seen=now_at)
+        if not path or now_at - prev["first_seen"] < STUCK_WAIT_S or d in acted:
+            continue
+        try:
+            interrupt(d, w.get("runId"))
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+            log(f"espera presa: interromper {d}: {type(e).__name__}: {e}")
+            continue
+        acted[d], due[d] = now_at, w.get("agentTerminalHandle")
+        append_event({"tipo": "wait_interrupted", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "comando": cmd, "arquivo": path, "minutos": int((now_at - prev["first_seen"]) // 60)})
+        line_list.append(f"{w.get('taskId')}: stuck wait interrupted ({_quote(cmd, 60)})")
+    for d, handle in list(due.items()):
+        if d not in {w["dispatchId"] for w in ws}:
+            due.pop(d)
+        elif type_text(handle, STUCK_WAIT_STEER) == "enviado":
+            due.pop(d)
+    new = {"waits": seen, "acted": acted, "steer_due": due}
+    if new != {k: _dict(state.get(k)) for k in new}:
+        _write_json(_path(STUCK_WAIT_FILE), new)
+    return line_list
+
+
 def notify_screens():
     """One round of the manager over the workers' screens: a permission prompt, AskUserQuestion or "trust this folder" stuck in a worker's terminal
     becomes a line typed into the coordinator, once per menu (event `pergunta_tela`, with the question and the options), with `orq reply_to-screen` to run.
@@ -5263,6 +5374,9 @@ def notify_screens():
         d, p = w["dispatchId"], (screens_read.get(w["dispatchId"]) or {}).get("pergunta")
         if not p and d in open_entries:
             append_event({"tipo": "pergunta_tela_fim", "dispatch": d})
+        if p and (command := screens_read[d].get("destrutivo")) and _deny_destructive(w, command, g["coordenador"]):
+            line_list.append(f"{w.get('taskId')}: destructive prompt answered no ({_quote(command, 60)})")
+            continue
         if not p or (d in open_entries and open_entries[d].get("texto") == p["texto"] and open_entries[d].get("opcoes") == p["opcoes"]):
             continue
         ops = " ".join(f"{n}) {r}" for n, r in p["opcoes"])
@@ -5281,7 +5395,7 @@ def notify_screens():
             break
         append_event({"tipo": "limite_tela", "dispatch": d, "task": w.get("taskId"), "run": w.get("runId"), "terminal": w.get("agentTerminalHandle"), "texto": limit})
         line_list.append(f"{w.get('taskId')}: plan limit reported to the coordinator")
-    return line_list
+    return line_list + interrupt_stuck_waits(ws, screens_read)
 
 
 def no_terminal_line(open_state):
@@ -10175,6 +10289,46 @@ def doctor_hooks(pin=False):
     return 1 if broken else 0
 
 
+def _integrated_into_main(t):
+    """The proof that orq's own ticket `t` is in main, or None: a branch it put on the integrator queue is an ancestor of `main`. A project ticket never has it (its code is in another repo)."""
+    if t.get("projeto"):
+        return None
+    branches = {e["branch"] for e in read_events() if e.get("tipo") == "integrar_fila" and e.get("op") == "add" and e.get("ticket") == t["num"] and e.get("branch")}
+    return next((f"{b} is in {BRANCH_NO_REMOTE}" for b in sorted(branches) if (repo := _branch_repo(b)) and _git(repo, "merge-base", "--is-ancestor", b, BRANCH_NO_REMOTE) is not None), None)
+
+
+BACKLOG_DOCTOR_FILE = "backlog-doctor.json"  # {ts, sig}: the last hourly round and the notice it sent
+BACKLOG_DOCTOR_EVERY_S = 3600
+
+
+def backlog_doctor_round(now_at=None):
+    """Manager round, once per BACKLOG_DOCTOR_EVERY_S (ticket 371): runs `doctor_backlog`, applies on its own only the fix that carries a proof (`seguro`: orq's own ticket whose branch is
+    in main and whose task is completed: `ticket_close`) and sends the rest to the coordinator as one notice, again only when the list changes. Returns the panel lines."""
+    now_at = time.time() if now_at is None else now_at
+    g, state = _manager_cfg(), _dict(_read_json(_path(BACKLOG_DOCTOR_FILE)))
+    if not g.get("coordenador") or now_at - (state.get("ts") or 0) < BACKLOG_DOCTOR_EVERY_S:
+        return []
+    _write_json(_path(BACKLOG_DOCTOR_FILE), {**state, "ts": now_at})
+    found, line_list, rest = doctor_backlog(), [], []
+    for x in found["problemas"]:
+        try:
+            if not x.get("seguro"):
+                raise ValueError
+            ticket_close(x["ticket"], f"integrated into main ({x['seguro']}); closed by the backlog doctor")
+            line_list.append(f"{x['ticket']}: backlog fixed, closed (integrated into main)")
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired):
+            rest.append(x)
+    sig = hashlib.sha1(json.dumps([[x["ticket"], x["problema"]] for x in rest] + found["avisos"]).encode()).hexdigest()[:12]
+    if (rest or found["avisos"]) and sig != state.get("sig"):
+        text = f"orq: backlog and Orca differ and orq did not fix it ({len(rest)}): " + "; ".join(doctor_backlog_text({"problemas": rest, "avisos": found["avisos"]}).splitlines()) + " (orq doctor backlog)"
+        if notify_coordinator(g["coordenador"], text) in ("enviado", "adiado"):
+            line_list.append(f"backlog doctor: {len(rest)} difference(s) reported to the coordinator")
+        else:
+            sig = None  # not delivered: the next round tries again
+    _write_json(_path(BACKLOG_DOCTOR_FILE), {"ts": now_at, "sig": sig if rest or found["avisos"] else None})
+    return line_list
+
+
 def doctor_backlog():
     """`orq doctor backlog` (M6): crosses the tickets of the backlogs (the process's, the machine's and the groups') with Orca's tasks and states the fix for each difference, writing nothing.
 
@@ -10195,8 +10349,8 @@ def doctor_backlog():
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             notices.append(f"Run {run}: task-list failed ({e}): its tasks were not checked")
 
-    def add_finding(t, problem, fix):
-        problems.append({"ticket": t["num"], "problema": problem, "conserto": fix})
+    def add_finding(t, problem, fix, safe=None):
+        problems.append({"ticket": t["num"], "problema": problem, "conserto": fix, **({"seguro": safe} if safe else {})})  # `seguro`: the proof that makes the fix safe for the manager to apply (ticket 371)
 
     for b, t in tks:
         n, file_path = t["num"], f"TASKS_AXI_FILE={shlex.quote(b)} tasks-axi"
@@ -10212,11 +10366,11 @@ def doctor_backlog():
         if t["status"] == STATUS_CLOSED and is_open:
             add_finding(t, f"Done, but task {t['task']} is {st}", f"orca orchestration task-update --id {t['task']} --status completed --run {t['run']}")
         elif t["status"] == STATUS_IN_PROGRESS and not is_open:
-            add_finding(t, f"In flight, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>")
+            add_finding(t, f"In flight, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and _integrated_into_main(t))
         elif t["status"] == STATUS_IN_PROGRESS and st != "dispatched":
             add_finding(t, f"In flight, but task {t['task']} is {st}, with no dispatched worker", f"orq dispatch --run {t['run']} --ticket {n} --model <m> --effort <e>")
         elif t["status"] == STATUS_NEW and not is_open:
-            add_finding(t, f"Queued, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>")
+            add_finding(t, f"Queued, but task {t['task']} is already {st}", f"orq ticket close {n} --answer <what resolved it>", st == "completed" and _integrated_into_main(t))
         elif t["status"] == STATUS_NEW and st == "dispatched":
             add_finding(t, f"Queued, but task {t['task']} is dispatched", f"{file_path} start t{n}")
     try:
@@ -10403,9 +10557,9 @@ def screen_limit(line_list, agent="claude"):
 
 
 def _read_screens(ws, details):
-    """{dispatch: {espera, pergunta, limite}} of running workers whose screen (end of `terminal read --screen`) shows a shell/monitor still running
-    (`waiting`, the reason), a menu waiting for a human answer (`question`, from screen_question) or the plan-limit notice (`limit`, from screen_limit).
-    Only those with any of the three get in.
+    """{dispatch: {espera, pergunta, limite, espera_cmd, destrutivo}} of running workers whose screen (end of `terminal read --screen`) shows a shell/monitor still running
+    (`waiting`, the reason), a menu waiting for a human answer (`question`, from screen_question), the plan-limit notice (`limit`, from screen_limit) or an `until grep` wait
+    running in the foreground (`espera_cmd`, from stuck_wait_command). `destrutivo` is the destructive command a permission prompt asks about. Only those with any of the first four get in.
 
     Only the refresh, the manager and `orq agents` call this (one read per worker, in parallel); the prompt hooks read what was left in the cache. A read failure proves nothing.
     """
@@ -10418,8 +10572,10 @@ def _read_screens(ws, details):
         agent = details[w["dispatchId"]]["agente"]
         waiting = HARNESS[agent]["tela"]["espera"]
         m = waiting and waiting.search("\n".join(map(str, tail[-15:])))
-        found_item = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": screen_question(tail, agent), "limite": screen_limit(tail, agent)}
-        return w["dispatchId"], found_item if m or found_item["pergunta"] or found_item["limite"] else None
+        found_item = {"espera": f"{m.group(0).strip()} (tela)" if m else None, "pergunta": screen_question(tail, agent), "limite": screen_limit(tail, agent),
+                      "espera_cmd": stuck_wait_command(tail) if agent == "claude" else None}
+        found_item["destrutivo"] = found_item["pergunta"] and found_item["pergunta"]["tipo"] == "permissao" and destructive_command(tail) or None
+        return w["dispatchId"], found_item if m or found_item["pergunta"] or found_item["limite"] or found_item["espera_cmd"] else None
     target = [w for w in ws if w.get("dispatchStatus") == "dispatched" and w.get("agentTerminalHandle") and (details.get(w.get("dispatchId")) or {}).get("agente") in HARNESS]
     with ThreadPoolExecutor(8) as ex:
         return {d: a for d, a in ex.map(read_screen, target) if a}
@@ -14629,6 +14785,10 @@ def manager_absorb():
         line_list += [] if os.environ.get("ORQ_NO_CLEAN") else clean_round()
     except Exception as e:  # noqa: BLE001 - the cleaning doesn't take down the panel; the next loop tries
         log(f"clean: {type(e).__name__}: {e}")
+    try:
+        line_list += backlog_doctor_round()
+    except Exception as e:  # noqa: BLE001 - the backlog check doesn't take down the panel; the next hour tries
+        log(f"doctor backlog: {type(e).__name__}: {e}")
     try:
         line_list += hooks_broken_round()
     except Exception as e:  # noqa: BLE001 - the warning about hooks doesn't take down the panel; the next loop tries
