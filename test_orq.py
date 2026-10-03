@@ -15604,6 +15604,8 @@ open(os.path.join(d, "gh.log"), "a").write(json.dumps(sys.argv[1:]) + "\\n")
 file_path = os.path.join(d, "gh.json")
 data = json.load(open(file_path)) if os.path.exists(file_path) else {}
 if sys.argv[2] == "create":
+    if sys.argv[sys.argv.index("--body-file") + 1] == "-":
+        open(os.path.join(d, "body.txt"), "w").write(sys.stdin.read())
     url = "https://github.com/acme/app/pull/%d" % (300 + len(data))
     data[url] = {"state": "OPEN", "mergedAt": None, "baseRefName": sys.argv[sys.argv.index("--base") + 1], "title": sys.argv[sys.argv.index("--title") + 1]}
     json.dump(data, open(file_path, "w")); print(url)
@@ -15691,6 +15693,90 @@ def test_ticket143_pr_open_main_only_after_staging_enters():
     assert r.returncode == 1 and "staging" in r.stderr and not _log143(a, "gh.log"), r
 
 
+# ---------- ticket 338: orq pr open of a branch with no worktree, body from the report ----------
+
+REPORT338 = "# 338\n\nResumo da entrega.\n\n## Conformance\n\n1. red→green `test_x` (test_orq.py:1)\n\n## Risco\n\nPorta de mão dupla.\n"
+
+
+def _open_pr338(report=REPORT338, author="1+leo@users.noreply.github.com", message="feat: add algo", staging_conflict=False):
+    """The 02/10 case: a real origin with development, staging and main, and a branch `leodiegoo/feat/algo` that only origin has (no worktree, no local branch)."""
+    a = _open_pr143()
+    a.env.pop("ORQ_GIT")
+    a.env.update({"GIT_CONFIG_GLOBAL": os.devnull, "ORQ_AUTOR": ""})
+    t = a.tmp.name
+    origin, repo = os.path.join(t, "origin.git"), os.path.join(t, "clone")
+    a.git = lambda *x, **e: subprocess.run(["git", "-C", repo, *x], capture_output=True, text=True, check=True, env={**a.env, **e}).stdout.strip()
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True, env=a.env)
+    subprocess.run(["git", "clone", "-q", origin, repo], capture_output=True, check=True, env=a.env)
+    a.git("config", "user.name", "Leo")
+    a.git("config", "user.email", "1+leo@users.noreply.github.com")
+    a.git("checkout", "-q", "-b", "main")
+    open(os.path.join(repo, "a.js"), "w").write("base\n")
+    a.git("add", "a.js")
+    a.git("commit", "-qm", "chore: base")
+    for env_name in ("development", "staging"):
+        a.git("branch", env_name)
+    a.git("checkout", "-q", "-b", "leodiegoo/feat/algo", "development")
+    open(os.path.join(repo, "a.js"), "w").write("feature\n")
+    if report:
+        open(os.path.join(repo, "final-report.md"), "w").write(report)
+    a.git("add", ".")
+    a.git("commit", "-qm", message, GIT_AUTHOR_EMAIL=author)
+    if staging_conflict:
+        a.git("checkout", "-q", "staging")
+        open(os.path.join(repo, "a.js"), "w").write("other\n")
+        a.git("commit", "-qam", "fix: other")
+    a.git("push", "-q", "origin", "--all")
+    a.git("checkout", "-q", "main")
+    a.git("branch", "-qD", "leodiegoo/feat/algo")
+    a.git("update-ref", "-d", "refs/remotes/origin/leodiegoo/feat/algo")
+    a.repo, a.origin = repo, origin
+    a.remote_branches = lambda: subprocess.run(["git", "-C", origin, "branch", "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()
+    return a
+
+
+def _open_head338(a, *extra):
+    return a.orq("pr", "open", "--head", "leodiegoo/feat/algo", "--title", "feat: add algo", "--task", "task_feat", "--cwd", a.repo, *extra)
+
+
+def test_ticket338_pr_open_head_without_worktree_renames_pushes_and_opens_with_body_from_report():
+    a = _open_pr338()
+    r = _open_head338(a, "--rename")
+    assert r.returncode == 0, r.stderr
+    assert "feat/algo" in a.remote_branches(), "o push leva o nome convencional"
+    created_items = [c for c in _log143(a, "gh.log") if c[:2] == ["pr", "create"]]
+    assert [c[c.index("--base") + 1] for c in created_items] == ["development", "staging"], created_items
+    assert all(c[c.index("--head") + 1] == "feat/algo" for c in created_items)
+    body = open(os.path.join(a.fake, "body.txt")).read()
+    assert "## Summary\n\nResumo da entrega." in body and "red→green `test_x`" in body and "## Merge Danger\n\nPorta de mão dupla." in body, body
+    assert [(i["task"], i["base"]) for i in _read_state(os.path.join(a.home, "prs.json"))["itens"]] == [("task_feat", "development"), ("task_feat", "staging")]
+
+
+def test_ticket338_pr_open_head_keeps_the_name_unless_rename_is_asked():
+    a = _open_pr338()
+    assert _open_head338(a).returncode == 0
+    assert "leodiegoo/feat/algo" in a.remote_branches() and "feat/algo" not in a.remote_branches()
+
+
+def test_ticket338_pr_open_head_refuses_with_the_conflicting_files_before_any_push():
+    a = _open_pr338(staging_conflict=True)
+    r = _open_head338(a, "--rename")
+    assert r.returncode == 1 and "staging" in r.stderr and "a.js" in r.stderr and "merge/algo-staging" in r.stderr, r.stderr
+    assert "feat/algo" not in a.remote_branches() and not _log143(a, "gh.log")
+
+
+def test_ticket338_pr_open_head_refuses_foreign_author_and_trailer_before_any_push():
+    for kw, wanted in (({"author": "noreply@anthropic.com"}, "noreply@anthropic.com"), ({"message": "feat: add algo\n\nCo-Authored-By: X <x@y.z>"}, "Co-Authored-By")):
+        a = _open_pr338(**kw)
+        r = _open_head338(a, "--rename")
+        assert r.returncode == 1 and wanted in r.stderr, r.stderr
+        assert "feat/algo" not in a.remote_branches() and not _log143(a, "gh.log")
+
+
+def test_ticket338_pr_open_head_without_body_nor_report_refuses():
+    a = _open_pr338(report=None)
+    r = _open_head338(a)
+    assert r.returncode == 1 and "final-report.md" in r.stderr and not _log143(a, "gh.log"), r.stderr
 # ---------- ticket 227: orq pr abrir audits the commits and the branch ----------
 
 def _repo227(t):
