@@ -5880,9 +5880,14 @@ def no_terminal_line(open_state):
 
 
 def state(entry=None, include_old=False):
-    events, cur, open_state = read_events(), _cursor_ro(), _read_json(_path("open.json"))
-    txt = summary(events, open_state, _pending_ro(), entry, cursor=cur, turns=_turns_ro(), panel=panel_notice(), include_old=include_old)
-    return "\n".join([*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events), *filter(None, [released_line(events, tickets()), dispatch_wait_line(tickets(), events)]), *wave_lines()])
+    events, cur, open_state = hook_stage("digest_read", lambda: (read_events(), _cursor_ro(), _read_json(_path("open.json"))))
+    pending, turns, panel = _pending_ro(), _turns_ro(), panel_notice()
+    txt = hook_stage("digest_summary", lambda: summary(events, open_state, pending, entry, cursor=cur, turns=turns, panel=panel, include_old=include_old))
+    def extra_lines():
+        ts = tickets()
+        return [*filter(None, [codex_hooks_notice()]), txt, *filter(None, [no_terminal_line(open_state)]), *night_lines(cur, events),
+                *filter(None, [released_line(events, ts), dispatch_wait_line(ts, events)]), *wave_lines()]
+    return "\n".join(hook_stage("digest_context", extra_lines))
 
 
 # ---------- digest e modo ausente ----------
@@ -7373,6 +7378,12 @@ def timed_hook_stage(stages, name, fn, clock=None):
         stages[f"{name}_ms"] = round((clock() - started) * 1000, 3)
 
 
+def hook_stage(name, fn):
+    """Time a meaningful operation inside the currently running hook body."""
+    stages = HOOK_STATE.get("stages")
+    return timed_hook_stage(stages, name, fn) if isinstance(stages, dict) else fn()
+
+
 def save_hook_timings(kind, stages):
     """Persist latest stages and bounded history of slow hook executions."""
     path = _path(HOOK_TIMINGS_FILE)
@@ -7393,8 +7404,19 @@ def save_hook_timings(kind, stages):
 def hook_timings_text():
     """Human-readable latest measurements and slow execution history."""
     timings = _dict(_read_json(_path(HOOK_TIMINGS_FILE)))
-    lines = [f"hook timing: {kind}: " + ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items() if name.endswith("_ms"))
-             for kind, stages in sorted(timings.items()) if isinstance(stages, dict)]
+    lines = []
+    for kind, stages in sorted(timings.items()):
+        if not isinstance(stages, dict):
+            continue
+        lines.append(f"hook timing: {kind}: " + ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items() if name.endswith("_ms")))
+        measured = [(name, value) for name, value in stages.items()
+                    if name.endswith("_ms") and name not in ("parse_ms", "role_lookup_ms", "coordinator_lookup_ms", "total_ms", "hook_body_ms")
+                    and isinstance(value, (int, float))]
+        if not measured and isinstance(stages.get("hook_body_ms"), (int, float)):
+            measured = [("hook_body_ms", stages["hook_body_ms"])]
+        if measured:
+            name, value = max(measured, key=lambda item: item[1])
+            lines.append(f"slowest hook stage: {kind}: {name.removesuffix('_ms')} {value:g} ms")
     for item in timings.get("history", []) if isinstance(timings.get("history"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -7490,7 +7512,7 @@ ONLY_ORQ_COMMAND = re.compile(r"\s*/away(\s+\w+)?\s*$")
 
 def hook_prompt(ev, run):
     if not os.environ.get("ORQ_MATE"):
-        wake_release()  # a new turn: the Stop's `hook acordar` leaves, and whatever waits in the queue goes out in this prompt's context
+        hook_stage("wake_release", wake_release)  # a new turn: the Stop's `hook acordar` leaves, and whatever waits in the queue goes out in this prompt's context
     org = origin_name(ev.get("prompt"))
     text_value, with_notice = split_notice(ev.get("prompt")) if org == "usuario" else (ev.get("prompt") or "", False)
     if with_notice and not text_value.strip():
@@ -7506,35 +7528,35 @@ def hook_prompt(ev, run):
         if blocker:
             return blocker
     if org in ("orca", "notificacao"):
-        mark_arrival(org)
+        hook_stage("mark_arrival", lambda: mark_arrival(org))
     elif with_notice:
-        mark_arrival("orca")
+        hook_stage("mark_arrival", lambda: mark_arrival("orca"))
     if org == "orca":
-        refresh_bg(refresh=False)  # the Orca notice is the new-message signal: ingest the inbox now, without redoing aberto.json (one heartbeat per 100 s)
+        hook_stage("ingest_start", lambda: refresh_bg(refresh=False))  # the Orca notice is the new-message signal: ingest the inbox now, without redoing aberto.json (one heartbeat per 100 s)
     if org != "usuario":
         if not os.environ.get("ORQ_MATE"):
             with contextlib.suppress(Exception):
-                record_coordinator_resume()
-        ln = night_lines(_cursor_ro(), read_events()) if org in ("orca", "notificacao") else []  # the night wakes the coordinator by notice, not by user
+                hook_stage("away_resume", record_coordinator_resume)
+        ln = hook_stage("night_digest", lambda: night_lines(_cursor_ro(), read_events())) if org in ("orca", "notificacao") else []  # the night wakes the coordinator by notice, not by user
         if org == "orca" and (r := NOTICE_RUN.search(ev.get("prompt") or "")):
-            ln = [*inbox_in_prompt(r.group(1)), *ln]
-        if org == "aviso_orq" and text_value.lstrip().startswith("orq: PR ") and (obligation_part := obligations_line(read_events())):
+            ln = [*hook_stage("mailbox", lambda: inbox_in_prompt(r.group(1))), *ln]
+        if org == "aviso_orq" and text_value.lstrip().startswith("orq: PR ") and (obligation_part := hook_stage("obligations", lambda: obligations_line(read_events()))):
             ln = [*ln, obligation_part]  # the merge notice arrives already carrying what it asks for
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(ln)}} if ln else None
     with contextlib.suppress(Exception):
-        _gate_resets_total((ev.get("session_id") or "")[:8])
-    entry = append_event({"tipo": "entrada", "origem": "usuario", "texto": text_value[:2000], "sessao": (ev.get("session_id") or "")[:8],
+        hook_stage("gate_reset", lambda: _gate_resets_total((ev.get("session_id") or "")[:8]))
+    entry = hook_stage("entry_append", lambda: append_event({"tipo": "entrada", "origem": "usuario", "texto": text_value[:2000], "sessao": (ev.get("session_id") or "")[:8],
                             "terminal": os.environ["ORCA_TERMINAL_HANDLE"],
-                            **({"com_aviso": True} if with_notice else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, new_id=True)
+                            **({"com_aviso": True} if with_notice else {}), **({"grupo": os.environ["ORQ_MATE"]} if os.environ.get("ORQ_MATE") else {})}, new_id=True))
     if ONLY_ORQ_COMMAND.match(text_value):  # `/away` and `/away status` ask for no effect: they close on their own
-        intake(entry["id"], "conversa", note="orq command")
+        hook_stage("auto_intake", lambda: intake(entry["id"], "conversa", note="orq command"))
     with contextlib.suppress(Exception):  # the notices orq types and the entries it already knows the effect of (ticket 337)
-        auto_intake()
-    check_manager_bg()
-    ctx = state(entry)
-    if not os.environ.get("ORQ_MATE") and (deferred := context_notices()):  # the notice queue belongs to the coordinator
+        hook_stage("auto_intake", auto_intake)
+    hook_stage("manager_check", check_manager_bg)
+    ctx = hook_stage("state_digest", lambda: state(entry))
+    if not os.environ.get("ORQ_MATE") and (deferred := hook_stage("away_notices", context_notices)):  # the notice queue belongs to the coordinator
         ctx += "\n" + deferred
-    refresh_bg()
+    hook_stage("ingest_start", refresh_bg)
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
 
 
@@ -8323,6 +8345,7 @@ def run_hook(kind, harness="claude"):
     HOOK_STATE.clear()
     HOOK_STATE["kind"] = kind
     stages, started, persist_timings = {}, HOOK_CLOCK(), False
+    HOOK_STATE["stages"] = stages
 
     def overflow(*_):
         raise TimeoutError(f"hook {kind} passou de {HOOK_TIMEOUT}s")
@@ -8411,6 +8434,7 @@ def run_hook(kind, harness="claude"):
             stages["total_ms"] = round((HOOK_CLOCK() - started) * 1000, 3)
             with contextlib.suppress(Exception):
                 save_hook_timings(kind, stages)
+        HOOK_STATE.pop("stages", None)
         if HOOK_STATE.get("failed") and not HOOK_STATE.get("printed"):
             emit_hook()  # the hook died or lost Orca before answering: the warning still reaches the user
         elif kind in WARN_KINDS and not HOOK_STATE.get("failed"):

@@ -5828,6 +5828,26 @@ def test_ticket425_hook_timing_history_keeps_only_slow_runs_and_doctor_shows_it(
         orq_mod.HOME, orq_mod.now = original_home, original_now
 
 
+def test_ticket449_coordinator_prompt_reports_body_stages_and_slowest_stage():
+    a = Env()
+    r = a.prompt("synthetic coordinator prompt")
+    assert r.returncode == 0, r.stderr
+    timings = json.load(open(os.path.join(a.home, "hook-timings.json")))
+    stages = timings["prompt"]
+    for stage in ("wake_release_ms", "gate_reset_ms", "entry_append_ms", "auto_intake_ms", "manager_check_ms", "state_digest_ms", "ingest_start_ms"):
+        assert stage in stages, stages
+    assert stages["hook_body_ms"] < 1000, stages
+    doctor = a.orq("doctor", "hooks")
+    assert doctor.returncode == 0, doctor.stderr
+    assert "slowest hook stage: prompt:" in doctor.stdout, doctor.stdout
+    assert "state_digest" in doctor.stdout and "manager_check" in doctor.stdout, doctor.stdout
+
+    with InProcess(a):
+        orq_mod.save_hook_timings("prompt", {"state_digest_ms": 2, "manager_check_ms": 7, "hook_body_ms": 9, "total_ms": 10})
+    doctor = a.orq("doctor", "hooks")
+    assert "slowest hook stage: prompt: manager_check 7 ms" in doctor.stdout, doctor.stdout
+
+
 def test_ticket418_install_adds_codex_timeout_without_changing_claude_command():
     t = os.path.realpath(tempfile.mkdtemp())
     clone = _clone124(t)
