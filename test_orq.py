@@ -5406,6 +5406,43 @@ def test_ticket20_user_draft_in_coordinator_box_holds_the_notice():
     assert len(_sent_notices(a)) == 1
 
 
+def test_ticket414_free_terminal_uses_screen_when_orca_reports_a_stale_draft():
+    a = Env()
+    a.set("drafts.json", {"term_w1": "stale draft reported by Orca"})
+    a.set("screens.json", {"term_w1": _screen52("tela-claude-ocioso.txt")})
+    before = orq_mod.orca
+    try:
+        orq_mod.orca = lambda *args, **kwargs: (
+            {"wait": {"satisfied": True}} if args[0] == "wait"
+            else {"terminal": {"draft": "stale draft reported by Orca", "tail": json.load(open(os.path.join(a.fake, "screens.json")))["term_w1"]}}
+        )
+        assert orq_mod.free_terminal("term_w1") is None
+        a.set("screens.json", {"term_w1": ["Claude Code", "╭──────────────────────────────────────╮", "│ > texto digitado                     │", "╰──────────────────────────────────────╯"]})
+        assert orq_mod.free_terminal("term_w1") == "rascunho"
+    finally:
+        orq_mod.orca = before
+
+
+def test_ticket417_free_terminal_falls_back_to_orca_draft_when_screen_cannot_be_read():
+    before = orq_mod.orca
+    try:
+        for response in (
+            {"terminal": {"draft": "still typing", "source": "screen-unavailable", "tail": []}},
+            {"terminal": {"draft": "still typing", "tail": []}},
+        ):
+            orq_mod.orca = lambda *args, response=response, **kwargs: (
+                {"wait": {"satisfied": True}} if args[0] == "wait" else response
+            )
+            assert orq_mod.free_terminal("term_w1") == "rascunho"
+        orq_mod.orca = lambda *args, **kwargs: (
+            {"wait": {"satisfied": True}} if args[0] == "wait" else
+            ({"terminal": {"draft": "still typing"}} if "--screen" not in args else (_ for _ in ()).throw(RuntimeError("screen read failed")))
+        )
+        assert orq_mod.free_terminal("term_w1") == "rascunho"
+    finally:
+        orq_mod.orca = before
+
+
 def test_ticket20_enter_that_did_not_submit_gets_a_lone_enter_and_no_new_text():
     a = Env(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger"}, ["run_a"])
@@ -11136,7 +11173,7 @@ def test_ticket60_does_not_hibernate_with_shell_still_running_spinner_stuck_ques
         "shell still running": screen("tela-claude-shell.txt"),
         "spinner": screen("tela-claude-spinner.txt"),
         "pergunta presa": screen("tela-permissao.txt"),
-        "rascunho": lambda a: a.set("drafts.json", {"term_w1": "estava digitando"}),
+        "rascunho": lambda a: a.set("screens.json", {"term_w1": ["Claude Code", "╭──────────────────────────────────────╮", "│ > estava digitando                   │", "╰──────────────────────────────────────╯"]}),
         "no meio do turno": lambda a: a.set("busy.json", ["term_w1"]),
         "processo filho vivo": lambda a: _procs60(a, extra=[{"pid": 150, "ppid": 100, "rss": 5000, "args": CHILD60, "cwd": None}]),
         "sem prova do processo": lambda a: _procs60(a, without=("w1",)),
