@@ -16945,6 +16945,146 @@ def test_ticket421_external_guard_checks_every_publication_command_and_body_file
             assert orqlib._public_external_denial({"cwd": "/elsewhere"}, 'git -C /repo commit -m "docs: dbq"')
 
 
+def test_ticket483_ticket377_comment_is_refused_before_publication_without_authorization():
+    repo = "Confi" + "Neo" + "trust" + "/" + "neo" + "trust"
+    fixture = {
+        "url": f"https://github.com/{repo}/issues/2111#issuecomment-5965892582",
+        "body": "The ticket 377 comment exposed eL" + "tH and db" + "q.",
+    }
+    command = f'gh issue comment 2111 --repo {repo} --body "{fixture["body"]}"'
+    event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/repo", "session_id": "worker"}
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {"patterns": [r"re:\beLtH\b"]}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        missing = orqlib.hook_external(event, None)
+        missing_reason = missing["hookSpecificOutput"]["permissionDecisionReason"]
+        assert missing["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "authorization" in missing_reason.lower() and "issues/2111" in missing_reason
+        orqlib.authorize_external(fixture["url"], "30m")
+        exposed = orqlib.hook_external(event, None)
+        exposed_reason = exposed["hookSpecificOutput"]["permissionDecisionReason"]
+        assert exposed["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "public content refused" in exposed_reason and "eLtH" in exposed_reason and "dbq" in exposed_reason
+
+
+def test_ticket483_authorized_issue_pr_and_api_targets_pass_the_hook_exactly():
+    cases = [
+        ("https://github.com/client/repo/issues/2111", 'gh issue edit 2111 --repo client/repo --body "safe update"'),
+        ("https://github.com/client/repo/issues/2111", 'gh issue comment https://github.com/client/repo/issues/2111 --body "safe URL target"'),
+        ("https://github.com/client/repo/pull/42", 'gh pr comment 42 --repo client/repo --body "safe review note"'),
+        ("https://github.com/client/repo/pull/42", 'gh pr review 42 --repo client/repo --approve --body "safe approval"'),
+        ("https://github.com/client/repo/issues/2111", 'gh api repos/client/repo/issues/2111/comments -X POST -f body=safe'),
+        ("https://github.com/client/repo/pull/42", 'gh api --method PATCH repos/client/repo/pulls/42 -f title=safe'),
+    ]
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "_own_github_repo", return_value="acme/source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        for url, command in cases:
+            grant = orqlib.authorize_external(url)
+            event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/repo", "session_id": "worker"}
+            assert orqlib.hook_external(event, None) is None, (url, command, grant)
+
+
+def test_ticket483_away_and_a_grant_for_another_issue_do_not_authorize_the_target():
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "_own_github_repo", return_value="acme/source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"ausente": {"ligada_em": "2026-10-03T18:00:00Z"}, "papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        orqlib.authorize_external("https://github.com/client/repo/issues/2111")
+        event = {"tool_name": "Bash", "tool_input": {"command": 'gh issue comment 2112 --repo client/repo --body "safe"'},
+                 "cwd": "/repo", "session_id": "worker"}
+        result = orqlib.hook_external(event, None)
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "no active coordinator authorization" in reason and "issues/2112" in reason
+
+
+def test_ticket483_external_create_authorization_expires_and_is_consumed_once():
+    url = "https://github.com/client/repo/issues/new"
+    command = 'gh issue create --repo client/repo --title "Safe title" --body "Safe body"'
+    event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/repo", "session_id": "worker"}
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_AGORA": "2026-10-03T19:00:00Z"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "_own_github_repo", return_value="acme/source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        grant = orqlib.authorize_external(url)
+        assert grant["expires_utc"] == "2026-10-03T19:30:00Z"
+        assert orqlib.hook_external(event, None) is None
+        used = orqlib.hook_external(event, None)
+        assert "already approved one create" in used["hookSpecificOutput"]["permissionDecisionReason"]
+        orqlib.authorize_external(url, "1h")
+        with mock.patch.dict(os.environ, {"ORQ_AGORA": "2026-10-03T21:00:00Z"}):
+            expired = orqlib.hook_external(event, None)
+        assert "has expired" in expired["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_ticket483_api_create_scans_file_body_before_using_the_one_create_grant():
+    url = "https://github.com/client/repo/issues/new"
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "_own_github_repo", return_value="acme/source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        body_file = os.path.join(home, "body.json")
+        pathlib.Path(body_file).write_text('"dbq must not be published"')
+        command = f"gh api --method POST repos/client/repo/issues -F title=Safe -F body=@{body_file}"
+        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/repo", "session_id": "worker"}
+        orqlib.authorize_external(url)
+        blocked = orqlib.hook_external(event, None)
+        assert "public content refused" in blocked["hookSpecificOutput"]["permissionDecisionReason"]
+        assert orqlib._external_authorization_status(url) == "authorized", "a rejected body does not consume the create grant"
+        pathlib.Path(body_file).write_text('"safe body"')
+        assert orqlib.hook_external(event, None) is None
+        used = orqlib.hook_external(event, None)
+        assert "already approved one create" in used["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_ticket483_authorize_external_cli_requires_the_coordinator_terminal():
+    a = Env()
+    os.makedirs(a.home, exist_ok=True)
+    _write_state(os.path.join(a.home, "manager.json"), {"coordinator": "term_coord", "manager": "term_manager", "runs": ["run_a"]})
+    url = "https://github.com/client/repo/issues/2111"
+    granted = a.orq("authorize", "external", url, "--for", "2h")
+    assert granted.returncode == 0 and url in granted.stdout and "until" in granted.stdout, granted.stderr
+    records = json.load(open(os.path.join(a.home, "external-publications.json")))["authorizations"]
+    assert records[-1]["target_url"] == url and records[-1]["expires_utc"]
+    refused = a.orq("authorize", "external", url, ORCA_TERMINAL_HANDLE="term_worker")
+    assert refused.returncode != 0 and "only the bound coordinator terminal" in refused.stderr
+    unsupported = a.orq("authorize", "external", "https://github.com/client/repo/pulls/new")
+    assert unsupported.returncode != 0 and "repository-scoped /issues/new URL" in unsupported.stderr
+
+
+def test_ticket483_external_pr_create_without_an_exact_pr_url_is_refused():
+    event = {"tool_name": "Bash", "tool_input": {"command": 'gh pr create --repo client/repo --title "Safe title" --body "Safe body"'},
+             "cwd": "/repo", "session_id": "worker"}
+    with tempfile.TemporaryDirectory() as home, mock.patch.object(orqlib, "HOME", home), \
+         mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_coord"}), \
+         mock.patch.object(orqlib, "_public_project", return_value="source"), \
+         mock.patch.object(orqlib, "_own_github_repo", return_value="acme/source"), \
+         mock.patch.object(orqlib, "projects", return_value={"source": {"publico_proibido": {}}}), \
+         mock.patch.object(orqlib, "_cursor_ro", return_value={"papeis": {"worker": "worker"}}), \
+         mock.patch.object(orqlib, "_manager_cfg", return_value={"coordenador": "term_coord"}):
+        result = orqlib.hook_external(event, None)
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "PR creation has no exact PR URL to authorize" in reason
+
+
 def test_ticket421_pr_open_and_delivery_check_refuse_the_same_project_rule():
     with tempfile.TemporaryDirectory() as folder:
         body = os.path.join(folder, "body.md")
