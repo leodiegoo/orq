@@ -5406,6 +5406,23 @@ def test_ticket20_user_draft_in_coordinator_box_holds_the_notice():
     assert len(_sent_notices(a)) == 1
 
 
+def test_ticket414_free_terminal_uses_screen_when_orca_reports_a_stale_draft():
+    a = Env()
+    a.set("drafts.json", {"term_w1": "stale draft reported by Orca"})
+    a.set("screens.json", {"term_w1": _screen52("tela-claude-ocioso.txt")})
+    before = orq_mod.orca
+    try:
+        orq_mod.orca = lambda *args, **kwargs: (
+            {"wait": {"satisfied": True}} if args[0] == "wait"
+            else {"terminal": {"draft": "stale draft reported by Orca", "tail": json.load(open(os.path.join(a.fake, "screens.json")))["term_w1"]}}
+        )
+        assert orq_mod.free_terminal("term_w1") is None
+        a.set("screens.json", {"term_w1": ["Claude Code", "╭──────────────────────────────────────╮", "│ > texto digitado                     │", "╰──────────────────────────────────────╯"]})
+        assert orq_mod.free_terminal("term_w1") == "rascunho"
+    finally:
+        orq_mod.orca = before
+
+
 def test_ticket20_enter_that_did_not_submit_gets_a_lone_enter_and_no_new_text():
     a = Env(ORCA_TERMINAL_HANDLE="term_ger")
     _multi(a, {"run_a": "term_ger"}, ["run_a"])
@@ -24004,5 +24021,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
-
