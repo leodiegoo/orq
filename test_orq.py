@@ -23539,6 +23539,22 @@ def test_ticket391_cited_ticket_numbers_and_files_do_not_block_but_blocked_by_an
     assert _bl_items(a)["t04"]["bloqueios"] == ["t02"], "explicit Blocked by still blocks"
 
 
+def test_ticket402_area_blocking_stays_within_project_but_explicit_blocked_by_crosses_projects():
+    a = _env_tk()
+    _project(a, "orq", {"repo": "path:/r/orq"})
+    _project(a, "dbq", {"repo": "path:/r/dbq"})
+    shared = lambda name: _area_spec(a, name, "Touches: AGENTS.md\n\nUpdate the project instructions.")
+    assert _new(a, "orq: Base", "--project", "orq", spec=shared("orq.md")).returncode == 0
+    dbq = _new(a, "dbq: Feature", "--project", "dbq", spec=shared("dbq.md"))
+    assert dbq.returncode == 0, dbq.stderr
+    assert _bl_items(a)["t02"]["bloqueios"] == [], "a shared file name in another project is not an area conflict"
+    assert _new(a, "dbq: Same project", "--project", "dbq", spec=shared("dbq-2.md")).returncode == 0
+    assert _bl_items(a)["t03"]["bloqueios"] == ["t02"], "same-project area collisions still block"
+    explicit = _new(a, "dbq: Explicit", "--project", "dbq", "--blocked-by", "01", spec=_area_spec(a, "explicit.md", "No shared area."))
+    assert explicit.returncode == 0, explicit.stderr
+    assert _bl_items(a)["t04"]["bloqueios"] == ["t01"], "explicit blockers still cross project boundaries"
+
+
 def test_ticket388_send_back_refuses_the_dispatch_a_later_one_replaced_on_the_same_worktree():
     a = Env()
     a.set("workers.json", [{"handle": "term_w0", "run": "run_a", "task": "task_feita", "dispatch": "ctx_0", "status": "completed"},
@@ -23824,4 +23840,3 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
-
