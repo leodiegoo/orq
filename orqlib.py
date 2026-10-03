@@ -3329,6 +3329,85 @@ def _delivery_proof(m, p):
         append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m["run_id"], "msg": m["id"], "avisos": notices})
 
 
+def _push_product_pr(m, p):
+    """Push a successful product ticket to its declared open PR branch after local publication checks.
+
+    The destination is only considered when `Branch do PR:` is present on the ticket or the dispatch recorded
+    `--base-branch`. A fetch plus merge-base check guarantees a fast-forward; `git push` has no force option.
+    """
+    if p.get("outcome") != "succeeded" or not p.get("dispatchId"):
+        return True
+    dispatch = next((e for e in reversed(read_events()) if e.get("tipo") == "despacho" and e.get("dispatch") == p["dispatchId"]), {})
+    ticket = next((t for t in tickets() if t.get("task") == p.get("taskId")), None)
+    project = _delivery_project(ticket, p.get("dispatchId"))
+    if not project or not ticket:
+        return True
+    ticket_text = _text_of(ticket["arquivo"])
+    branch = _md_field(ticket_text, "Branch do PR") or dispatch.get("base_branch")
+    if not branch:
+        return True
+    repo = repo_folder(projects()[project]["repo"])
+    worktree = _dispatch_worktree(m.get("run_id"), p["dispatchId"])
+    if not repo or not worktree:
+        reason = "project repository or dispatch worktree is unavailable"
+        _product_push_notice(m, p, branch, reason)
+        return False
+    remote = (projects()[project].get("remote") or "origin")
+    try:
+        fetch = subprocess.run([GIT, "-C", repo, "fetch", remote, branch], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        _product_push_notice(m, p, branch, f"could not fetch {remote}/{branch} ({type(error).__name__}: {error})")
+        return False
+    upstream = f"refs/remotes/{remote}/{branch}"
+    tip = (_git(repo, "rev-parse", "--verify", upstream) or "").strip()
+    head = (_git(worktree, "rev-parse", "HEAD") or "").strip()
+    reasons = []
+    if fetch.returncode or not tip:
+        reasons.append(f"could not fetch {remote}/{branch}: {(fetch.stderr or '').strip()}")
+    elif subprocess.run([GIT, "-C", worktree, "merge-base", "--is-ancestor", tip, head], capture_output=True).returncode:
+        reasons.append(f"HEAD {head[:8]} is not a fast-forward of {remote}/{branch} ({tip[:8]})")
+    config = projects()[project]
+    expected = config.get("author") or config.get("autor") or (_git(repo, "config", "user.email") or "").strip()
+    if not expected:
+        reasons.append("project author email is not configured")
+    elif tip and head:
+        commits = _git(worktree, "rev-list", f"{tip}..{head}")
+        for sha in (commits or "").split():
+            record = (_git(worktree, "show", "-s", "--format=%ae%x00%ce%x00%B", sha) or "").split("\0", 2)
+            if len(record) != 3 or record[0] != expected or record[1] != expected:
+                reasons.append(f"commit {sha[:8]} author and committer must be {expected}")
+            if re.search(r"^co-authored-by:|generated with|🤖", record[2] if len(record) == 3 else "", re.I | re.M):
+                reasons.append(f"commit {sha[:8]} has a Co-Authored-By trailer or generator footer")
+    if reasons:
+        _product_push_notice(m, p, branch, "; ".join(reasons))
+        return False
+    try:
+        pushed = subprocess.run([GIT, "-C", worktree, "push", remote, f"HEAD:refs/heads/{branch}"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        _product_push_notice(m, p, branch, f"git push failed ({type(error).__name__}: {error})")
+        return False
+    if pushed.returncode:
+        _product_push_notice(m, p, branch, (pushed.stderr or "git push failed").strip())
+        return False
+    append_event({"tipo": "pr_branch_push", "dispatch": p["dispatchId"], "task": p.get("taskId"), "run": m.get("run_id"),
+                  "msg": m["id"], "projeto": project, "branch": branch, "head": head, "remote": remote})
+    linked_pr = next((item for item in _prs_ro()["itens"] if item.get("task") == p.get("taskId") and item.get("estado") == "aberto"), None)
+    if linked_pr:
+        try:
+            ticket_close(ticket["num"], f"pushed {head} to {remote}/{branch}; {linked_pr['url']}")
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            _product_push_notice(m, p, branch, f"pushed {head}, but ticket {ticket['num']} could not close ({e})")
+            return False
+    return True
+
+
+def _product_push_notice(m, p, branch, reason):
+    text_value = f"ticket {p.get('taskId')} was not pushed to PR branch {branch}: {reason}"
+    append_event({"tipo": "entrega", "dispatch": p.get("dispatchId"), "task": p.get("taskId"), "run": m.get("run_id"),
+                  "msg": m.get("id"), "avisos": [text_value]})
+    log(f"product PR branch push: {text_value}")
+
+
 BRANCH_RE = re.compile(r"\b(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)/[\w./-]*\w")
 
 
@@ -3672,16 +3751,21 @@ def _ingest_msg(m, since, already, titles, send=True):
         return 0
     p = _payload(m)
     _delivery_proof(m, p)
-    queued = None
+    queued, delivery_ok = None, True
     try:
-        if _delivery_worktrees(m, p, send) and _delivery_conformance(m, p, send):  # a commit outside the dispatch worktrees (ticket 352); an incomplete one went back to the worker: it does not enter the integrator queue (ticket 201)
+        worktree_ok = _delivery_worktrees(m, p, send)  # a commit outside the dispatch worktrees (ticket 352)
+        delivery_ok = worktree_ok and _delivery_conformance(m, p, send)  # an incomplete delivery went back to the worker: it does not enter the integrator queue (ticket 201)
+        if delivery_ok:
             queued = None if _manual_delivery(m, p) else _orq_delivery(m, p)
             _delivery_head_of_worktree(m, p)
             if queued and (t := next((t for t in tickets() if t["num"] == queued), None)) and cites_red_green(t["arquivo"]):
                 red_proof_bg(queued)  # only the delivery that just entered the queue: the manager and `orq inbox` ingest the same message
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:  # the queue is an extra: the message's report is not lost because of it
+        delivery_ok = False
         log(f"orq delivery: worker_done {m['id']}: {type(e).__name__}: {e}")
-    _release_delivered(m, p, queued)
+    pushed = _push_product_pr(m, p) if delivery_ok else False
+    if pushed:
+        _release_delivered(m, p, queued)
     if p.get("reportPath"):
         items = _report_items(p["reportPath"])
         alert = None
@@ -13200,6 +13284,8 @@ def projects():
         findings[item_name] = {"repo": d.get("repo"), "harness": harness, "grupo": d.get("grupo"), "ambientes": envs, "producao": production, "fluxo": flow,
                          "fila_e2e": d.get("fila_e2e"), "transcritos": d.get("transcritos"), "erro": error,
                          "merge_allowed": {b: v for b, v in d["merge_allowed"].items() if v is True} if isinstance(d.get("merge_allowed"), dict) else {},
+                         "remote": d.get("remote") if isinstance(d.get("remote"), str) and d["remote"].strip() else None,
+                         "author": d.get("author") or d.get("autor") if isinstance(d.get("author") or d.get("autor"), str) else None,
                          "deploy_check": d["deploy_check"] if isinstance(d.get("deploy_check"), str) and d["deploy_check"].strip() else None,
                          "caminhos_ui": [g for g in d["caminhos_ui"] if isinstance(g, str) and g] if isinstance(d.get("caminhos_ui"), list) else [],
                          "tests": _file_tests(d.get("tests")),
@@ -13869,7 +13955,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         ev = {"tipo": "despacho", "run": run, "task": task, "dispatch": dispatch, "titulo": title, "agente": agent, "modelo": model, "effort": effort, "terminal": terminal,
               **({"worktree": worktree} if worktree else {}), **({"nome": name} if name else {}), **({"entrada": entry} if entry else {}),
               **({"ticket": tk["num"]} if tk else {}), **({"ambiente": list(environment)} if environment else {}), **({"prioridade": priority_level} if priority_level else {}),
-              **({"projeto": project} if project else {}),
+              **({"projeto": project} if project else {}), **({"base_branch": base_branch} if base_branch else {}),
               **({"servico": True} if service else {}), **({"direct": direct} if direct else {}),
               **({"worktrees": [w for _, w in pairs]} if pairs else {}), **({"conformidade": items, "entrada_real": real} if items else {}), **({"scratch": scratch} if scratch else {})}
         append_event(ev)

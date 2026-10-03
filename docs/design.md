@@ -666,6 +666,10 @@ Rehearsal on the real case: with the log cut before tickets 196 to 200 (2026-10-
 
 Limits: the check sees only `orq pr open`; a PR created with `gh pr create` by hand is linked by the hook and not checked, and `pr open <branch>` skips the conformance verdict (it has no dispatch). The orq integrator (`scripts/integrar.py`) writes no PR text, so it has no phase to check; a product integration is a dispatch, checked through its delivery. The block written once into a ticket file keeps its numbering if the ticket's items are edited afterwards. The title fallback depends on the coordinator's title convention (`#<issue> ... ticket NN`).
 
+## Product PR branch delivery (ticket 439)
+
+`_ingest_msg` checks product tickets with a `Branch do PR:` field or a dispatch `base_branch` before releasing the worker. `_push_product_pr` fetches the configured project remote (`remote`, default `origin`), checks that the dispatch worktree HEAD descends from the fetched branch tip, and validates every new commit's author and committer against the configured project `author` (default repository `user.email`), rejecting Co-Authored-By and generator footers. It pushes with ordinary `git push remote HEAD:refs/heads/<branch>`; git's non-fast-forward rejection is the final race guard. Success records `pr_branch_push` with the remote, branch and hash and closes the local product ticket with its linked PR URL. Any check or push failure records an `entrega` notice and prevents automatic release.
+
 ## Integrating branches outside the live checkout (ticket 55)
 
 The live clone is the repository and the installation at once: the hooks, `orq` and the manager panel run whatever is checked out there. A `git merge` with open conflicts in it leaves `<<<<<<<` in `orqlib.py`, and then `orq` dies with a `SyntaxError` on every command, every worker's PreToolUse and PostToolUse hooks fail, and the panel and the digest stop.
