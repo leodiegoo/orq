@@ -7260,6 +7260,8 @@ def confirm_batches(run_id, res, by):
 
 HOOK_TIMINGS_FILE = "hook-timings.json"
 HOOK_CLOCK = time.perf_counter
+HOOK_TIMING_HISTORY_LIMIT = 50
+HOOK_TIMING_HISTORY_THRESHOLD_MS = 3000
 
 
 def timed_hook_stage(stages, name, fn, clock=None):
@@ -7273,18 +7275,34 @@ def timed_hook_stage(stages, name, fn, clock=None):
 
 
 def save_hook_timings(kind, stages):
-    """Persist the latest measured stages per hook kind for `orq doctor hooks`."""
+    """Persist latest stages and bounded history of slow hook executions."""
     path = _path(HOOK_TIMINGS_FILE)
     current = _dict(_read_json(path))
     current[kind] = stages
+    history = current.get("history")
+    if not isinstance(history, list):
+        history = []
+    total_ms = stages.get("total_ms", 0)
+    if isinstance(total_ms, (int, float)) and total_ms > HOOK_TIMING_HISTORY_THRESHOLD_MS:
+        event = {"kind": kind, "at": now(), "stages": {name: value for name, value in stages.items() if name.endswith("_ms")},
+                 "box_bytes": stages.get("box_bytes", 0)}
+        history.append(event)
+        current["history"] = history[-HOOK_TIMING_HISTORY_LIMIT:]
     _write_json(path, current)
 
 
 def hook_timings_text():
-    """Human-readable latest stage timings, empty before a hook has run."""
+    """Human-readable latest measurements and slow execution history."""
     timings = _dict(_read_json(_path(HOOK_TIMINGS_FILE)))
-    return [f"hook timing: {kind}: " + ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items())
-            for kind, stages in sorted(timings.items()) if isinstance(stages, dict)]
+    lines = [f"hook timing: {kind}: " + ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items() if name.endswith("_ms"))
+             for kind, stages in sorted(timings.items()) if isinstance(stages, dict)]
+    for item in timings.get("history", []) if isinstance(timings.get("history"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        stages = item.get("stages") if isinstance(item.get("stages"), dict) else {}
+        summary = ", ".join(f"{name.removesuffix('_ms')} {value:g} ms" for name, value in stages.items() if name.endswith("_ms"))
+        lines.append(f"slow hook timing: {item.get('at', '?')} {item.get('kind', '?')}: {summary}; box {item.get('box_bytes', 0)} bytes")
+    return lines
 
 
 def absorb_heartbeats(run_id, pending_messages=None):
@@ -8215,6 +8233,7 @@ def run_hook(kind, harness="claude"):
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             return 0  # outside Orca there is no Run or terminal: it neither calls Orca nor fills the log
         ev = timed_hook_stage(stages, "parse", lambda: json.load(sys.stdin))
+        stages["box_bytes"] = len(json.dumps(ev, ensure_ascii=False).encode("utf-8"))
         ev["_harness_orq"] = harness  # which agent the hook came from: the coordinator keeps its own
         if kind == "acordar" and (os.environ.get("ORQ_MATE") or harness != "claude"):
             return 0  # only the Claude coordinator has an async rewake; the mate and Codex get their notices typed
