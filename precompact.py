@@ -119,6 +119,7 @@ def build(run, cwd):
     # what matters most comes first: the resume cuts the end (M12). No "orq status": `orq hook session` injects a newer one on compact (B29)
     sections = [
         ("Bound Run", run["id"]),
+        *([("Away mandate", "\n".join(orq.away_readback(orq._cursor_ro())))] if orq.away_enabled() else []),
         ("Last 10 user entries", entries_section()),
         ("Map", DESIGN_PATH),
         ("Agents", agents_section()),

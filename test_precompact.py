@@ -132,6 +132,17 @@ def test_review6_b29_snapshot_does_not_repeat_orq_status():
     assert "orq status" not in open(last_item).read() and "Aberto: backlog" not in open(last_item).read()
 
 
+def test_ticket390_snapshot_carries_the_away_mandate_only_while_away_is_on():
+    cur = os.path.join(HOME, "cursor.json")
+    open(cur, "w").write(json.dumps({"ausente": {"ligada_em": "2026-10-01T22:00:00Z", "palavras": "só investiga, não mergeia"}}))
+    run_it([], {"session_id": "s1", "cwd": REPO})
+    assert "## Away mandate" in open(last_item).read() and "só investiga, não mergeia" in open(last_item).read()
+    os.remove(cur)
+    run_it([], {"session_id": "s1", "cwd": REPO})
+    assert "só investiga" not in open(last_item).read()
+
+
+test_ticket390_snapshot_carries_the_away_mandate_only_while_away_is_on()
 test_review6_m12_resume_shows_newest_entry_and_the_map_within_the_cap()
 test_review6_b29_snapshot_does_not_repeat_orq_status()
 test_review6_b32_delivered_without_release_appear_with_the_command()

@@ -1,6 +1,6 @@
 ---
 description: Turns the orq away mode on or off, or shows it
-argument-hint: [on [--until HH:MM] [--max-dispatches N] [--max-failures 3]|off|status]
+argument-hint: [on [--text "<your words>"] [--until HH:MM] [--max-dispatches N] [--max-failures 3]|off|status]
 allowed-tools: Bash(orq away:*)
 ---
 !`orq away $ARGUMENTS`
