@@ -18504,6 +18504,35 @@ def test_ticket102_m6_doctor_backlog_points_to_task_orca_does_not_list_and_write
     assert open(a.env["ORQ_BACKLOG"]).read() == before and not _log(a, "updated.log"), "o doctor só imprime o conserto"
 
 
+def test_ticket452_doctor_backlog_accepts_completed_deliveries_waiting_for_integrator_or_on_hold():
+    a = _env_tk()
+    for title in ("Na fila", "Segurado", "Fora", "Em ciclo"):
+        _new(a, title)
+        item = backlog_mod.read_value(a.env["ORQ_BACKLOG"])[-1]
+        backlog_mod.cli(a.env["ORQ_BACKLOG"], "start", item["id"])
+    a.set("tasks_run_a.json", [{"id": f"task_tk{i}", "task_title": "entregue", "status": "completed"} for i in range(1, 5)])
+    assert a.orq("integrar", "fila", "add", "feat/fila", "01").returncode == 0
+    assert a.orq("hold", "02", "--reason", "aguardando decisão").returncode == 0
+    _evs(a, {"tipo": "entrega_orq", "ticket": "04", "branch": "feat/ciclo"},
+         {"tipo": "ciclo", "branches": ["feat/ciclo"]})
+
+    r = a.orq("doctor", "backlog", "--json")
+    issues = json.loads(r.stdout)["problemas"]
+    assert r.returncode == 1 and [i["ticket"] for i in issues] == ["03"], issues
+    assert "already completed" in issues[0]["problema"]
+
+
+def test_ticket452_doctor_backlog_does_not_report_a_live_integrator_service_ticket():
+    a = _env_tk()
+    _new(a, "Integrador")
+    backlog_mod.cli(a.env["ORQ_BACKLOG"], "start", "t01")
+    a.set("tasks_run_a.json", [{"id": "task_tk1", "task_title": "integrador", "status": "completed"}])
+    _evs(a, {"tipo": "despacho", "run": "run_a", "task": "task_tk1", "dispatch": "ctx_integrador", "ticket": "01", "servico": True})
+
+    r = a.orq("doctor", "backlog")
+    assert r.returncode == 0 and "consistent (1 tickets, 1 tasks checked)" in r.stdout, (r.stdout, r.stderr)
+
+
 # ---- M7: backlog per group ----
 
 def _orq_group(a, **cfg):

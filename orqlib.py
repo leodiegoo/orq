@@ -11594,7 +11594,7 @@ def backlog_doctor_round(now_at=None):
     if not g.get("coordenador") or now_at - (state.get("ts") or 0) < BACKLOG_DOCTOR_EVERY_S:
         return []
     _write_json(_path(BACKLOG_DOCTOR_FILE), {**state, "ts": now_at})
-    found, line_list, rest = doctor_backlog(), [], []
+    found, line_list, rest = doctor_backlog(manager=True), [], []
     for x in found["problemas"]:
         try:
             if not x.get("seguro"):
@@ -11614,7 +11614,7 @@ def backlog_doctor_round(now_at=None):
     return line_list
 
 
-def doctor_backlog():
+def doctor_backlog(manager=False):
     """`orq doctor backlog` (M6): crosses the tickets of the backlogs (the process's, the machine's and the groups') with Orca's tasks and states the fix for each difference, writing nothing.
 
     Looks for: In flight with no dispatched task, Done with an open task, Queued whose task has already finished or is dispatched, a task that Orca does not list, a missing spec and a file in
@@ -11629,6 +11629,10 @@ def doctor_backlog():
         tks += [(b, t) for i in item_list if (t := backlog.ticket_of_item(i, by_id, root))]
     live_pending = {i["id"] for b in backlogs for i in backlog.read_value(b) if i["repo"] == "pend" and i["estado"] != "done"}
     by_run, notices, problems = {}, [], []
+    events = read_events()
+    integrating, held = integration_queue(), _held(events)
+    dispatch_tickets, services = _dispatch_ticket(events), _services(events)
+    service_tickets = {ticket for dispatch, ticket in dispatch_tickets.items() if dispatch in services and dispatch not in _released(events)}
     for run in sorted({t["run"] for _, t in tks if t["run"] and t["task"]}):
         try:
             by_run[run] = {x["id"]: x for x in orca("task-list", "--run", run, timeout=20)["tasks"]}
@@ -11651,6 +11655,9 @@ def doctor_backlog():
             add_finding(t, f"task {t['task']} is not in Run {t['run']}", "if the work is done, orq ticket close; otherwise recreate the ticket (orq ticket new)")
             continue
         st, is_open = tk.get("status"), tk.get("status") not in ("completed", "failed")
+        if (t["status"] == STATUS_IN_PROGRESS and st == "completed"
+                and (n in integrating or n in held or (not manager and _integrated_into_main(t)) or n in service_tickets)):
+            continue
         if t["status"] == STATUS_CLOSED and is_open:
             add_finding(t, f"Done, but task {t['task']} is {st}", f"orca orchestration task-update --id {t['task']} --status completed --run {t['run']}")
         elif t["status"] == STATUS_IN_PROGRESS and not is_open:
