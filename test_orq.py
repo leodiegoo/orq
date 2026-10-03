@@ -16430,6 +16430,52 @@ def test_ticket165_returned_delivery_leaves_stop_until_new_worker_done():
     assert r2["estado"] == "entregue" and next_item([r2], new), "worker_done novo volta a ser entrega a integrar"
 
 
+# ---------- ticket 340: a delivery held on purpose (the 02/10 case: 214, 209 and 226 kept charging the Stop) ----------
+
+def test_ticket340_held_delivery_leaves_stop_and_notice_shows_reason_and_follow_up_inherits():
+    from datetime import datetime, timezone
+    now_at = datetime.now(timezone.utc)
+    ev = [{"tipo": "despacho", "dispatch": "d1", "task": "t1", "ticket": "50"}, {"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m1"}]
+    row = {"dispatch": "d1", "task": "t1", "estado": "entregue"}
+    next_item = lambda r, events: orq_mod.next_without_user(tks=[_tk126("50", "claimed")], agent_rows=r, integration={}, queue=[], events=events, cfg=orq_mod.machine_cfg(), without_push=0)
+    notice = lambda events: orq_mod.alive_line(events, {"agentes": [row]}, now_at)
+    assert "delivered ticket 50" in next_item([row], ev) and "Delivered, not released: 1" in notice(ev), "without the hold the Stop and the manager charge it"
+    held = ev + [{"tipo": "segurar", "ticket": "50", "dispatch": "d1", "task": "t1", "motivo": "waits for the 329 decision", "ts": "2026-10-02T12:00:00Z"}]
+    (r,) = orq_mod.reassess([row], held, now_at, integration={})
+    assert r["estado"] == "entregue" and r["segurada"]["motivo"] == "waits for the 329 decision"
+    assert next_item([r], held) is None and "Delivered, not released" not in notice(held), "held: out of the Stop and of the notice"
+    follow = held + [{"tipo": "despacho", "dispatch": "d2", "task": "t2", "ticket": "50"}, {"tipo": "worker_done", "dispatch": "d2", "task": "t2", "msg": "m2"}]
+    (r2,) = orq_mod.reassess([{"dispatch": "d2", "task": "t2", "estado": "entregue"}], follow, now_at, integration={})
+    assert r2["segurada"]["motivo"] == "waits for the 329 decision" and next_item([r2], follow) is None, "the follow-up of the ticket inherits the reason"
+    freed = held + [{"tipo": "segurar_solta", "ticket": "50", "dispatch": "d1", "task": "t1"}]
+    (r3,) = orq_mod.reassess([row], freed, now_at, integration={})
+    assert "segurada" not in r3 and "delivered ticket 50" in next_item([r3], freed), "--release puts it back in the queue of charges"
+    sent_back = held + [{"tipo": "devolver", "dispatch": "d1", "task": "t1"}, {"tipo": "worker_done", "dispatch": "d1", "task": "t1", "msg": "m3"}]
+    (r4,) = orq_mod.reassess([row], sent_back, now_at, integration={})
+    assert "segurada" not in r4, "send-back (329) drops the hold: the redone delivery is charged again"
+
+
+def test_ticket340_hold_command_records_reason_shows_it_in_agents_and_release_undoes_it():
+    a = Env()
+    a.set("workers.json", [{"handle": "term_w1", "run": "run_a", "task": "task_w1", "status": "completed", "terminal": "retained",
+                            "reason": "user_takeover", "ownership": "user_owned", "release": "retained", "release_reason": "user_takeover", "release_ownership": "user_owned"}])
+    a.set("runs.json", [{"id": "run_a", "objective": "A"}])
+    os.makedirs(a.home, exist_ok=True)
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "despacho", "dispatch": "ctx_term_w1", "task": "task_w1", "ticket": "50", "ts": "2026-10-02T10:00:00Z"}) + "\n")
+    assert a.orq("hold", "ctx_term_w1").returncode == 1, "no reason, no hold"
+    assert a.orq("hold", "ctx_fantasma", "--reason", "x").returncode == 1
+    assert a.orq("hold", "ctx_term_w1", "--release").returncode == 1, "nothing held to release"
+    r = a.orq("hold", "ctx_term_w1", "--reason", "waits for the 329 decision")
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "segurar"]
+    assert (ev["ticket"], ev["dispatch"], ev["motivo"]) == ("50", "ctx_term_w1", "waits for the 329 decision") and ev["ts"], ev
+    panel = a.orq("agents").stdout
+    assert "HELD: waits for the 329 decision (for " in panel and "orq hold task_w1 --release" in panel, panel
+    assert a.orq("hold", "task_w1", "--release").returncode == 0 and [e["tipo"] for e in a.events()][-1] == "segurar_solta"
+    assert "HELD" not in a.orq("agents").stdout
+
+
 def test_ticket165_steer_on_completed_task_suggests_orq_give_back():
     a = Env()
     _steer_env(a)
@@ -17614,6 +17660,7 @@ PAIRS129 = [  # (pt argv, English argv): one pair for each command, subcommand, 
     ("pend edit x --titulo T --detalhe D --frente F --comando C --espera E --ate 2026-10-10", "pend edit x --title T --detail D --stream F --command C --waiting E --until 2026-10-10"),
     ("backlog mover 1 2 --grupo g", "backlog move 1 2 --group g"),
     ("devolver t m", "send-back t m"),
+    ("segurar t --motivo m", "hold t --reason m"),
     ("steer t txt --entrada e1", "steer t txt --entry e1"),
     ("pr ligar t http://u --nota n", "pr link t http://u --note n"),
     ("pr abrir feat/x --titulo T --corpo b.md --sem-prova m", "pr open feat/x --title T --body b.md --no-proof m"),

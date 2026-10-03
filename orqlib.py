@@ -1163,6 +1163,7 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
     released, pauses, screens, not_started = _released(events), interrupted_dispatches(events), screens or {}, _not_started(events)
     delivery_notices = {e.get("dispatch"): e["avisos"] for e in events if e.get("tipo") == "entrega" and e.get("avisos")}
     integration, dispatch_tickets, services = integration_queue() if integration is None else integration, _dispatch_ticket(events), _services(events)
+    held = _held(events)
     controls = {}
     for e in events:
         if e.get("tipo") == "controle" and e.get("resultado") != "iniciado":
@@ -1204,6 +1205,7 @@ def build_agents(workers, msgs, events, now_at, details=None, live=None, turns=N
         if waiting:
             agent_row["espera"] = waiting
         _mark_integration_and_service(agent_row, integration, dispatch_tickets, services)
+        _mark_held(agent_row, held, dispatch_tickets)
         if (screen_questions or {}).get(d) and w.get("dispatchStatus") == "dispatched" and state != "sem_terminal":
             agent_row["pergunta"] = screen_questions[d]
         if screens.get(d) and state != "sem_terminal":
@@ -1240,6 +1242,30 @@ def _sent_back(events):
     return out
 
 
+def _held(events):
+    """{ticket or dispatch: {motivo, ts}} of the deliveries the coordinator holds on purpose (`orq hold`): they leave the away Stop and the "Delivered, not released" notice.
+    Keyed by ticket when there is one, so the follow-up dispatch of a held ticket inherits the reason; `hold --release` and `send-back` (the worker redoes it) drop it."""
+    tickets_of, out = _dispatch_ticket(events), {}
+    for e in events:
+        if e.get("tipo") not in ("segurar", "segurar_solta", "devolver"):
+            continue
+        key = e.get("ticket") or tickets_of.get(e.get("dispatch")) or tickets_of.get(e.get("task")) or e.get("dispatch") or e.get("task")
+        if e["tipo"] == "segurar":
+            out[str(key)] = {"motivo": e.get("motivo"), "ts": e.get("ts")}
+        else:
+            out.pop(str(key), None)
+    return out
+
+
+def _mark_held(agent_row, held, dispatch_tickets):
+    """`segurada` ({motivo, ts}) in the line of a delivered worker whose ticket or dispatch is held; gone when it is not (the cache line may carry an old one)."""
+    agent_row.pop("segurada", None)
+    if agent_row.get("estado") == "entregue":
+        tk = dispatch_tickets.get(agent_row.get("dispatch")) or dispatch_tickets.get(agent_row.get("task"))
+        if entry := held.get(str(tk)) or held.get(str(agent_row.get("dispatch"))) or held.get(str(agent_row.get("task"))):
+            agent_row["segurada"] = entry
+
+
 def _mark_integration_and_service(agent_row, integration, dispatch_tickets, services):
     """Puts into `agent_row` (an agent's line) what the integrator queue and the service dispatches say about it: the state `aguardando_integracao` in place of
     travado/nao_comecou/parado, and the service's `cycle`. The reason for travado goes away: the worker isn't stuck, it's waiting for main."""
@@ -1263,7 +1289,7 @@ def reassess(agents_, events, now_at, turns=None, integration=None):
     integration, dispatch_tickets, services = integration_queue() if integration is None else integration, _dispatch_ticket(events), _services(events)
     signals = liveness_signals(events)
     released = _released(events) | {e.get("dispatch") for e in events if e.get("tipo") == "liberar" and e.get("estado") == "released"}
-    pauses, out, sent_back_list = interrupted_dispatches(events), [], _sent_back(events)
+    pauses, out, sent_back_list, held = interrupted_dispatches(events), [], _sent_back(events), _held(events)
     for agent_row in agents_:
         agent_row = dict(agent_row)
         if agent_row.get("estado") in ("entregue", "devolvida", "servico", "rodando", "travado", "limite", "nao_comecou", "parado", "aguardando_integracao") and agent_row.get("dispatch") in released:
@@ -1299,6 +1325,7 @@ def reassess(agents_, events, now_at, turns=None, integration=None):
             else:
                 agent_row.pop("limite", None), agent_row.pop("limite_ts", None)
         _mark_integration_and_service(agent_row, integration, dispatch_tickets, services)
+        _mark_held(agent_row, held, dispatch_tickets)
         out.append(agent_row)
     return out
 
@@ -1312,7 +1339,7 @@ def alive_line(events, open_state, now_at=None, turns=None):
     if isinstance((open_state or {}).get("agentes"), list):
         agent_rows = reassess(open_state["agentes"], events, now_at, turns)
         live = sorted((a for a in agent_rows if a["estado"] in ("travado", "limite", "nao_comecou", "parado", "perguntando", "rodando", "aguardando_integracao")), key=lambda a: a.get("prioridade") or 2)
-        without_release = sum(a["estado"] == "entregue" and not a.get("retido") for a in agent_rows)
+        without_release = sum(a["estado"] == "entregue" and not a.get("retido") and not a.get("segurada") for a in agent_rows)
         item_list = []
         for a in live[:3]:
             item_name = f"{'P' + str(a['prioridade']) + ' ' if a.get('prioridade') else ''}{(a.get('task') or '?')[:9]}… "
@@ -2158,6 +2185,7 @@ TYPES_EN = {  # the event types; those already in English (pr, ok, info, intake,
     "entrada": "entry", "obrigacao": "obligation", "steer_fim": "steer_end", "steer_reentrega": "steer_redelivered",
     "steer_digitado_ocupado": "steer_typed_busy", "retomada": "resumed", "pergunta_tela": "screen_question", "pergunta_tela_fim": "screen_question_end",
     "pend": "pending", "liberar": "release", "mate_entregue": "mate_delivered", "mate_pedido": "mate_request", "mate_reenvio": "mate_resent",
+    "segurar": "hold", "segurar_solta": "hold_release",
     "mate_escalado": "mate_escalated", "mate_dormiu": "mate_slept", "mate_acordou": "mate_woke", "integrar_fila": "integrate_queue",
     "despacho": "dispatch", "despacho_fila": "dispatch_queued", "alerta": "alert", "alerta_visto": "alert_seen", "uso_aviso": "usage_notice",
     "uso_parou": "usage_stopped", "run_projeto": "run_project", "resposta": "answer", "resposta_worker": "worker_answer",
@@ -4757,7 +4785,7 @@ def pr_notify():
             _mutate_prs(lambda d, f=reserve: f(d, value=False))  # nothing was typed: the next round tries
             break
         append_event({"tipo": "pr", "op": "avisado", "task": i["task"], "url": i["url"], "numero": i["numero"]})
-        line_list.append(f"{i['task']}: PR #{i['numero']} " + (f"request {asked['corr']} sent to the mate {mate}" if asked else f"notice typed in the {'mate ' + mate if mate_terminal else 'coordinator'}"))
+        line_list.append(f"{i['task']}: PR #{i['numero']} " + (f"request {asked['corr']} sent to the mate {mate}" if asked else "notice typed in the coordinator"))
     for i in [x for x in _prs_ro()["itens"] if x["estado"] == "aberto" and _blocked_by_base(x.get("ci")) and x.get("base_avisada") != ", ".join(x["ci"]["falhas"])]:
         key_name = ", ".join(i["ci"]["falhas"])
         since = i["ci"].get("base_vermelha_desde")
@@ -6385,7 +6413,7 @@ def next_without_user(tks, agent_rows, integration, queue, events, cfg, without_
         return f"{without} worker(s) lost the terminal without worker_done: `orq resume --dry-run`, then `orq resume`"
     for a in agent_rows:
         n = dispatch_index.get(a.get("dispatch")) or dispatch_index.get(a.get("task"))
-        if a.get("estado") == "entregue" and n and n not in integration and (by_num.get(n) or {}).get("status") != STATUS_CLOSED:
+        if a.get("estado") == "entregue" and not a.get("segurada") and n and n not in integration and (by_num.get(n) or {}).get("status") != STATUS_CLOSED:
             return f"worker {a['dispatch']} delivered ticket {n} and the delivery was not integrated: `orq integrate queue add <branch> {n}`, then release the worker"
     if pending_item:
         return pending_item
@@ -8517,6 +8545,26 @@ def send_back(target, reason, run=None, achado=False):
         return append_event({"tipo": "devolver", "task": t["id"], "dispatch": d, "run": run_, "texto": reason, "via": via, **({"aviso": notice} if notice else {})})
 
 
+def hold(target, reason=None, release=False):
+    """`orq hold <ticket|dispatch|task> --reason R`: the delivery stays unintegrated on purpose, so the away Stop and the manager's "Delivered, not released" notice stop asking;
+    `orq agents` shows R and for how long. Kept by ticket, so a new dispatch of the same ticket inherits it. `release` puts the delivery back in the queue of charges.
+    ValueError if `target` is no known ticket or dispatch, there is no reason, or there is nothing held to release."""
+    events = read_events()
+    dispatch_info = next((e for e in reversed(events) if e.get("tipo") == "despacho" and target in (e.get("dispatch"), e.get("task"))), None)
+    ticket = next((t["num"] for t in tickets() if t["num"] in (target, target.lstrip("0"))), None) or (dispatch_info or {}).get("ticket")
+    if not ticket and not dispatch_info:
+        raise ValueError(f"{target} is neither a ticket nor a dispatch")
+    key = str(ticket or dispatch_info["dispatch"])
+    ev = {"tipo": "segurar_solta" if release else "segurar", "ticket": ticket or None, "dispatch": (dispatch_info or {}).get("dispatch"), "task": (dispatch_info or {}).get("task")}
+    if release:
+        if key not in _held(events):
+            raise ValueError(f"{target} is not held")
+        return append_event(ev)
+    if not (reason or "").strip():
+        raise ValueError("--reason is required: it is what `orq agents` shows for the held delivery")
+    return append_event({**ev, "motivo": reason.strip()})
+
+
 # ---------- delivery conformance, plan phases and the scratch tracker (ticket 201) ----------
 # The 02/10 incident (#2039): a "phase 1 integrated" went out without four tickets of the plan, and nothing proved item by item what each ticket asked for.
 
@@ -9782,6 +9830,9 @@ def agents_text(agent_rows):
         elif a["estado"] in ("travado", "nao_comecou", "parado"):
             line_list.append(f'            -> orq steer {a["task"]} "<ajuste>" --run {a["run"]}')
         elif a["estado"] == "entregue":
+            if a.get("segurada"):
+                since = _ts(a["segurada"].get("ts"))
+                line_list.append(f"            HELD: {a['segurada'].get('motivo')}" + (f" (for {_duration((datetime.now(timezone.utc) - since).total_seconds())})" if since else "") + f" -> orq hold {a['task']} --release")
             line_list.append(f"            -> orq release {a['dispatch']}" if not a.get("retido") else f"            retained: {a['retido']} (orq release does not close it)")
         elif a["estado"] == "hibernado":
             line_list.append(f"            -> orq wake {a['task']} (steer and reply also wake it)")
@@ -14648,7 +14699,7 @@ ALIASES = {  # pt -> en. "" are the commands; the key of each other table is the
          "projetos": "projects", "projeto": "project", "fluxo": "flow", "ciclo": "cycle", "integrar": "integrate", "lavish-resposta": "lavish-answer",
          "perguntar": "ask", "auditar-respostas": "audit-answers", "auditar-publicacao": "audit-publication", "gerente": "manager", "retomar": "resume",
          "hibernar": "hibernate", "acordar": "wake", "pausar": "pause", "prioridade": "priority", "uso": "usage", "maquina": "machine",
-         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "limpar-residuos": "clean", "devolver": "send-back", "provar-red": "prove-red", "revisar": "review", "caixa": "inbox",
+         "fila-despacho": "dispatch-queue", "grupos": "groups", "limpar": "clean", "limpar-residuos": "clean", "devolver": "send-back", "segurar": "hold", "provar-red": "prove-red", "revisar": "review", "caixa": "inbox",
          "transcrito": "transcript", "servico": "service", "lembrar": "remind", "fase": "phase", "onda": "wave"},
     "pend": {"lista": "list"},
     "backlog": {"mover": "move"},
@@ -14761,6 +14812,10 @@ def parser():
     pr_.add_argument("--worktree", help="the worktree with the delivery (default: <ORQ_WT>/<ticket> or the dispatch's)")
     pr_.add_argument("--base", help="the base branch (default: the project's first environment)")
     pr_.add_argument("--timeout", type=int, default=RED_TIMEOUT_S, help="seconds for the whole proof")
+    hd = sub.add_parser("hold", aliases=["segurar"], help="orq hold <ticket|dispatch> --reason \"...\": a delivery held on purpose leaves the away Stop and the manager's notice and shows in `orq agents` with the reason; --release brings it back")
+    hd.add_argument("target")
+    _arg(hd, "motivo", help="why the delivery is not integrated (required unless --release)")
+    hd.add_argument("--release", action="store_true", help="puts the held delivery back in the queue of charges")
     st = sub.add_parser("steer")
     st.add_argument("task")
     st.add_argument("text_value")
@@ -15213,6 +15268,8 @@ def main(argv=None):
             r = prove_red_ticket(a.target, a.command, a.worktree, a.base, a.timeout)
             print("\n".join([f"{f['arquivo']}: {RED_STATE[f['resultado']]}" + (f" ({f['motivo']})" if f.get("motivo") else "") for f in r["files"]]
                              or ["no test file created or changed by the branch"]) + f"\nhead {r['head'][:8]}: {r['resultado']}")
+        elif a.cmd == "hold":
+            print(json.dumps(hold(a.target, a.reason, a.release), ensure_ascii=False))
         elif a.cmd == "steer":
             ev = steer(a.task, a.text_value, a.run, a.entry)
             print(json.dumps(ev, ensure_ascii=False))
