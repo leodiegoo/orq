@@ -12553,6 +12553,13 @@ def stamp_identity(path, source):
             subprocess.run(["git", "-C", path, "config", key, val], capture_output=True, check=False)
 
 
+def worker_identity_environment(source):
+    """Pass the project's identity to the worker process as well as its worktree config, overriding harness-provided Git identities."""
+    name, email = ((_git(source, "config", key) or "").strip() for key in ("user.name", "user.email"))
+    return {key: value for key, value in (("GIT_AUTHOR_NAME", name), ("GIT_AUTHOR_EMAIL", email),
+                                          ("GIT_COMMITTER_NAME", name), ("GIT_COMMITTER_EMAIL", email)) if value}
+
+
 def _checkpoint(dispatch):
     """The dispatch's worktree (path, head, dirty files) and the profile the worker came up with (agent, model, effort), from worker-show.
 
@@ -14157,8 +14164,8 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
             if project and projects().get(project, {}).get("commit_autorizado") is True:
                 spec = f"{spec.rstrip()}{commit_permission}"
             spec = f"{spec.rstrip()}\n\n{SPEC_BLOCKS}\n"
-        environment = night_environment() if night_active(_cursor_ro()) else None  # at night the worker comes up with no git prompt (credential, pinentry)
         folder = (repo_folder(repo) if repo else None) or os.getcwd()  # the project's repo root; a selector with no known folder falls back to the cwd, as before
+        environment = {**(night_environment() if night_active(_cursor_ro()) else {}), **worker_identity_environment(folder)}
         items, real, scratch = dispatch_conformance(spec, title, scratch_roots([folder]), tk and tk["arquivo"])  # ticket 201: what the delivery must prove
         if items and spec is not None:
             spec = f"{spec.rstrip()}\n\n{conformance_block(items, real)}"
@@ -14195,7 +14202,7 @@ def dispatch_worker(run, title, spec_file, model, effort, worktree=None, name=No
         append_event(ev)
     out = {"dispatchId": dispatch, "taskId": task, "run": run, "terminal": terminal, "espera": f"python3 ~/.claude/scripts/orca-wait-runs.py {run}"}
     with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError, OSError):
-        stamp_identity(_checkpoint(dispatch)["caminho"], folder)  # ticket 348: the worker commits as the project's author, not as Git's default
+        stamp_identity(_checkpoint(dispatch)["caminho"], folder)  # ticket 348: the worktree config also records the project's author
     if agent == "codex":
         with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, KeyError):
             trusted += trust_codex(_checkpoint(dispatch)["caminho"])  # the worktree Orca created
