@@ -99,6 +99,7 @@ test("it should leave the badge in the theme text when the project has no valid 
   const sem = { ...e, digest: { ...e.digest, projetos: [{ nome: "orq", cor: "azul" }], grupos: [] } }
   const workers = montarBlocos(sem).find((b) => b.id === "workers")!
   expect((workers.linhas[0] as Trecho[])[0]).toEqual({ t: "orq", c: undefined, b: undefined })
+})
 
 test("it should list the slots per project and the starvation warning in the machine block", () => {
   const e = { ...lerEstado(fixtures, agora), vivoMs: agora - 5000 }
