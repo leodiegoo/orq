@@ -8034,6 +8034,110 @@ print(json.dumps(data[sys.argv[3]]))
 """
 PR1 = "https://github.com/acme/app/pull/1216"
 PR2 = "https://github.com/acme/app/pull/1220"
+PR1355 = "https://github.com/" + "Confi" + "Neo" + "trust" + "/" + "neo" + "trust-web/pull/1355"
+PR1355_BODY = """## Summary
+
+Método de widget que **não está promovido** passa a comparar o cache com o banco em **todo** acerto de chave de empresa da lista; o sorteio de `resultCache.comparison.sampleRate` só vale para método promovido. Os 4 métodos rebaixados pelas divergências do prisma 382 (01/10) não voltavam a ganhar a promoção: eles comparavam só 6% a 12% dos acertos.
+
+```text
+createWidgetMethod
+  cacheKey && isComparisonActive(companyId)
+-   && shouldSampleComparison()                 // sorteio para qualquer método
++   && (!promotable || shouldSampleComparison()) // sorteio só quando promovido
+```
+
+- Método não promovido roda a query de qualquer jeito; comparar custa um `GET` no lugar de um `EXISTS`. O sorteio existe para limitar o custo de banco de um método promovido, onde a comparação é a única razão de a query rodar.
+- Com sorteio de ~0,1 (valor inferido: as settings de produção não foram lidas) e 6 a 16 acertos por dia, 15 comparações limpas levavam de 8 a 15 dias. Sem o sorteio, o ADR estima 8 a 30 comparações por dia por método e a janela de promoção em 1 a 2 dias.
+- ADR `20261002-metodo-rebaixado-compara-todo-acerto.md`, `GLOSSARY.md` e `DEPLOYMENT.md` atualizados.
+
+## Evidence
+
+- **Antes:** `getMarketEstimatedRevenue`, `Unit`, `AvgPrice` e `getRevenueByChannel`: 22 de 25 invocações com chave sem serem servidas; 2 a 29 comparações por empresa e dia (`widgetCacheComparisons`).
+  **Depois:** teste novo em `createWidgetMethod.unit-test.js` red antes e green depois (método não promovido compara todo acerto; promovido continua sorteando). Números da execução do autor; o red/green não foi reexecutado na revisão.
+- **Fica para depois do deploy:** só a medição depois do deploy mostra `served_from_cache` maior que 0; o ADR define a conferência. Nenhuma setting de produção precisa mudar.
+
+## Merge Danger
+
+**Door:** two-way
+
+Uma condição em `createWidgetMethod`; reverter volta ao sorteio.
+
+**Blast Radius:** custo de Redis em widgets rebaixados
+
+Cada acerto de método não promovido faz um `GET` do payload para comparar. Só vale para empresas da lista de comparação. `git merge-tree` limpo contra development, staging e main.
+"""
+
+
+def _pr_continuation_env(body, url=PR1):
+    a = _prs_env()
+    _group(a)
+    _pr(a, url, body=body)
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"terminal": "term_mate", "runs": ["run_mate"]}}}, f)
+    a.set("terminals.json", ["term_mate", "term_coord"])
+    with open(os.path.join(a.home, "events.jsonl"), "w") as f:
+        f.write(json.dumps({"tipo": "despacho", "task": "task_feat1", "run": "run_mate", "projeto": "orq"}) + "\n")
+    return a
+
+
+def test_ticket424_real_pr_body_requests_deploy_followup_from_project_mate():
+    a = _pr_continuation_env(PR1355_BODY, PR1355)
+    r = a.orq("pr", "ligar", "task_feat1", PR1355)
+    assert r.returncode == 0, r.stderr
+    requests = [e for e in a.events() if e.get("tipo") == "mate_pedido"]
+    assert len(requests) == 1, requests
+    assert PR1355 in requests[0]["texto"] and "served_from_cache" in requests[0]["texto"], requests[0]
+    assert "Blocked by the production continuation ticket \"levar #1355 até produção\"" in requests[0]["texto"], requests[0]
+
+
+def test_ticket424_same_pr_item_from_link_and_poll_creates_only_one_request():
+    body = "## Follow-up\n\n- Add the usage metric.\n"
+    a = _pr_continuation_env(body)
+    assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    assert len([e for e in a.events() if e.get("tipo") == "mate_pedido"]) == 1
+
+
+def test_ticket424_pr_without_pending_section_creates_no_request():
+    a = _pr_continuation_env("## Summary\n\nA routine refactor with no follow-up work.\n")
+    assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
+    assert not [e for e in a.events() if e.get("tipo") == "mate_pedido"]
+
+
+def test_ticket424_each_followup_list_item_becomes_a_separate_request():
+    body = "## Known Gaps\n\n- Verify the metric after deployment.\n- Add the operator documentation.\n"
+    a = _pr_continuation_env(body)
+    assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
+    requests = [e for e in a.events() if e.get("tipo") == "mate_pedido"]
+    assert len(requests) == 2, requests
+    assert all(PR1 in e["texto"] for e in requests), requests
+    assert sum("Blocked by" in e["texto"] for e in requests) == 1, requests
+
+
+def test_ticket424_mate_raise_pr_reads_body_and_requests_followup():
+    a = _pr_continuation_env("## Pendente\n\n- Cobrir o alerta com teste.\n")
+    r = a.orq("mate", "raise", "--type", "pr", "--text", f"PR pronto {PR1}", "--link", PR1, ORQ_MATE="orq")
+    assert r.returncode == 0, r.stderr
+    requests = [e for e in a.events() if e.get("tipo") == "mate_pedido"]
+    assert len(requests) == 1 and PR1 in requests[0]["texto"] and "Cobrir o alerta" in requests[0]["texto"], requests
+
+
+def test_ticket424_followup_without_active_mate_becomes_coordinator_entry():
+    a = _pr_continuation_env("## Follow-up\n\n- Add the usage metric.\n")
+    with open(os.path.join(a.home, "cursor.json"), "w") as f:
+        json.dump({"mates": {"orq": {"runs": ["run_mate"]}}}, f)
+    assert a.orq("pr", "ligar", "task_feat1", PR1).returncode == 0
+    entries = [e for e in a.events() if e.get("tipo") == "entrada" and e.get("origem") == "pr_followup"]
+    assert len(entries) == 1 and PR1 in entries[0]["texto"] and "Add the usage metric" in entries[0]["texto"], entries
+
+
+def test_ticket424_existing_ticket_citing_same_pr_and_item_suppresses_request():
+    a = _pr_continuation_env("## Follow-up\n\n- Add the usage metric.\n")
+    os.makedirs(a.env["ORQ_ISSUES"], exist_ok=True)
+    with open(os.path.join(a.env["ORQ_ISSUES"], "01-existing.md"), "w") as f:
+        f.write(f"# 01: Add the usage metric\nStatus: ready-for-agent\nBlocked by: (none)\nRun: run_mate\nDispatch: manual\n\n## What to build\n\n{PR1}\n\nAdd the usage metric.\n\n## Acceptance criteria\n\n- [ ] Metric is recorded.\n")
+    assert a.orq("pr", "link", "task_feat1", PR1).returncode == 0
+    assert not [e for e in a.events() if e.get("tipo") == "mate_pedido"]
 
 
 def _gh(a, **env):
