@@ -22499,19 +22499,73 @@ def _resolve356(a, n):
     open(path, "w").write(txt.replace("Status: claimed", "Status: resolved"))
 
 
-def test_ticket356_sweep_reopens_the_resolved_ticket_without_code_and_leaves_dropped_and_integrated_alone():
-    a = _orphan_env()
-    for n in ("322", "60"):
-        _resolve356(a, n)
+def _repo356(tmp, ahead=(), picked=()):
+    """A real repo: main, a branch per `ahead` with a commit main does not have, a branch per `picked` whose commit was cherry-picked into main (a rewritten merge: another sha, same patch)."""
+    git = lambda *a: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+    repo = _repo_with_branch(tmp)
+    for b in (*ahead, *picked):
+        git("checkout", "-q", "-b", b, "main")
+        open(os.path.join(repo, b.replace("/", "_")), "w").write(b)
+        git("add", "."), git("commit", "-q", "-m", f"work on {b}")
+    git("checkout", "-q", "main")
+    for b in picked:
+        git("cherry-pick", b)
+    return repo
+
+
+def test_ticket356_sweep_reopens_the_resolved_ticket_only_when_its_branch_exists_and_the_proof_fails():
+    tmp = tempfile.mkdtemp()
+    a = _orphan_env(ORQ_REPOS=_repo356(tmp, ahead=["fix/322-deny"], picked=["feat/91-p"]))
     _evs(a, {"tipo": "entrega_orq", "ticket": "90", "branch": "feat/90-d", "dispatch": "ctx_90", "ts": "2026-10-02T09:00:00Z"},
-         {"tipo": "ticket", "op": "fechar", "ticket": "90", "largado": "not needed", "ts": "2026-10-02T09:05:00Z"})
-    _tk_file(a, "90", "orq: t90", "task_90")
-    _resolve356(a, "90")
+         {"tipo": "ticket", "op": "fechar", "ticket": "90", "largado": "not needed", "ts": "2026-10-02T09:05:00Z"},
+         {"tipo": "entrega_orq", "ticket": "91", "branch": "feat/91-p", "dispatch": "ctx_91", "ts": "2026-10-02T09:00:00Z"})
+    for n in ("90", "91"):
+        _tk_file(a, n, f"orq: t{n}", f"task_{n}")
+    with open(os.path.join(a.home, "gerente.json"), "w") as f:
+        json.dump({"coordenador": "term_coord", "gerente": "term_ger", "runs": []}, f)
+    for n in ("322", "183", "60", "90", "91"):  # 322: branch exists, not in main; 183: branch gone; 60: cycle record; 90: dropped; 91: branch exists, cherry-picked into main
+        _resolve356(a, n)
     r = a.orq("orphans")
     assert r.returncode == 0, r.stderr
-    assert "Status: claimed" in _read_text(a, "322") and "Status: resolved" in _read_text(a, "60") and "Status: resolved" in _read_text(a, "90")
+    assert "Status: claimed" in _read_text(a, "322")
+    assert all("Status: resolved" in _read_text(a, n) for n in ("183", "60", "90", "91")), "a gone branch or a proof keeps the ticket resolved"
     (ev,) = [e for e in a.events() if e["tipo"] == "ticket" and e["op"] == "reabrir"]
     assert ev["ticket"] == "322", ev
+    assert sorted(e["ticket"] for e in a.events() if e["tipo"] == "orphan" and e.get("op") == "alerta") == ["183", "322"], "the gone branch is told once; the proven one is not an orphan"
+    assert a.orq("orphans").returncode == 0
+    assert len([e for e in a.events() if e["tipo"] == "orphan" and e.get("op") == "alerta"]) == 2
+
+
+def test_ticket383_restore_puts_back_to_resolved_what_has_proof_or_a_gone_branch_with_the_old_answer_and_leaves_the_rest():
+    tmp = tempfile.mkdtemp()
+    repo = _repo356(tmp, ahead=["fix/322-deny"], picked=["feat/91-p"])
+    git = lambda *x: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True)
+    git("checkout", "-q", "-b", "feat/92-s", "main")  # a rewritten merge: main has the same subject with another patch
+    open(os.path.join(repo, "s92"), "w").write("one"), git("add", "."), git("commit", "-q", "-m", "feat: s92")
+    git("checkout", "-q", "main"), open(os.path.join(repo, "s92"), "w").write("two"), git("add", "."), git("commit", "-q", "-m", "feat: s92")
+    a = _orphan_env(ORQ_REPOS=repo)
+    for n, b in (("91", "feat/91-p"), ("92", "feat/92-s")):
+        _tk_file(a, n, f"orq: t{n}", f"task_{n}")
+        _evs(a, {"tipo": "entrega_orq", "ticket": n, "branch": b, "dispatch": f"ctx_{n}", "ts": "2026-10-02T09:00:00Z"})
+    # 183 gone branch, 91 cherry, 92 subject, 322 branch ahead of main (stays), 80 never reopened by the sweep (stays), 777 does not exist
+    for n in ("183", "91", "92", "322", "80"):
+        path = os.path.join(a.env["ORQ_ISSUES"], f"{n}-t.md")
+        open(path, "a").write(f"\n## Answer\n\nresposta antiga {n}\n")
+        _evs(a, {"tipo": "ticket", "op": "reabrir", "ticket": n, "motivo": "its branch is not in main", "ts": "2026-10-03T03:00:00Z"}) if n != "80" else None
+    listing = os.path.join(tmp, "reabertos.txt")
+    open(listing, "w").write("183\n91\n92\n322\n80\n777  # no file\n")
+    r = a.orq("orphans", "--restore", listing, "--dry-run", "--json")
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert sorted(x["ticket"] for x in got["restored"]) == ["183", "91", "92"] and sorted(x["ticket"] for x in got["stayed"]) == ["322", "777", "80"], got
+    assert all("Status: claimed" in _read_text(a, n) for n in ("183", "91", "92")) and not [e for e in a.events() if e.get("op") == "restaurar"], "the dry run changes nothing"
+    r = a.orq("orphans", "--restore", listing)
+    assert r.returncode == 0 and "3 restored, 3 stay" in r.stdout, r.stdout + r.stderr
+    for n in ("183", "91", "92"):
+        assert "Status: resolved" in _read_text(a, n) and f"resposta antiga {n}" in _read_text(a, n), n
+    assert all("Status: claimed" in _read_text(a, n) for n in ("322", "80"))
+    assert a.orq("orphans").returncode == 0
+    assert all("Status: resolved" in _read_text(a, n) for n in ("183", "91", "92")), "the sweep does not reopen what was restored on the subject proof"
 
 
 def _manual_env(tmp):
