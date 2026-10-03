@@ -8093,6 +8093,74 @@ def test_pr_poll_gh_down_leaves_the_pr_for_the_next_round():
     assert not [e for e in a.events() if e["tipo"] == "entrada"]
 
 
+def _mute_gh(a):
+    path = os.path.join(a.tmp.name, "gh-mudo")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(path, 0o755)
+    a.env["ORQ_GH"] = path
+
+
+def _ctx396(a):
+    return json.loads(a.prompt("oi").stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def _prs_file(a):
+    return _read_state(os.path.join(a.home, "prs.json"))
+
+
+def test_pr_poll_mute_gh_does_not_advance_the_last_poll():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    a.orq("pr", "poll", "--forcar")
+    ok = _prs_file(a)["ultimo_poll_ok"]
+    _mute_gh(a)
+    time.sleep(1.1)
+    assert a.orq("pr", "poll", "--forcar").returncode == 0
+    d = _prs_file(a)
+    assert d["ultimo_poll"] == d["ultimo_poll_ok"] == ok and d["poll_falhas"] == 1
+
+
+def test_pr_poll_blind_alert_is_recorded_once_on_the_third_lap_and_ends_on_the_first_answer():
+    a = _prs_env()
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    good_gh = a.env["ORQ_GH"]
+    _mute_gh(a)
+    alerts = lambda: [e for e in a.events() if e.get("alerta") == "pr_poll_cego"]
+    for _ in range(2):
+        a.orq("pr", "poll", "--forcar")
+    assert not alerts()
+    for _ in range(3):
+        a.orq("pr", "poll", "--forcar")
+    assert len(alerts()) == 1, "once, not on every lap"
+    assert "gh auth status" in _ctx396(a)
+    a.env["ORQ_GH"] = good_gh
+    a.orq("pr", "poll", "--forcar")
+    assert _prs_file(a)["poll_falhas"] == 0
+    assert len([e for e in a.events() if e["tipo"] == "pr_poll_cego_fim"]) == 1
+    assert "gh auth status" not in _ctx396(a)
+
+
+def test_pr_poll_without_open_pr_does_not_count_a_failure():
+    a = _prs_env()
+    _mute_gh(a)
+    for _ in range(4):
+        a.orq("pr", "poll", "--forcar")
+    assert _gh_calls(a) == [] and not [e for e in a.events() if e.get("alerta") == "pr_poll_cego"]
+
+
+def test_pr_poll_partial_answer_advances_the_ok_poll_and_does_not_alert():
+    a = _prs_env()
+    other = "https://github.com/acme/other/pull/7"
+    a.orq("pr", "ligar", "task_feat1", PR1)
+    a.orq("pr", "ligar", "task_feat2", other)
+    for _ in range(4):
+        a.orq("pr", "poll", "--forcar")  # gh.json knows only acme/app: acme/other has no answer
+    d = _prs_file(a)
+    assert d.get("ultimo_poll_ok") and not d.get("poll_falhas")
+    assert not [e for e in a.events() if e.get("alerta") == "pr_poll_cego"]
+
+
 def test_pr_prompt_and_stop_hooks_do_not_call_gh():
     a = _prs_env()
     a.orq("pr", "ligar", "task_feat1", PR1)
