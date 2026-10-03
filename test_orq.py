@@ -20995,11 +20995,11 @@ EVENTOS_LIDOS = {
     "nao_iniciou": "hook_stop wake_stopped", "noite_parou": "wake_stopped", "obrigacao": "hook_stop wake_stopped", "pend": "hook_stop wake_stopped",
     "pendente_avisado": "hook_stop wake_stopped", "pr": "hook_stop wake_stopped", "pr_poll_cego_fim": "hook_stop wake_stopped",
     "prioridade": "hook_stop wake_stopped", "queue_item_aged": "hook_stop wake_stopped", "resposta": "hook_stop wake_stopped",
-    "resposta_coordenador": "hook_stop", "resposta_lavish": "hook_stop wake_stopped", "resumo_add": "hook_stop wake_stopped",
-    "retomada": "hook_stop wake_stopped", "run_projeto": "hook_stop wake_stopped", "segurar": "hook_stop wake_stopped",
-    "segurar_solta": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped", "steer": "hook_stop wake_stopped",
-    "steer_fim": "hook_stop wake_stopped", "steer_reentrega": "hook_stop wake_stopped", "ticket": "hook_stop wake_stopped",
-    "worker_done": "hook_stop wake_stopped",
+    "resposta_coordenador": "hook_stop", "resposta_lavish": "hook_stop wake_stopped", "resposta_worker": "hook_stop wake_stopped",
+    "resumo_add": "hook_stop wake_stopped", "retomada": "hook_stop wake_stopped", "run_projeto": "hook_stop wake_stopped",
+    "segurar": "hook_stop wake_stopped", "segurar_solta": "hook_stop wake_stopped", "servico_marcado": "hook_stop wake_stopped",
+    "steer": "hook_stop wake_stopped", "steer_fim": "hook_stop wake_stopped", "steer_reentrega": "hook_stop wake_stopped",
+    "ticket": "hook_stop wake_stopped", "worker_done": "hook_stop wake_stopped",
 }
 NOT_EVENTS = {"decisao"}  # compared on `tipo` in the same code, but it is a pending item's type (pendencias), not an event
 
