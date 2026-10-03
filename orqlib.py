@@ -67,6 +67,7 @@ PLAN = orqpaths.PLAN  # tickets, specs, reports and the design map (ORQ_PLAN)
 WT_ROOT = orqpaths.WT  # the orq ticket worktrees and the integrator's (ORQ_WT)
 ORCA = os.environ.get("ORQ_ORCA") or "orca"
 GH = os.environ.get("ORQ_GH") or "gh"
+PR_BLIND_LAPS = 3  # laps in a row without a gh answer for an open PR before the `pr_poll_cego` alert
 GIT = os.environ.get("ORQ_GIT") or "git"
 CLEAN_SCRIPT = os.environ.get("ORQ_LIMPAR") or os.path.join(orqpaths.HERE, "scripts", "limpar-mergeados.py")
 CLEAN_DELAY_S = float(os.environ.get("ORQ_LIMPAR_ATRASO_S") or 20)  # the same delay as the "merged" hook
@@ -1678,6 +1679,8 @@ def recent_alerts(events, now_at, agents_=None):
             resolve(e.get("ref"))
         elif e.get("tipo") == "integrate_cycle" and e.get("stage") == "merge":
             resolve(None, "integrador_parado")
+        elif e.get("tipo") == "pr_poll_cego_fim":
+            resolve(None, "pr_poll_cego")
     for a in agents_ or []:
         if a.get("estado") == "liberado":
             resolve(a.get("task"))
@@ -1936,6 +1939,9 @@ def _extra(events, all_listing, now_at, pending_items=None, cursor=None, open_st
     for a in alerts[:2]:
         if a.get("alerta") == "integrador_parado":
             parts.append(f"Alert: integrator stopped since {_hora_local(a.get('desde'))} with the queue waiting: wake it (orq integrate queue list).")
+            continue
+        if a.get("alerta") == "pr_poll_cego":
+            parts.append(f"Alert: gh has not answered for the open PRs in {a.get('voltas')} laps in a row, a merge would go unnoticed: check `gh auth status`.")
             continue
         if a.get("alerta") == "steer_nao_lido":
             parts.append(f"Alert: steer not read in {a.get('task')} after {STEER_ATTEMPTS} notices to the stopped terminal: check the worker (orq agents).")
@@ -5097,8 +5103,19 @@ def clean_closed(now_at=None, days=None, dry=False, auto=False):
 
 def _apply_prs(d, seen, now_at):
     """Moves each open PR that gh saw merged or closed to the new state: one `pr` event and one `pr` entry per PR, only once (the entry's `ref` is the URL, so repeating the
-    handoff does not duplicate it). Returns the lines of what changed."""
-    d["ultimo_poll"] = now_at
+    handoff does not duplicate it). Returns the lines of what changed.
+
+    `last_poll` only moves when gh answered for at least one open PR: a mute gh would otherwise look like a fresh poll. `poll_falhas` counts the laps in a row with no answer
+    for an open PR; the third records the `pr_poll_cego` alert (once), the first answer after it records `pr_poll_cego_fim`."""
+    if any(seen.get(i["url"]) for i in d["itens"] if i["estado"] == "aberto"):
+        d["ultimo_poll"] = d["ultimo_poll_ok"] = now_at
+        if d.get("poll_falhas", 0) >= PR_BLIND_LAPS:
+            append_event({"tipo": "pr_poll_cego_fim"})
+        d["poll_falhas"] = 0
+    else:
+        d["poll_falhas"] = d.get("poll_falhas", 0) + 1
+        if d["poll_falhas"] == PR_BLIND_LAPS:
+            append_event({"tipo": "alerta", "alerta": "pr_poll_cego", "voltas": PR_BLIND_LAPS})
     event_list = read_events()
     already = {e.get("ref") for e in event_list if e.get("origem") == "pr"}
     line_list = []
@@ -5925,7 +5942,7 @@ def build_digest(events, prs, pending_items, open_state, ts, queue, since, now_a
     return {"versao": 1, "geradoEm": now_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "ausente": {"ligado": bool(away_alias), "desde": _dict(away_alias).get("ligada_em")},
             "fila": declared or derived, "proximoPasso": next_step, "pendencias": pending, "linha": line[-DIGEST_LINES:], "rodando": running, "maquina": machine,
             "tickets_orq": panel_tickets(ts, agents),
-            "pagina": {"data": now_at.astimezone().strftime("%Y-%m-%d"), "gerado": now_at.astimezone().strftime("%H:%M"), "desde": since, "poll": prs.get("ultimo_poll"),
+            "pagina": {"data": now_at.astimezone().strftime("%Y-%m-%d"), "gerado": now_at.astimezone().strftime("%H:%M"), "desde": since, "poll": prs.get("ultimo_poll_ok"),
                        "linha_antes": max(0, len(line) - DIGEST_LINES), "declarada": bool(declared),
                        "pontos": _points(list(flow_info.values()) or [task_flow(None, events)])}}
 
