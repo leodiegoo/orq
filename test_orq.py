@@ -23155,6 +23155,41 @@ def test_ticket386_close_accepts_a_product_ticket_with_the_pr_in_the_answer_and_
     assert r.returncode == 1 and "fix/322-deny" in r.stderr, "an orq ticket keeps the integration proof, a PR in the Answer does not replace it"
 
 
+# ---------- ticket 341: tickets that touch the same area block each other in order ----------
+
+def _area_spec(a, name, what):
+    return _spec_tk(a, what, item_name=name)
+
+
+def test_ticket341_same_function_blocks_the_second_and_it_leaves_when_the_first_closes():
+    a = _env_tk()
+    assert _new(a, "First", spec=_area_spec(a, "a.md", "Change `_external_denied` and `hooks/guard.py`.")).returncode == 0
+    r = json.loads(_new(a, "Second", spec=_area_spec(a, "b.md", "Also fix `_external_denied()`.")).stdout)
+    assert _bl_items(a)["t02"]["bloqueios"] == ["t01"], "the second is born blocked by the first"
+    assert "waits for 01: they touch _external_denied" in r["aviso"]
+    assert [i["id"] for i in backlog_mod.ready(list(_bl_items(a).values()))] == ["t01"]
+    a.orq("ticket", "fechar", "01", "--answer", "integrated")
+    assert "t02" in {i["id"] for i in backlog_mod.ready(list(_bl_items(a).values()))}, "it leaves on its own when the first enters"
+
+
+def test_ticket341_different_areas_and_common_files_do_not_block():
+    a = _env_tk()
+    _new(a, "First", spec=_area_spec(a, "a.md", "Change `pr_open` in `README.md` and `docs/design.md`."))
+    _new(a, "Second", spec=_area_spec(a, "b.md", "Change `away_on` in `README.md` and `docs/design.md`."))
+    assert _bl_items(a)["t02"]["bloqueios"] == [], "no shared function: nothing blocks, only the worker ceiling limits"
+
+
+def test_ticket341_touches_line_declares_the_area_and_unblock_frees_the_ticket():
+    a = _env_tk()
+    _new(a, "First", spec=_area_spec(a, "a.md", "Touches: .github/workflows/, AGENTS.md\n\nDo it."))
+    _new(a, "Second", spec=_area_spec(a, "b.md", "Touches: AGENTS.md\n\nDo it too."))
+    assert _bl_items(a)["t02"]["bloqueios"] == ["t01"]
+    assert a.orq("unblock", "02", "--reason", "").returncode != 0, "the reason is required"
+    out = json.loads(a.orq("unblock", "02", "--reason", "only neighbours").stdout)
+    assert out == {"ticket": "02", "liberado": ["01"], "restam": []}
+    assert _bl_items(a)["t02"]["bloqueios"] == []
+
+
 if __name__ == "__main__":
     opts = _suite_args(sys.argv[1:])
     os.nice(10)  # the suite yields to interactive work (ticket 328)
@@ -23187,3 +23222,4 @@ if __name__ == "__main__":
     print("slowest:\n" + "\n".join(f"  {r['s']:7.2f}s {r['cpu']:7.2f}s CPU  {n}" for n, r in slow))
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
+

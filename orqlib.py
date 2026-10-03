@@ -5791,7 +5791,7 @@ def digest_json(d):
             "pendencias": d["pendencias"], "linha": d["linha"] if d["ausente"]["ligado"] else [], "rodando": d["rodando"],
             "tickets_orq": d["tickets_orq"], "idade": d["idade"],
             **({"ausencia": d["ausencia"]} if d.get("ausencia") else {}),
-            **({"retro": d["retro"]} if d.get("retro") else {})}  # additive: with no recorded round the v1 contract stays as it was
+            **({"retro": d["retro"]} if d.get("retro") else {}), **({"bloqueios_area": d["bloqueios_area"]} if d.get("bloqueios_area") else {})}  # additive: with no recorded round the v1 contract stays as it was
 
 
 def html_digest(d):
@@ -5822,6 +5822,7 @@ def html_digest(d):
             if isinstance(pg.get("poll"), (int, float)) else "The PR state has not been read by any poll yet (`orq pr poll`); this page does not query GitHub.")
     since = f"Since {_hora_local(pg['desde'])}." if pg["desde"] else "Since the start of the log."
     retro = ('<h2>Failures per retro round</h2><ul class="sub">' + "".join(f'<li>until {e(r["ate"][:10])}: {r["falhas"]} failure(s)</li>' for r in d["retro"]) + "</ul>") if d.get("retro") else ""
+    area = f'<h2>Area blocks</h2><p class="sub">{d["bloqueios_area"]["total"]} in the last 7 days: {e(", ".join(f"{k} ({v})" for k, v in d["bloqueios_area"]["por_area"].items()))}</p>' if d.get("bloqueios_area") else ""
     absence = f'<h2>Away report</h2><pre>{e(chr(10).join(d["ausencia"]))}</pre>' if d.get("ausencia") else ""
     legenda = "".join(f'<span><span class="dot {c}"></span> {e(n)}</span>' for n, c in pg["pontos"].items())
     before_of = [n for n, c in pg["pontos"].items() if c != "p"]  # the order of the environments before production, within each step
@@ -5834,7 +5835,7 @@ def html_digest(d):
             f'{queue}<h2>With you</h2>{f"<div class=grid>{pending}</div>" if pending else "<p class=sub>Nothing waiting on you.</p>"}'
             f'<h2>Running now</h2>{f"<div class=run>{rod}</div>" if rod else "<p class=sub>No worker running: nothing alive.</p>"}{vagas}'
             f'<h1 style="margin-top:36px">What happened</h1>{before}'
-            f'{f"<ol class=tl>{line}</ol>" if line else "<p class=sub>Nothing since then.</p>"}{absence}{retro}</main></body></html>')
+            f'{f"<ol class=tl>{line}</ol>" if line else "<p class=sub>Nothing since then.</p>"}{absence}{retro}{area}</main></body></html>')
 
 
 def digest_generate(now_at=None, since=None, with_html=False):
@@ -5853,6 +5854,14 @@ def digest_generate(now_at=None, since=None, with_html=False):
     d["idade"] = {"escala": cfg["age_colors"], "fatores": AGE_FACTOR,  # the panel and the TUI draw the same scale from these
                   "filas": [{k: i[k] for k in ("kind", "id", "titulo", "prioridade", "desde")} for i in queue_ages(now_at, cfg)],
                   "obrigacoes": [{"entrada": o["entrada"], "chave": o["chave"], "texto": o.get("texto"), "desde": o.get("ts")} for o in open_obligations(events)]}
+    week = (now_at - timedelta(days=7)).isoformat()  # ticket 341: the blocks the orq created by area, and what each one waited on
+    blocks = [e for e in events if e.get("tipo") == "bloqueio_area" and (e.get("ts") or "") >= week]
+    if blocks:
+        by_area = {}
+        for e in blocks:
+            for x in e.get("area") or []:
+                by_area[x] = by_area.get(x, 0) + 1
+        d["bloqueios_area"] = {"total": len(blocks), "por_area": dict(sorted(by_area.items(), key=lambda kv: -kv[1])[:5])}
     d["retro"] = [{"ate": r["ate"], "falhas": r["falhas"], "metricas": r["metricas"]} for r in _retro_rounds()[-4:]]  # the latest rounds of `orq retro --write_out`
     with contextlib.suppress(OSError), open(_path(os.path.join(DIGEST, "ausencia.md")), encoding="utf-8") as f:  # the last `orq away off`
         d["ausencia"] = f.read().rstrip().splitlines()
@@ -10082,6 +10091,43 @@ def _meta_ticket(model=None, effort=None, dispatch_mode=None, waiting=None, proj
     return {k: " ".join(v.split()) for k, v in (("modelo", model), ("effort", effort), ("despacho", dispatch_mode), ("espera", waiting), ("projeto", project)) if v}
 
 
+_TOUCHES = re.compile(r"^Touches:[ \t]*(.+)$", re.M | re.I)
+_AREA_TOKEN = re.compile(r"`([^`\s<>]{3,})`")
+_AREA_COMMON = {"readme.md", "docs/design.md", "test_orq.py", "orqlib.py", "orq.py", "final-report.md", "test_noite_replay.py"}  # every ticket touches these: they never make two tickets collide
+
+
+def ticket_area(text):
+    """The area a ticket will touch (ticket 341): the `Touches:` line (comma-separated files, functions or folders) when the spec declares it; otherwise the names the text cites in
+    backticks that look like a function (`_external_denied`, `pr_open()`) or a path (`.github/workflows/`, `hooks/x.py`), minus the files every ticket touches and the orq worktree boilerplate."""
+    text = re.split(r"^## (?:orq worktree|Delivery conformance)\b", text or "", flags=re.M)[0]
+    if m := _TOUCHES.search(text):
+        return {x.strip().strip("`").rstrip("()").lower() for x in m.group(1).split(",") if x.strip()}
+    found = set()
+    for tok in _AREA_TOKEN.findall(text):
+        tok = tok.rstrip("()").rstrip(".,;:")
+        if tok.isupper() or tok.lower() in _AREA_COMMON or tok.startswith("--") or not re.search(r"[_/]|\.\w{1,4}$", tok):
+            continue
+        found.add(tok.lower())
+    return found
+
+
+def area_blockers(body_text, ts):
+    """{ticket number: sorted shared area} of the open tickets whose area meets the one of `body_text` by intersection (ticket 341). A wave's milestone or join never counts."""
+    mine = ticket_area(body_text)
+    findings = {}
+    for t in ts:
+        if t["status"] == STATUS_CLOSED or t.get("role") or not mine or not t.get("arquivo"):
+            continue
+        try:
+            with open(t["arquivo"], encoding="utf-8") as f:
+                shared = mine & ticket_area(f.read())
+        except OSError:
+            continue
+        if shared:
+            findings[t["num"]] = sorted(shared)
+    return findings
+
+
 def _backlog_ticket_add(number, title, blockers, path, task, run, meta):
     """`add` of ticket `tNN` to the backlog: kind `ticket`, `repo` from the title prefix, one `blocked-by` per blocker and the body with the `spec:` (relative to the ISSUES folder),
     the `orca: <task> <run>` and the meta. The CLI requires the blocker to exist in this same backlog."""
@@ -10141,11 +10187,15 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
             raise ValueError(f"wave {wave} is closed (its join {w['join']['num']} already closed): put the task in a later wave")
         blockers = list(dict.fromkeys([*blockers, w["milestone"]["num"]]))
         join = w["join"]["num"]
+    by_area = {n: a for n, a in area_blockers(body_text, existing.values()).items() if n not in blockers}  # ticket 341: the same area waits for whoever is already on it
+    blockers += list(by_area)
     target = default_run(run)
     meta = _meta_ticket(model, effort, dispatch_mode, waiting, dispatch_project(project, target))
     if join:  # the wave of the task (ticket 342), after the meta that ticket 315 builds from the target Run
         meta = {**meta, "wave": str(wave)}
-    deps, notices = [], []
+    deps, notices = [], [f"waits for {n}: they touch {', '.join(a[:3])} (orq unblock <ticket> --reason \"...\" if the area is only a neighbour)" for n, a in by_area.items()]
+    if join:
+        notices += [f"wave {wave} has a serial stretch: this task waits for {n}, of the same wave" for n in by_area if existing[n].get("wave") == int(wave)]
     for n in blockers:
         t = existing.get(n)
         if not t:
@@ -10196,7 +10246,39 @@ def ticket_new(title, spec_file, blocked_by=None, run=None, model=None, effort=N
         else:
             _write(path, _trocar_campo(txt, "Task", task))
         append_event({"tipo": "ticket", "op": "novo", "ticket": number, "task": task, "run": target, "titulo": title, **({"deps": deps} if deps else {})})
+        for n, a in by_area.items():
+            append_event({"tipo": "bloqueio_area", "ticket": number, "bloqueado_por": n, "area": a[:5]})
     return {"ticket": number, "arquivo": path, "task": task, "run": target, **({"aviso": "; ".join(notices)} if notices else {})}
+
+
+def ticket_unblock(numero, reason, by=None):
+    """Releases a ticket from its open blockers (all of them, or only `by`), with the reason in the log (ticket 341: the coordinator or the mate says the area is only a neighbour).
+    Returns {ticket, liberado, restam}; the ticket is dispatched afterwards with `orq dispatch --ticket`."""
+    n = str(numero).strip().zfill(2)
+    if not (reason or "").strip():
+        raise ValueError("unblock needs --reason: why the two tickets can go in parallel")
+    ts = tickets()
+    t = next((x for x in ts if x["num"] == n), None)
+    if not t:
+        raise ValueError(f"ticket {n} does not exist")
+    status = {x["num"]: x["status"] for x in ts}
+    open_items = [b for b in t["blocked_by"] if status.get(b) != STATUS_CLOSED]
+    free = [str(by).strip().zfill(2)] if by else open_items
+    if not set(free) & set(open_items):
+        raise ValueError(f"ticket {n} is not blocked by {', '.join(free) or 'anyone'}")
+    free = [b for b in free if b in open_items]
+    if _tickets_in_backlog():
+        for b in free:
+            backlog.cli(BACKLOG, "unblock", f"t{n}", "--by", f"t{b}")
+    else:
+        with open(t["arquivo"], encoding="utf-8") as f:
+            _write(t["arquivo"], _trocar_campo(f.read(), "Blocked by", ", ".join(b for b in t["blocked_by"] if b not in free) or "(nenhum)"))
+    left = [b for b in open_items if b not in free]
+    if not left and t["task"] and t["run"]:
+        with contextlib.suppress(Exception), _no_run(t["run"]):
+            orca("task-update", "--id", t["task"], "--status", "ready", "--run", t["run"], timeout=20)
+    append_event({"tipo": "ticket", "op": "desbloqueio", "ticket": n, "liberado": free, "motivo": " ".join(reason.split())})
+    return {"ticket": n, "liberado": free, "restam": left}
 
 
 def ticket_close(numero, answer, dropped=None, integrated=False):
@@ -16533,6 +16615,10 @@ def parser():
     _arg(tn, "projeto", help="the project the released ticket starts in (`Project:`); without it the Run's or the coordinator's cwd project applies")
     tn.add_argument("--wave", type=int, help="puts the task in wave N: blocked by the wave's milestone, and the wave's join waits for it (ticket 342)")
     tn.add_argument("--after", help="the number of a wave's milestone: same as --wave of that wave")
+    tu = sub.add_parser("unblock", help="orq unblock <ticket> --reason \"...\" [--by NN]: lets a ticket go in parallel with the one that blocked it by area (ticket 341)")
+    tu.add_argument("ticket")
+    tu.add_argument("--reason", required=True)
+    tu.add_argument("--by", help="only this blocker (default: all the open ones)")
     tf = tk.add_parser("close", aliases=["fechar"], help="writes the Answer, sets resolved and completes the task")
     tf.add_argument("numero")
     tf.add_argument("--answer", help="text or the path of a file (required, unless --dropped says why)")
@@ -17005,6 +17091,8 @@ def main(argv=None):
             else:
                 print(json.dumps([{"wave": w["wave"], "milestone": w["milestone"]["num"], "join": w["join"]["num"], "tasks": [t["num"] for t in w["tasks"]]} for w in waves()], ensure_ascii=False) if a.json
                       else "\n".join(wave_lines()) or "no wave")
+        elif a.cmd == "unblock":
+            print(json.dumps(ticket_unblock(a.ticket, a.reason, a.by), ensure_ascii=False))
         elif a.cmd == "ticket":
             if a.op == "new":
                 if not (a.model and a.effort):
