@@ -1293,12 +1293,12 @@ def integrate_publish(repo=None, ref="origin/main"):
     whose branch a cycle recorded at its current tip (`_close_integrated`; the integrator rewrites commits, so ancestry proves nothing), runs `worktrees_clean` and sends a short
     summary (cycle, tickets, hash). Never raises. Returns {estado: publicou|em_dia|auditoria|push|sem_origem, hash, intervalo, tickets, avisos}."""
     repo = repo or HOME
-    head = (_git(repo, "rev-parse", "--short", "main") or "").strip()
+    head = (_git(repo, "rev-parse", "--short", BRANCH_NO_REMOTE) or "").strip()
     out = {"estado": "sem_origem", "hash": head, "intervalo": None, "tickets": [], "avisos": []}
     if not head or _git(repo, "rev-parse", "--verify", "-q", ref) is None:
         out["avisos"].append(f"{repo} has no main or no {ref}: nothing published")
         return out
-    base, span = _git(repo, "rev-parse", "--short", ref).strip(), f"{ref}..main"
+    base, span = _git(repo, "rev-parse", "--short", ref).strip(), f"{ref}..{BRANCH_NO_REMOTE}"
     if int((_git(repo, "rev-list", "--count", span) or "0").strip()):
         out["intervalo"] = f"{base}..{head}"
         try:
@@ -1311,7 +1311,7 @@ def integrate_publish(repo=None, ref="origin/main"):
             _publish_notify(f"{head}:audit", f"orq main at {head} NOT published: the audit refused ({_quote('; '.join(reasons), 300)}). Fix it and run `orq integrate publish`.")
             return out
         try:
-            r = subprocess.run([GIT, "-C", repo, "push", ref.split("/")[0], "main"], capture_output=True, text=True, timeout=PUBLISH_PUSH_S)
+            r = subprocess.run([GIT, "-C", repo, "push", ref.split("/")[0], BRANCH_NO_REMOTE], capture_output=True, text=True, timeout=PUBLISH_PUSH_S)
             error = r.stderr.strip() or "push failed" if r.returncode else None
         except (subprocess.TimeoutExpired, OSError) as e:
             error = f"{type(e).__name__}: {e}"
