@@ -8,7 +8,7 @@
 
 Before the tests it runs the night replay (test_noite_replay.py, ticket 216) and prints its time; a red replay leaves main where it was and writes a
 `[PENDENTE` line to ciclos.log, which the manager turns into a notice to the coordinator (ticket 137).
-After the fast-forward it calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
+After the fast-forward it appends `FF main <from>..<to>` to ciclos.log (the completed-cycle line that closes an earlier `[PENDENTE`, ticket 370) and calls `orq integrate conclude`, which closes what the cycle integrated (queue, ticket, worker, cycle). The push stays manual.
 
 The live clone is both the repository and the installation: hooks, orq and the panel run what is there. A merge with an open conflict in it leaves
 markers in orqlib.py and takes everything down. Here the conflict only exists in the worktree.
@@ -92,6 +92,10 @@ def conclude(viva, wt):
             print(r.stderr.strip(), file=sys.stderr)
 
 
+def cycles_log():
+    return os.environ.get("ORQ_CICLOS_LOG") or os.path.join(os.environ.get("ORQ_WT_DIR") or orqpaths.WT, "integracao", "ciclos.log")
+
+
 def advance(wt):
     viva = alive()
     branch = git(wt, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -106,7 +110,7 @@ def advance(wt):
     if replay:
         started = time.time()
         if subprocess.run(replay, shell=True, cwd=wt).returncode:
-            log_path = os.environ.get("ORQ_CICLOS_LOG") or os.path.join(os.environ.get("ORQ_WT_DIR") or orqpaths.WT, "integracao", "ciclos.log")
+            log_path = cycles_log()
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"[PENDENTE: main did not advance, night replay failed] {time.strftime('%Y-%m-%d %H:%M')} {branch} in {wt}\n")
@@ -114,10 +118,15 @@ def advance(wt):
         print(f"integrar: night replay ok in {time.time() - started:.1f} s")
     if subprocess.run(tests_for(viva, wt), shell=True, cwd=wt).returncode:
         die(f"tests failing in {wt}; main did not advance")
+    old = git(viva, "rev-parse", "--short", "HEAD").stdout.strip()
     ff = git(viva, "merge", "--ff-only", branch)
     if ff.returncode:
         die(f"the live main cannot fast-forward (it moved, or has local changes):\n{ff.stderr.strip()}\n"
                f"bring main into the worktree (`git -C {shlex.quote(wt)} merge main`), resolve there and run `integrar.py --avancar {wt}`")
+    log_path = cycles_log()  # the completed-cycle line that closes an earlier `[PENDENTE` (ticket 370)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M')} FF main {old}..{git(viva, 'rev-parse', '--short', 'HEAD').stdout.strip()}\n")
     conclude(viva, wt)  # before removing the worktree: the branches file lives in its gitdir
     git(viva, "worktree", "remove", "--force", wt)
     git(viva, "branch", "-d", branch)
