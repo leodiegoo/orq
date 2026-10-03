@@ -21859,3 +21859,26 @@ if __name__ == "__main__":
     print(f"{sum(r['ok'] for r in results.values())}/{len(tests)} testes passaram (-j {opts.jobs}: {wall:.0f}s wall, {cpu:.0f}s CPU)")
     sys.exit(1 if failures else 0)
 
+
+
+# ---------- ticket 369: a stalled worker of a mate's Run goes to the mate ----------
+
+def test_ticket369_stalled_worker_of_a_mate_run_becomes_a_mate_request_and_leaves_the_coordinator():
+    from datetime import datetime, timezone
+    now_at = datetime.now(timezone.utc)
+    row = lambda run: {"dispatch": "ctx_1", "task": "task_aaaaaaaaaa", "run": run, "estado": "travado", "motivo": "no heartbeat", "idade_s": 900}
+    sent, written = [], []
+    saved = orq_mod._mates, orq_mod.mate_request, orq_mod.append_event
+    orq_mod._mates = lambda: {"orq": {"terminal": "term_mate", "runs": ["run_mate"]}}
+    orq_mod.mate_request = lambda g, text, *a, **k: sent.append((g, text)) or {"corr": "p1"}
+    orq_mod.append_event = written.append
+    try:
+        assert orq_mod._stalled_worker([row("run_mate")], [], now_at) is None, "the coordinator is not charged for the mate's Run"
+        assert "orq steer task_aaaaaaaaaa" in orq_mod._stalled_worker([row("run_coord")], [], now_at), "the coordinator's Run stays as it was"
+        assert orq_mod.stalled_to_mates([row("run_coord")], []) == [] and sent == []
+        assert len(orq_mod.stalled_to_mates([row("run_mate")], [])) == 1
+        assert sent[0][0] == "orq" and 'orq steer task_aaaaaaaaaa "<adjustment>" --run run_mate' in sent[0][1], sent
+        assert written == [{"tipo": "mate_travado", "dispatch": "ctx_1", "estado": "travado", "grupo": "orq", "corr": "p1"}]
+        assert orq_mod.stalled_to_mates([row("run_mate")], written) == [] and len(sent) == 1, "once per dispatch and state"
+    finally:
+        orq_mod._mates, orq_mod.mate_request, orq_mod.append_event = saved
