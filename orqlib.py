@@ -2606,9 +2606,11 @@ def manager_lock():
             _MANAGER_LOCK[0] = 0
 
 
-def _orca(*args, timeout, h, area="orchestration", env_extra=None):
-    """A call to the Orca binary with handle `h` in the ORCA_TERMINAL_HANDLE variable."""
-    env = {**os.environ, "ORCA_TERMINAL_HANDLE": h} if h and h != os.environ.get("ORCA_TERMINAL_HANDLE") else None
+def _orca(*args, timeout, h, area="orchestration", env_extra=None, actual_terminal=False):
+    """A call to Orca, using `h` when supplied or the runtime terminal when `actual_terminal` is true."""
+    env = dict(os.environ) if actual_terminal else ({**os.environ, "ORCA_TERMINAL_HANDLE": h} if h and h != os.environ.get("ORCA_TERMINAL_HANDLE") else None)
+    if actual_terminal:
+        env.pop("ORCA_TERMINAL_HANDLE", None)
     if env_extra:
         env = {**(env or os.environ), **env_extra}
     p = subprocess.run([ORCA, area, *args, "--json"], capture_output=True, text=True, timeout=timeout, env=env)
@@ -2616,6 +2618,27 @@ def _orca(*args, timeout, h, area="orchestration", env_extra=None):
     if not out.get("ok"):
         raise RuntimeError((out.get("error") or {}).get("message") or "orca failed")
     return out["result"]
+
+
+TERMINAL_IDENTITY_TIMEOUT = min(TIMEOUT_ORCA, 1.0)
+
+
+def actual_terminal_handle():
+    """The current Orca terminal reported by the runtime, independent of ORCA_TERMINAL_HANDLE."""
+    try:
+        result = _orca("show", timeout=TERMINAL_IDENTITY_TIMEOUT, h=None, area="terminal", actual_terminal=True)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+        return None
+    terminal = result.get("terminal") if isinstance(result, dict) else None
+    handle = terminal.get("handle") if isinstance(terminal, dict) else None
+    return handle if isinstance(handle, str) and handle else None
+
+
+def terminal_identity_matches():
+    """Only let a Stop or Run notice proceed when orq's environment matches this runtime terminal."""
+    configured = os.environ.get("ORCA_TERMINAL_HANDLE")
+    actual = actual_terminal_handle()
+    return bool(configured and actual and configured == actual)
 
 
 def handle_orca():
@@ -9093,12 +9116,9 @@ def run_hook(kind, harness="claude"):
         ev["_harness_orq"] = harness  # which agent the hook came from: the coordinator keeps its own
         if kind == "acordar" and (os.environ.get("ORQ_MATE") or harness != "claude"):
             return 0  # only the Claude coordinator has an async rewake; the mate and Codex get their notices typed
-        if os.environ.get("ORQ_MATE"):
-            if kind in ("prompt", "stop"):
-                mate_turn(kind, ev)  # without Orca: the deadline for requests to the mate counts from the end of its turn
-            elif kind == "guard" and ev.get("tool_name") == "AskUserQuestion":
-                print(json.dumps(guard_mate(), ensure_ascii=False))
-                return 0
+        if os.environ.get("ORQ_MATE") and kind == "guard" and ev.get("tool_name") == "AskUserQuestion":
+            print(json.dumps(guard_mate(), ensure_ascii=False))
+            return 0
         if kind == "externas":  # every Bash, from any session: only reads the cursor, no Orca
             out = hook_external(ev, None)
             if out:
@@ -9132,6 +9152,14 @@ def run_hook(kind, harness="claude"):
                         log(f"worker ack: {type(e).__name__}: {e}")
             timed_hook_stage(stages, "worker_fast_path", worker_fast_path)
             return 0
+        if kind == "acordar" and role == "worker":
+            return 0  # a worker Stop never waits on the coordinator's notice queue
+        if kind == "acordar" and not terminal_identity_matches():
+            return 0  # another terminal (or an unverified one) must not wait on this terminal's notices
+        if kind == "prompt" and role != "worker" and NOTICE_RUN.search(ev.get("prompt") or "") and not terminal_identity_matches():
+            return 0  # do not read a Run inbox from a session whose environment names another terminal
+        if os.environ.get("ORQ_MATE") and kind in ("prompt", "stop"):
+            mate_turn(kind, ev)  # without Orca: the deadline for requests to the mate counts from the end of its turn
         run = timed_hook_stage(stages, "coordinator_lookup", lambda: coordinator(ev))
         persist_timings = run is not None or role == "worker"
         if run is None:
@@ -12868,6 +12896,23 @@ def doctor_hooks(pin=False):
     if pin:
         print("orq link: " + ("wrapper written" if pin_orq_link() else "unchanged"))
     return 1 if broken else 0
+
+
+def doctor_terminal():
+    """Compare the configured Orca handle with the terminal identity supplied by the runtime."""
+    configured = os.environ.get("ORCA_TERMINAL_HANDLE") or None
+    actual = actual_terminal_handle()
+    return {"configured": configured, "actual": actual, "matches": configured == actual if configured and actual else None}
+
+
+def doctor_terminal_text(result):
+    if result["matches"] is False:
+        return f"warning: ORCA_TERMINAL_HANDLE={result['configured']} differs from actual terminal {result['actual']}"
+    if result["matches"] is True:
+        return f"ORCA_TERMINAL_HANDLE matches actual terminal {result['actual']}"
+    if result["actual"]:
+        return f"warning: ORCA_TERMINAL_HANDLE is unset; actual terminal is {result['actual']}"
+    return "warning: could not read the actual Orca terminal identity"
 
 
 def _integrated_into_main(t):
@@ -19416,6 +19461,8 @@ def parser():
     dc.add_parser("away", help="the away-mode preflight (what `away on` checks first): hard failures exit 1, warnings only print; it turns nothing on")
     dh = dc.add_parser("hooks", help="checks the interpreter of each orq hook (it must import orqlib: Python 3.12+); --pin writes the absolute path into the hook commands and the `orq` link")
     dh.add_argument("--pin", action="store_true")
+    dterm = dc.add_parser("terminal", help="checks whether ORCA_TERMINAL_HANDLE matches this runtime terminal")
+    dterm.add_argument("--json", action="store_true")
     dbk = dc.add_parser("backlog", help="cross-checks the backlog tickets with the Orca tasks and prints the fix for each difference (writes nothing)")
     dbk.add_argument("--json", action="store_true")
     dsc = dc.add_parser("scratch", help="lists the .scratch tickets still ready-for-agent in a phase already declared integrated (writes nothing)")
@@ -19877,6 +19924,10 @@ def main(argv=None):
             return 1 if r["duros"] else 0
         elif a.cmd == "doctor" and a.op == "hooks":
             return doctor_hooks(a.pin)
+        elif a.cmd == "doctor" and a.op == "terminal":
+            result = doctor_terminal()
+            print(json.dumps(result, ensure_ascii=False) if a.json else doctor_terminal_text(result))
+            return 1 if result["matches"] is False else 0
         elif a.cmd == "doctor" and a.op == "old":
             r = doctor_old(a.release, a.max_age_hours, a.ticket)
             print(json.dumps(r, ensure_ascii=False) if a.json else doctor_old_text(r, a.release))

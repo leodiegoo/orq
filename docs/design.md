@@ -26,6 +26,8 @@ The hooks are installed globally, so they run in every session, workers included
 
 Orca's `worker-list` is not used as a role signal. Without `--run` it is scoped to the Run bound to the calling terminal, and a Run a worker created by mistake never lists that worker.
 
+Before a coordinator reads a Run-specific notice or enters the asynchronous Stop notice wait, orq asks `orca terminal show` for the runtime terminal and compares it with `ORCA_TERMINAL_HANDLE`. If the handles differ or Orca cannot confirm the runtime terminal, the hook exits silently without reading the inbox or waiting on the shared notice queue. Worker Stop hooks keep their local fast path and never wait on that queue. `orq doctor terminal` reports when the environment handle does not match the runtime terminal.
+
 ## Entries and effects
 
 An entry (`entry`) is something that demands a decision from the coordinator. There are four sources:

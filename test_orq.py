@@ -185,6 +185,10 @@ if sys.argv[1] == "terminal" and cmd == "list":
     print(json.dumps({"ok": True, "result": {"terminals": [{"handle": h, **read_value("terminais_wt.json", {}).get(h, {})} for h in live], "truncated": os.path.exists(os.path.join(d, "terminals_truncados"))}})); sys.exit(0)
 if sys.argv[1] == "terminal":
     # orca terminal show: terminals.json guarda os handles vivos; handle morto é terminal_handle_stale, como no Orca real
+    if cmd == "show" and not opt("--terminal"):
+        current = os.environ.get("FAKE_CURRENT_TERMINAL")
+        if current:
+            print(json.dumps({"ok": True, "result": {"terminal": {"handle": current}}})); sys.exit(0)
     if opt("--terminal") in read_value("terminals.json", []):
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": opt("--terminal")}}})); sys.exit(0)
     print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}})); sys.exit(0)
@@ -512,7 +516,7 @@ class Env:
         self.env = {**os.environ, "ORQ_HOME": self.home, "ORQ_ORCA": self.bin, "FAKE_DIR": self.fake, "ORQ_NO_BG": "1", "ORQ_LIMPAR": "/nao/existe/limpar.py",
                     "ORQ_LOG": os.path.join(t, "orq.log"), "ORQ_PENDENCIAS": os.path.join(t, "pendencias.json"),
                     "ORQ_ISSUES": os.path.join(t, "issues"), "ORQ_STEERS": os.path.join(t, "steers"), "ORQ_WT_ROOT": os.path.join(t, "orq-wt"), "ORQ_CICLOS_LOG": os.path.join(t, "ciclos.log"), "ORQ_MAPA": os.path.join(t, "desenho.md"),
-                    "ORCA_TERMINAL_HANDLE": "term_coord", "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
+                    "ORCA_TERMINAL_HANDLE": "term_coord", "FAKE_CURRENT_TERMINAL": env.get("ORCA_TERMINAL_HANDLE", "term_coord"), "ORQ_ORCA_TIMEOUT": "10", "ORQ_RESUMOS": os.path.join(t, "resumos"), "ORQ_STEER_ESPERA_S": "0", "ORQ_HUD_CACHE": os.path.join(t, "hud"), "ORQ_CODEX_CONFIG": os.path.join(t, "codex-config.toml"), "ORQ_CODEX_HOOKS": os.path.join(t, "hooks.json"), "ORQ_MAQUINA_LEITURA": os.path.join(t, "maquina-leitura.json"), "ORQ_OCIOSO_MS": "50", "ORQ_AVISO_GAP_S": "0", "ORQ_INICIO_ESPERA_S": "0.3", **env}
         self.set("run.json", {"id": run} if run else None)
         self.machine()
         self.set("../pendencias.json", {"itens": [{"id": "freio-prod", "tipo": "decisao"}, {"id": "avisar-x", "tipo": "avisar"}]})
@@ -529,8 +533,9 @@ class Env:
                        **({"processos": processes} if processes else {})}, f)
 
     def orq(self, *args, stdin=None, cwd=None, **env):
+        actual = env.get("FAKE_CURRENT_TERMINAL", env.get("ORCA_TERMINAL_HANDLE", self.env["FAKE_CURRENT_TERMINAL"]))
         return subprocess.run([sys.executable, ORQ, *args], input=stdin, capture_output=True, text=True, cwd=cwd,
-                              env={**self.env, **env}, timeout=30)
+                              env={**self.env, "FAKE_CURRENT_TERMINAL": actual, **env}, timeout=30)
 
     def prompt(self, text_value, **env):
         return self.orq("hook", "prompt", stdin=json.dumps({"prompt": text_value, "session_id": "abcdef123456"}), **env)
@@ -20985,6 +20990,46 @@ def test_ticket182_read_failure_keeps_the_command_hint():
     assert "orq inbox run_a --ack" in ctx, ctx
 
 
+# ---------- ticket 519: Run inbox Stop notices belong to their actual terminal ----------
+
+def test_ticket519_foreign_terminal_stop_does_not_touch_the_owners_inbox():
+    a = Env(ORCA_TERMINAL_HANDLE="term_owner", FAKE_CURRENT_TERMINAL="term_owner")
+    a.set("run.json", {"id": "run_a", "handle": "term_owner"})
+    a.inbox(("question", {"taskId": "task_1", "dispatchId": "ctx_1"}))
+    _body182(a, "msg_1", "preciso responder a pergunta", sender="term_manager")
+
+    before_foreign_notice = len(_log(a, "calls.log"))
+    foreign_notice = a.orq("hook", "prompt", stdin=json.dumps({"prompt": NOTICE_A, "session_id": "other-session"}), FAKE_CURRENT_TERMINAL="term_other")
+    assert (foreign_notice.returncode, foreign_notice.stdout) == (0, ""), foreign_notice
+    assert a.states() == {"msg_1": "unread"}, "a foreign terminal cannot consume the owner's manager notice"
+    calls = _log(a, "calls.log")[before_foreign_notice:]
+    assert not [call for call in calls if call[0] in ("check", "inbox")], calls
+
+    owner_context = _ctx182(a.prompt(NOTICE_A))
+    assert owner_context.count("msg_1 question") == 1 and "preciso responder a pergunta" in owner_context, owner_context
+    assert "term_owner" not in owner_context and "term_other" not in owner_context, owner_context
+    assert a.states() == {"msg_1": "acked"}, "the owner received and acknowledged the manager notice once"
+
+    other_stop = a.orq("hook", "stop", stdin=json.dumps({"session_id": "other-session"}), FAKE_CURRENT_TERMINAL="term_other")
+    assert (other_stop.returncode, other_stop.stdout) == (0, ""), other_stop
+    before_rewake = len(_log(a, "calls.log"))
+    other_rewake = a.orq("hook", "acordar", "claude", stdin=json.dumps({"session_id": "other-session"}), FAKE_CURRENT_TERMINAL="term_other")
+    assert (other_rewake.returncode, other_rewake.stdout, other_rewake.stderr) == (0, "", ""), other_rewake
+    calls = _log(a, "calls.log")[before_rewake:]
+    assert not [call for call in calls if call[0] in ("run-current", "check", "inbox")], calls
+
+
+def test_ticket519_doctor_reports_when_the_environment_handle_is_not_the_actual_terminal():
+    a = Env(ORCA_TERMINAL_HANDLE="term_claimed", FAKE_CURRENT_TERMINAL="term_actual")
+    mismatch = a.orq("doctor", "terminal", "--json")
+    assert mismatch.returncode == 1, mismatch
+    assert json.loads(mismatch.stdout) == {"configured": "term_claimed", "actual": "term_actual", "matches": False}, mismatch.stdout
+
+    match = a.orq("doctor", "terminal", "--json", ORCA_TERMINAL_HANDLE="term_actual", FAKE_CURRENT_TERMINAL="term_actual")
+    assert match.returncode == 0, match
+    assert json.loads(match.stdout) == {"configured": "term_actual", "actual": "term_actual", "matches": True}, match.stdout
+
+
 # ---------- ticket 228: a hook that fails or does not import warns the user and the coordinator, and the hooks' Python is checked ----------
 
 def _broken_install228(source='x = f"{"a"}" +\n'):
@@ -25938,7 +25983,7 @@ def test_ticket394_wake_does_nothing_for_workers_mates_and_codex():
     for env, args, label in (({"ORQ_MATE": "grupo"}, (), "mate"), ({}, ("codex",), "codex")):
         r = a.orq("hook", "acordar", *args, stdin=json.dumps({"session_id": "abcdef123456"}), **env)
         assert r.returncode == 0 and r.stderr == "", (label, r)
-    w = Env(run=None)
+    w = Env()
     os.makedirs(w.home, exist_ok=True)
     _write_state(os.path.join(w.home, "cursor.json"), {"papeis": {"abcdef123456": "worker"}})
     _wake_queue(w, "orq: nao sai")
