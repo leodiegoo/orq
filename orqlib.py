@@ -9835,8 +9835,63 @@ def mate_sleep(group_name, reason="manual", agent_rows=None):
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         _mate_mut(group_name, terminal=t, dormiu=None)
         raise ValueError(f"mate {group_name}: terminal close failed ({e})")
+    live_after_close = _alive_terminals()
+    if live_after_close is None or t in live_after_close:
+        _mate_mut(group_name, terminal=t, dormiu=None)
+        reason = "Orca could not confirm the terminal close" if live_after_close is None else f"terminal {t} is still listed"
+        raise ValueError(f"mate {group_name}: {reason}; the old session remains selected")
     append_event({"tipo": "mate_dormiu", "grupo": group_name, "terminal": t, "sessao": m["sessao"], "motivo": reason})
     return {"grupo": group_name, "terminal": t, "sessao": m["sessao"], "motivo": reason}
+
+
+def mate_switch(group_name, harness, model=None, effort=None):
+    """Safely replaces a group's mate session with a fresh session on another harness."""
+    cfg = groups().get(group_name)
+    if cfg is None:
+        raise ValueError(f"group {group_name} does not exist in {GROUPS_DIR}/")
+    if harness not in HARNESSES:
+        raise ValueError(f"--harness expects {', '.join(HARNESSES)} (got {harness!r})")
+    if bool(model) != bool(effort):
+        raise ValueError("--model and --effort go together: pass both or let the target harness use its configured defaults")
+    if model:
+        if effort not in HARNESS[harness]["efforts"]:
+            raise ValueError(f"{harness} has no effort {effort!r} ({', '.join(HARNESS[harness]['efforts'])})")
+        validate_model_effort(model, effort)
+
+    previous_harness = cfg.get("harness") or "claude"
+    if previous_harness == harness:
+        raise ValueError(f"mate {group_name} already uses {harness}: nothing was changed")
+    mate = _dict(_mates().get(group_name))
+    if mate.get("aprovacao_hooks"):
+        raise ValueError(f"mate {group_name} has a pending Codex hooks approval")
+    pending = [p["corr"] for p in mate_pending(read_events(), _mates(), datetime.now(timezone.utc)) if p["grupo"] == group_name]
+    if pending:
+        raise ValueError(f"mate {group_name} has an open request ({', '.join(pending)})")
+    if _mate_has_worker(mate):
+        raise ValueError(f"mate {group_name} has a worker in its Run that was not released")
+
+    old_terminal = mate.get("terminal")
+    if old_terminal:
+        live = _alive_terminals()
+        if live is None:
+            raise ValueError("Orca did not list the terminals: without knowing whether the mate is alive, nothing was switched")
+        if old_terminal in live:
+            mate_sleep(group_name, "harness switch")
+
+    # The old terminal is closed or Orca proved it gone. A session from one harness
+    # cannot be resumed by the other, so clear it before saving the target profile.
+    _mate_mut(group_name, terminal=None, sessao=None, dormiu=None, morto=None)
+    profile = dict(cfg)
+    profile["harness"] = harness
+    if model:
+        profile["modelo"], profile["effort"] = model, effort
+    else:
+        profile.pop("modelo", None)
+        profile.pop("effort", None)
+    _write_json(os.path.join(_path(GROUPS_DIR), f"{group_name}.json"), profile, indent=2)
+
+    opened = mate_open(group_name)
+    return {"grupo": group_name, "de": previous_harness, "harness": harness, "modelo": model, "effort": effort, **opened}
 
 
 def _list_and(item_list):
@@ -19230,6 +19285,11 @@ def parser():
     mt = sub.add_parser("mate", help="a group's secondmate: open | sleep | request | raise | requests").add_subparsers(dest="op", required=True)
     mt.add_parser("open", aliases=["abrir"], help="opens the group's mate").add_argument("group_name")
     mt.add_parser("sleep", aliases=["dormir"], help="hibernates the group's mate (the manager does it by itself after ORQ_MATE_DORMIR_MIN idle minutes); orq mate request wakes it").add_argument("group_name")
+    switch_mate = mt.add_parser("switch", help="safely closes the current mate and opens it on another harness")
+    switch_mate.add_argument("group_name")
+    switch_mate.add_argument("--harness", required=True, choices=HARNESSES)
+    switch_mate.add_argument("--model")
+    switch_mate.add_argument("--effort")
     mp = mt.add_parser("request", aliases=["pedir"], help="asks the group's mate for something")
     mp.add_argument("group_name")
     _arg(mp, "texto", required=True)
@@ -19686,6 +19746,8 @@ def main(argv=None):
             print(json.dumps(mate_open(a.group_name), ensure_ascii=False))
         elif a.cmd == "mate" and a.op == "sleep":
             print(json.dumps(mate_sleep(a.group_name), ensure_ascii=False))
+        elif a.cmd == "mate" and a.op == "switch":
+            print(json.dumps(mate_switch(a.group_name, a.harness, a.model, a.effort), ensure_ascii=False))
         elif a.cmd == "mate" and a.op == "request":
             r = mate_request(a.group_name, a.text_value, a.deadline, a.responde)
             print(json.dumps(r, ensure_ascii=False))

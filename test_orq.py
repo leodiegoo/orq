@@ -146,7 +146,8 @@ if sys.argv[1] == "terminal" and cmd in ("close", "rename", "send"):
     if cmd == "send" and os.environ.get("FAKE_FAIL_SEND_DEPOIS") and len(ler_linhas("send.log")) > int(os.environ["FAKE_FAIL_SEND_DEPOIS"]):
         failure("falhou terminal send")  # o enésimo send em diante falha (o texto do anterior já foi digitado)
     if cmd == "close":
-        json.dump([h for h in read_value("terminals.json", []) if h != opt("--terminal")], open(os.path.join(d, "terminals.json"), "w"))
+        if os.environ.get("FAKE_STAY_TERMINAL") != opt("--terminal"):
+            json.dump([h for h in read_value("terminals.json", []) if h != opt("--terminal")], open(os.path.join(d, "terminals.json"), "w"))
         file_path = os.environ.get("ORQ_PROCESSOS")
         if file_path and os.path.exists(file_path):
             # fechar o terminal mata o agente e tudo o que sobe abaixo dele (ORQ_PROCESSOS: a lista de processos falsa, com o terminal de cada agente)
@@ -13028,6 +13029,85 @@ def test_ticket413_codex_mate_open_and_resume_bypass_shell_alias():
     commands = [json.loads(x) for x in open(os.path.join(a.fake, "create.log"))]
     command = commands[1][commands[1].index("--command") + 1]
     assert " ORQ_MATE=orq command codex resume sess-mate -m gpt-6-sol --dangerously-bypass-approvals-and-sandbox" in command, command
+
+
+def test_ticket465_mate_switch_refuses_a_working_claude_mate_without_changing_state():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.set("busy.json", ["term_mate"])
+    group_path = os.path.join(a.home, "groups", "orq.json")
+    old_profile = json.load(open(group_path))
+    old_mate = _cursor(a)["mates"]["orq"]
+
+    r = a.orq("mate", "switch", "orq", "--harness", "codex", "--model", "gpt-6-sol", "--effort", "medium")
+
+    assert r.returncode != 0 and "not free" in r.stderr, r.stdout + r.stderr
+    assert not _log(a, "close.log") and not _log(a, "create.log")
+    assert json.load(open(group_path)) == old_profile
+    assert _cursor(a)["mates"]["orq"] == old_mate
+    assert "term_mate" in json.load(open(os.path.join(a.fake, "terminals.json")))
+
+
+def test_ticket465_mate_switch_refuses_if_orca_still_lists_the_closed_terminal():
+    a = Env(FAKE_STAY_TERMINAL="term_mate")
+    _group(a)
+    _mate_alive(a)
+    a.set("screens.json", {"term_mate": _screen52("tela-claude-ocioso.txt")})
+    group_path = os.path.join(a.home, "groups", "orq.json")
+    old_profile = json.load(open(group_path))
+
+    r = a.orq("mate", "switch", "orq", "--harness", "codex", "--model", "gpt-6-sol", "--effort", "medium")
+
+    assert r.returncode != 0 and "still listed" in r.stderr, r.stdout + r.stderr
+    assert not _log(a, "create.log") and "term_mate" in json.load(open(os.path.join(a.fake, "terminals.json")))
+    assert json.load(open(group_path)) == old_profile
+    mate = _cursor(a)["mates"]["orq"]
+    assert mate["terminal"] == "term_mate" and mate["sessao"] == "sess-mate" and not mate.get("dormiu"), mate
+
+
+def test_ticket465_mate_switch_closes_claude_then_opens_fresh_codex_with_requested_profile():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.set("screens.json", {"term_mate": _screen52("tela-claude-ocioso.txt")})
+
+    r = a.orq("mate", "switch", "orq", "--harness", "codex", "--model", "gpt-6-sol", "--effort", "xhigh")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    result = json.loads(r.stdout)
+    assert result["grupo"] == "orq" and result["terminal"] == "term_ret1" and not result["retomado"], result
+    profile = json.load(open(os.path.join(a.home, "groups", "orq.json")))
+    assert (profile["harness"], profile["model"], profile["effort"]) == ("codex", "gpt-6-sol", "xhigh"), profile
+    mate = _cursor(a)["mates"]["orq"]
+    assert mate["terminal"] == "term_ret1" and mate.get("sessao") is None and not mate.get("dormiu"), mate
+    calls = _log(a, "calls.log")
+    closed = next(i for i, call in enumerate(calls) if call[0] == "close" and call[call.index("--terminal") + 1] == "term_mate")
+    created = next(i for i, call in enumerate(calls) if call[0] == "create")
+    assert closed < created, calls
+    command = _log(a, "create.log")[0]
+    command = command[command.index("--command") + 1]
+    assert " ORQ_MATE=orq command codex -m gpt-6-sol -c 'model_reasoning_effort=\"xhigh\"'" in command, command
+    assert "--resume" not in command and "sess-mate" not in command, command
+    terminals = json.load(open(os.path.join(a.fake, "terminals.json")))
+    assert "term_mate" not in terminals and "term_ret1" in terminals, terminals
+
+
+def test_ticket465_mate_switch_uses_codex_defaults_when_model_and_effort_are_omitted():
+    a = Env()
+    _group(a)
+    _mate_alive(a)
+    a.set("screens.json", {"term_mate": _screen52("tela-claude-ocioso.txt")})
+
+    r = a.orq("mate", "switch", "orq", "--harness", "codex")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    profile = json.load(open(os.path.join(a.home, "groups", "orq.json")))
+    assert profile["harness"] == "codex" and "model" not in profile and "effort" not in profile, profile
+    command = _log(a, "create.log")[0]
+    command = command[command.index("--command") + 1]
+    assert " ORQ_MATE=orq command codex --dangerously-bypass-approvals-and-sandbox" in command, command
+    assert " -m " not in command and " -c " not in command and "--resume" not in command, command
 
 
 def test_ticket460_codex_hooks_review_waits_for_approval_before_redelivery():
