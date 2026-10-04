@@ -19450,6 +19450,57 @@ def test_ticket452_doctor_backlog_does_not_report_a_live_integrator_service_tick
     assert r.returncode == 0 and "consistent (1 tickets, 1 tasks checked)" in r.stdout, (r.stdout, r.stderr)
 
 
+def test_ticket474_doctor_backlog_guides_missing_deliveries_and_manager_leaves_them_open():
+    a = _doctor_env371(tempfile.mkdtemp())
+    for title in ("orq: local missing queue", "orq: missing branch ref", "orq: queued", "orq: integrated", "orq: no delivery", "orq: delivery without branch"):
+        _new(a, title)
+        backlog_mod.cli(a.env["ORQ_BACKLOG"], "start", f"t{len(_bl_items(a)):02d}")
+    repo = a.env["ORQ_REPOS"]
+    subprocess.run(["git", "-C", repo, "branch", "feat/orq-z"], check=True, capture_output=True)
+    task_list = _tasks_fake(a)
+    for task in task_list:
+        task["status"] = "completed"
+    a.set("tasks_run_a.json", task_list)
+    _evs(a,
+         {"tipo": "entrega_orq", "ticket": "01", "branch": "feat/orq-x", "ts": "2026-10-01T00:00:00Z"},
+         {"tipo": "entrega_orq", "ticket": "02", "branch": "feat/orq-not-found", "ts": "2026-10-01T00:00:00Z"},
+         {"tipo": "entrega_orq", "ticket": "04", "branch": "feat/orq-z", "ts": "2026-10-01T00:00:00Z"},
+         {"tipo": "entrega", "ticket": "06", "ts": "2026-10-01T00:00:00Z"},
+         {"tipo": "ciclo", "hash": "abc1234", "branches": ["feat/orq-z"], "tickets": [], "ts": "2999-01-01T00:00:00Z"})
+    assert a.orq("integrate", "queue", "add", "feat/orq-y", "03").returncode == 0
+
+    result = a.orq("doctor", "backlog", "--json")
+    findings = {item["ticket"]: item for item in json.loads(result.stdout)["problemas"]}
+    assert result.returncode == 1 and set(findings) == {"01", "02", "05", "06"}, findings
+    assert "feat/orq-x" in findings["01"]["problema"] and "queue" in findings["01"]["problema"].lower(), findings["01"]
+    assert findings["01"]["conserto"] == "orq integrate queue add feat/orq-x 01", findings["01"]
+    assert "orq ticket close" not in findings["01"]["conserto"]
+    assert "feat/orq-not-found" in findings["02"]["problema"] and "coordinator review" in findings["02"]["conserto"].lower(), findings["02"]
+    assert "orq ticket close" not in findings["02"]["conserto"] and "integrate queue add" not in findings["02"]["conserto"]
+    assert "orq ticket close 05" in findings["05"]["conserto"], findings["05"]
+    assert "no branch" in findings["06"]["problema"] and "coordinator review" in findings["06"]["conserto"].lower(), findings["06"]
+    assert "orq ticket close" not in findings["06"]["conserto"]
+
+    refused = a.orq("ticket", "close", "01", "--answer", "work complete")
+    assert refused.returncode == 1 and "feat/orq-x" in refused.stderr and "not in main" in refused.stderr, refused.stderr
+    assert _bl_items(a)["t01"]["estado"] == "in_flight"
+    before_queue = json.loads(a.orq("integrate", "queue", "list", "--json").stdout)
+    assert [item["ticket"] for item in before_queue] == ["03"], before_queue
+
+    a.orq("gerente", "absorver")
+    items = _bl_items(a)
+    assert all(items[f"t{n}"]["estado"] == "in_flight" for n in ("01", "02", "03", "05", "06")), items
+    assert items["t04"]["estado"] == "done", "only cycle-backed proof lets the manager close a delivered ticket"
+    after_queue = json.loads(a.orq("integrate", "queue", "list", "--json").stdout)
+    assert [item["ticket"] for item in after_queue] == ["03"], after_queue
+    unsafe_closes = [event for event in a.events() if event.get("tipo") == "ticket" and event.get("ticket") in {"01", "02", "06"} and event.get("op") == "fechar"]
+    assert not unsafe_closes, unsafe_closes
+    notice_text = next(_whole_notice(notice[notice.index("--text") + 1]) for notice in _sent_notices(a)
+                       if "orq: backlog and Orca differ" in _whole_notice(notice[notice.index("--text") + 1]))
+    assert "01:" in notice_text and "feat/orq-x" in notice_text and "02:" in notice_text and "feat/orq-not-found" in notice_text, notice_text
+    assert "03:" not in notice_text and "04:" not in notice_text, notice_text
+
+
 # ---- M7: backlog per group ----
 
 def _orq_group(a, **cfg):
