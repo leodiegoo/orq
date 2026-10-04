@@ -8021,6 +8021,15 @@ HOOK_TIMING_HISTORY_LIMIT = 50
 HOOK_TIMING_HISTORY_THRESHOLD_MS = 3000
 
 
+def process_cpu_seconds():
+    """CPU seconds used by this process and its waited children, excluding scheduler waits."""
+    import resource
+
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
 def timed_hook_stage(stages, name, fn, clock=None):
     """Runs one hook stage and records its elapsed milliseconds; `clock` keeps measurements deterministic in tests."""
     clock = clock or HOOK_CLOCK

@@ -1294,6 +1294,8 @@ Measured with `Amb` (fake Orca, isolated `ORQ_HOME`), median of 15 runs, machine
 
 The coordinator `prompt` hook was never under the ceiling (it calls Orca); the tests that hold 100 ms are the worker, `place` and `external` ones.
 
+The ticket 540 checks for worker `stop` and coordinator `place` measure CPU time for the test process and its waited subprocesses. A scheduler pause under parallel load no longer makes those checks fail; CPU spent in the hook and its subprocesses still counts against the 100 ms limit.
+
 ## Notices to the coordinator
 
 The manager types notices into the coordinator's terminal (a PR merged or closed, a stuck E2E queue, plan usage, a worker menu on screen). On 01/10 one of them landed in the middle of a sentence the user was typing: the box was read empty, the user started typing, and the `send` with Enter arrived after. Two changes close that race.

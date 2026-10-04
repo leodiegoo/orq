@@ -104,6 +104,8 @@ The weekly retro skill is opt-in: `ln -s "$PWD/skills/orq-retro" ~/.claude/skill
 
 The orq hooks exit at once outside an Orca terminal and in worker sessions, so they are safe to install globally. The worker-routing guard is the exception: it checks dispatch commands in every session.
 
+The worker `stop` and coordinator `place` latency tests use a 100 ms CPU-time budget for the test process and its waited subprocesses. Scheduler pauses under parallel load do not count toward the budget, while CPU spent in the hook still does.
+
 Branch cleanup (`limpar-mergeados.py`) reads the branch patterns to keep from `~/.claude/scripts/limpar-mergeados.keep` (one glob per line; a missing file means none). It treats `main`, `development` and `staging` as protected branches (override with `ORQ_PROTECTED_BRANCHES`, comma-separated) and counts a branch as finished only when a PR into `main` merges it (`ORQ_FINAL_BASE`); a project that declares its environments ([Projects](#projects)) supplies both itself.
 
 ## Configuration

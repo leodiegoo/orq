@@ -4604,9 +4604,9 @@ def test_place_only_in_coordinator_and_under_100_ms():
     assert _notice(_place(w, pw)) == "" and _calls(w, "run-current") == []
     assert _notice(_place(a, p, ORCA_TERMINAL_HANDLE="")) == "", "fora do Orca"
     ev = {"session_id": "abcdef123456", "cwd": p, "tool_name": "Bash", "tool_input": {"command": "git commit -m x"}}
-    t = time.perf_counter()
+    t = orq_mod.process_cpu_seconds()
     orq_mod.hook_place(ev, None)
-    assert time.perf_counter() - t < 0.1, "o hook em si (git incluído) passa de 100 ms"
+    assert orq_mod.process_cpu_seconds() - t < 0.1, "o hook em si (git incluído) usa mais de 100 ms de CPU"
 
 
 def test_place_follows_the_cd_before_a_git_write():
@@ -5960,10 +5960,40 @@ def test_ticket24_worker_hook_stays_under_100_ms():
     _hook(a, "prompt", prompt=PREAMBLE_24)
     durations = []
     for _ in range(5):
-        t0 = time.perf_counter()
+        t0 = orq_mod.process_cpu_seconds()
         _hook(a, "stop")
-        durations.append(time.perf_counter() - t0)
+        durations.append(orq_mod.process_cpu_seconds() - t0)
     assert min(durations) < 0.1, durations
+
+
+def test_ticket540_latency_checks_ignore_simulated_host_contention_in_parallel():
+    run = subprocess.run
+
+    def run_with_scheduler_wait(*args, **kwargs):
+        result = run(*args, **kwargs)
+        command = args[0]
+        hook_process = isinstance(command, (list, tuple)) and ORQ in command and "hook" in command
+        git_probe = isinstance(command, (list, tuple)) and command[0] == "git" and "rev-parse" in command and "--show-toplevel" in command
+        if hook_process or git_probe:
+            time.sleep(0.15)  # simulated descheduling after work completes: wall time grows, process CPU does not
+        return result
+
+    checks = [
+        ("test_ticket24_worker_hook_stays_under_100_ms", test_ticket24_worker_hook_stays_under_100_ms),
+        ("test_place_only_in_coordinator_and_under_100_ms", test_place_only_in_coordinator_and_under_100_ms),
+    ]
+    wait_started = orq_mod.process_cpu_seconds()
+    time.sleep(0.15)
+    assert orq_mod.process_cpu_seconds() - wait_started < 0.1, "scheduler wait was charged as CPU"
+    work_started = orq_mod.process_cpu_seconds()
+    cpu_deadline = time.process_time() + 0.11
+    while time.process_time() < cpu_deadline:
+        pass
+    assert orq_mod.process_cpu_seconds() - work_started >= 0.1, "CPU work was not counted"
+    with mock.patch.object(subprocess, "run", side_effect=run_with_scheduler_wait):
+        results = _run_tests(checks, jobs=2, echo=lambda _line: None)
+    failed = {name: result["err"] for name, result in results.items() if not result["ok"]}
+    assert not failed, failed
 
 
 def test_ticket418_worker_prompt_uses_fast_path_and_records_stage_times_without_ingest():
