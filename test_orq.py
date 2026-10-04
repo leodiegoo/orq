@@ -3883,6 +3883,56 @@ def test_dispatch_new_worktree_passes_on_name_and_base_branch():
     assert ev["worktree_mode"] == "new-top-level" and ev["branch"] == "feat/x" and ev["nome"] == "feat/x", ev
 
 
+def test_ticket531_explicit_worktree_keeps_selector_and_records_actual_root_without_worker_path():
+    a = Env(run="run_a")
+    _, worktree = _repo(a.tmp.name)
+    root = os.path.realpath(worktree)
+
+    r = _dispatch(a, "--worktree", worktree)
+
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == f"path:{root}", arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["worktree"] == f"path:{root}" and ev["worktree_path"] == root, ev
+    assert ev["worktree_mode"] == "existing", ev
+
+
+def test_ticket531_named_worktree_keeps_selector_and_records_actual_root_without_worker_path():
+    a = Env(run="run_a")
+    _, worktree = _repo(a.tmp.name)
+    root = os.path.realpath(worktree)
+    a.set("worktrees.json", [{"path": worktree, "displayName": "worker-wt", "branch": "refs/heads/feat/w", "isMainWorktree": False}])
+
+    r = _dispatch(a, "--worktree", "name:worker-wt")
+
+    assert r.returncode == 0, r.stderr
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == f"path:{root}", arg
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["worktree"] == f"path:{root}" and ev["worktree_path"] == root, ev
+    assert ev["worktree_mode"] == "existing" and ev["branch"] == "feat/w", ev
+
+
+def test_ticket531_service_refuses_live_main_and_records_current_root():
+    a = Env(run="run_a")
+    main, worktree = _repo(a.tmp.name)
+    nested = os.path.join(main, "nested")
+    os.mkdir(nested)
+
+    r = _dispatch(a, "--worktree", "current", "--service", cwd=nested)
+
+    assert r.returncode == 1 and main in r.stderr and "separate worktree" in r.stderr.lower(), r.stderr
+    assert not _log(a, "started.log")
+    assert not [e for e in a.events() if e["tipo"] in ("despacho", "servico_marcado")]
+
+    r = _dispatch(a, "--worktree", "current", "--service", cwd=worktree)
+    assert r.returncode == 0, r.stderr
+    (ev,) = [e for e in a.events() if e["tipo"] == "despacho"]
+    assert ev["servico"] is True and ev["worktree"] == "current", ev
+    assert ev["worktree_mode"] == "current" and ev["worktree_path"] == os.path.realpath(worktree), ev
+
+
 def test_ticket442_parent_branch_sets_board_lineage_and_ticket_metadata():
     rows = [{"id": "repo::/wt/feature", "path": "/wt/feature", "branch": "refs/heads/feat/failover", "displayName": "failover"}]
     calls = []
@@ -24184,6 +24234,16 @@ def test_ticket531_new_top_level_dispatches_in_different_worktrees_do_not_supers
     events = [{"tipo": "despacho", "task": "task_old", "dispatch": "ctx_old", "worktree": "new-top-level", "worktree_path": "/wt/old"},
               {"tipo": "despacho", "task": "task_new", "dispatch": "ctx_new", "worktree": "new-top-level", "worktree_path": "/wt/new"}]
     assert orqlib._superseding_dispatch(events, "ctx_old") is None
+
+
+def test_ticket531_supersession_matches_legacy_path_selector_to_canonical_root():
+    a = Env(run="run_a")
+    _, worktree = _repo(a.tmp.name)
+    root = os.path.realpath(worktree)
+    events = [{"tipo": "despacho", "task": "task_old", "dispatch": "ctx_old", "worktree": f"path:{root}"},
+              {"tipo": "despacho", "task": "task_new", "dispatch": "ctx_new", "worktree_path": root}]
+
+    assert orqlib._superseding_dispatch(events, "ctx_old") == ("ctx_new", "task_new")
 
 
 def test_ticket531_integrator_requeue_branch_resolves_from_queue_and_delivery_history():
