@@ -9792,8 +9792,9 @@ def mate_lines():
 
 
 def dispatch_group(title, ticket=None, project=None, run=None):
-    """(group, reason) of a dispatch that belongs to a group with a configured mate (open or asleep), by title prefix or by the project's folder; (None, reason) otherwise.
-    The mate's own dispatches (ORQ_MATE) never go back up to it."""
+    """(group, reason) of a group-owned ticket, or of a request whose configured mate is open or asleep; (None, reason) otherwise.
+    Title prefixes and project folders establish membership. A ticket match is returned even without a live mate so `dispatch_to_mate` can refuse an
+    implicit Run change; the mate's own dispatches (ORQ_MATE) never go back up to it."""
     if os.environ.get("ORQ_MATE"):
         return None, "dispatch made by a mate"
     if ticket and not title:
@@ -9803,6 +9804,8 @@ def dispatch_group(title, ticket=None, project=None, run=None):
     item_name, reason = group_of(groups(), title=title, cwd=project and repo_folder(projects()[project]["repo"]))
     if not item_name:
         return None, reason
+    if ticket:
+        return item_name, reason
     m, live = _dict(_mates().get(item_name)), _alive_terminals()
     if (m.get("dormiu") and not m.get("terminal")) or (m.get("terminal") and (live is None or m["terminal"] in live)):
         return item_name, reason
@@ -9810,11 +9813,13 @@ def dispatch_group(title, ticket=None, project=None, run=None):
 
 
 def dispatch_to_mate(item_name, reason, run, title, ticket, spec_file, model, effort):
-    """`orq dispatch` of a group's ticket: asks the group's mate to dispatch it (`orq mate request`, which wakes a sleeping one) instead of starting the worker."""
-    what = f"ticket {str(ticket).zfill(2)}" if ticket else f"{title!r} (spec {spec_file})"
+    """Routes title/spec requests to a group's mate; a ticket needs an explicit choice because `--run` already names its worker Run."""
+    if ticket:
+        raise ValueError(f"ticket {str(ticket).strip().zfill(2)} belongs to group {item_name}: use --direct to dispatch this ticket in that Run, or orq mate request to ask the group's mate")
+    what = f"{title!r} (spec {spec_file})"
     r = mate_request(item_name, f"dispatch {what} in your Run: model {model}, effort {effort} (the coordinator's Run is {run}). Answer with the worker's dispatch id.")
     append_event({"tipo": "mate_dispatch", "grupo": item_name, "corr": r["corr"], "run": run, "motivo": reason, "modelo": model, "effort": effort,
-                  **({"ticket": str(ticket).zfill(2)} if ticket else {"titulo": title})})
+                  "titulo": title})
     return {"estado": "mate", "grupo": item_name, "corr": r["corr"], "entrega": r["entrega"], "motivo": reason}
 
 
