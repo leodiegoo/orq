@@ -403,7 +403,7 @@ elif cmd == "worker-start":
     open(os.path.join(d, "started-env.log"), "a").write(json.dumps({k: os.environ.get(k) for k in ("GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")}) + "\\n")
     if os.environ.get("FAKE_FAIL_START_MODEL") and os.environ["FAKE_FAIL_START_MODEL"] == opt("--model"):
         failure("model not available: " + str(opt("--model")))
-    if os.environ.get("FAKE_REQUIRE_NAME") and opt("--worktree") != "current" and not opt("--name") and not opt("--retry-of"):
+    if os.environ.get("FAKE_REQUIRE_NAME") and opt("--worktree") in (None, "new-top-level") and not opt("--name") and not opt("--retry-of"):
         failure("New worktrees require --name")  # como o Orca real: worktree nova sem nome
     ws = read_value("workers.json", [])
     n = len(ws) + 1
@@ -25488,6 +25488,7 @@ def _queue389(a, minutes_ago, ticket="9", branch="feat/x"):
 def _env389():
     a = Env(run="run_a", ORCA_TERMINAL_HANDLE="term_ger")
     _manager(a)
+    a.integrator_worktree = _integrator_worktree389(a)
     plan = os.path.join(a.tmp.name, "plan")
     os.makedirs(os.path.join(plan, "specs"))
     open(os.path.join(plan, "specs", "orq-integrador-servico.md"), "w").write("## What to build\nintegre\n")
@@ -25500,12 +25501,74 @@ def _integrator_starts(a):
     return [e for e in a.events() if e["tipo"] == "despacho" and e.get("servico") and "integrador" in (e.get("titulo") or "").lower()]
 
 
+def _integrator_worktree389(a, path=None):
+    if path is None:
+        _, path = _repo(os.path.join(a.tmp.name, "integrator"))
+    a.set("worktrees.json", [{"path": path, "displayName": "orq-integrator", "branch": "refs/heads/feat/w", "isMainWorktree": False}])
+    return path
+
+
+def test_ticket489_manager_starts_integrator_in_its_existing_worktree():
+    a = _env389()
+    worktree = a.integrator_worktree
+    _queue389(a, 8)
+
+    r = a.orq("gerente", "absorver", FAKE_REQUIRE_NAME="1")
+
+    assert r.returncode == 0, r.stderr
+    (ev,) = _integrator_starts(a)
+    assert ev["worktree"] == f"path:{os.path.realpath(worktree)}", ev
+    (arg,) = _log(a, "started.log")
+    assert arg[arg.index("--worktree") + 1] == f"path:{os.path.realpath(worktree)}", arg
+    assert "--name" not in arg
+    assert len(json.load(open(os.path.join(a.fake, "worktrees.json")))) == 1, "reuse the managed worktree"
+
+
+def test_ticket489_manager_refuses_to_start_when_the_integrator_worktree_is_missing():
+    a = _env389()
+    a.set("worktrees.json", [])
+    _queue389(a, 8)
+
+    r = a.orq("gerente", "absorver")
+
+    assert r.returncode == 0, r.stderr
+    assert "integrator not started" in r.stdout and "did not match a local Orca worktree" in r.stdout, r.stdout
+    assert not _log(a, "started.log") and not _integrator_starts(a)
+
+
+def test_ticket489_manager_refuses_to_start_when_the_integrator_worktree_is_dirty():
+    a = _env389()
+    open(os.path.join(a.integrator_worktree, "leftover.txt"), "w").write("uncommitted\n")
+    _queue389(a, 8)
+
+    r = a.orq("gerente", "absorver")
+
+    assert r.returncode == 0, r.stderr
+    assert "integrator not started" in r.stdout and "is dirty" in r.stdout, r.stdout
+    assert not _log(a, "started.log") and not _integrator_starts(a)
+
+
+def test_ticket489_manager_refuses_to_start_when_the_integrator_selector_is_not_a_git_worktree():
+    a = _env389()
+    invalid = os.path.join(a.tmp.name, "not-a-worktree")
+    os.mkdir(invalid)
+    _integrator_worktree389(a, invalid)
+    _queue389(a, 8)
+
+    r = a.orq("gerente", "absorver")
+
+    assert r.returncode == 0, r.stderr
+    assert "integrator not started" in r.stdout and "not a Git worktree" in r.stdout, r.stdout
+    assert not _log(a, "started.log") and not _integrator_starts(a)
+
+
 def test_ticket389_manager_starts_the_integrator_when_an_old_queue_entry_has_none_alive():
     a = _env389()
     _queue389(a, 8)
     assert a.orq("gerente", "absorver").returncode == 0
     (ev,) = _integrator_starts(a)
     assert ev["run"] == "run_a", ev
+    assert ev["worktree"] == f"path:{os.path.realpath(a.integrator_worktree)}", ev
     assert a.orq("gerente", "absorver").returncode == 0
     assert len(_integrator_starts(a)) == 1, "one integrator at a time: the one just started counts"
 

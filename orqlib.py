@@ -1529,6 +1529,18 @@ def integrate_publish_round():
 INTEGRATOR_BOOT_S = float(os.environ.get("ORQ_INTEGRADOR_SOBE_MIN") or 5) * 60  # a queue entry this old with no live integrator makes the manager start one (ticket 389)
 INTEGRA_ORPHAN_S = float(os.environ.get("ORQ_INTEGRA_ORFA_MIN") or 15) * 60  # an integra-* folder with no process and no commit for this long is reported as orphan
 INTEGRATOR_MODEL, INTEGRATOR_EFFORT = "claude-sonnet-5-5", "medium"
+INTEGRATOR_WORKTREE = "name:orq-integrator"  # ticket 489 reuses the ticket 463 selector for Orca's managed integrator worktree
+
+
+def _integrator_worktree():
+    """Return the existing clean integrator worktree selector, refusing any missing or unusable state."""
+    _, path = _resolve_dispatch_worktree(INTEGRATOR_WORKTREE)
+    status = _git(path, "status", "--porcelain")
+    if status is None:
+        raise ValueError(f"integrator worktree {path} could not be inspected; refusing to start")
+    if status.strip():
+        raise ValueError(f"integrator worktree {path} is dirty; clean it before retrying")
+    return INTEGRATOR_WORKTREE
 
 
 def _orphan_integra(now_at):
@@ -1583,7 +1595,9 @@ def integrator_lap():
     if not run:
         return lines
     try:
-        r = dispatch_worker(run, "Integrador", os.path.join(PLAN, "specs", "orq-integrador-servico.md"), INTEGRATOR_MODEL, INTEGRATOR_EFFORT, project=project, service=True, priority_level=1)
+        worktree = _integrator_worktree()
+        r = dispatch_worker(run, "Integrador", os.path.join(PLAN, "specs", "orq-integrador-servico.md"), INTEGRATOR_MODEL, INTEGRATOR_EFFORT,
+                            worktree=worktree, project=project, service=True, priority_level=1)
     except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
         return lines + [f"integrator not started: {e}"]
     return lines + [f"integrator started for {len(items)} waiting branch(es)" + (" (queued: no slot)" if r.get("estado") == "enfileirado" else "")]
